@@ -8,8 +8,9 @@ customer, not a collection of compiler-shaped demos.
 headless packages and their 37 internal dependency edges. Most packages have
 only their build declaration. The source seed ports memory alignment, the
 region operations needed by `SnapshotRegionFilter`, and filter geometry, with
-12 authored headless checks. Those checks do not yet pass the compiler; there
-is no supplied-byte scanner or CLI entry yet. The remaining work is
+12 authored headless checks. Package checking completes, but native Terminal
+production still rejects the geometry entry's missing checked Unit body plan.
+There is no supplied-byte scanner or CLI entry yet. The remaining work is
 listed in [TASKS.md](TASKS.md); passing repository checks is not port completion.
 
 ## Build and test
@@ -21,8 +22,8 @@ library. The commands work in PowerShell and macOS/Linux shells:
 ```text
 python tools/verify.py layout --upstream ../squalr_workspace
 python tools/verify.py audit --omega /path/to/omega
-python tools/verify.py check --omega /path/to/omega
-python tools/verify.py native --omega /path/to/omega
+python tools/verify.py check --timeout 600 --omega /path/to/omega
+python tools/verify.py native --timeout 600 --omega /path/to/omega
 ```
 
 On Windows use the path to `omega.exe`; on macOS use `python3` if necessary.
@@ -38,6 +39,16 @@ the harness neither accepts package trust nor replaces native execution with
 interpretation. It retains the command, host, output and exit status under
 `build/verification/`. Ordinary package review/acceptance is a separate explicit
 step; no generated approval file is checked in.
+
+Before native execution, use `omega update --project squalr-tests --target <target>`
+with the same compiler (`macos_arm64` on macOS or `windows_x86_64` on Windows).
+Inspect the reported review, resolve its exact pending decisions, then run
+`omega update --resume --project squalr-tests`. The checked-in `omega.lock`
+records the reviewed macOS baseline. Local package identities include checkout
+paths, so another checkout needs ordinary update/review for its local owners;
+Windows acceptance and runtime validation remain open. The longer harness timeout
+accommodates the measured roughly 210-second package passes of the tested debug
+compiler; it does not turn a timeout into a successful check.
 
 The root `build.omg` is a workspace catalog. Each nested `build.omg` owns its
 package or application and relative sibling dependencies. Applications select

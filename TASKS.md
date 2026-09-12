@@ -6,18 +6,21 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
 - **GEOMETRY-NATIVE.** Check and execute squalr-tests/main.omg through its own
   nested build.omg and ordinary squalr-engine-api imports. Confirm the filter's
   nested region identity, saturation and overlap counts against the mapped Rust
-  methods. Outer command: `python tools/verify.py native --omega <executable>`.
+  methods. Outer command: `python tools/verify.py native --timeout 600 --omega <executable>`.
   With std pinned to `a91d878cb9252647d977c45787969b16e6ef937a`,
-  Omega `e0d24c82fbca1bbae9f2b22cb661d5754e8c1707` on macOS ARM64
-  (Python 3.13) completes dependency review and exits 200 on 18 local-receiver
-  diagnostics in `Main::main`: calls such as `aligned.get_element_count(..)`
-  reject a LET-bound receiver because native receiver resolution does not retain
-  its storage. Omega's `validation/src/calls/expression_scanning/result_realization.rs`
-  owns the current fence; its **STATE-LOCAL-VALUE-FRONTIER** task owns the
-  value/storage/call join. Preserve the authored locals and repair the general
-  compiler path. The unchanged native command must print `Squalr geometry: PASS`;
-  native execution and Windows revalidation remain open. Current evidence is
-  under `build/verification/`.
+  Omega `26b7fe994beff8dd04e14bb223e6869c39a65e6e` on macOS ARM64
+  (Python 3.13, `RUST_MIN_STACK=67108864`) completes package checking and
+  acceptance. The native command exits 200 after 209.677 seconds at Terminal
+  production: `InvalidUnitMachinePlan` for `Main::main`, with reason
+  `attached Unit closure is missing a checked transitive machine plan`.
+  Omega's `checked-trees-to-lowered-psi/src/attached_unit/bodies.rs` consumes
+  the missing ordinary/composed checked body; trace its producer rather than
+  removing closure validation. **STATE-LOCAL-VALUE-FRONTIER** owns the general
+  operation/control join. Preserve the authored locals, geometry checks and
+  package graph. The command must print `Squalr geometry: PASS`; native execution
+  and Windows revalidation remain open. Current evidence is under
+  `build/verification/`. The reviewed macOS lock retains checkout-specific local
+  source identities; another checkout must complete ordinary update/review.
   Seed parity gaps still include Rust debug-only assertions, clone/serialization,
   alignment string parsing, region alignment/expansion and named trait operators.
 - **SUPPLIED-BYTES-SCAN.** Port the actual scalar scan, snapshot storage,
