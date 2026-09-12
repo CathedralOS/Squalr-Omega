@@ -7,15 +7,17 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   nested build.omg and ordinary squalr-engine-api imports. Confirm the filter's
   nested region identity, saturation and overlap counts against the mapped Rust
   methods. Outer command: `python tools/verify.py native --omega <executable>`.
-  At Omega `24ab0f1c87378054b6dfe9daa84f9b7b4a85c247` on Windows:
-  `check --project squalr-engine-api` loads the modules but reports four
-  exact-declaring-type case-membership diagnostics and one unproved alignment
-  local range. Triage these against the declared case/return contracts before
-  assigning a compiler fix. Application `audit` and `check` stop in pinned std
-  on unsynthesized `Optional` equality. `native` currently resolves the std alias
-  as a local path, without the selected package binding. Preserve these separate
-  failures; no dependency copying or fake approval is a fix. Evidence is under
-  `build/verification/`; macOS and native execution remain unverified.
+  With std pinned to `a91d878cb9252647d977c45787969b16e6ef937a`,
+  Omega `e0d24c82fbca1bbae9f2b22cb661d5754e8c1707` on macOS ARM64
+  (Python 3.13) completes dependency review and exits 200 on 18 local-receiver
+  diagnostics in `Main::main`: calls such as `aligned.get_element_count(..)`
+  reject a LET-bound receiver because native receiver resolution does not retain
+  its storage. Omega's `validation/src/calls/expression_scanning/result_realization.rs`
+  owns the current fence; its **STATE-LOCAL-VALUE-FRONTIER** task owns the
+  value/storage/call join. Preserve the authored locals and repair the general
+  compiler path. The unchanged native command must print `Squalr geometry: PASS`;
+  native execution and Windows revalidation remain open. Current evidence is
+  under `build/verification/`.
   Seed parity gaps still include Rust debug-only assertions, clone/serialization,
   alignment string parsing, region alignment/expansion and named trait operators.
 - **SUPPLIED-BYTES-SCAN.** Port the actual scalar scan, snapshot storage,
