@@ -8,8 +8,7 @@ customer, not a collection of compiler-shaped demos.
 headless packages and their 37 internal dependency edges. Most packages have
 only their build declaration. The source seed ports memory alignment, the
 region operations needed by `SnapshotRegionFilter`, and filter geometry, with
-12 authored headless checks. Package checking completes, but native Terminal
-production still rejects the geometry entry's missing checked Unit body plan.
+12 authored headless checks, now passing through native execution on macOS ARM64.
 There is no supplied-byte scanner or CLI entry yet. The remaining work is
 listed in [TASKS.md](TASKS.md); passing repository checks is not port completion.
 
@@ -17,7 +16,9 @@ listed in [TASKS.md](TASKS.md); passing repository checks is not port completion
 
 Python 3.11+ runs the portable harness. Supply an Omega executable built from
 the checkout you are testing; it must retain access to that checkout's bundled
-library. The commands work in PowerShell and macOS/Linux shells:
+library. Prefer `cargo build -p omega --release` (or `mbx build -p omega --release`)
+for the complete package graph; an unoptimized compiler can spend several minutes
+in package checking. The commands work in PowerShell and macOS/Linux shells:
 
 ```text
 python tools/verify.py layout --upstream ../squalr_workspace
@@ -46,9 +47,14 @@ Inspect the reported review, resolve its exact pending decisions, then run
 `omega update --resume --project squalr-tests`. The checked-in `omega.lock`
 records the reviewed macOS baseline. Local package identities include checkout
 paths, so another checkout needs ordinary update/review for its local owners;
-Windows acceptance and runtime validation remain open. The longer harness timeout
-accommodates the measured roughly 210-second package passes of the tested debug
-compiler; it does not turn a timeout into a successful check.
+Windows acceptance and runtime validation remain open. A timeout is not a
+successful check.
+
+If a newer compiler rejects a historical lock policy version, preserve the old
+lock under ignored `build/verification/lock-migration/` and retain its exact source
+pins before starting fresh `omega update` review. Inspect and resolve the new
+findings; do not edit version numbers or copy old decision rows into a new lock.
+Git retains the previously committed lock as well.
 
 The root `build.omg` is a workspace catalog. Each nested `build.omg` owns its
 package or application and relative sibling dependencies. Applications select

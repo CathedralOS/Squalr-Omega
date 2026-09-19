@@ -3,25 +3,18 @@
 The complete CLI/headless Rust behavior is the target; this list is ordered
 execution, not a substitute feature set. See PORTING.md and upstream.json.
 
-- **GEOMETRY-NATIVE.** Check and execute squalr-tests/main.omg through its own
-  nested build.omg and ordinary squalr-engine-api imports. Confirm the filter's
-  nested region identity, saturation and overlap counts against the mapped Rust
-  methods. Outer command: `python tools/verify.py native --timeout 600 --omega <executable>`.
-  With std pinned to `a91d878cb9252647d977c45787969b16e6ef937a`,
-  Omega `26b7fe994beff8dd04e14bb223e6869c39a65e6e` on macOS ARM64
-  (Python 3.13, `RUST_MIN_STACK=67108864`) completes package checking and
-  acceptance. The native command exits 200 after 209.677 seconds at Terminal
-  production: `InvalidUnitMachinePlan` for `Main::main`, with reason
-  `attached Unit closure is missing a checked transitive machine plan`.
-  Omega's `checked-trees-to-lowered-psi/src/attached_unit/bodies.rs` consumes
-  the missing ordinary/composed checked body; trace its producer rather than
-  removing closure validation. **STATE-LOCAL-VALUE-FRONTIER** owns the general
-  operation/control join. Preserve the authored locals, geometry checks and
-  package graph. The command must print `Squalr geometry: PASS`; native execution
-  and Windows revalidation remain open. Current evidence is under
-  `build/verification/`. The reviewed macOS lock retains checkout-specific local
-  source identities; another checkout must complete ordinary update/review.
-  Seed parity gaps still include Rust debug-only assertions, clone/serialization,
+- **GEOMETRY-PARITY.** Validate the geometry application on Windows through its
+  nested build.omg and ordinary squalr-engine-api imports, then finish the mapped
+  Rust behavior still absent from the seed. Outer command:
+  `python tools/verify.py native --timeout 600 --omega <executable>`.
+  Omega and std `87d8b22713ff5e46e535a4b1c62a8b6710d0d1ab` pass all 12 authored
+  geometry checks on macOS ARM64 using the release compiler, Python 3.13 and
+  `RUST_MIN_STACK=67108864`: native exit 0, `Squalr geometry: PASS`.
+  The receiver uses intrinsic `Service<Console>` establishment. Preserve the
+  authored locals, algorithms and package graph. Current evidence is under
+  `build/verification/`; another checkout needs ordinary update/review of its
+  local source identities. Windows was not run. Remaining parity gaps include
+  Rust debug-only assertions, clone/serialization,
   alignment string parsing, region alignment/expansion and named trait operators.
 - **SUPPLIED-BYTES-SCAN.** Port the actual scalar scan, snapshot storage,
   comparison dispatch, RLE encoder and query path in squalr-engine-api and
