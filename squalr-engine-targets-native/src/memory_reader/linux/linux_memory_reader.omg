@@ -1,0 +1,106 @@
+module src::memory_reader::linux::linux_memory_reader;
+
+use omega_language_std::filesystem_host;
+use omega::language::core::service;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_targets::src::target_providers::MemoryReadResult;
+use src::memory_reader::memory_reader_trait::MemoryReaderTrait;
+use src::proc_paths::ProcName;
+
+// Port of memory_reader/linux/linux_memory_reader.rs. Upstream issues one
+// process_vm_readv per read and returns bool; Omega's raw boundary for the same
+// mechanism is a positioned pread on /proc/<pid>/mem — the descriptor is scoped
+// to the call (mirroring process_vm_readv's per-call nature; the provider keeps
+// upstream's pid-as-handle convention rather than inventing fd custody). The
+// read's byte count stays observable as Complete/Partial so short reads —
+// pages disappearing mid-range — are not collapsed to an opaque false.
+// The service fields are ZII-established like upstream's unit struct `new()`;
+// `expected`/`mem_fd`/`proc_fd`/`count`/`scratch` are per-call storage (the
+// no-captured-locals lowering rule).
+pub data LinuxMemoryReader {
+    host: Service<FilesystemHost>;
+    proc_fd: i32;
+    mem_fd: i32;
+    count: i64;
+    expected: u64;
+    scratch: i32;
+    name: ProcName;
+}
+
+pub linux_x86_64 machine LinuxMemoryReader::read_bytes(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    address: u64,
+    values: &mut [u8]
+) -> MemoryReadResult
+satisfies MemoryReaderTrait::read_bytes
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.expected = values.len;
+    transition values.len == 0 {
+        true -> MemoryReadResult::Complete { count: 0 }
+        false -> open_proc(process_info, address, values)
+    }
+
+    state open_proc(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        values: &mut [u8]
+    ) -> MemoryReadResult {
+        self.proc_fd = self.host.open("/proc", 65536);
+        transition self.proc_fd >= 0 {
+            true -> open_mem(process_info, address, values)
+            false -> failed()
+        }
+    }
+
+    state open_mem(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        values: &mut [u8]
+    ) -> MemoryReadResult {
+        let pid: u32 = process_info.get_process_id_raw();
+        self.name = ProcName::for_process(pid, 109, 101, 109, 0, 3);
+        transition self.name.len <= 48 {
+            true -> open_mem_at(address, values, self.name.len)
+            false -> open_mem_at(address, values, 48)
+        }
+    }
+
+    state open_mem_at(&mut self, address: u64, values: &mut [u8], name_len: u64) -> MemoryReadResult {
+        self.mem_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 0);
+        transition self.mem_fd >= 0 {
+            true -> read(address, values)
+            false -> close_proc_failed()
+        }
+    }
+
+    state read(&mut self, address: u64, values: &mut [u8]) -> MemoryReadResult {
+        self.count = self.host.read_at(self.mem_fd, values, self.expected, address as i64 in Wrapping);
+        self.scratch = self.host.close(self.mem_fd);
+        self.scratch = self.host.close(self.proc_fd);
+        transition self.count < 0 {
+            true -> failed()
+            false -> classify()
+        }
+    }
+
+    state classify(&mut self) -> MemoryReadResult {
+        transition (self.count as u64) == self.expected {
+            true -> MemoryReadResult::Complete { count: self.count as u64 }
+            false -> MemoryReadResult::Partial { count: self.count as u64 }
+        }
+    }
+
+    state close_proc_failed(&mut self) -> MemoryReadResult {
+        self.scratch = self.host.close(self.proc_fd);
+        transition { _ -> failed() }
+    }
+
+    state failed(&mut self) -> MemoryReadResult {
+        MemoryReadResult::Failed
+    }
+}

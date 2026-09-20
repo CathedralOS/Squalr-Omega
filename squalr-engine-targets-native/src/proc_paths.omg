@@ -1,0 +1,153 @@
+module src::proc_paths;
+
+// Shared /proc/<pid>/<leaf> name builder. Upstream formats the path with
+// `format!("/proc/{pid}/{leaf}")`; Omega builds the same relative name as a
+// plain byte buffer, resolved beneath a /proc dirfd via `open_at` (the trusted
+// plain-name op — decimal digits and the fixed leaf cannot contain a NUL, so
+// no Path domain re-proof is needed). Leaf bytes arrive as scalars because a
+// slice parameter's length is not provable in Omega.
+
+// "<pid>/<leaf>": at most 10 decimal digits + '/' + a bounded leaf.
+pub data ProcName {
+    bytes: [u8; 48];
+    len: u64;
+    leaf_pos: u64;
+}
+
+// Leaf words used at the call sites: "maps" (4), "mem" (3), "exe" (3).
+pub machine ProcName::for_process(
+    process_id: u32,
+    leaf_a: u8,
+    leaf_b: u8,
+    leaf_c: u8,
+    leaf_d: u8,
+    leaf_len: u64
+) -> ProcName {
+    let mut name: ProcName = ProcName::for_pid(process_id);
+    name.put_leaf(leaf_a, leaf_b, leaf_c, leaf_d, leaf_len);
+    name
+}
+
+// Just "<pid>" — the procfs dir name itself (liveness probe).
+pub machine ProcName::for_pid(process_id: u32) -> ProcName {
+    let mut name: ProcName = ProcName { len: 0, leaf_pos: 0 };
+    name.put_pid(process_id as u64, 0);
+    name.reverse(0, ((name.len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+    name
+}
+
+// Emit the decimal pid least-significant-digit first; for_process reverses.
+machine ProcName::put_pid(&mut self, remaining: u64, digit_index: u64) {
+    transition digit_index < 48 {
+        true -> store_digit(remaining, digit_index)
+        false -> done()
+    }
+    state store_digit(&mut self, remaining: u64, digit_index: u64) {
+        self.bytes[digit_index] = (((48 as u64 in Wrapping) + ((remaining % 10) as u64 as u64 in Wrapping)) as u64) as u8;
+        self.len = ((digit_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition remaining >= 10 {
+            true -> self.put_pid(remaining / 10, ((digit_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> done()
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+machine ProcName::reverse(&mut self, low: u64, high: u64) {
+    transition low < high && low < 48 && high < 48 {
+        true -> swap(low, high)
+        false -> done()
+    }
+    state swap(&mut self, low: u64, high: u64) {
+        let byte: u8 = self.bytes[low];
+        self.bytes[low] = self.bytes[high];
+        self.bytes[high] = byte;
+        transition { _ -> self.reverse(((low as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((high as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64) }
+    }
+    state done(&mut self) {
+    }
+}
+
+machine ProcName::put_leaf(&mut self, leaf_a: u8, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+    transition self.len < 48 {
+        true -> separator(leaf_a, leaf_b, leaf_c, leaf_d, leaf_len)
+        false -> finished()
+    }
+    state separator(&mut self, leaf_a: u8, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        self.bytes[self.len] = 47;
+        self.len = ((self.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> leaf_first(leaf_a, leaf_b, leaf_c, leaf_d, leaf_len) }
+    }
+    state leaf_first(&mut self, leaf_a: u8, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        transition leaf_len >= 1 {
+            true -> len_first(leaf_a, leaf_b, leaf_c, leaf_d, leaf_len)
+            false -> finished()
+        }
+    }
+    state len_first(&mut self, leaf_a: u8, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        transition self.len < 48 {
+            true -> store_first(leaf_a, leaf_b, leaf_c, leaf_d, leaf_len)
+            false -> finished()
+        }
+    }
+    state store_first(&mut self, leaf_a: u8, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        self.bytes[self.len] = leaf_a;
+        self.len = ((self.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> leaf_second(leaf_b, leaf_c, leaf_d, leaf_len) }
+    }
+    state leaf_second(&mut self, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        transition leaf_len >= 2 {
+            true -> len_second(leaf_b, leaf_c, leaf_d, leaf_len)
+            false -> finished()
+        }
+    }
+    state len_second(&mut self, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        transition self.len < 48 {
+            true -> store_second(leaf_b, leaf_c, leaf_d, leaf_len)
+            false -> finished()
+        }
+    }
+    state store_second(&mut self, leaf_b: u8, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        self.bytes[self.len] = leaf_b;
+        self.len = ((self.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> leaf_third(leaf_c, leaf_d, leaf_len) }
+    }
+    state leaf_third(&mut self, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        transition leaf_len >= 3 {
+            true -> len_third(leaf_c, leaf_d, leaf_len)
+            false -> finished()
+        }
+    }
+    state len_third(&mut self, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        transition self.len < 48 {
+            true -> store_third(leaf_c, leaf_d, leaf_len)
+            false -> finished()
+        }
+    }
+    state store_third(&mut self, leaf_c: u8, leaf_d: u8, leaf_len: u64) {
+        self.bytes[self.len] = leaf_c;
+        self.len = ((self.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> leaf_fourth(leaf_d, leaf_len) }
+    }
+    state leaf_fourth(&mut self, leaf_d: u8, leaf_len: u64) {
+        transition leaf_len >= 4 {
+            true -> len_fourth(leaf_d)
+            false -> finished()
+        }
+    }
+    state len_fourth(&mut self, leaf_d: u8) {
+        transition self.len < 48 {
+            true -> store_fourth(leaf_d)
+            false -> finished()
+        }
+    }
+    state store_fourth(&mut self, leaf_d: u8) {
+        self.bytes[self.len] = leaf_d;
+        self.len = ((self.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> finished() }
+    }
+    state finished(&mut self) {
+        self.leaf_pos = 0;
+    }
+}
