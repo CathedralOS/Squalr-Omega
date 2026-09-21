@@ -1,0 +1,100 @@
+module src::memory_writer::linux::linux_memory_writer;
+
+use omega_language_std::filesystem_host;
+use omega::language::core::service;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_targets::src::target_providers::MemoryWriteResult;
+use src::memory_writer::memory_writer_trait::MemoryWriterTrait;
+use src::proc_paths::ProcName;
+
+// Port of memory_writer/linux/linux_memory_writer.rs. Upstream writes through
+// process_vm_writev (with a fallback /proc/pid/mem write); Omega's positioned
+// write on /proc/<pid>/mem opened O_RDWR is the same kernel mechanism. Partial
+// writes surface their count rather than collapsing to false.
+pub data LinuxMemoryWriter {
+    host: Service<FilesystemHost>;
+    proc_fd: i32;
+    mem_fd: i32;
+    count: i64;
+    expected: u64;
+    scratch: i32;
+    name: ProcName;
+}
+
+pub linux_x86_64 machine LinuxMemoryWriter::write_bytes(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    address: u64,
+    values: &[u8]
+) -> MemoryWriteResult
+satisfies MemoryWriterTrait::write_bytes
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.expected = values.len;
+    transition values.len == 0 {
+        true -> MemoryWriteResult::Complete { count: 0 }
+        false -> open_proc(process_info, address, values)
+    }
+
+    state open_proc(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        values: &[u8]
+    ) -> MemoryWriteResult {
+        self.proc_fd = self.host.open("/proc", 65536);
+        transition self.proc_fd >= 0 {
+            true -> open_mem(process_info, address, values)
+            false -> failed()
+        }
+    }
+
+    state open_mem(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        values: &[u8]
+    ) -> MemoryWriteResult {
+        let pid: u32 = process_info.get_process_id_raw();
+        self.name = ProcName::for_process(pid, 109, 101, 109, 0, 3);
+        transition self.name.len <= 48 {
+            true -> open_mem_at(address, values, self.name.len)
+            false -> open_mem_at(address, values, 48)
+        }
+    }
+
+    state open_mem_at(&mut self, address: u64, values: &[u8], name_len: u64) -> MemoryWriteResult {
+        self.mem_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 2);
+        transition self.mem_fd >= 0 {
+            true -> write(address, values)
+            false -> close_proc_failed()
+        }
+    }
+
+    state write(&mut self, address: u64, values: &[u8]) -> MemoryWriteResult {
+        self.count = self.host.write_at(self.mem_fd, values, address as i64 in Wrapping);
+        self.scratch = self.host.close(self.mem_fd);
+        self.scratch = self.host.close(self.proc_fd);
+        transition self.count < 0 {
+            true -> failed()
+            false -> classify()
+        }
+    }
+
+    state classify(&mut self) -> MemoryWriteResult {
+        transition (self.count as u64) == self.expected {
+            true -> MemoryWriteResult::Complete { count: self.count as u64 }
+            false -> MemoryWriteResult::Partial { count: self.count as u64 }
+        }
+    }
+
+    state close_proc_failed(&mut self) -> MemoryWriteResult {
+        self.scratch = self.host.close(self.proc_fd);
+        transition { _ -> failed() }
+    }
+
+    state failed(&mut self) -> MemoryWriteResult {
+        MemoryWriteResult::Failed
+    }
+}

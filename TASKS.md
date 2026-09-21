@@ -14,11 +14,10 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   authored locals, algorithms and package graph. Current evidence is under
   `build/verification/`; another checkout needs ordinary update/review of its
   local source identities. Windows was not run. Remaining parity gaps include
-  Rust debug-only assertions, clone/serialization,
-  alignment string parsing, the set_alignment call-site gate
-  (a `&mut self` machine taking a data parameter loses the entry attachment
-  identity; the ported machine is source-checked but not yet exercised) and
-  named trait operators.
+  Rust debug-only assertions, alignment string parsing, the set_alignment
+  call-site gate (a `&mut self` machine taking a data parameter loses the
+  entry attachment identity; the ported machine is source-checked but not
+  yet exercised) and named trait operators.
 - **SUPPLIED-BYTES-SCAN.** Port the actual scalar scan, snapshot storage,
   comparison dispatch, RLE encoder and query path in squalr-engine-api and
   squalr-engine-scanning. Preserve growable and partitioned output, candidate
