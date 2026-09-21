@@ -1,0 +1,183 @@
+module src::process_query::linux::linux_process_query;
+
+use omega_language_std::filesystem_host;
+use omega::language::core::service;
+use squalr_engine_api::src::structures::memory::bitness::Bitness;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_api::src::structures::processes::process_info::ProcessInfo;
+use squalr_engine_targets::src::target_providers::OpenedProcessResult;
+use squalr_engine_targets::src::target_providers::ProcessListOutcome;
+use squalr_engine_targets::src::target_providers::ProcessQueryOutcome;
+use src::proc_paths::ProcName;
+
+// Port of process_query/linux/linux_process_query.rs, bounded to what the
+// headless read path exercises: open_process (handle = pid, exactly as
+// upstream), close_process (upstream's unconditional Ok), the ELF-header
+// target-architecture read of /proc/<pid>/exe with upstream's host fallback,
+// and is_process_alive as the procfs existence check standing in for
+// upstream's kill(pid, 0). start/stop_monitoring and the full get_processes
+// enumeration (sysinfo's /proc sweep with names) are declared on the trait and
+// stay NotImplemented here until the enumeration's buffer contract settles —
+// they are not silently faked.
+pub data LinuxProcessQuery {
+    host: Service<FilesystemHost>;
+    proc_fd: i32;
+    exe_fd: i32;
+    header: [u8; 1];
+    count: i64;
+    scratch: i32;
+    name: ProcName;
+    bitness: Bitness;
+}
+
+pub linux_x86_64 machine LinuxProcessQuery::open_process(
+    &mut self,
+    process_info: &ProcessInfo
+) -> OpenedProcessResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    // read_process_executable_bytes -> ELF EI_CLASS at offset 4 (also the
+    // process-existence probe: an unreadable exe means the process is gone or
+    // unreadable — upstream falls back to the host architecture either way).
+    let pid: u32 = process_info.get_process_id_raw();
+    self.name = ProcName::for_process(pid, 101, 120, 101, 0, 3);
+    self.proc_fd = self.host.open("/proc", 65536);
+    transition self.proc_fd >= 0 {
+        true -> open_exe(process_info)
+        false -> fallback(process_info)
+    }
+
+    state open_exe(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        transition self.name.len <= 48 {
+            true -> open_exe_at(process_info, self.name.len)
+            false -> open_exe_at(process_info, 48)
+        }
+    }
+
+    state open_exe_at(&mut self, process_info: &ProcessInfo, name_len: u64) -> OpenedProcessResult {
+        self.exe_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 0);
+        transition self.exe_fd >= 0 {
+            true -> read_class(process_info)
+            false -> close_fallback(process_info)
+        }
+    }
+
+    state read_class(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        self.count = self.host.read_at(self.exe_fd, self.header[0..1], 1, 4);
+        self.scratch = self.host.close(self.exe_fd);
+        self.scratch = self.host.close(self.proc_fd);
+        transition self.count == 1 && self.header[0] == 1 {
+            true -> arch32(process_info)
+            false -> arch64_or_fallback(process_info)
+        }
+    }
+
+    state arch32(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        self.bitness = Bitness::Bit32;
+        transition { _ -> opened(process_info) }
+    }
+
+    state arch64_or_fallback(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        transition self.count == 1 && self.header[0] == 2 {
+            true -> arch64(process_info)
+            false -> host_fallback(process_info)
+        }
+    }
+
+    state arch64(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        self.bitness = Bitness::Bit64;
+        transition { _ -> opened(process_info) }
+    }
+
+    // TargetArchitecture::unknown(host_pointer_width, Little): on linux_x86_64
+    // the host is Bit64.
+    state host_fallback(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        self.bitness = Bitness::Bit64;
+        transition { _ -> opened(process_info) }
+    }
+
+    state close_fallback(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        self.scratch = self.host.close(self.proc_fd);
+        transition { _ -> host_fallback(process_info) }
+    }
+
+    state fallback(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        transition { _ -> host_fallback(process_info) }
+    }
+
+    state opened(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        // Upstream: handle = process_id as u64; icon None; name from the query.
+        transition process_info.name_len <= 256 {
+            true -> opened_with_len(process_info, process_info.name_len)
+            false -> opened_with_len(process_info, 256)
+        }
+    }
+
+    state opened_with_len(&mut self, process_info: &ProcessInfo, name_len: u64) -> OpenedProcessResult {
+        let pid: u32 = process_info.get_process_id_raw();
+        OpenedProcessResult::Opened {
+            info: OpenedProcessInfo::new(
+                pid,
+                process_info.name[0..name_len],
+                pid as u64,
+                self.bitness
+            )
+        }
+    }
+}
+
+pub linux_x86_64 machine LinuxProcessQuery::close_process(
+    &mut self,
+    handle: u64
+) -> ProcessQueryOutcome
+{
+    // Upstream: `Ok(())` for any handle — there is no descriptor custody.
+    ProcessQueryOutcome::Succeeded
+}
+
+pub linux_x86_64 machine LinuxProcessQuery::is_process_alive(
+    &mut self,
+    process_id: u32
+) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    // Upstream uses kill(pid, 0) (ESRCH => dead); procfs existence is the same
+    // signal for this package's scope: /proc/<pid> present iff the pid lives.
+    self.name = ProcName::for_pid(process_id);
+    self.proc_fd = self.host.open("/proc", 65536);
+    transition self.proc_fd >= 0 {
+        true -> probe()
+        false -> dead()
+    }
+
+    state probe(&mut self) -> bool {
+        transition self.name.len <= 48 {
+            true -> probe_at(self.name.len)
+            false -> probe_at(48)
+        }
+    }
+
+    state probe_at(&mut self, name_len: u64) -> bool {
+        self.exe_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 65536);
+        self.scratch = self.host.close(self.proc_fd);
+        transition self.exe_fd >= 0 {
+            true -> alive()
+            false -> dead()
+        }
+    }
+
+    state alive(&mut self) -> bool {
+        self.scratch = self.host.close(self.exe_fd);
+        transition { _ -> yes() }
+    }
+
+    state yes(&mut self) -> bool {
+        true
+    }
+
+    state dead(&mut self) -> bool {
+        false
+    }
+}
