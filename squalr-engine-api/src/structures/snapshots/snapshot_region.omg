@@ -1,0 +1,445 @@
+module src::structures::snapshots::snapshot_region;
+
+use omega::language::core::option;
+use src::structures::memory::normalized_region;
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::results::snapshot_region_scan_results::SnapshotRegionFilterBounds;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+
+machine min_u64(left: u64, right: u64) -> u64 {
+    transition left < right {
+        true -> (left)
+        _ -> (right)
+    }
+}
+
+machine max_u64(left: u64, right: u64) -> u64 {
+    transition left < right {
+        true -> (right)
+        _ -> (left)
+    }
+}
+
+// Port of SnapshotRegion. Upstream owns Vec<u8> current/previous value buffers,
+// Vec<u64> page boundaries and a HashSet<u64> of page-boundary tombstones.
+// Omega storage is caller-supplied: each region borrows its value extents with
+// a live collected count, a boundaries extent with a live count, and a
+// tombstones extent scanned linearly (set semantics modulo order — upstream
+// HashSet's iteration order is likewise unspecified).
+//
+// Upstream's get_current_values_filter_pointer returns a raw byte pointer into
+// the value buffer; Omega callers receive the region's value extents through
+// get_current_values()/get_previous_values() and index them with
+// `filter_base - region_base` arithmetic — the same element window upstream
+// dereferenced unsafely.
+pub data SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols> {
+    normalized_region: normalized_region::NormalizedRegion;
+    current_values: &'current mut [u8];
+    current_values_len: u64;
+    previous_values: &'previous mut [u8];
+    previous_values_len: u64;
+    page_boundaries: &'boundaries mut [u64];
+    page_boundary_count: u64;
+    page_boundary_tombstones: &'tombstones mut [u64];
+    tombstone_count: u64;
+    // Upstream keeps a SnapshotRegionScanResults record here and swaps it in
+    // initialize_scan_results / set_scan_results. Omega persistent fields can
+    // only receive loans at construction, so the region instead holds the
+    // results extent fixed for its lifetime: callers write each output
+    // collection through mutate_scan_result_collection_at (set_window +
+    // recount_results) and publish the live count through
+    // set_scan_result_collection_count. DEVIATION (language): set_scan_results
+    // + resize_to_filters arrive as set_scan_result_collection_count +
+    // resize_to_filters; the upstream pairing is preserved by the caller.
+    scan_result_filter_collections: &'cols mut [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>];
+    scan_result_collection_count: u64;
+}
+
+pub machine SnapshotRegion::new<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    normalized_region: normalized_region::NormalizedRegion,
+    current_values: &'current mut [u8],
+    current_values_len: u64,
+    previous_values: &'previous mut [u8],
+    previous_values_len: u64,
+    page_boundaries: &'boundaries mut [u64],
+    page_boundary_count: u64,
+    page_boundary_tombstones: &'tombstones mut [u64],
+    tombstone_count: u64,
+    scan_result_filter_collections: &'cols mut [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+    scan_result_collection_count: u64
+) -> SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols> {
+    (SnapshotRegion {
+        normalized_region: normalized_region,
+        current_values: current_values,
+        current_values_len: current_values_len,
+        previous_values: previous_values,
+        previous_values_len: previous_values_len,
+        page_boundaries: page_boundaries,
+        page_boundary_count: page_boundary_count,
+        page_boundary_tombstones: page_boundary_tombstones,
+        tombstone_count: tombstone_count,
+        scan_result_filter_collections: scan_result_filter_collections,
+        scan_result_collection_count: scan_result_collection_count,
+    })
+}
+
+pub machine SnapshotRegion::get_base_address(&self) -> u64 {
+    self.normalized_region.get_base_address()
+}
+
+pub machine SnapshotRegion::get_end_address(&self) -> u64 {
+    self.normalized_region.get_end_address()
+}
+
+pub machine SnapshotRegion::get_region_size(&self) -> u64 {
+    self.normalized_region.get_region_size()
+}
+
+pub machine SnapshotRegion::get_current_values(&self) -> &[u8] {
+    self.current_values
+}
+
+pub machine SnapshotRegion::get_previous_values(&self) -> &[u8] {
+    self.previous_values
+}
+
+pub machine SnapshotRegion::get_current_values_len(&self) -> u64 {
+    self.current_values_len
+}
+
+pub machine SnapshotRegion::get_previous_values_len(&self) -> u64 {
+    self.previous_values_len
+}
+
+pub machine SnapshotRegion::has_current_values(&self) -> bool {
+    self.current_values_len > 0
+}
+
+pub machine SnapshotRegion::has_previous_values(&self) -> bool {
+    self.previous_values_len > 0
+}
+
+// Upstream: `current_values` is only as long as the bytes actually collected,
+// and tombstoned pages subtract their ranges from the collected total.
+pub machine SnapshotRegion::get_collected_byte_count(&self) -> u64 {
+    transition self.current_values_len > 0 {
+        true -> collected()
+        _ -> (0)
+    }
+    state collected(&self) -> u64 {
+        let region_size: u64 = self.get_region_size();
+        transition self.current_values_len < region_size {
+            true -> collected_size(self.current_values_len)
+            _ -> collected_size(region_size)
+        }
+    }
+    state collected_size(&self, current_value_size: u64) -> u64 {
+        transition self.tombstone_count > 0 {
+            true -> with_tombstones(current_value_size)
+            _ -> (current_value_size)
+        }
+    }
+    state with_tombstones(&self, current_value_size: u64) -> u64 {
+        transition self.page_boundary_count > 0 {
+            true -> ranges(current_value_size)
+            _ -> base_only(current_value_size)
+        }
+    }
+    state base_only(&self, current_value_size: u64) -> u64 {
+        let base_is_tombstoned: bool = self.tombstone_contains(self.get_base_address());
+        transition base_is_tombstoned {
+            true -> (0)
+            _ -> (current_value_size)
+        }
+    }
+    state ranges(&self, current_value_size: u64) -> u64 {
+        let base_address: u64 = self.get_base_address();
+        let collected: u64 = sum_uncollected_free_ranges(0, base_address, 0);
+        let end_address: u64 = self.get_end_address();
+        let last_range_start: u64 = last_boundary_or_base();
+        transition self.tombstone_contains(last_range_start) {
+            true -> finish(collected, current_value_size)
+            _ -> tail(collected, last_range_start, end_address, current_value_size)
+        }
+    }
+    state tail(&self, collected: u64, range_start: u64, end_address: u64, current_value_size: u64) -> u64 {
+        let tail_bytes: u64 = ((end_address as u64 in Saturating) - (range_start as u64 in Saturating)) as u64;
+        let total: u64 = ((collected as u64 in Saturating) + (tail_bytes as u64 in Saturating)) as u64;
+        finish(total, current_value_size)
+    }
+    state finish(&self, collected: u64, current_value_size: u64) -> u64 {
+        transition collected < current_value_size {
+            true -> (collected)
+            _ -> (current_value_size)
+        }
+    }
+    state sum_uncollected_free_ranges(&self, boundary_index: u64, range_start: u64, accumulated: u64) -> u64 {
+        transition boundary_index < self.page_boundary_count {
+            true -> in_extent(self.page_boundaries, boundary_index, range_start, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state in_extent(
+        &self,
+        boundaries: &[u64],
+        boundary_index: u64,
+        range_start: u64,
+        accumulated: u64
+    ) -> u64 {
+        transition boundary_index < boundaries.len {
+            true -> merge(boundaries, boundary_index, range_start, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state merge(
+        &self,
+        boundaries: &[u64],
+        boundary_index: u64 [0..boundaries.len],
+        range_start: u64,
+        accumulated: u64
+    ) -> u64 {
+        let next_index: u64 = ((boundary_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_boundary: u64 = boundaries[boundary_index];
+        transition self.tombstone_contains(range_start) {
+            true -> skip(next_index, next_boundary, accumulated)
+            _ -> add_range(next_index, next_boundary, range_start, accumulated)
+        }
+    }
+    state add_range(&self, next_index: u64, next_boundary: u64, range_start: u64, accumulated: u64) -> u64 {
+        let range_bytes: u64 = ((next_boundary as u64 in Saturating) - (range_start as u64 in Saturating)) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (range_bytes as u64 in Saturating)) as u64;
+        sum_uncollected_free_ranges(next_index, next_boundary, next_accumulated)
+    }
+    state skip(&self, next_index: u64, next_boundary: u64, accumulated: u64) -> u64 {
+        sum_uncollected_free_ranges(next_index, next_boundary, accumulated)
+    }
+    state last_boundary_or_base(&self) -> u64 {
+        let last_index: u64 = ((self.page_boundary_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition last_index < self.page_boundary_count {
+            true -> last_in_extent(self.page_boundaries, last_index)
+            _ -> base()
+        }
+    }
+    state last_in_extent(&self, boundaries: &[u64], last_index: u64 [0..self.page_boundary_count]) -> u64 {
+        transition last_index < boundaries.len {
+            true -> value(boundaries, last_index)
+            _ -> base()
+        }
+    }
+    state value(&self, boundaries: &[u64], last_index: u64 [0..boundaries.len]) -> u64 {
+        boundaries[last_index]
+    }
+    state base(&self) -> u64 {
+        self.get_base_address()
+    }
+}
+
+// Upstream HashSet::contains — membership check over the tombstone extent.
+pub machine SnapshotRegion::tombstone_contains(&self, address: u64) -> bool {
+    transition {
+        _ -> scan(0, address)
+    }
+    state scan(&self, tombstone_index: u64, address: u64) -> bool {
+        transition tombstone_index < self.tombstone_count {
+            true -> in_extent(self.page_boundary_tombstones, tombstone_index, address)
+            _ -> (false)
+        }
+    }
+    state in_extent(&self, tombstones: &[u64], tombstone_index: u64, address: u64) -> bool {
+        transition tombstone_index < tombstones.len {
+            true -> check(tombstones, tombstone_index, address)
+            _ -> (false)
+        }
+    }
+    state check(&self, tombstones: &[u64], tombstone_index: u64 [0..tombstones.len], address: u64) -> bool {
+        transition tombstones[tombstone_index] == address {
+            true -> (true)
+            _ -> scan_next(tombstone_index, address)
+        }
+    }
+    state scan_next(&self, tombstone_index: u64, address: u64) -> bool {
+        let next_index: u64 = ((tombstone_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        scan(next_index, address)
+    }
+}
+
+// Upstream initialize_scan_results / set_scan_results replaced the region's
+// results object. Here the caller fills the fixed results extent via
+// mutate_scan_result_collection_at and publishes its live length through this
+// setter; an empty initialize is just count 0.
+pub machine SnapshotRegion::set_scan_result_collection_count(&mut self, collection_count: u64) {
+    self.scan_result_collection_count = collection_count;
+}
+
+pub machine SnapshotRegion::has_scan_results(&self) -> bool {
+    (self.scan_result_collection_count > 0)
+}
+
+pub machine SnapshotRegion::get_scan_result_collection_count(&self) -> u64 {
+    (self.scan_result_collection_count)
+}
+
+// Shared view of the region's scan result collections.
+pub machine SnapshotRegion::get_scan_result_collections<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &self
+) -> &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>] {
+    (self.scan_result_filter_collections)
+}
+
+// Folded number of live scan results across all collections on this region;
+// mirrors upstream get_scan_results().get_number_of_results().
+pub machine SnapshotRegion::get_scan_result_number_of_results<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
+    transition {
+        _ -> fold_results(self.scan_result_filter_collections, 0, 0)
+    }
+    state fold_results(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64,
+        accumulated: u64
+    ) -> u64 {
+        transition collection_index < self.scan_result_collection_count && collection_index < collections.len {
+            true -> add_results(collections, collection_index, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state add_results(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64 [0..collections.len],
+        accumulated: u64
+    ) -> u64 {
+        let collection_results: u64 = collections[collection_index].get_number_of_results();
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (collection_results as u64 in Saturating)) as u64;
+        let next_index: u64 = ((collection_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        fold_results(collections, next_index, next_accumulated)
+    }
+}
+
+// Folded min/max filter bounds across collections with at least one result;
+// mirrors upstream get_scan_results().get_filter_bounds().
+pub machine SnapshotRegion::get_scan_result_filter_bounds<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> SnapshotRegionFilterBounds {
+    transition {
+        _ -> fold_bounds(self.scan_result_filter_collections, 0, 18446744073709551615, 0, false)
+    }
+    state fold_bounds(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64,
+        minimum: u64,
+        maximum: u64,
+        has_results: bool
+    ) -> SnapshotRegionFilterBounds {
+        transition collection_index < self.scan_result_collection_count && collection_index < collections.len {
+            true -> probe_results(collections, collection_index, minimum, maximum, has_results)
+            _ -> done(minimum, maximum, has_results)
+        }
+    }
+    state probe_results(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64 [0..collections.len],
+        minimum: u64,
+        maximum: u64,
+        has_results: bool
+    ) -> SnapshotRegionFilterBounds {
+        let collection_results: u64 = collections[collection_index].get_number_of_results();
+        transition collection_results > 0 && collection_index < collections.len {
+            true -> read_bounds(collections, collection_index, minimum, maximum)
+            _ -> fold_bounds(collections, ((collection_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, minimum, maximum, has_results)
+        }
+    }
+    state read_bounds(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64 [0..collections.len],
+        minimum: u64,
+        maximum: u64
+    ) -> SnapshotRegionFilterBounds {
+        let collection_minimum: u64 = collections[collection_index].get_filter_minimum_address();
+        let collection_maximum: u64 = collections[collection_index].get_filter_maximum_address();
+        let next_index: u64 = ((collection_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_minimum: u64 = min_u64(minimum, collection_minimum);
+        let next_maximum: u64 = max_u64(maximum, collection_maximum);
+        fold_bounds(collections, next_index, next_minimum, next_maximum, true)
+    }
+    state done(&self, minimum: u64, maximum: u64, has_results: bool) -> SnapshotRegionFilterBounds {
+        transition has_results {
+            true -> (SnapshotRegionFilterBounds { minimum_address: minimum, maximum_address: maximum })
+            _ -> (SnapshotRegionFilterBounds { minimum_address: 0, maximum_address: 0 })
+        }
+    }
+}
+
+// Index of the collection keyed by the given data type, or None.
+pub machine SnapshotRegion::find_scan_result_collection_index_by_data_type<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &self,
+    data_type: &DataTypeRef
+) -> Optional<u64> {
+    transition {
+        _ -> scan_collections(self.scan_result_filter_collections, 0, data_type)
+    }
+    state scan_collections(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64,
+        data_type: &DataTypeRef
+    ) -> Optional<u64> {
+        transition collection_index < self.scan_result_collection_count && collection_index < collections.len {
+            true -> check_collection(collections, collection_index, data_type)
+            _ -> (Optional::None)
+        }
+    }
+    state check_collection(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64 [0..collections.len],
+        data_type: &DataTypeRef
+    ) -> Optional<u64> {
+        let matches: bool = DataTypeRef::equals(collections[collection_index].get_data_type_ref(), data_type);
+        transition matches {
+            true -> (Optional::Some { value: collection_index })
+            _ -> next_collection(collection_index, data_type)
+        }
+    }
+    state next_collection(&self, collection_index: u64, data_type: &DataTypeRef) -> Optional<u64> {
+        let next_index: u64 = ((collection_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        scan_collections(self.scan_result_filter_collections, next_index, data_type)
+    }
+}
+
+// Shared access to one collection by slot index.
+pub machine SnapshotRegion::get_scan_result_collection_at<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &self,
+    collection_index: u64
+) -> Optional<&SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>> {
+    transition collection_index < self.scan_result_collection_count && collection_index < self.scan_result_filter_collections.len {
+        true -> in_extent(self.scan_result_filter_collections, collection_index)
+        _ -> (Optional::None)
+    }
+    state in_extent(
+        &self,
+        collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64 [0..collections.len]
+    ) -> Optional<&SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>> {
+        (Optional::Some { value: &collections[collection_index] })
+    }
+}
+
+// Exclusive access to one collection by slot index.
+pub machine SnapshotRegion::mutate_scan_result_collection_at<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &mut self,
+    collection_index: u64
+) -> Optional<&mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>> {
+    transition collection_index < self.scan_result_collection_count && collection_index < self.scan_result_filter_collections.len {
+        true -> in_extent(&mut self.scan_result_filter_collections, collection_index)
+        _ -> (Optional::None)
+    }
+    state in_extent(
+        &mut self,
+        collections: &mut [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64 [0..collections.len]
+    ) -> Optional<&mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>> {
+        (Optional::Some { value: &mut collections[collection_index] })
+    }
+}

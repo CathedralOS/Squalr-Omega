@@ -1,0 +1,797 @@
+module src::structures::snapshots::snapshot;
+
+use omega::language::core::option;
+use src::structures::snapshots::snapshot_region::SnapshotRegion;
+
+// Port of Snapshot. Upstream owns Vec<SnapshotRegion> and a BTreeSet<u64> of
+// tombstoned result indices. Omega regions live in a caller-supplied extent
+// (SnapshotRegion holds borrows, so it cannot be moved for Vec-style
+// retain/sort); ordering and liveness are carried by a `region_order`
+// permutation extent — `discard_empty_regions`/`sort_regions` rewrite the
+// permutation exactly as upstream rewrites the region vector, so iteration
+// order and membership match.
+//
+// Tombstones are an extent with insert-unique semantics (BTreeSet's ordering
+// is only used upstream for range iteration; the ported visible-count paths
+// count in-range membership, which is order-insensitive).
+//
+// Deferred (documented, not faked): get_scan_result/get_scan_results_page
+// (ScanResultValued decode), commit_deleted_scan_result_indices's structural
+// filter rebuild, and per-data-type paged counting. `commit_deleted...`
+// crashes Abort if exercised with a non-empty tombstone set rather than
+// silently skipping the rebuild.
+pub data Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols> {
+    snapshot_regions: &'regions mut [SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>];
+    region_order: &'order mut [u64];
+    region_count: u64;
+    deleted_scan_result_indices: &'deleted mut [u64];
+    deleted_count: u64;
+}
+
+pub machine Snapshot::new<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    snapshot_regions: &'regions mut [SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+    region_order: &'order mut [u64],
+    region_count: u64,
+    deleted_scan_result_indices: &'deleted mut [u64]
+) -> Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols> {
+    (Snapshot {
+        snapshot_regions: snapshot_regions,
+        region_order: region_order,
+        region_count: region_count,
+        deleted_scan_result_indices: deleted_scan_result_indices,
+        deleted_count: 0,
+    })
+}
+
+pub machine Snapshot::get_region_count<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
+    self.region_count
+}
+
+pub machine Snapshot::get_deleted_count<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
+    self.deleted_count
+}
+
+// Slot lookup result: Optional<u64> in spirit; a dedicated case avoids
+// destructuring a scalar payload out of the generic carrier.
+pub data RegionSlot [copy] {
+    case Present(slot: u64);
+    case Absent;
+}
+
+// Upstream get_snapshot_regions iter in slot order of the live permutation.
+pub machine Snapshot::get_region_slot_at<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self, ordinal: u64) -> RegionSlot {
+    transition ordinal < self.region_count {
+        true -> in_extent(self.region_order, ordinal)
+        _ -> (RegionSlot::Absent)
+    }
+    state in_extent(&self, order: &[u64], ordinal: u64 [0..self.region_count]) -> RegionSlot {
+        transition ordinal < order.len {
+            true -> slot(order, ordinal)
+            _ -> (RegionSlot::Absent)
+        }
+    }
+    state slot(&self, order: &[u64], ordinal: u64 [0..order.len]) -> RegionSlot {
+        let region_index: u64 = order[ordinal];
+        transition region_index < self.snapshot_regions.len {
+            true -> (RegionSlot::Present { slot: region_index })
+            _ -> (RegionSlot::Absent)
+        }
+    }
+}
+
+// Read access to a region by ordinal through the live permutation.
+pub machine Snapshot::get_region_at<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &self,
+    ordinal: u64
+) -> Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+    transition ordinal < self.region_count {
+        true -> slot(self.region_order, self.snapshot_regions, ordinal)
+        _ -> (Optional::None)
+    }
+    state slot(
+        &self,
+        order: &[u64],
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        ordinal: u64 [0..self.region_count]
+    ) -> Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+        transition ordinal < order.len {
+            true -> index(order, regions, ordinal)
+            _ -> (Optional::None)
+        }
+    }
+    state index(
+        &self,
+        order: &[u64],
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        ordinal: u64 [0..order.len]
+    ) -> Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+        let region_index: u64 = order[ordinal];
+        transition region_index < regions.len {
+            true -> some(regions, region_index)
+            _ -> (Optional::None)
+        }
+    }
+    state some(
+        &self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        region_index: u64 [0..regions.len]
+    ) -> Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+        (Optional::Some { value: &regions[region_index] })
+    }
+}
+
+// Mutable access to a region by ordinal through the live permutation; the scan
+// leg mutates scan results in place.
+pub machine Snapshot::mutate_region_at<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &mut self,
+    ordinal: u64
+) -> Optional<&mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+    transition ordinal < self.region_count {
+        true -> slot(self.region_order, &mut self.snapshot_regions, ordinal)
+        _ -> (Optional::None)
+    }
+    state slot(
+        &mut self,
+        order: &[u64],
+        regions: &mut [SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        ordinal: u64 [0..self.region_count]
+    ) -> Optional<&mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+        transition ordinal < order.len {
+            true -> index(order, &mut regions, ordinal)
+            _ -> (Optional::None)
+        }
+    }
+    state index(
+        &mut self,
+        order: &[u64],
+        regions: &mut [SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        ordinal: u64 [0..order.len]
+    ) -> Optional<&mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+        let region_index: u64 = order[ordinal];
+        transition region_index < regions.len {
+            true -> some(&mut regions, region_index)
+            _ -> (Optional::None)
+        }
+    }
+    state some(
+        &mut self,
+        regions: &mut [SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        region_index: u64 [0..regions.len]
+    ) -> Optional<&mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> {
+        (Optional::Some { value: &mut regions[region_index] })
+    }
+}
+
+pub machine Snapshot::get_byte_count<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
+    transition {
+        _ -> sum(0, 0)
+    }
+    state sum(&self, ordinal: u64, accumulated: u64) -> u64 {
+        transition ordinal < self.region_count {
+            true -> accumulate(ordinal, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state accumulate(&self, ordinal: u64, accumulated: u64) -> u64 {
+        let region_result: Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> = self.get_region_at(ordinal);
+        transition region_result {
+            Optional::Some { value } -> add(ordinal, accumulated, value)
+            Optional::None -> (accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state add(&self, ordinal: u64, accumulated: u64, region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>) -> u64 {
+        let next_ordinal: u64 = ((ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (region.get_region_size() as u64 in Saturating)) as u64;
+        sum(next_ordinal, next_accumulated)
+    }
+}
+
+pub machine Snapshot::get_collected_byte_count<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
+    transition {
+        _ -> sum(0, 0)
+    }
+    state sum(&self, ordinal: u64, accumulated: u64) -> u64 {
+        transition ordinal < self.region_count {
+            true -> accumulate(ordinal, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state accumulate(&self, ordinal: u64, accumulated: u64) -> u64 {
+        let region_result: Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> = self.get_region_at(ordinal);
+        transition region_result {
+            Optional::Some { value } -> add(ordinal, accumulated, value)
+            Optional::None -> (accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state add(&self, ordinal: u64, accumulated: u64, region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>) -> u64 {
+        let next_ordinal: u64 = ((ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (region.get_collected_byte_count() as u64 in Saturating)) as u64;
+        sum(next_ordinal, next_accumulated)
+    }
+}
+
+// Structural result count before tombstones are applied.
+pub machine Snapshot::get_structural_number_of_results<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
+    transition {
+        _ -> sum(0, 0)
+    }
+    state sum(&self, ordinal: u64, accumulated: u64) -> u64 {
+        transition ordinal < self.region_count {
+            true -> accumulate(ordinal, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state accumulate(&self, ordinal: u64, accumulated: u64) -> u64 {
+        let region_result: Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> = self.get_region_at(ordinal);
+        transition region_result {
+            Optional::Some { value } -> add(ordinal, accumulated, value)
+            Optional::None -> (accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state add(&self, ordinal: u64, accumulated: u64, region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>) -> u64 {
+        let next_ordinal: u64 = ((ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (region.get_scan_result_number_of_results() as u64 in Saturating)) as u64;
+        sum(next_ordinal, next_accumulated)
+    }
+}
+
+// Visible result count: structural minus tombstoned indices in range.
+pub machine Snapshot::get_number_of_results<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
+    transition {
+        _ -> sum(0, 0, 0)
+    }
+    state sum(&self, ordinal: u64, index_base: u64, accumulated: u64) -> u64 {
+        transition ordinal < self.region_count {
+            true -> accumulate(ordinal, index_base, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state accumulate(&self, ordinal: u64, index_base: u64, accumulated: u64) -> u64 {
+        let region_result: Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> = self.get_region_at(ordinal);
+        transition region_result {
+            Optional::Some { value } -> add(ordinal, index_base, accumulated, value)
+            Optional::None -> (accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state add(&self, ordinal: u64, index_base: u64, accumulated: u64, region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>) -> u64 {
+        let region_results: u64 = region.get_scan_result_number_of_results();
+        let deleted_in_region: u64 = self.count_deleted_in_range(index_base, ((index_base as u64 in Saturating) + (region_results as u64 in Saturating)) as u64);
+        let next_ordinal: u64 = ((ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_base: u64 = ((index_base as u64 in Saturating) + (region_results as u64 in Saturating)) as u64;
+        let visible: u64 = ((region_results as u64 in Saturating) - (deleted_in_region as u64 in Saturating)) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (visible as u64 in Saturating)) as u64;
+        sum(next_ordinal, next_base, next_accumulated)
+    }
+}
+
+// Count of tombstoned indices inside [base, end) — upstream's BTreeSet range
+// count, ported as a linear membership fold.
+pub machine Snapshot::count_deleted_in_range<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self, range_base: u64, range_end: u64) -> u64 {
+    transition {
+        _ -> fold(0, range_base, range_end, 0)
+    }
+    state fold(&self, tombstone_index: u64, range_base: u64, range_end: u64, accumulated: u64) -> u64 {
+        transition tombstone_index < self.deleted_count {
+            true -> in_extent(self.deleted_scan_result_indices, tombstone_index, range_base, range_end, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state in_extent(&self, tombstones: &[u64], tombstone_index: u64, range_base: u64, range_end: u64, accumulated: u64) -> u64 {
+        transition tombstone_index < tombstones.len {
+            true -> check(tombstones, tombstone_index, range_base, range_end, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state check(&self, tombstones: &[u64], tombstone_index: u64 [0..tombstones.len], range_base: u64, range_end: u64, accumulated: u64) -> u64 {
+        let tombstone: u64 = tombstones[tombstone_index];
+        let next_index: u64 = ((tombstone_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition tombstone >= range_base && tombstone < range_end {
+            true -> fold(next_index, range_base, range_end, ((accumulated as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            _ -> fold(next_index, range_base, range_end, accumulated)
+        }
+    }
+}
+
+// Tombstone membership (BTreeSet::contains).
+pub machine Snapshot::is_scan_result_deleted<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self, result_index: u64) -> bool {
+    transition {
+        _ -> scan(0, result_index)
+    }
+    state scan(&self, tombstone_index: u64, result_index: u64) -> bool {
+        transition tombstone_index < self.deleted_count {
+            true -> in_extent(self.deleted_scan_result_indices, tombstone_index, result_index)
+            _ -> (false)
+        }
+    }
+    state in_extent(&self, tombstones: &[u64], tombstone_index: u64, result_index: u64) -> bool {
+        transition tombstone_index < tombstones.len {
+            true -> check(tombstones, tombstone_index, result_index)
+            _ -> (false)
+        }
+    }
+    state check(&self, tombstones: &[u64], tombstone_index: u64 [0..tombstones.len], result_index: u64) -> bool {
+        transition tombstones[tombstone_index] == result_index {
+            true -> (true)
+            _ -> scan_next(tombstone_index, result_index)
+        }
+    }
+    state scan_next(&self, tombstone_index: u64, result_index: u64) -> bool {
+        let next_index: u64 = ((tombstone_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        scan(next_index, result_index)
+    }
+}
+
+// Upstream delete_scan_results for a single index: insert into the tombstone
+// set when inside the structural result range and not already present.
+pub machine Snapshot::delete_scan_result<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self, result_index: u64) -> bool {
+    let structural_count: u64 = self.get_structural_number_of_results();
+    transition result_index < structural_count {
+        true -> not_deleted(result_index)
+        _ -> (false)
+    }
+    state not_deleted(&mut self, result_index: u64) -> bool {
+        transition self.is_scan_result_deleted(result_index) {
+            true -> (false)
+            _ -> insert(result_index)
+        }
+    }
+    state insert(&mut self, result_index: u64) -> bool {
+        transition self.deleted_count < self.deleted_scan_result_indices.len {
+            true -> in_extent(&mut self.deleted_scan_result_indices, self.deleted_count, result_index)
+            _ -> (false)
+        }
+    }
+    state in_extent(&mut self, tombstones: &mut [u64], write_index: u64, result_index: u64) -> bool {
+        transition write_index < tombstones.len {
+            true -> assign(&mut tombstones, write_index, result_index)
+            _ -> (false)
+        }
+    }
+    state assign(&mut self, tombstones: &mut [u64], write_index: u64 [0..tombstones.len], result_index: u64) -> bool {
+        tombstones[write_index] = result_index;
+        self.deleted_count = write_index + 1;
+        true
+    }
+}
+
+pub machine Snapshot::clear_deleted_scan_result_indices<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self) {
+    self.deleted_count = 0;
+}
+
+// Upstream commit rebuilds filters to fold tombstones into the structural
+// layout — that rebuild (per-collection remove_results_at_indices filter
+// splitting) is not ported yet. The reachable contract is ported: an empty
+// tombstone set is a 0-returning no-op; a non-empty set crashes rather than
+// silently pretending the rebuild happened.
+pub machine Snapshot::commit_deleted_scan_result_indices<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self) -> u64
+crashes Abort
+{
+    transition self.deleted_count > 0 {
+        true -> unported()
+        _ -> (0)
+    }
+    state unported(&self) -> u64 {
+        crash Abort;
+    }
+}
+
+// Upstream discard_empty_regions: Vec::retain(region_size > 0). Ported as a
+// permutation compaction: live ordinals move to the front of `region_order`.
+pub machine Snapshot::discard_empty_regions<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self) {
+    transition {
+        _ -> compact(0, 0)
+    }
+    state compact(&mut self, read_ordinal: u64, write_ordinal: u64) -> u64 {
+        transition read_ordinal < self.region_count {
+            true -> probe(read_ordinal, write_ordinal)
+            _ -> finish(write_ordinal)
+        }
+    }
+    state probe(&mut self, read_ordinal: u64, write_ordinal: u64) -> u64 {
+        let slot_result: RegionSlot = self.get_region_slot_at(read_ordinal);
+        transition slot_result {
+            RegionSlot::Present { slot } -> sized(read_ordinal, write_ordinal, slot)
+            RegionSlot::Absent -> next(read_ordinal, write_ordinal)
+            _ -> next(read_ordinal, write_ordinal)
+        }
+    }
+    state next(&mut self, read_ordinal: u64, write_ordinal: u64) -> u64 {
+        let next_read: u64 = ((read_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        compact(next_read, write_ordinal)
+    }
+    state sized(&mut self, read_ordinal: u64, write_ordinal: u64, slot: u64) -> u64 {
+        let region_result: Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> = self.get_region_at(read_ordinal);
+        transition region_result {
+            Optional::Some { value } -> keep_if(read_ordinal, write_ordinal, slot, value)
+            Optional::None -> next(read_ordinal, write_ordinal)
+            _ -> next(read_ordinal, write_ordinal)
+        }
+    }
+    state keep_if(&mut self, read_ordinal: u64, write_ordinal: u64, slot: u64, region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>) -> u64 {
+        let region_size: u64 = region.get_region_size();
+        transition region_size > 0 {
+            true -> write_slot(read_ordinal, write_ordinal, slot)
+            _ -> next(read_ordinal, write_ordinal)
+        }
+    }
+    state write_slot(&mut self, read_ordinal: u64, write_ordinal: u64, slot: u64) -> u64 {
+        transition write_ordinal < self.region_order.len {
+            true -> assign(&mut self.region_order, read_ordinal, write_ordinal, slot)
+            _ -> finish(write_ordinal)
+        }
+    }
+    state assign(&mut self, order: &mut [u64], read_ordinal: u64, write_ordinal: u64, slot: u64) -> u64 {
+        transition write_ordinal < order.len {
+            true -> set(&mut order, read_ordinal, write_ordinal, slot)
+            _ -> finish(write_ordinal)
+        }
+    }
+    state set(&mut self, order: &mut [u64], read_ordinal: u64, write_ordinal: u64 [0..order.len], slot: u64) -> u64 {
+        order[write_ordinal] = slot;
+        compact(((read_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((write_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+    }
+    state finish(&mut self, write_ordinal: u64) -> u64 {
+        self.region_count = write_ordinal;
+        write_ordinal
+    }
+}
+
+// Upstream sort_regions: ascending base address. Insertion sort over the
+// permutation; `regions` and `order` are disjoint field borrows held for the
+// whole sort so no `self` calls interleave with the live `order` borrow.
+pub machine Snapshot::sort_regions<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self) {
+    transition {
+        _ -> outer(self.snapshot_regions, &mut self.region_order, 1)
+    }
+    state outer(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64
+    ) {
+        transition insert_ordinal < self.region_count {
+            true -> inner_entry(regions, order, insert_ordinal)
+            _ -> idle()
+        }
+    }
+    state inner_entry(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64 [0..self.region_count]
+    ) {
+        transition insert_ordinal < order.len {
+            true -> read_key(regions, order, insert_ordinal)
+            _ -> idle()
+        }
+    }
+    state read_key(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64 [0..order.len]
+    ) {
+        let insert_slot: u64 = order[insert_ordinal];
+        let insert_base: u64 = self.slot_base_in(regions, insert_slot);
+        let hole: u64 = shift_larger(regions, order, insert_ordinal, insert_base);
+        transition {
+            _ -> place_hole(regions, order, insert_ordinal, hole, insert_slot)
+        }
+    }
+    // Walk left while order[hole-1]'s base > insert_base; returns the hole.
+    state shift_larger(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_base: u64
+    ) -> u64 {
+        transition hole > 0 {
+            true -> probe(regions, order, hole, insert_base)
+            _ -> (hole)
+        }
+    }
+    state probe(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_base: u64
+    ) -> u64 {
+        let probe_index: u64 = ((hole as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition probe_index < order.len {
+            true -> compare(regions, order, hole, insert_base, probe_index)
+            _ -> (hole)
+        }
+    }
+    state compare(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_base: u64,
+        probe_index: u64 [0..order.len]
+    ) -> u64 {
+        let probe_slot: u64 = order[probe_index];
+        let probe_base: u64 = self.slot_base_in(regions, probe_slot);
+        transition probe_base > insert_base {
+            true -> shift(regions, order, hole, insert_base, probe_index, probe_slot)
+            _ -> (hole)
+        }
+    }
+    state shift(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_base: u64,
+        probe_index: u64,
+        probe_slot: u64
+    ) -> u64 {
+        transition hole < order.len {
+            true -> assign_shift(regions, order, hole, insert_base, probe_index, probe_slot)
+            _ -> (hole)
+        }
+    }
+    state assign_shift(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_base: u64,
+        probe_index: u64,
+        probe_slot: u64
+    ) -> u64 {
+        transition hole < order.len {
+            true -> write_shift(regions, order, hole, insert_base, probe_index, probe_slot)
+            _ -> (hole)
+        }
+    }
+    state write_shift(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64 [0..order.len],
+        insert_base: u64,
+        probe_index: u64,
+        probe_slot: u64
+    ) -> u64 {
+        order[hole] = probe_slot;
+        shift_larger(regions, order, probe_index, insert_base)
+    }
+    state place_hole(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64,
+        hole: u64,
+        insert_slot: u64
+    ) {
+        transition hole < order.len {
+            true -> write_hole(regions, order, insert_ordinal, hole, insert_slot)
+            _ -> idle()
+        }
+    }
+    state write_hole(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64,
+        hole: u64,
+        insert_slot: u64
+    ) {
+        transition hole < order.len {
+            true -> set_hole(regions, order, insert_ordinal, hole, insert_slot)
+            _ -> idle()
+        }
+    }
+    state set_hole(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64,
+        hole: u64 [0..order.len],
+        insert_slot: u64
+    ) {
+        order[hole] = insert_slot;
+        let next_ordinal: u64 = ((insert_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> outer(regions, order, next_ordinal)
+        }
+    }
+    state idle(&mut self) {
+    }
+}
+
+// Upstream sort_regions_for_read: descending region size (memory-read
+// prioritization). Same insertion-sort shape over the permutation.
+pub machine Snapshot::sort_regions_for_read<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self) {
+    transition {
+        _ -> outer(self.snapshot_regions, &mut self.region_order, 1)
+    }
+    state outer(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64
+    ) {
+        transition insert_ordinal < self.region_count {
+            true -> inner_entry(regions, order, insert_ordinal)
+            _ -> idle()
+        }
+    }
+    state inner_entry(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64 [0..self.region_count]
+    ) {
+        transition insert_ordinal < order.len {
+            true -> read_key(regions, order, insert_ordinal)
+            _ -> idle()
+        }
+    }
+    state read_key(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64 [0..order.len]
+    ) {
+        let insert_slot: u64 = order[insert_ordinal];
+        let insert_size: u64 = self.slot_size_in(regions, insert_slot);
+        let hole: u64 = shift_smaller(regions, order, insert_ordinal, insert_size);
+        transition {
+            _ -> place_hole(regions, order, insert_ordinal, hole, insert_slot)
+        }
+    }
+    state shift_smaller(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_size: u64
+    ) -> u64 {
+        transition hole > 0 {
+            true -> probe(regions, order, hole, insert_size)
+            _ -> (hole)
+        }
+    }
+    state probe(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_size: u64
+    ) -> u64 {
+        let probe_index: u64 = ((hole as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition probe_index < order.len {
+            true -> compare(regions, order, hole, insert_size, probe_index)
+            _ -> (hole)
+        }
+    }
+    state compare(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_size: u64,
+        probe_index: u64 [0..order.len]
+    ) -> u64 {
+        let probe_slot: u64 = order[probe_index];
+        let probe_size: u64 = self.slot_size_in(regions, probe_slot);
+        transition probe_size < insert_size {
+            true -> shift(regions, order, hole, insert_size, probe_index, probe_slot)
+            _ -> (hole)
+        }
+    }
+    state shift(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64,
+        insert_size: u64,
+        probe_index: u64,
+        probe_slot: u64
+    ) -> u64 {
+        transition hole < order.len {
+            true -> write_shift(regions, order, hole, insert_size, probe_index, probe_slot)
+            _ -> (hole)
+        }
+    }
+    state write_shift(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        hole: u64 [0..order.len],
+        insert_size: u64,
+        probe_index: u64,
+        probe_slot: u64
+    ) -> u64 {
+        order[hole] = probe_slot;
+        shift_smaller(regions, order, probe_index, insert_size)
+    }
+    state place_hole(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64,
+        hole: u64,
+        insert_slot: u64
+    ) {
+        transition hole < order.len {
+            true -> write_hole(regions, order, insert_ordinal, hole, insert_slot)
+            _ -> idle()
+        }
+    }
+    state write_hole(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64,
+        hole: u64,
+        insert_slot: u64
+    ) {
+        transition hole < order.len {
+            true -> set_hole(regions, order, insert_ordinal, hole, insert_slot)
+            _ -> idle()
+        }
+    }
+    state set_hole(
+        &mut self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        order: &mut [u64],
+        insert_ordinal: u64,
+        hole: u64 [0..order.len],
+        insert_slot: u64
+    ) {
+        order[hole] = insert_slot;
+        let next_ordinal: u64 = ((insert_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> outer(regions, order, next_ordinal)
+        }
+    }
+    state idle(&mut self) {
+    }
+}
+
+// Base address of the region in permutation slot `slot` (shared-extent
+// variant used while `order` is mutably borrowed).
+pub machine Snapshot::slot_base_in<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &self,
+    regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+    slot: u64
+) -> u64 {
+    transition slot < regions.len {
+        true -> read(regions, slot)
+        _ -> (0)
+    }
+    state read(
+        &self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        slot: u64 [0..regions.len]
+    ) -> u64 {
+        regions[slot].get_base_address()
+    }
+}
+
+pub machine Snapshot::slot_size_in<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &self,
+    regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+    slot: u64
+) -> u64 {
+    transition slot < regions.len {
+        true -> read(regions, slot)
+        _ -> (0)
+    }
+    state read(
+        &self,
+        regions: &[SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>],
+        slot: u64 [0..regions.len]
+    ) -> u64 {
+        regions[slot].get_region_size()
+    }
+}
