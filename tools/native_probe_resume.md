@@ -28,34 +28,39 @@ checks all 17 packages clean and published the lock;
 
 ## The blocker (toolchain-owned, named on the Omega board)
 
-The executable milestone cannot compile into any `ProgramEntry`:
+Update (2026-09-21, leaf `omega-fused-host-providers`): `omega_reference` and
+every `Source::Git` std pin now sit at Omega main `56adcc62ec`, past
+`2704dd0edb` "mint toolchain-settled FilesystemHost provider plan". The
+compiler mints the per-target `FilesystemHost` plan and splices it into
+selected-plan provenance, so the earlier
+`requires a selected Fused provider` / `no exact Fused selected-provider-plan
+join` rejection is gone. The witness now fails one stage later, inside
+`omega-language-std`'s own review projection:
 
-- A `Service<FilesystemHost>` or `Service<TimeHost>` field — direct or nested
-  inside provider data — rejects with
-  `requires a selected Fused provider for boundary <name>` /
-  `rejoins 0 Terminal attachment identities; expected one`.
-- Std ships fused providers only for `Console` and `ProcessExit`
-  (`provider_defaults` `select_provider` closures in
-  `source/library/std/targets/<t>/{console,process_exit}_impl.omg`).
-- A package-authored `boundary machine ... satisfies FilesystemHost::op` is
-  refused as an unknown boundary slot; a `via Binding::Syscall` leaf is refused
-  on slice/`in Path` carriers by `external_shapes`; a full 50-op
-  `via Binding::CompilerIntrinsic` closure satisfies selection but entry still
-  fails: `routed service field has no exact Fused selected-provider-plan join`
-  — dispatch wants `CheckedAdapter` rows (checked-body satisfies machines on
-  the provider data), which `via` rows never produce.
-- Omega TASKS.md already pins this gap (`filesystem_cohort_witness.rs`):
-  a demanded canonical `FilesystemHost` leaf resolves to zero selected
-  provider rows because provider plans derive only from `satisfies`
-  conformances and none exists for the canonical host. `TimeHost` is in the
-  same boat — no provider exists anywhere.
+- `packages/review/evidence/src/capture/providers/policy/replay.rs::validate`
+  replays every retained selected-plan provenance row as an authored
+  candidate through `selected_provider_plan_facts_with_independent_components`.
+- The minted plan's realization symbols are deliberately `invalid` (the
+  settlement table, not an authored machine, realizes each row), so
+  `exact_provenance_realization` resolves each to 0 typed machines and emits
+  11 diagnostics (`ProviderPlan ... retained realization symbol Handle{0,0}
+  resolves to 0 exact typed machines`), exit 200.
+- Omega TASKS.md pins the fix: carry the exact toolchain-settled identity
+  through package review — validate the settled target/schema/rows, do not
+  exempt ordinary `UniqueCoveringCandidate` plans. Diagnosis lives in
+  `wiki/drafts/toolchain_settled_plan_provenance_replay.md`. The
+  `is_toolchain_settled` discriminator already exists on
+  `SelectedProviderPlanFacts` and is used elsewhere in review capture
+  (`capture/package/providers.rs`); the rejection site just cannot reach it
+  today.
+- `TimeHost` remains unsettled at HEAD — no std target ships
+  `time_impl.omg` — needed only for the throughput leg, not for the
+  /proc-based read leg.
 
-Until provider planning mints toolchain-settled `FilesystemHost`/`TimeHost`
-fused providers, no ProgramEntry can hold them, so the /proc-based read leg is
-unattemptable. Fixing it needs `omega-rust/omega/build/provider-planning` and
-`native-realization/.../terminal_authority_policy/filesystem.rs`, fenced by
-wave items (UEFI-OS-HANDOFF / TWO-AXIS-TERMINAL-AUTHORITY-REVIEW at time of
-writing).
+Until package review can replay the toolchain-settled plan (and `TimeHost`
+gains a settled provider), no `ProgramEntry` can hold
+`Service<FilesystemHost>`/`Service<TimeHost>` fields, so the executable
+milestone stays unattemptable.
 
 ## Resume steps
 
