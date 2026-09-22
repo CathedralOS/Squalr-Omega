@@ -8,6 +8,15 @@ use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filte
 use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
+use squalr_engine_api::src::registries::scan_rules::element_scan_rule_registry::ElementScanRuleRegistry;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint::ScanConstraint;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
 use src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
 use src::scanners::scalar::scanner_scalar_single_element::ScannerScalarSingleElement;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
@@ -28,6 +37,18 @@ pub data ScalarRegionScanKind [copy] {
     case SingleElement;
 }
 
+// Matchable selection carrier — this pin can construct `Optional` but not
+// match it downstream (same limitation `AnonymousValueStringParse` works
+// around), so scanner acquisition routes through this local enum.
+pub data ScalarScanSelection {
+    case None;
+    case Some(driver: ScalarRegionScan);
+}
+
+// Receiver type for the dispatcher's attached machines (upstream's `impl
+// ElementScanDispatcher` block — the struct carries no state).
+pub data ElementScanDispatcher {}
+
 pub data ScalarRegionScan {
     kind: ScalarRegionScanKind;
     iterative_scan: ScalarIterativeScan;
@@ -35,12 +56,36 @@ pub data ScalarRegionScan {
     pending_region: SnapshotRegionFilter;
 }
 
+// The upstream scanner acquisition arm: `acquire_scanner_instance`'s
+// Option-returning surface, kept as Optional for callers that only
+// construct-side it. Matching callers use `dispatch_scalar_selection`.
 pub machine ElementScanDispatcher::dispatch_scalar_region(
     snapshot_region_filter: &SnapshotRegionFilter,
     snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
     single_current_value: u64,
     single_previous_value: u64
 ) -> Optional<ScalarRegionScan>
+crashes Abort
+{
+    transition ElementScanDispatcher::dispatch_scalar_selection(
+        snapshot_region_filter,
+        snapshot_filter_element_scan_plan,
+        single_current_value,
+        single_previous_value
+    ) {
+        ScalarScanSelection::Some { driver } -> (Optional::Some { value: driver })
+        _ -> (Optional::None)
+    }
+}
+
+// The same acquisition as a matchable selection (upstream returns the
+// scanner directly; the enum only encodes its absence).
+pub machine ElementScanDispatcher::dispatch_scalar_selection(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+    single_current_value: u64,
+    single_previous_value: u64
+) -> ScalarScanSelection
 crashes Abort
 {
     let planned: PlannedScanType =
@@ -53,10 +98,10 @@ crashes Abort
             single_current_value,
             single_previous_value
         )
-        PlannedScanType::Invalid -> (Optional::None)
-        PlannedScanType::Vector { scan_type, vectorization_size } -> (Optional::None)
-        PlannedScanType::ByteArray { scan_type } -> (Optional::None)
-        _ -> (Optional::None)
+        PlannedScanType::Invalid -> (ScalarScanSelection::None)
+        PlannedScanType::Vector { scan_type, vectorization_size } -> (ScalarScanSelection::None)
+        PlannedScanType::ByteArray { scan_type } -> (ScalarScanSelection::None)
+        _ -> (ScalarScanSelection::None)
     }
 
     state scalar_kind(
@@ -65,11 +110,11 @@ crashes Abort
         snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
         single_current_value: u64,
         single_previous_value: u64
-    ) -> Optional<ScalarRegionScan> {
+    ) -> ScalarScanSelection {
         transition scan_type {
             PlannedScanTypeScalar::ScalarIterative -> (
-                Optional::Some {
-                    value: ScalarRegionScan {
+                ScalarScanSelection::Some {
+                    driver: ScalarRegionScan {
                         kind: ScalarRegionScanKind::Iterative,
                         iterative_scan: ScalarIterativeScan::new(
                             snapshot_region_filter,
@@ -94,7 +139,7 @@ crashes Abort
         snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
         single_current_value: u64,
         single_previous_value: u64
-    ) -> Optional<ScalarRegionScan> {
+    ) -> ScalarScanSelection {
         let emitted: EmittedRegion = ScannerScalarSingleElement::scan_region(
             snapshot_region_filter,
             snapshot_filter_element_scan_plan,
@@ -110,11 +155,11 @@ crashes Abort
 
     state single_with(
         region: SnapshotRegionFilter
-    ) -> Optional<ScalarRegionScan> {
+    ) -> ScalarScanSelection {
         // The pending single-shot result rides beside an unused iterative
         // driver; the tag gates which path `next` takes.
-        Optional::Some {
-            value: ScalarRegionScan {
+        ScalarScanSelection::Some {
+            driver: ScalarRegionScan {
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
                 has_single_pending: true,
@@ -123,9 +168,9 @@ crashes Abort
         }
     }
 
-    state single_empty() -> Optional<ScalarRegionScan> {
-        Optional::Some {
-            value: ScalarRegionScan {
+    state single_empty() -> ScalarScanSelection {
+        ScalarScanSelection::Some {
+            driver: ScalarRegionScan {
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
                 has_single_pending: false,
@@ -189,5 +234,1745 @@ pub machine ScalarRegionScan::next(
         EmittedRegion::Region {
             region: SnapshotRegionFilter::clone(&self.pending_region)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upstream `dispatch_scan`: drains every filter of one input collection
+// through that data type's sequential (AND) scan constraints and produces the
+// region's result collection. Omega has no Vec, so the flat_map chain shape
+// upstream's Vecs hide is explicit here: `filter_out` is the caller-lent
+// result slab (the returned collection views the range written at
+// `out_cursor`), `round_a`/`round_b` ping-pong intermediate filters between
+// constraints, and `driver_cell` is a 1-slot home for the selected scanner
+// (let-locals are immutable, so `next` runs through the slot). Overshooting a
+// lent buffer aborts rather than silently truncating the result ranges.
+// ---------------------------------------------------------------------------
+
+// One (filter, constraint) application: decode captured bytes, plan, apply
+// filter rules, select the scalar driver and drain it into `dst`.
+machine apply_constraint<'a, 'p, 'r, 't, 'd, 'c>(
+    snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+    result_value_size_in_bytes: u64,
+    element_scan_plan: &ElementScanPlan<'d, 'c>,
+    constraint_index: u64,
+    snapshot_region_filter: &SnapshotRegionFilter,
+    current_elements: &mut [u64],
+    previous_elements: &mut [u64],
+    driver_cell: &mut [ScalarRegionScan],
+    dst: &mut [SnapshotRegionFilter],
+    dst_len: u64
+) -> u64
+crashes Abort
+{
+    let constraint: ScanConstraintFinalized<'c> =
+        element_scan_plan.get_constraint(constraint_index);
+    let compare_type: ScanCompareType = constraint.get_scan_compare_type();
+    let operand_value: u64 = constraint.get_operand_value();
+    let unit_size: u64 = constraint.get_unit_size_in_bytes();
+    let has_sfn: bool = constraint.has_scan_function_scalar();
+    let sfn: ScanFunctionScalar = constraint.get_scan_function_scalar();
+    let periodicity: u64 = constraint.get_periodicity();
+    let scan_constraint: ScanConstraint<'c> = constraint.get_scan_constraint();
+    let is_floating_point: bool = scan_constraint.is_floating_point();
+    let prefer_type_scanner: bool = scan_constraint.prefers_type_scanner();
+    let has_mask: bool = scan_constraint.has_mask();
+    let memory_alignment: MemoryAlignment =
+        element_scan_plan.get_memory_alignment();
+    let mut scan_plan: SnapshotFilterElementScanPlan =
+        SnapshotFilterElementScanPlan::new(
+            compare_type,
+            operand_value,
+            unit_size,
+            has_sfn,
+            sfn,
+            memory_alignment
+        );
+    ElementScanRuleRegistry::apply_filter_rules(
+        compare_type,
+        snapshot_region.has_current_values(),
+        snapshot_region.has_previous_values(),
+        snapshot_region_filter.get_region_size(),
+        result_value_size_in_bytes,
+        is_floating_point,
+        prefer_type_scanner,
+        memory_alignment.get_size_in_bytes(),
+        periodicity,
+        has_mask,
+        &mut scan_plan
+    );
+    let current_count: u64 = snapshot_region.read_current_elements(
+        snapshot_region_filter,
+        unit_size,
+        memory_alignment,
+        current_elements
+    );
+    transition snapshot_region.has_previous_values() {
+        true -> decode_previous(
+            snapshot_region,
+            element_scan_plan,
+            snapshot_region_filter,
+            scan_plan,
+            unit_size,
+            memory_alignment,
+            current_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        )
+        false -> pick_current(
+            snapshot_region,
+            element_scan_plan,
+            snapshot_region_filter,
+            scan_plan,
+            current_count,
+            0,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        )
+        _ -> pick_current(
+            snapshot_region,
+            element_scan_plan,
+            snapshot_region_filter,
+            scan_plan,
+            current_count,
+            0,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        )
+    }
+
+    state decode_previous(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        scan_plan: SnapshotFilterElementScanPlan,
+        unit_size: u64,
+        memory_alignment: MemoryAlignment,
+        current_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64
+    ) -> u64 {
+        let previous_count: u64 = snapshot_region.read_previous_elements(
+            snapshot_region_filter,
+            unit_size,
+            memory_alignment,
+            previous_elements
+        );
+        transition { _ -> pick_current(
+            snapshot_region,
+            element_scan_plan,
+            snapshot_region_filter,
+            scan_plan,
+            current_count,
+            previous_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        ) }
+    }
+
+    // The single-element scanner consumes element 0 of each window; the
+    // iterative driver ignores them. Guards keep the read provable.
+    state pick_current(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        scan_plan: SnapshotFilterElementScanPlan,
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64
+    ) -> u64 {
+        transition current_count > 0
+            && current_count <= current_elements.len
+            && 0 < current_elements.len
+        {
+            true -> pick_previous(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                current_elements[0]
+            )
+            false -> make_driver(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                0,
+                0
+            )
+            _ -> make_driver(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                0,
+                0
+            )
+        }
+    }
+
+    state pick_previous(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        scan_plan: SnapshotFilterElementScanPlan,
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64,
+        single_current: u64
+    ) -> u64 {
+        transition previous_count > 0
+            && previous_count <= previous_elements.len
+            && 0 < previous_elements.len
+        {
+            true -> make_driver(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                single_current,
+                previous_elements[0]
+            )
+            false -> make_driver(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                single_current,
+                0
+            )
+            _ -> make_driver(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                single_current,
+                0
+            )
+        }
+    }
+
+    state make_driver(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        scan_plan: SnapshotFilterElementScanPlan,
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64,
+        single_current: u64,
+        single_previous: u64
+    ) -> u64 {
+        transition ElementScanDispatcher::dispatch_scalar_selection(
+            snapshot_region_filter,
+            &scan_plan,
+            single_current,
+            single_previous
+        ) {
+            ScalarScanSelection::Some { driver } -> install(
+                snapshot_region_filter,
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                driver
+            )
+            _ -> (dst_len)
+        }
+    }
+
+    state install(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64,
+        driver: ScalarRegionScan
+    ) -> u64 {
+        transition 0 < driver_cell.len {
+            true -> store_driver(
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                driver
+            )
+            false -> abort_chain(dst_len)
+            _ -> abort_chain(dst_len)
+        }
+    }
+
+    state store_driver(
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64,
+        driver: ScalarRegionScan
+    ) -> u64 {
+        driver_cell[0] = driver;
+        transition { _ -> pull(
+            current_count,
+            previous_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        ) }
+    }
+
+    // Decode scratch smaller than the element count is a caller bug —
+    // abort rather than scan a truncated window.
+    state pull(
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64
+    ) -> u64 {
+        transition current_count <= current_elements.len
+            && previous_count <= previous_elements.len
+            && 0 < driver_cell.len
+        {
+            true -> emit(
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len
+            )
+            false -> abort_chain(dst_len)
+            _ -> abort_chain(dst_len)
+        }
+    }
+
+    state emit(
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64
+    ) -> u64 {
+        // Whole decoded windows — the driver bounds each element read
+        // against `current_values.len` itself (`in_bounds`); `pull`'s guard
+        // has already established the scratch holds `count` elements, so a
+        // caller undersizing the scratch aborts there rather than silently
+        // truncating the element windows.
+        let emitted: EmittedRegion = driver_cell[0].next(
+            current_elements,
+            previous_elements
+        );
+        transition emitted {
+            EmittedRegion::Region { region } -> append_emit(
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                region
+            )
+            _ -> (dst_len)
+        }
+    }
+
+    state append_emit(
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64,
+        region: SnapshotRegionFilter
+    ) -> u64 {
+        transition dst_len < dst.len {
+            true -> store_emit(
+                current_count,
+                previous_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len,
+                region
+            )
+            false -> abort_chain(dst_len)
+            _ -> abort_chain(dst_len)
+        }
+    }
+
+    state store_emit(
+        current_count: u64,
+        previous_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64,
+        region: SnapshotRegionFilter
+    ) -> u64 {
+        dst[dst_len] = region;
+        transition { _ -> pull(
+            current_count,
+            previous_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            ((dst_len as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        ) }
+    }
+
+    state abort_chain(dst_len: u64) -> u64 {
+        crash Abort;
+    }
+}
+
+// The AND-sequential constraint chain over one input filter. Round `n` reads
+// the surviving filters and writes `n+1`'s survivors; the last constraint
+// writes into `dst` (the result slab), earlier rounds ping-pong between the
+// two scratch buffers.
+machine run_filter_chain<'a, 'p, 'r, 't, 'd, 'c>(
+    snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+    result_value_size_in_bytes: u64,
+    element_scan_plan: &ElementScanPlan<'d, 'c>,
+    data_type_id: &'t [u8],
+    constraint_count: u64,
+    input_filter: &SnapshotRegionFilter,
+    current_elements: &mut [u64],
+    previous_elements: &mut [u64],
+    driver_cell: &mut [ScalarRegionScan],
+    dst: &mut [SnapshotRegionFilter],
+    dst_len: u64,
+    round_a: &mut [SnapshotRegionFilter],
+    round_b: &mut [SnapshotRegionFilter]
+) -> u64
+crashes Abort
+{
+    transition 0 < round_a.len {
+        true -> seed(
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            input_filter,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len,
+            round_a,
+            round_b
+        )
+        false -> abort_run(dst_len)
+        _ -> abort_run(dst_len)
+    }
+
+    state seed(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        input_filter: &SnapshotRegionFilter,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64,
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        round_a[0] = SnapshotRegionFilter::clone(input_filter);
+        transition { _ -> round_a(0, 1, dst_len,
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            round_a,
+            round_b
+        ) }
+    }
+
+    // Round reading round_a. `constraint_ordinal` is the position among this
+    // data type's matching constraints.
+    state round_a(
+        constraint_ordinal: u64,
+        a_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        transition constraint_ordinal < constraint_count {
+            true -> last_a(constraint_ordinal, a_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> (dst_len)
+            _ -> (dst_len)
+        }
+    }
+
+    state last_a(
+        constraint_ordinal: u64,
+        a_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        let next_ordinal: u64 = ((constraint_ordinal as u64 in Saturating)
+            + (1 as u64 in Saturating)) as u64;
+        transition next_ordinal == constraint_count {
+            true -> each_a_out(constraint_ordinal, a_count, 0, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> each_a_b(constraint_ordinal, a_count, 0, 0, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            _ -> each_a_b(constraint_ordinal, a_count, 0, 0, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+        }
+    }
+
+    state each_a_b(
+        constraint_ordinal: u64,
+        a_count: u64,
+        source_index: u64,
+        b_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        transition source_index < a_count && source_index < round_a.len {
+            true -> apply_a_b(constraint_ordinal, a_count, source_index, b_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> round_b(
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                b_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            _ -> round_b(
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                b_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+        }
+    }
+
+    state apply_a_b(
+        constraint_ordinal: u64,
+        a_count: u64,
+        source_index: u64,
+        b_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        let constraint_index: u64 = element_scan_plan.constraint_index_for(
+            data_type_id,
+            constraint_ordinal
+        );
+        let next_b_count: u64 = apply_constraint(
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            constraint_index,
+            &round_a[source_index],
+            current_elements,
+            previous_elements,
+            driver_cell,
+            round_b,
+            b_count
+        );
+        transition { _ -> each_a_b(
+            constraint_ordinal,
+            a_count,
+            ((source_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            next_b_count,
+            dst_len,
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            round_a,
+            round_b
+        ) }
+    }
+
+    state each_a_out(
+        constraint_ordinal: u64,
+        a_count: u64,
+        source_index: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        transition source_index < a_count && source_index < round_a.len {
+            true -> apply_a_out(constraint_ordinal, a_count, source_index, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> (dst_len)
+            _ -> (dst_len)
+        }
+    }
+
+    state apply_a_out(
+        constraint_ordinal: u64,
+        a_count: u64,
+        source_index: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        let constraint_index: u64 = element_scan_plan.constraint_index_for(
+            data_type_id,
+            constraint_ordinal
+        );
+        let next_dst_len: u64 = apply_constraint(
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            constraint_index,
+            &round_a[source_index],
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        );
+        transition { _ -> each_a_out(
+            constraint_ordinal,
+            a_count,
+            ((source_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            next_dst_len,
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            round_a,
+            round_b
+        ) }
+    }
+
+    state round_b(
+        constraint_ordinal: u64,
+        b_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        transition constraint_ordinal < constraint_count {
+            true -> last_b(constraint_ordinal, b_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> (dst_len)
+            _ -> (dst_len)
+        }
+    }
+
+    state last_b(
+        constraint_ordinal: u64,
+        b_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        let next_ordinal: u64 = ((constraint_ordinal as u64 in Saturating)
+            + (1 as u64 in Saturating)) as u64;
+        transition next_ordinal == constraint_count {
+            true -> each_b_out(constraint_ordinal, b_count, 0, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> each_b_a(constraint_ordinal, b_count, 0, 0, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            _ -> each_b_a(constraint_ordinal, b_count, 0, 0, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+        }
+    }
+
+    state each_b_a(
+        constraint_ordinal: u64,
+        b_count: u64,
+        source_index: u64,
+        a_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        transition source_index < b_count && source_index < round_b.len {
+            true -> apply_b_a(constraint_ordinal, b_count, source_index, a_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> round_a(
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                a_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            _ -> round_a(
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                a_count, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+        }
+    }
+
+    state apply_b_a(
+        constraint_ordinal: u64,
+        b_count: u64,
+        source_index: u64,
+        a_count: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        let constraint_index: u64 = element_scan_plan.constraint_index_for(
+            data_type_id,
+            constraint_ordinal
+        );
+        let next_a_count: u64 = apply_constraint(
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            constraint_index,
+            &round_b[source_index],
+            current_elements,
+            previous_elements,
+            driver_cell,
+            round_a,
+            a_count
+        );
+        transition { _ -> each_b_a(
+            constraint_ordinal,
+            b_count,
+            ((source_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            next_a_count,
+            dst_len,
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            round_a,
+            round_b
+        ) }
+    }
+
+    state each_b_out(
+        constraint_ordinal: u64,
+        b_count: u64,
+        source_index: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        transition source_index < b_count && source_index < round_b.len {
+            true -> apply_b_out(constraint_ordinal, b_count, source_index, dst_len,
+                snapshot_region,
+                result_value_size_in_bytes,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                round_a,
+                round_b
+            )
+            false -> (dst_len)
+            _ -> (dst_len)
+        }
+    }
+
+    state apply_b_out(
+        constraint_ordinal: u64,
+        b_count: u64,
+        source_index: u64,
+        dst_len: u64,
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        result_value_size_in_bytes: u64,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter]
+    ) -> u64 {
+        let constraint_index: u64 = element_scan_plan.constraint_index_for(
+            data_type_id,
+            constraint_ordinal
+        );
+        let next_dst_len: u64 = apply_constraint(
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            constraint_index,
+            &round_b[source_index],
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        );
+        transition { _ -> each_b_out(
+            constraint_ordinal,
+            b_count,
+            ((source_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            next_dst_len,
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            round_a,
+            round_b
+        ) }
+    }
+
+    state abort_run(dst_len: u64) -> u64 {
+        crash Abort;
+    }
+}
+
+// Upstream `resolve_result_value_size_in_bytes`: the collection's own value
+// size unless a matching constraint's operand is larger.
+machine resolve_result_value_size<'d, 'c>(
+    element_scan_plan: &ElementScanPlan<'d, 'c>,
+    data_type_id: &[u8],
+    constraint_count: u64,
+    default_size: u64
+) -> u64 {
+    transition { _ -> walk(
+        element_scan_plan,
+        data_type_id,
+        constraint_count,
+        default_size,
+        0
+    ) }
+
+    state walk(
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &[u8],
+        constraint_count: u64,
+        best: u64,
+        constraint_ordinal: u64
+    ) -> u64 {
+        transition constraint_ordinal < constraint_count {
+            true -> probe(
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                best,
+                constraint_ordinal
+            )
+            false -> (best)
+            _ -> (best)
+        }
+    }
+
+    state probe(
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &[u8],
+        constraint_count: u64,
+        best: u64,
+        constraint_ordinal: u64
+    ) -> u64 {
+        let constraint_index: u64 = element_scan_plan.constraint_index_for(
+            data_type_id,
+            constraint_ordinal
+        );
+        let constraint: ScanConstraintFinalized<'c> =
+            element_scan_plan.get_constraint(constraint_index);
+        let operand_size: u64 = constraint.get_operand_size_in_bytes();
+        transition operand_size > best {
+            true -> walk(
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                operand_size,
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+            false -> walk(
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                best,
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+            _ -> walk(
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                best,
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+}
+
+// Upstream `resolve_result_container_type`: the first matching constraint's
+// Array/ArrayFixed container type, else None.
+machine resolve_result_container_type<'d, 'c>(
+    element_scan_plan: &ElementScanPlan<'d, 'c>,
+    data_type_id: &[u8],
+    constraint_count: u64
+) -> ContainerType {
+    transition { _ -> walk(element_scan_plan, data_type_id, constraint_count, 0) }
+
+    state walk(
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &[u8],
+        constraint_count: u64,
+        constraint_ordinal: u64
+    ) -> ContainerType {
+        transition constraint_ordinal < constraint_count {
+            true -> probe(
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                constraint_ordinal
+            )
+            false -> (ContainerType::None)
+            _ -> (ContainerType::None)
+        }
+    }
+
+    state probe(
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &[u8],
+        constraint_count: u64,
+        constraint_ordinal: u64
+    ) -> ContainerType {
+        let constraint_index: u64 = element_scan_plan.constraint_index_for(
+            data_type_id,
+            constraint_ordinal
+        );
+        let constraint: ScanConstraintFinalized<'c> =
+            element_scan_plan.get_constraint(constraint_index);
+        let scan_constraint: ScanConstraint<'c> = constraint.get_scan_constraint();
+        let container_type: ContainerType =
+            scan_constraint.get_result_container_type();
+        transition container_type {
+            ContainerType::Array -> (container_type)
+            ContainerType::ArrayFixed { length } -> (container_type)
+            _ -> walk(
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                ((constraint_ordinal as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+}
+
+// `&'r` view of a range of the lent result slab — the only shape the
+// prover accepts for a caller-lent view (subslice end bounds do not
+// propagate through state edges; the requires contract does).
+machine view_filter_range<'r>(
+    filter_out: &'r mut [SnapshotRegionFilter],
+    lo: u64,
+    hi: u64
+) -> &'r [SnapshotRegionFilter]
+requires lo <= hi && hi <= filter_out.len
+{
+    &filter_out[lo..hi]
+}
+
+// Upstream `dispatch_scan` — the per-collection driver upstream maps over
+// `snapshot_region.get_scan_results().get_filter_collections()`. Returns the
+// freshly written result collection viewing `filter_out[out_cursor..]`.
+pub machine ElementScanDispatcher::dispatch_scan<'a, 'p, 'r, 't, 'd, 'c, 'f>(
+    snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+    snapshot_region_filter_collection: &'t SnapshotRegionFilterCollection<'r, 't>,
+    element_scan_plan: &ElementScanPlan<'d, 'c>,
+    current_elements: &mut [u64],
+    previous_elements: &mut [u64],
+    driver_cell: &mut [ScalarRegionScan],
+    filter_out: &'r mut [SnapshotRegionFilter],
+    round_a: &mut [SnapshotRegionFilter],
+    round_b: &mut [SnapshotRegionFilter],
+    out_cursor: u64
+) -> SnapshotRegionFilterCollection<'r, 't>
+crashes Abort
+{
+    let data_type_ref: DataTypeRef<'t> =
+        snapshot_region_filter_collection.get_data_type_ref();
+    let data_type_id: &'t [u8] = data_type_ref.get_data_type_id();
+    let constraint_count: u64 =
+        element_scan_plan.count_constraints_for(data_type_id);
+    let memory_alignment: MemoryAlignment =
+        snapshot_region_filter_collection.get_memory_alignment();
+    let default_size: u64 =
+        snapshot_region_filter_collection.get_result_value_size_in_bytes();
+    let result_value_size: u64 = resolve_result_value_size(
+        element_scan_plan,
+        data_type_id,
+        constraint_count,
+        default_size
+    );
+    transition constraint_count == 0 {
+        true -> no_constraints(
+            snapshot_region_filter_collection,
+            data_type_id,
+            memory_alignment,
+            result_value_size,
+            filter_out,
+            out_cursor
+        )
+        false -> scan_input(
+            snapshot_region,
+            snapshot_region_filter_collection,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            memory_alignment,
+            result_value_size,
+            0,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            filter_out,
+            round_a,
+            round_b,
+            out_cursor,
+            out_cursor
+        )
+        _ -> scan_input(
+            snapshot_region,
+            snapshot_region_filter_collection,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            memory_alignment,
+            result_value_size,
+            0,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            filter_out,
+            round_a,
+            round_b,
+            out_cursor,
+            out_cursor
+        )
+    }
+
+    // Upstream `None` from get(): a data type without constraints yields no
+    // result filters — the returned collection is empty but still carries the
+    // collection identity.
+    state no_constraints(
+        snapshot_region_filter_collection: &SnapshotRegionFilterCollection<'r, 't>,
+        data_type_id: &'t [u8],
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_out: &'r mut [SnapshotRegionFilter],
+        out_cursor: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        transition out_cursor <= out_cursor && out_cursor <= filter_out.len {
+            true -> make_empty(
+                data_type_id,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_out,
+                out_cursor
+            )
+            false -> abort_scan(filter_out, data_type_id)
+            _ -> abort_scan(filter_out, data_type_id)
+        }
+    }
+
+    state make_empty(
+        data_type_id: &'t [u8],
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_out: &'r mut [SnapshotRegionFilter],
+        out_cursor: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        let empty_view: &'r [SnapshotRegionFilter] = view_filter_range(
+            filter_out,
+            out_cursor,
+            out_cursor
+        );
+        SnapshotRegionFilterCollection::new_with_result_size(
+            empty_view,
+            DataTypeRef::new(data_type_id),
+            memory_alignment,
+            result_value_size_in_bytes,
+            0
+        )
+    }
+
+    state scan_input(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        snapshot_region_filter_collection: &SnapshotRegionFilterCollection<'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_index: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        out_cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        let filters: &'r [SnapshotRegionFilter] =
+            snapshot_region_filter_collection.get_filters();
+        transition filter_index < filters.len {
+            true -> copy_in(
+                snapshot_region,
+                snapshot_region_filter_collection,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_index,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                filter_out,
+                round_a,
+                round_b,
+                out_cursor,
+                out_len
+            )
+            false -> build_collection(
+                snapshot_region_filter_collection,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_out,
+                out_cursor,
+                out_len
+            )
+            _ -> build_collection(
+                snapshot_region_filter_collection,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_out,
+                out_cursor,
+                out_len
+            )
+        }
+    }
+
+    // Clone the input filter before the chain: an element borrow of the
+    // collection's `&'r` filter view carried through the chain would share
+    // 'r with `filter_out` in the returned collection — a form the checker
+    // rejects. The clone is a value; the seed slab stays read-only here.
+    state copy_in(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        snapshot_region_filter_collection: &SnapshotRegionFilterCollection<'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_index: u64,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        out_cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        let filters: &'r [SnapshotRegionFilter] =
+            snapshot_region_filter_collection.get_filters();
+        transition filter_index < filters.len {
+            true -> clone_input(
+                snapshot_region,
+                snapshot_region_filter_collection,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_index,
+                filters,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                filter_out,
+                round_a,
+                round_b,
+                out_cursor,
+                out_len
+            )
+            false -> build_collection(
+                snapshot_region_filter_collection,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_out,
+                out_cursor,
+                out_len
+            )
+            _ -> build_collection(
+                snapshot_region_filter_collection,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_out,
+                out_cursor,
+                out_len
+            )
+        }
+    }
+
+    state clone_input(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        snapshot_region_filter_collection: &SnapshotRegionFilterCollection<'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_index: u64,
+        filters: &'f [SnapshotRegionFilter],
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        out_cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        let input_filter: SnapshotRegionFilter =
+            SnapshotRegionFilter::clone(&filters[filter_index]);
+        transition { _ -> chain(
+            snapshot_region,
+            snapshot_region_filter_collection,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            memory_alignment,
+            result_value_size_in_bytes,
+            filter_index,
+            input_filter,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            filter_out,
+            round_a,
+            round_b,
+            out_cursor,
+            out_len
+        ) }
+    }
+
+    state chain(
+        snapshot_region: &SnapshotRegion<'a, 'p, 'r, 't>,
+        snapshot_region_filter_collection: &SnapshotRegionFilterCollection<'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_index: u64,
+        input_filter: SnapshotRegionFilter,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        out_cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        let next_out_len: u64 = run_filter_chain(
+            snapshot_region,
+            result_value_size_in_bytes,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            &input_filter,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            filter_out,
+            out_len,
+            round_a,
+            round_b
+        );
+        transition { _ -> scan_input(
+            snapshot_region,
+            snapshot_region_filter_collection,
+            element_scan_plan,
+            data_type_id,
+            constraint_count,
+            memory_alignment,
+            result_value_size_in_bytes,
+            ((filter_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            filter_out,
+            round_a,
+            round_b,
+            out_cursor,
+            next_out_len
+        ) }
+    }
+
+    state build_collection(
+        snapshot_region_filter_collection: &SnapshotRegionFilterCollection<'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_out: &'r mut [SnapshotRegionFilter],
+        out_cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        transition out_cursor <= out_len && out_len <= filter_out.len {
+            true -> make_collection(
+                snapshot_region_filter_collection,
+                element_scan_plan,
+                data_type_id,
+                constraint_count,
+                memory_alignment,
+                result_value_size_in_bytes,
+                filter_out,
+                out_cursor,
+                out_len
+            )
+            false -> abort_scan(filter_out, data_type_id)
+            _ -> abort_scan(filter_out, data_type_id)
+        }
+    }
+
+    state make_collection(
+        snapshot_region_filter_collection: &SnapshotRegionFilterCollection<'r, 't>,
+        element_scan_plan: &ElementScanPlan<'d, 'c>,
+        data_type_id: &'t [u8],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        result_value_size_in_bytes: u64,
+        filter_out: &'r mut [SnapshotRegionFilter],
+        out_cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        let view: &'r [SnapshotRegionFilter] = view_filter_range(
+            filter_out,
+            out_cursor,
+            out_len
+        );
+        let number_of_results: u64 =
+            SnapshotRegionFilterCollection::count_results(
+                view,
+                result_value_size_in_bytes,
+                memory_alignment,
+                0,
+                0
+            );
+        let data_type_ref: DataTypeRef<'t> =
+            snapshot_region_filter_collection.get_data_type_ref();
+        let container_type: ContainerType = resolve_result_container_type(
+            element_scan_plan,
+            data_type_id,
+            constraint_count
+        );
+        let collection: SnapshotRegionFilterCollection<'r, 't> =
+            SnapshotRegionFilterCollection::new_with_result_size(
+                view,
+                data_type_ref,
+                memory_alignment,
+                result_value_size_in_bytes,
+                number_of_results
+            );
+        collection.with_result_container_type(container_type)
+    }
+
+    state abort_scan(
+        filter_out: &'r mut [SnapshotRegionFilter],
+        data_type_id: &'t [u8]
+    ) -> SnapshotRegionFilterCollection<'r, 't> {
+        crash Abort;
     }
 }
