@@ -1,0 +1,203 @@
+module src::pointer_scans::pointer_scan_level_collector;
+
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_execution_plan::PointerScanExecutionPlan;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use src::pointer_scans::pointer_scan_candidate_collector::PointerScanCandidateCollector;
+use src::pointer_scans::pointer_scan_task_builder::PointerScanTaskBuilder;
+use src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+use src::pointer_scans::structures::pointer_scan_target_ranges::PointerScanTargetRangeSet;
+use src::pointer_scans::structures::snapshot_region_scan_task::SnapshotRegionScanTasks;
+
+// Port of pointer_scan_level_collector.rs.
+//
+// Upstream `discover_pointer_levels` returns `Vec<PointerScanCollectedLevel>`
+// after running its whole level loop eagerly. Vec construction does not
+// exist in Omega yet, so the collector is a pull driver: `next` runs exactly
+// one upstream loop iteration, yielding `EmittedDiscoveredLevel::Level` per
+// retained level and `Done` where upstream breaks (empty frontier, empty
+// level, or depth reached). Levels are produced in upstream order; the
+// caller drains until Done.
+pub data EmittedDiscoveredLevel {
+    case Level(level: PointerScanCollectedLevel);
+    case Done;
+}
+
+pub data PointerScanDiscoveredLevels<'a> {
+    frontier_target_ranges: PointerScanTargetRangeSet;
+    snapshot_region_scan_tasks: SnapshotRegionScanTasks<'a>;
+    pointer_scan_parameters: &'a PointerScanParameters;
+    pointer_chain_depth: u64;
+    stopped: bool;
+}
+
+// Upstream construction: initial frontier from the target addresses, tasks
+// from the builder, depth counter at zero. A `max_depth == 0` scan returns
+// an empty result upstream; here `next` reports `Done` immediately via the
+// same check on its first entry.
+pub machine PointerScanDiscoveredLevels::new<'a>(
+    frontier_target_ranges: PointerScanTargetRangeSet,
+    snapshot_region_scan_tasks: SnapshotRegionScanTasks<'a>,
+    pointer_scan_parameters: &'a PointerScanParameters
+) -> PointerScanDiscoveredLevels<'a> {
+    PointerScanDiscoveredLevels {
+        frontier_target_ranges: frontier_target_ranges,
+        snapshot_region_scan_tasks: snapshot_region_scan_tasks,
+        pointer_scan_parameters: pointer_scan_parameters,
+        pointer_chain_depth: 0,
+        stopped: false,
+    }
+}
+
+pub machine PointerScanDiscoveredLevels::next<'a>(
+    &mut self
+) -> EmittedDiscoveredLevel {
+    transition self.stopped {
+        true -> (EmittedDiscoveredLevel::Done)
+        false -> depth_gate()
+        _ -> depth_gate()
+    }
+
+    state depth_gate(&mut self) -> EmittedDiscoveredLevel {
+        // Upstream `if max_depth == 0 { return vec![] }` — the driver yields
+        // `Done` on its first call instead.
+        transition self.pointer_scan_parameters.get_max_depth() == 0 {
+            true -> stop()
+            false -> frontier_gate()
+            _ -> frontier_gate()
+        }
+    }
+
+    state frontier_gate(&mut self) -> EmittedDiscoveredLevel {
+        // Upstream `if frontier_target_ranges.is_empty() { break; }`.
+        transition self.frontier_target_ranges.is_empty() {
+            true -> stop()
+            false -> plan()
+            _ -> plan()
+        }
+    }
+
+    state plan(&mut self) -> EmittedDiscoveredLevel {
+        let collector: PointerScanCandidateCollector = PointerScanCandidateCollector {};
+        let pointer_size: PointerScanPointerSize =
+            self.pointer_scan_parameters.get_pointer_size();
+        let pointer_scan_execution_plan: PointerScanExecutionPlan =
+            collector.build_execution_plan(
+                &self.frontier_target_ranges,
+                pointer_size,
+                &self.snapshot_region_scan_tasks
+            );
+        // Upstream `retain_heap_candidates = !is_terminal_level`.
+        let is_terminal_level: bool = ((self.pointer_chain_depth as u64 in Saturating)
+            + 1) as u64 >= self.pointer_scan_parameters.get_max_depth();
+        let discovered_pointer_level: PointerScanCollectedLevel =
+            collector.collect_candidates(
+                &self.snapshot_region_scan_tasks,
+                &self.frontier_target_ranges,
+                &pointer_scan_execution_plan,
+                true,
+                !is_terminal_level
+            );
+        transition discovered_pointer_level.is_empty() {
+            true -> stop()
+            false -> emit(discovered_pointer_level, is_terminal_level)
+            _ -> emit(discovered_pointer_level, is_terminal_level)
+        }
+    }
+
+    state emit(
+        &mut self,
+        discovered_pointer_level: PointerScanCollectedLevel,
+        is_terminal_level: bool
+    ) -> EmittedDiscoveredLevel {
+        // Upstream rebuilds the frontier from the level's heap candidate
+        // addresses only on non-terminal levels.
+        transition is_terminal_level {
+            true -> advance(discovered_pointer_level)
+            false -> rebuild_frontier(discovered_pointer_level)
+        }
+    }
+
+    state rebuild_frontier(
+        &mut self,
+        discovered_pointer_level: PointerScanCollectedLevel
+    ) -> EmittedDiscoveredLevel {
+        // Upstream `PointerScanTargetRangeSet::from_sorted_target_addresses_iter(
+        //   heap_candidates.iter().map(|c| c.pointer_address), radius)`: the
+        // heap candidates' ordered addresses belong to the collected level,
+        // so the set is rebuilt from the level itself.
+        let scan_offset_radius: u64 =
+            self.pointer_scan_parameters.get_offset_radius();
+        self.frontier_target_ranges =
+            PointerScanTargetRangeSet::from_collected_level_heap_addresses(
+                &discovered_pointer_level,
+                scan_offset_radius
+            );
+        advance(discovered_pointer_level)
+    }
+
+    state advance(
+        &mut self,
+        discovered_pointer_level: PointerScanCollectedLevel
+    ) -> EmittedDiscoveredLevel {
+        self.pointer_chain_depth =
+            ((self.pointer_chain_depth as u64 in Saturating) + 1) as u64;
+        transition self.pointer_chain_depth >=
+            self.pointer_scan_parameters.get_max_depth() {
+            true -> stop_with(discovered_pointer_level)
+            false -> (EmittedDiscoveredLevel::Level { level: discovered_pointer_level })
+            _ -> (EmittedDiscoveredLevel::Level { level: discovered_pointer_level })
+        }
+    }
+
+    state stop_with(
+        &mut self,
+        discovered_pointer_level: PointerScanCollectedLevel
+    ) -> EmittedDiscoveredLevel {
+        self.stopped = true;
+        EmittedDiscoveredLevel::Level { level: discovered_pointer_level }
+    }
+
+    state stop(&mut self) -> EmittedDiscoveredLevel {
+        self.stopped = true;
+        EmittedDiscoveredLevel::Done
+    }
+}
+
+// Upstream's `PointerScanLevelCollector` unit struct.
+pub data PointerScanLevelCollector {}
+
+// Upstream `discover_pointer_levels`. Its `Vec` return becomes the driver
+// above — same construction of target ranges, task build, and loop bounds.
+// The `with_logging` parameter is retained for signature parity; the upstream
+// `log::info!` timing/progress emissions are deferred to a logging surface
+// and change no data flow.
+pub machine PointerScanLevelCollector::discover_pointer_levels<'a>(
+    &self,
+    snapshots: &'a [&'a Snapshot],
+    target_addresses: &[u64],
+    pointer_scan_parameters: &PointerScanParameters,
+    modules: &[NormalizedModule],
+    with_logging: bool
+) -> PointerScanDiscoveredLevels<'a> {
+    let pointer_size: PointerScanPointerSize = pointer_scan_parameters.get_pointer_size();
+    let scan_offset_radius: u64 = pointer_scan_parameters.get_offset_radius();
+    let snapshot_region_scan_tasks: SnapshotRegionScanTasks<'a> =
+        PointerScanTaskBuilder::build_snapshot_region_scan_tasks(
+            snapshots,
+            modules,
+            pointer_size
+        );
+    let frontier_target_ranges: PointerScanTargetRangeSet =
+        PointerScanTargetRangeSet::from_target_addresses(
+            target_addresses,
+            scan_offset_radius
+        );
+    PointerScanDiscoveredLevels::new(
+        frontier_target_ranges,
+        snapshot_region_scan_tasks,
+        pointer_scan_parameters
+    )
+}
