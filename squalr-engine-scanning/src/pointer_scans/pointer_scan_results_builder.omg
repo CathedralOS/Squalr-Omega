@@ -1,0 +1,452 @@
+module src::pointer_scans::pointer_scan_results_builder;
+
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node_type::PointerScanNodeType;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+use squalr_engine_api::src::structures::pointer_scans::emitted_built_level::EmittedBuiltLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_built_level_source::PointerScanBuiltLevelSource;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use src::pointer_scans::pointer_scan_level_collector::EmittedDiscoveredLevel;
+use src::pointer_scans::pointer_scan_level_collector::PointerScanDiscoveredLevels;
+use src::pointer_scans::structures::pointer_scan_collected_candidate::PointerScanCollectedCandidate;
+use src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+
+// Port of pointer_scan_results_builder.rs.
+//
+// Upstream returns `PointerScanResults` eagerly holding
+// `Vec<PointerScanLevel>` + `Vec<PointerScanLevelCandidates>` (plus `Vec<u64>`
+// target addresses and `Vec<String>` module names). Growable vectors do not
+// exist in Omega, so the per-level products are produced by a pull driver:
+// `PointerScanBuiltLevels::next` runs exactly one upstream loop iteration and
+// yields `(PointerScanLevel, PointerScanLevelCandidates)` pairs in upstream
+// order — discovery_depth = enumerate index + 1, candidate ids sequential
+// from 1 with saturating increments, static candidates before heap
+// candidates inside each level. The api-structures peer's
+// `PointerScanResults::new` owns the driver (partition-owned output — the
+// same level-partitioned layout upstream's two parallel vectors encode),
+// derives the bounded-text `module_names` from the `&[NormalizedModule]`
+// slice (bounded names per `ProcessInfo`; `Vec<String>` cannot be
+// materialized), and borrows `target_addresses` in place of upstream's
+// `Vec<u64>`.
+// The primed first collected level: `prime` pulls it ahead of emission so the
+// upstream `collected_pointer_levels.is_empty()` branch stays an eager branch
+// in `build_results` rather than a drain-side effect inside the results type.
+pub data PendingDiscoveredLevel {
+    case Level(level: PointerScanCollectedLevel);
+    case Undrawn;
+    case Drained;
+}
+
+pub data PointerScanBuiltLevels<'a, 'b> {
+    collected_pointer_levels: PointerScanDiscoveredLevels<'a, 'b>;
+    pending: PendingDiscoveredLevel;
+    // The candidate set of the level currently being built; Omega locals and
+    // parameters are immutable, so it lives on the driver while candidates
+    // push into it and moves out when the level finishes.
+    building_candidates: PointerScanLevelCandidates;
+    pointer_level_index: u64;
+    next_candidate_id: u64;
+    total_static_node_count: u64;
+    total_heap_node_count: u64;
+}
+
+pub machine PointerScanBuiltLevels::new<'a, 'b>(
+    collected_pointer_levels: PointerScanDiscoveredLevels<'a, 'b>,
+    building_candidates: PointerScanLevelCandidates
+) -> PointerScanBuiltLevels<'a, 'b> {
+    PointerScanBuiltLevels {
+        collected_pointer_levels: collected_pointer_levels,
+        pending: PendingDiscoveredLevel::Undrawn,
+        building_candidates: building_candidates,
+        pointer_level_index: 0,
+        next_candidate_id: 1,
+        total_static_node_count: 0,
+        total_heap_node_count: 0,
+    }
+}
+
+// Upstream `collected_pointer_levels.is_empty()`: pulls the first level into
+// `pending` once so `build_results` can branch before any level is emitted.
+// This is a `&mut` argument machine rather than `&mut self`: receiver calls
+// are only admitted on `&mut` parameters and `&mut self` fields, so callers
+// hand the driver in through a mutable argument.
+pub machine PointerScanBuiltLevels::prime<'a, 'b>(
+    built_levels: &mut PointerScanBuiltLevels<'a, 'b>
+) {
+    transition built_levels.pending {
+        PendingDiscoveredLevel::Undrawn -> pull(built_levels)
+        _ -> settled(built_levels)
+    }
+
+    state pull(built_levels: &mut PointerScanBuiltLevels<'a, 'b>) {
+        let emission: EmittedDiscoveredLevel =
+            built_levels.collected_pointer_levels.next();
+        transition emission {
+            EmittedDiscoveredLevel::Level { level } -> hold(built_levels, level)
+            EmittedDiscoveredLevel::Done -> drain(built_levels)
+            _ -> drain(built_levels)
+        }
+    }
+
+    state hold(
+        built_levels: &mut PointerScanBuiltLevels<'a, 'b>,
+        level: PointerScanCollectedLevel
+    ) {
+        built_levels.pending = PendingDiscoveredLevel::Level { level: level };
+    }
+
+    state drain(built_levels: &mut PointerScanBuiltLevels<'a, 'b>) {
+        built_levels.pending = PendingDiscoveredLevel::Drained;
+    }
+
+    state settled(built_levels: &mut PointerScanBuiltLevels<'a, 'b>) {
+    }
+}
+
+// True iff the primed pull found a first level — upstream's `!is_empty()`.
+pub machine PointerScanBuiltLevels::has_pending_level<'a, 'b>(&self) -> bool {
+    transition self.pending {
+        PendingDiscoveredLevel::Level { .. } -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine PointerScanBuiltLevels::get_total_static_node_count<'a, 'b>(&self) -> u64
+    satisfies PointerScanBuiltLevelSource::get_total_static_node_count {
+    self.total_static_node_count
+}
+
+pub machine PointerScanBuiltLevels::get_total_heap_node_count<'a, 'b>(&self) -> u64
+    satisfies PointerScanBuiltLevelSource::get_total_heap_node_count {
+    self.total_heap_node_count
+}
+
+// The api peer's `PointerScanBuiltLevelSource` contract (`next` yields the
+// level partition pairs upstream collected into two parallel vectors).
+pub machine PointerScanBuiltLevels::next<'a, 'b>(&mut self) -> EmittedBuiltLevel
+    satisfies PointerScanBuiltLevelSource::next {
+    let moved_pending: PendingDiscoveredLevel = self.pending;
+    self.pending = PendingDiscoveredLevel::Drained;
+    transition moved_pending {
+        PendingDiscoveredLevel::Level { level } -> build_level(level)
+        _ -> pull_next()
+    }
+
+    state pull_next(&mut self) -> EmittedBuiltLevel {
+        let emission: EmittedDiscoveredLevel = self.collected_pointer_levels.next();
+        transition emission {
+            EmittedDiscoveredLevel::Level { level } -> build_level(level)
+            EmittedDiscoveredLevel::Done -> (EmittedBuiltLevel::Done)
+            _ -> (EmittedBuiltLevel::Done)
+        }
+    }
+
+    // One upstream `for (pointer_level_index, collected_pointer_level)` body:
+    // build_level_candidates + PointerScanLevel::new + totals accumulation.
+    state build_level(
+        &mut self,
+        collected_pointer_level: PointerScanCollectedLevel
+    ) -> EmittedBuiltLevel {
+        let discovery_depth: u64 =
+            ((self.pointer_level_index as u64 in Saturating) + 1) as u64;
+        self.building_candidates =
+            PointerScanLevelCandidates::new_presorted(discovery_depth);
+        emit_static_candidate(collected_pointer_level, discovery_depth, 0)
+    }
+
+    // Upstream's static-candidate loop: `PointerScanCandidate::new(
+    // next_candidate_id, discovery_depth, Static, pointer_address,
+    // pointer_value, module_index, module_offset)`; id += saturating(1).
+    state emit_static_candidate(
+        &mut self,
+        collected_pointer_level: PointerScanCollectedLevel,
+        discovery_depth: u64,
+        candidate_index: u64
+    ) -> EmittedBuiltLevel {
+        transition candidate_index
+            < collected_pointer_level.get_static_candidate_count() {
+            true -> push_static(
+                collected_pointer_level,
+                discovery_depth,
+                candidate_index
+            )
+            false -> emit_heap_candidate(collected_pointer_level, discovery_depth, 0)
+        }
+    }
+
+    state push_static(
+        &mut self,
+        collected_pointer_level: PointerScanCollectedLevel,
+        discovery_depth: u64,
+        candidate_index: u64
+    ) -> EmittedBuiltLevel
+    requires
+        candidate_index < collected_pointer_level.get_static_candidate_count()
+    {
+        let collected_pointer_candidate: &PointerScanCollectedCandidate =
+            collected_pointer_level.get_static_candidate(candidate_index);
+        self.building_candidates.static_candidates.push(PointerScanCandidate::new(
+            self.next_candidate_id,
+            discovery_depth,
+            PointerScanNodeType::Static,
+            collected_pointer_candidate.pointer_address,
+            collected_pointer_candidate.pointer_value,
+            collected_pointer_candidate.module_index,
+            collected_pointer_candidate.module_offset
+        ));
+        self.next_candidate_id =
+            ((self.next_candidate_id as u64 in Saturating) + 1) as u64;
+        emit_static_candidate(
+            collected_pointer_level,
+            discovery_depth,
+            ((candidate_index as u64 in Saturating) + 1) as u64
+        )
+    }
+
+    // Upstream's heap-candidate loop: same id discipline; module_index and
+    // module_offset are 0 for heap nodes.
+    state emit_heap_candidate(
+        &mut self,
+        collected_pointer_level: PointerScanCollectedLevel,
+        discovery_depth: u64,
+        candidate_index: u64
+    ) -> EmittedBuiltLevel {
+        transition candidate_index
+            < collected_pointer_level.get_heap_candidate_count() {
+            true -> push_heap(
+                collected_pointer_level,
+                discovery_depth,
+                candidate_index
+            )
+            false -> finish_level(discovery_depth)
+        }
+    }
+
+    state push_heap(
+        &mut self,
+        collected_pointer_level: PointerScanCollectedLevel,
+        discovery_depth: u64,
+        candidate_index: u64
+    ) -> EmittedBuiltLevel
+    requires
+        candidate_index < collected_pointer_level.get_heap_candidate_count()
+    {
+        let collected_pointer_candidate: &PointerScanCollectedCandidate =
+            collected_pointer_level.get_heap_candidate(candidate_index);
+        self.building_candidates.heap_candidates.push(PointerScanCandidate::new(
+            self.next_candidate_id,
+            discovery_depth,
+            PointerScanNodeType::Heap,
+            collected_pointer_candidate.pointer_address,
+            collected_pointer_candidate.pointer_value,
+            0,
+            0
+        ));
+        self.next_candidate_id =
+            ((self.next_candidate_id as u64 in Saturating) + 1) as u64;
+        emit_heap_candidate(
+            collected_pointer_level,
+            discovery_depth,
+            ((candidate_index as u64 in Saturating) + 1) as u64
+        )
+    }
+
+    // Upstream's per-level epilogue: `PointerScanLevel::new(discovery_depth,
+    // node_count, static_node_count, heap_node_count)` and the
+    // `saturating_add` totals accumulation.
+    state finish_level(&mut self, discovery_depth: u64) -> EmittedBuiltLevel {
+        let built_candidates: PointerScanLevelCandidates = self.building_candidates;
+        self.building_candidates = PointerScanLevelCandidates::new_presorted(0);
+        let static_node_count: u64 = built_candidates.get_static_node_count();
+        let heap_node_count: u64 = built_candidates.get_heap_node_count();
+        self.total_static_node_count =
+            ((self.total_static_node_count as u64 in Saturating)
+                + (static_node_count as u64 in Saturating)) as u64;
+        self.total_heap_node_count =
+            ((self.total_heap_node_count as u64 in Saturating)
+                + (heap_node_count as u64 in Saturating)) as u64;
+        self.pointer_level_index =
+            ((self.pointer_level_index as u64 in Saturating) + 1) as u64;
+        EmittedBuiltLevel::Level {
+            level: PointerScanLevel::new(
+                discovery_depth,
+                built_candidates.get_node_count(),
+                static_node_count,
+                heap_node_count
+            ),
+            level_candidates: built_candidates,
+        }
+    }
+}
+
+// Upstream's `PointerScanResultsBuilder` unit struct.
+pub data PointerScanResultsBuilder {}
+
+pub machine PointerScanResultsBuilder::build_results<'x, 'a, 'b, 'c, 'd>(
+    &self,
+    pointer_scan_results_id: u64,
+    pointer_scan_parameters: &PointerScanParameters,
+    target_descriptor: PointerScanTargetDescriptor,
+    target_addresses: &'c [u64],
+    address_space: PointerScanAddressSpace,
+    modules: &'d [NormalizedModule],
+    built_levels: &'x mut PointerScanBuiltLevels<'a, 'b>,
+    with_logging: bool
+) -> PointerScanResults<'x, 'c, 'd> {
+    transition true {
+        true -> check_levels(
+            pointer_scan_results_id,
+            pointer_scan_parameters,
+            target_descriptor,
+            target_addresses,
+            address_space,
+            modules,
+            built_levels
+        )
+        _ -> check_levels(
+            pointer_scan_results_id,
+            pointer_scan_parameters,
+            target_descriptor,
+            target_addresses,
+            address_space,
+            modules,
+            built_levels
+        )
+    }
+
+    // Upstream first derives `module_names` (`Vec<String>`) and delegates to
+    // `build_results_with_module_names`. A flat name list cannot be
+    // materialized in Omega, so the two machines collapse into one and the
+    // name derivation moves inside the api peer's `PointerScanResults::new`,
+    // which reads the same `&[NormalizedModule]` slice. The caller constructs
+    // `built_levels` from the discovered-levels driver so the results can
+    // borrow it through the api `PointerScanBuiltLevelSource` trait for as
+    // long as the caller's 'x.
+    state check_levels(
+        &self,
+        pointer_scan_results_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'c [u64],
+        address_space: PointerScanAddressSpace,
+        modules: &'d [NormalizedModule],
+        built_levels: &'x mut PointerScanBuiltLevels<'a, 'b>
+    ) -> PointerScanResults<'x, 'c, 'd> {
+        PointerScanBuiltLevels::prime(&mut built_levels);
+        transition built_levels.has_pending_level() {
+            true -> populated(
+                pointer_scan_results_id,
+                pointer_scan_parameters,
+                target_descriptor,
+                target_addresses,
+                address_space,
+                modules,
+                built_levels
+            )
+            false -> empty(
+                pointer_scan_results_id,
+                pointer_scan_parameters,
+                target_descriptor,
+                target_addresses,
+                address_space,
+                modules,
+                built_levels
+            )
+            _ -> empty(
+                pointer_scan_results_id,
+                pointer_scan_parameters,
+                target_descriptor,
+                target_addresses,
+                address_space,
+                modules,
+                built_levels
+            )
+        }
+    }
+
+    state populated(
+        &self,
+        pointer_scan_results_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'c [u64],
+        address_space: PointerScanAddressSpace,
+        modules: &'d [NormalizedModule],
+        built_levels: &'x mut PointerScanBuiltLevels<'a, 'b>
+    ) -> PointerScanResults<'x, 'c, 'd> {
+        let pointer_size: PointerScanPointerSize =
+            pointer_scan_parameters.get_pointer_size();
+        let max_depth: u64 = pointer_scan_parameters.get_max_depth();
+        let offset_radius: u64 = pointer_scan_parameters.get_offset_radius();
+        PointerScanResults::new(
+            pointer_scan_results_id,
+            target_descriptor,
+            target_addresses,
+            address_space,
+            pointer_size,
+            max_depth,
+            offset_radius,
+            modules,
+            built_levels
+        )
+    }
+
+    // Upstream's `if collected_pointer_levels.is_empty()` branch, including
+    // the `with_logging` "found no reachable pointer nodes" line — the log
+    // emission is deferred to a logging surface; the branch itself is kept.
+    state empty(
+        &self,
+        pointer_scan_results_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'c [u64],
+        address_space: PointerScanAddressSpace,
+        modules: &'d [NormalizedModule],
+        built_levels: &'x mut PointerScanBuiltLevels<'a, 'b>
+    ) -> PointerScanResults<'x, 'c, 'd> {
+        PointerScanResultsBuilder::create_empty_results(
+            pointer_scan_results_id,
+            pointer_scan_parameters,
+            target_descriptor,
+            target_addresses,
+            address_space,
+            modules,
+            built_levels
+        )
+    }
+}
+
+// Upstream `create_empty_results`: `PointerScanResults::new` with empty
+// levels/candidates, empty module names and zero totals. The api peer's
+// `new_empty` is the same construction; the results still borrow the (now
+// drained) source so the lifetime contract matches `new`.
+pub machine PointerScanResultsBuilder::create_empty_results<'x, 'a, 'b, 'c, 'd>(
+    pointer_scan_results_id: u64,
+    pointer_scan_parameters: &PointerScanParameters,
+    target_descriptor: PointerScanTargetDescriptor,
+    target_addresses: &'c [u64],
+    address_space: PointerScanAddressSpace,
+    modules: &'d [NormalizedModule],
+    built_levels: &'x mut PointerScanBuiltLevels<'a, 'b>
+) -> PointerScanResults<'x, 'c, 'd> {
+    let pointer_size: PointerScanPointerSize = pointer_scan_parameters.get_pointer_size();
+    let max_depth: u64 = pointer_scan_parameters.get_max_depth();
+    let offset_radius: u64 = pointer_scan_parameters.get_offset_radius();
+    PointerScanResults::new_empty(
+        pointer_scan_results_id,
+        target_descriptor,
+        target_addresses,
+        address_space,
+        pointer_size,
+        max_depth,
+        offset_radius,
+        modules,
+        built_levels
+    )
+}
