@@ -1,0 +1,301 @@
+module src::structures::scanning::filters::snapshot_region_filter_collection;
+
+use omega::language::core::option;
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+
+// Port of SnapshotRegionFilterCollection. Upstream stores
+// Vec<Vec<SnapshotRegionFilter>> — runs of filters kept adjacent so parallel
+// scan dispatch can treat each inner run independently. Omega has no nested
+// allocation, so the collection is a flat caller-supplied filter extent plus
+// a parallel run-length extent: run `r` covers the next `run_lengths[r]`
+// filters, preserving the partition boundaries (and thus result ranges and
+// candidate-stride coverage) rather than collapsing them into one list.
+//
+// `filters_offset`/`runs_offset` are collection-local windows into the shared
+// extents (upstream Vec ownership relocates data per collection; here the
+// relocating step is an offset+count window, with `filter_count`/`run_count`
+// as the live lengths).
+pub data SnapshotRegionFilterCollection<'type_id, 'filters, 'runs> {
+    snapshot_region_filters: &'filters mut [SnapshotRegionFilter];
+    filters_offset: u64;
+    filter_count: u64;
+    run_lengths: &'runs mut [u64];
+    runs_offset: u64;
+    run_count: u64;
+    data_type_ref: DataTypeRef<'type_id>;
+    memory_alignment: MemoryAlignment;
+    result_value_size_in_bytes: u64;
+    result_container_type: ContainerType;
+    number_of_results: u64;
+}
+
+// Local bounds of one run, used by dispatch iteration.
+pub data SnapshotRegionFilterRun {
+    filters_offset: u64;
+    filter_count: u64;
+}
+
+pub machine SnapshotRegionFilterCollection::new<'type_id, 'filters, 'runs>(
+    snapshot_region_filters: &'filters mut [SnapshotRegionFilter],
+    run_lengths: &'runs mut [u64],
+    data_type_ref: DataTypeRef<'type_id>,
+    memory_alignment: MemoryAlignment,
+    result_value_size_in_bytes: u64
+) -> SnapshotRegionFilterCollection<'type_id, 'filters, 'runs> {
+    (SnapshotRegionFilterCollection {
+        snapshot_region_filters: snapshot_region_filters,
+        filters_offset: 0,
+        filter_count: 0,
+        run_lengths: run_lengths,
+        runs_offset: 0,
+        run_count: 0,
+        data_type_ref: data_type_ref,
+        memory_alignment: memory_alignment,
+        result_value_size_in_bytes: result_value_size_in_bytes,
+        result_container_type: ContainerType::None,
+        number_of_results: 0,
+    })
+}
+
+pub machine SnapshotRegionFilterCollection::get_data_type_ref(&self) -> &DataTypeRef {
+    &self.data_type_ref
+}
+
+pub machine SnapshotRegionFilterCollection::get_memory_alignment(&self) -> MemoryAlignment {
+    self.memory_alignment
+}
+
+pub machine SnapshotRegionFilterCollection::get_result_value_size_in_bytes(&self) -> u64 {
+    self.result_value_size_in_bytes
+}
+
+pub machine SnapshotRegionFilterCollection::get_result_container_type(&self) -> ContainerType {
+    self.result_container_type
+}
+
+pub machine SnapshotRegionFilterCollection::set_result_container_type(
+    &mut self,
+    result_container_type: ContainerType
+) {
+    self.result_container_type = result_container_type;
+}
+
+pub machine SnapshotRegionFilterCollection::get_number_of_results(&self) -> u64 {
+    self.number_of_results
+}
+
+pub machine SnapshotRegionFilterCollection::set_number_of_results(&mut self, number_of_results: u64) {
+    self.number_of_results = number_of_results;
+}
+
+pub machine SnapshotRegionFilterCollection::get_filter_count(&self) -> u64 {
+    self.filter_count
+}
+
+pub machine SnapshotRegionFilterCollection::get_run_count(&self) -> u64 {
+    self.run_count
+}
+
+pub machine SnapshotRegionFilterCollection::get_filters_offset(&self) -> u64 {
+    self.filters_offset
+}
+
+pub machine SnapshotRegionFilterCollection::get_runs_offset(&self) -> u64 {
+    self.runs_offset
+}
+
+pub machine SnapshotRegionFilterCollection::set_window(&mut self, filters_offset: u64, filter_count: u64, runs_offset: u64, run_count: u64) {
+    self.filters_offset = filters_offset;
+    self.filter_count = filter_count;
+    self.runs_offset = runs_offset;
+    self.run_count = run_count;
+}
+
+// Read one filter by collection-local index (flattened across runs), matching
+// upstream's flattening order over `Vec<Vec<Filter>>`.
+pub machine SnapshotRegionFilterCollection::get_filter_at(&self, local_index: u64) -> Optional<&SnapshotRegionFilter> {
+    transition local_index < self.filter_count {
+        true -> window(self.snapshot_region_filters, local_index)
+        _ -> (Optional::None)
+    }
+    state window(&self, filters: &[SnapshotRegionFilter], local_index: u64 [0..self.filter_count]) -> Optional<&SnapshotRegionFilter> {
+        let absolute_index: u64 = ((self.filters_offset as u64 in Saturating) + (local_index as u64 in Saturating)) as u64;
+        transition absolute_index < filters.len {
+            true -> present(filters, absolute_index)
+            _ -> (Optional::None)
+        }
+    }
+    state present(&self, filters: &[SnapshotRegionFilter], absolute_index: u64 [0..filters.len]) -> Optional<&SnapshotRegionFilter> {
+        (Optional::Some { value: &filters[absolute_index] })
+    }
+}
+
+// Write one filter by collection-local index.
+pub machine SnapshotRegionFilterCollection::set_filter_at(&mut self, local_index: u64, filter: SnapshotRegionFilter) {
+    transition local_index < self.filter_count {
+        true -> window(&mut self.snapshot_region_filters, local_index, filter)
+        _ -> idle()
+    }
+    state window(&mut self, filters: &mut [SnapshotRegionFilter], local_index: u64 [0..self.filter_count], filter: SnapshotRegionFilter) {
+        let absolute_index: u64 = ((self.filters_offset as u64 in Saturating) + (local_index as u64 in Saturating)) as u64;
+        transition absolute_index < filters.len {
+            true -> write_at(&mut filters, absolute_index, filter)
+            _ -> idle()
+        }
+    }
+    state write_at(&mut self, filters: &mut [SnapshotRegionFilter], absolute_index: u64 [0..filters.len], filter: SnapshotRegionFilter) {
+        filters[absolute_index] = filter;
+    }
+    state idle(&mut self) {
+    }
+}
+
+// Local bounds of one run for dispatch iteration.
+pub machine SnapshotRegionFilterCollection::get_run_bounds(&self, run_index: u64) -> Optional<SnapshotRegionFilterRun> {
+    transition run_index < self.run_count {
+        true -> length(self.run_lengths, run_index)
+        _ -> (Optional::None)
+    }
+    state length(&self, run_lengths: &[u64], run_index: u64 [0..self.run_count]) -> Optional<SnapshotRegionFilterRun> {
+        let absolute_run_index: u64 = ((self.runs_offset as u64 in Saturating) + (run_index as u64 in Saturating)) as u64;
+        transition absolute_run_index < run_lengths.len {
+            true -> present(run_lengths, absolute_run_index, run_index)
+            _ -> (Optional::None)
+        }
+    }
+    state present(
+        &self,
+        run_lengths: &[u64],
+        absolute_run_index: u64 [0..run_lengths.len],
+        run_index: u64
+    ) -> Optional<SnapshotRegionFilterRun> {
+        let run_filter_count: u64 = run_lengths[absolute_run_index];
+        let start_offset: u64 = self.run_start_offset(run_index);
+        (Optional::Some {
+            value: SnapshotRegionFilterRun {
+                filters_offset: start_offset,
+                filter_count: run_filter_count,
+            }
+        })
+    }
+}
+
+// Local index of run `run_index`'s first filter.
+pub machine SnapshotRegionFilterCollection::run_start_offset(&self, run_index: u64) -> u64 {
+    transition {
+        _ -> sum_runs(self.run_lengths, 0, run_index, 0)
+    }
+    state sum_runs(&self, run_lengths: &[u64], cursor: u64, run_index: u64, accumulated: u64) -> u64 {
+        transition cursor < run_index && cursor < self.run_count {
+            true -> add_run(run_lengths, cursor, run_index, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state add_run(&self, run_lengths: &[u64], cursor: u64, run_index: u64, accumulated: u64) -> u64 {
+        let absolute_cursor: u64 = ((self.runs_offset as u64 in Saturating) + (cursor as u64 in Saturating)) as u64;
+        transition absolute_cursor < run_lengths.len {
+            true -> fold(run_lengths, absolute_cursor, cursor, run_index, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state fold(
+        &self,
+        run_lengths: &[u64],
+        absolute_cursor: u64 [0..run_lengths.len],
+        cursor: u64,
+        run_index: u64,
+        accumulated: u64
+    ) -> u64 {
+        let next_cursor: u64 = ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (run_lengths[absolute_cursor] as u64 in Saturating)) as u64;
+        sum_runs(run_lengths, next_cursor, run_index, next_accumulated)
+    }
+}
+
+// Upstream get_filter_minimum_address: base of the first run's first filter.
+pub machine SnapshotRegionFilterCollection::get_filter_minimum_address(&self) -> u64 {
+    transition self.filter_count > 0 {
+        true -> read_at(self.snapshot_region_filters, 0)
+        _ -> (0)
+    }
+    state read_at(&self, filters: &[SnapshotRegionFilter], local_index: u64) -> u64 {
+        let absolute_index: u64 = ((self.filters_offset as u64 in Saturating) + (local_index as u64 in Saturating)) as u64;
+        transition absolute_index < filters.len {
+            true -> base(filters, absolute_index)
+            _ -> (0)
+        }
+    }
+    state base(&self, filters: &[SnapshotRegionFilter], absolute_index: u64 [0..filters.len]) -> u64 {
+        filters[absolute_index].get_base_address()
+    }
+}
+
+// Upstream get_filter_maximum_address: end of the last run's last filter.
+pub machine SnapshotRegionFilterCollection::get_filter_maximum_address(&self) -> u64 {
+    transition self.filter_count > 0 {
+        true -> last()
+        _ -> (0)
+    }
+    state last(&self) -> u64 {
+        let last_index: u64 = ((self.filter_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition last_index < self.filter_count {
+            true -> read_at(self.snapshot_region_filters, last_index)
+            _ -> (0)
+        }
+    }
+    state read_at(&self, filters: &[SnapshotRegionFilter], local_index: u64 [0..self.filter_count]) -> u64 {
+        let absolute_index: u64 = ((self.filters_offset as u64 in Saturating) + (local_index as u64 in Saturating)) as u64;
+        transition absolute_index < filters.len {
+            true -> end(filters, absolute_index)
+            _ -> (0)
+        }
+    }
+    state end(&self, filters: &[SnapshotRegionFilter], absolute_index: u64 [0..filters.len]) -> u64 {
+        filters[absolute_index].get_end_address()
+    }
+}
+
+// Upstream `new_with_result_size` computes number_of_results as the sum over
+// filters of get_element_count(result_size, alignment); upstream also drops
+// sub-size filters and re-sorts, which this port preserves by callers laying
+// out the extents already filtered and sorted (the extents are caller-owned,
+// so compaction happens where they are built).
+pub machine SnapshotRegionFilterCollection::recount_results(&mut self)
+crashes Abort
+{
+    transition {
+        _ -> count(&mut self.snapshot_region_filters, 0, 0)
+    }
+    state count(&mut self, filters: &mut [SnapshotRegionFilter], local_index: u64, accumulated: u64) -> u64 {
+        transition local_index < self.filter_count {
+            true -> window(&mut filters, local_index, accumulated)
+            _ -> done(accumulated)
+        }
+    }
+    state window(&mut self, filters: &mut [SnapshotRegionFilter], local_index: u64 [0..self.filter_count], accumulated: u64) -> u64 {
+        let absolute_index: u64 = ((self.filters_offset as u64 in Saturating) + (local_index as u64 in Saturating)) as u64;
+        transition absolute_index < filters.len {
+            true -> fold(&mut filters, absolute_index, local_index, accumulated)
+            _ -> done(accumulated)
+        }
+    }
+    state fold(
+        &mut self,
+        filters: &mut [SnapshotRegionFilter],
+        absolute_index: u64 [0..filters.len],
+        local_index: u64,
+        accumulated: u64
+    ) -> u64 {
+        let element_count: u64 = filters[absolute_index].get_element_count(self.result_value_size_in_bytes, self.memory_alignment);
+        let next_index: u64 = ((local_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) + (element_count as u64 in Saturating)) as u64;
+        count(&mut filters, next_index, next_accumulated)
+    }
+    state done(&mut self, accumulated: u64) -> u64 {
+        self.number_of_results = accumulated;
+        accumulated
+    }
+}
