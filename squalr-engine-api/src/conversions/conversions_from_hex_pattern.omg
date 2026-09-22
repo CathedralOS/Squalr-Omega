@@ -1,0 +1,549 @@
+module src::conversions::conversions_from_hex_pattern;
+
+// Port of conversions/conversions_from_hex_pattern.rs: parses a masked hex
+// byte pattern in which individual nibbles may be wildcarded with `x`/`X`.
+// Tokens are separated by any combination of ' ', ',', '-'; each token's edge
+// whitespace is trimmed (upstream trims each split piece), empty pieces are
+// filtered, and each remaining token must be exactly two characters. Nibble
+// encoding: both exact -> mask 0xFF, low wild -> 0xF0, high wild -> 0x0F,
+// both wild -> 0x00; the pattern byte zeroes wildcarded nibbles.
+//
+// Named deviations (no semantics change for accepted input):
+// - Upstream returns Result<(Vec<u8>, Vec<u8>), String>. Omega has no growable
+//   owner yet (Vec construction waits on the Allocation<T>/Arena surface), so
+//   parse fills caller-provided pattern/mask buffers and Ok reports the shared
+//   token count -- the read_all convention. OutputFull is the capacity refusal
+//   upstream's Vec::push never needed; a caller supplying buffers at least
+//   input.len / 2 elements never sees it.
+// - Upstream's Err is a formatted String echoing the token and position. A data
+//   case cannot retain a borrowed byte view, so HexPatternParseError carries
+//   the same failure classes and their data (token index, measured length, the
+//   offending uppercased byte) without the echoed text.
+// - Authored text is a BYTE DOMAIN: token length is measured in bytes, not
+//   scalar chars, so a multi-byte UTF-8 token reports its byte length in
+//   BadTokenLength. Empty/whitespace checks trim ASCII whitespace
+//   (9/10/11/12/13/32); exotic Unicode whitespace is out of the byte domain.
+pub data ConversionsFromHexPattern {}
+
+// First case is the ZII zero case = failure, the repo's result-enum convention.
+pub data HexPatternParseResult {
+    case Error(error: HexPatternParseError);
+    case Ok(count: u64);
+}
+
+pub data HexPatternParseError [copy] {
+    case EmptyInput;
+    case NoTokens;
+    case BadTokenLength(token_index: u64, length: u64);
+    case InvalidNibble(token_index: u64, byte: u8);
+    case OutputFull;
+}
+
+// Token separators: ' ', ',', '-'.
+machine ConversionsFromHexPattern::is_separator(byte: u8) -> bool {
+    transition byte {
+        32 -> (true)
+        44 -> (true)
+        45 -> (true)
+        _ -> (false)
+    }
+}
+
+// ASCII whitespace trimmed at token edges: '\t' '\n' '\x0B' '\x0C' '\r' ' '.
+machine ConversionsFromHexPattern::is_ascii_whitespace(byte: u8) -> bool {
+    transition byte {
+        9 -> (true)
+        10 -> (true)
+        11 -> (true)
+        12 -> (true)
+        13 -> (true)
+        32 -> (true)
+        _ -> (false)
+    }
+}
+
+// char::to_ascii_uppercase on the byte domain.
+machine ConversionsFromHexPattern::uppercase_ascii(byte: u8) -> u8 {
+    transition byte >= 97 && byte <= 122 {
+        true -> (byte - 32)
+        false -> (byte)
+    }
+}
+
+// char::is_ascii_hexdigit: '0'-'9', 'A'-'F', 'a'-'f'.
+machine ConversionsFromHexPattern::is_ascii_hexdigit(byte: u8) -> bool {
+    transition (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102) {
+        true -> (true)
+        false -> (false)
+    }
+}
+
+// char::to_digit(16) for an already-verified hex byte; the `_` arm mirrors the
+// upstream expect("verified hex digit") -- unreachable from the checked call.
+// The [0..=15] range is the exact nibble codomain, which is what lets `pack`
+// prove (hi << 4) | lo stays inside u8.
+machine ConversionsFromHexPattern::hex_value(nibble: u8) -> u8 [0..=15] {
+    transition nibble {
+        48 -> (0)
+        49 -> (1)
+        50 -> (2)
+        51 -> (3)
+        52 -> (4)
+        53 -> (5)
+        54 -> (6)
+        55 -> (7)
+        56 -> (8)
+        57 -> (9)
+        65 -> (10)
+        66 -> (11)
+        67 -> (12)
+        68 -> (13)
+        69 -> (14)
+        70 -> (15)
+        _ -> (0)
+    }
+}
+
+// Parses `input` into the paired buffers; Ok(count) means pattern[0..count] and
+// mask[0..count] are the yielded (pattern_bytes, mask_bytes).
+//
+// One forward pass over `rest`: `scan` walks separator runs, `token` accumulates
+// one raw token until the next separator. Per token the walk tracks `nonws`
+// (non-whitespace bytes seen, saturated at 2), `span` (distance from the first
+// non-ws byte), `last` (offset of the most recent non-ws byte), and `b1`/`b2`
+// (the first and second non-ws bytes). Edge trimming falls out of that
+// accounting: leading ws never sets `nonws`, interior ws grows `span` but not
+// `last`, so a trimmed length of exactly 2 lands its bytes at b1/b2. `last + 1`
+// is the trimmed token length (byte measure, per the domain deviation above).
+pub machine ConversionsFromHexPattern::parse(
+    input: &[u8],
+    out_pattern: &mut [u8],
+    out_mask: &mut [u8]
+) -> HexPatternParseResult {
+    transition { _ -> leading(input, out_pattern, out_mask) }
+
+    // input.trim().is_empty() over the ASCII whitespace domain.
+    state leading(rest: &[u8], out_pattern: &mut [u8], out_mask: &mut [u8]) -> HexPatternParseResult {
+        transition rest.len > 0 {
+            true -> leading_byte(rest, out_pattern, out_mask)
+            false -> reject(HexPatternParseError::EmptyInput)
+        }
+    }
+
+    state leading_byte(rest: &[u8], out_pattern: &mut [u8], out_mask: &mut [u8]) -> HexPatternParseResult {
+        transition ConversionsFromHexPattern::is_ascii_whitespace(rest[0]) {
+            true -> leading(rest[1..], out_pattern, out_mask)
+            false -> scan(rest, out_pattern, out_mask, 0)
+        }
+    }
+
+    state scan(rest: &[u8], out_pattern: &mut [u8], out_mask: &mut [u8], count: u64) -> HexPatternParseResult {
+        transition rest.len > 0 {
+            true -> scan_byte(rest, out_pattern, out_mask, count)
+            false -> finish(count)
+        }
+    }
+
+    state scan_byte(rest: &[u8], out_pattern: &mut [u8], out_mask: &mut [u8], count: u64) -> HexPatternParseResult {
+        transition ConversionsFromHexPattern::is_separator(rest[0]) {
+            true -> scan(rest[1..], out_pattern, out_mask, count)
+            false -> token(rest, out_pattern, out_mask, count, 0, 0, 0, 0, 0)
+        }
+    }
+
+    state token(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        nonws: u64,
+        span: u64,
+        last: u64,
+        b1: u8,
+        b2: u8
+    ) -> HexPatternParseResult {
+        transition rest.len > 0 {
+            true -> token_byte(rest, out_pattern, out_mask, count, nonws, span, last, b1, b2)
+            false -> decide(rest, out_pattern, out_mask, count, nonws, last, b1, b2)
+        }
+    }
+
+    state token_byte(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        nonws: u64,
+        span: u64,
+        last: u64,
+        b1: u8,
+        b2: u8
+    ) -> HexPatternParseResult {
+        transition ConversionsFromHexPattern::is_separator(rest[0]) {
+            true -> decide(rest, out_pattern, out_mask, count, nonws, last, b1, b2)
+            false -> classify(rest[1..], out_pattern, out_mask, count, nonws, span, last, b1, b2, rest[0])
+        }
+    }
+
+    state classify(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        nonws: u64,
+        span: u64,
+        last: u64,
+        b1: u8,
+        b2: u8,
+        byte: u8
+    ) -> HexPatternParseResult {
+        transition ConversionsFromHexPattern::is_ascii_whitespace(byte) {
+            true -> whitespace_byte(rest, out_pattern, out_mask, count, nonws, span, last, b1, b2)
+            false -> nibble_byte(rest, out_pattern, out_mask, count, nonws, span, last, b1, b2, byte)
+        }
+    }
+
+    // Whitespace inside a raw token: leading bytes (no non-ws seen yet) leave
+    // the span untouched; later bytes extend it and may end up trimmed.
+    state whitespace_byte(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        nonws: u64,
+        span: u64,
+        last: u64,
+        b1: u8,
+        b2: u8
+    ) -> HexPatternParseResult {
+        transition nonws > 0 {
+            true -> token(rest, out_pattern, out_mask, count, nonws, ((span as u64 in Saturating) + (1 as u64 in Saturating)) as u64, last, b1, b2)
+            false -> token(rest, out_pattern, out_mask, count, nonws, span, last, b1, b2)
+        }
+    }
+
+    state nibble_byte(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        nonws: u64,
+        span: u64,
+        last: u64,
+        b1: u8,
+        b2: u8,
+        byte: u8
+    ) -> HexPatternParseResult {
+        transition nonws {
+            0 -> token(rest, out_pattern, out_mask, count, 1, 0, 0, byte, b2)
+            1 -> token(rest, out_pattern, out_mask, count, 2, ((span as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((span as u64 in Saturating) + (1 as u64 in Saturating)) as u64, b1, byte)
+            _ -> token(rest, out_pattern, out_mask, count, ((nonws as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((span as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((span as u64 in Saturating) + (1 as u64 in Saturating)) as u64, b1, b2)
+        }
+    }
+
+    // Token boundary: a filtered all-whitespace piece resumes the scan; a real
+    // token is measured. `count` is the ordinal of accepted tokens -- upstream's
+    // enumerate index in its error text.
+    state decide(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        nonws: u64,
+        last: u64,
+        b1: u8,
+        b2: u8
+    ) -> HexPatternParseResult {
+        transition nonws == 0 {
+            true -> scan(rest, out_pattern, out_mask, count)
+            false -> measure(rest, out_pattern, out_mask, count, last, b1, b2)
+        }
+    }
+
+    state measure(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        last: u64,
+        b1: u8,
+        b2: u8
+    ) -> HexPatternParseResult {
+        transition last == 1 {
+            true -> decode_hi(rest, out_pattern, out_mask, count, b1, b2)
+            false -> reject(HexPatternParseError::BadTokenLength { token_index: count, length: ((last as u64 in Saturating) + (1 as u64 in Saturating)) as u64 })
+        }
+    }
+
+    // parse_token: uppercased hi/lo nibbles; 'X' (88) is the only wildcard.
+    state decode_hi(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        b1: u8,
+        b2: u8
+    ) -> HexPatternParseResult {
+        let hi: u8 = ConversionsFromHexPattern::uppercase_ascii(b1);
+        let lo: u8 = ConversionsFromHexPattern::uppercase_ascii(b2);
+        transition hi == 88 || ConversionsFromHexPattern::is_ascii_hexdigit(hi) {
+            true -> decode_lo(rest, out_pattern, out_mask, count, hi, lo)
+            false -> reject(HexPatternParseError::InvalidNibble { token_index: count, byte: hi })
+        }
+    }
+
+    state decode_lo(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        hi: u8,
+        lo: u8
+    ) -> HexPatternParseResult {
+        transition lo == 88 || ConversionsFromHexPattern::is_ascii_hexdigit(lo) {
+            true -> nibble_hi(rest, out_pattern, out_mask, count, hi, lo)
+            false -> reject(HexPatternParseError::InvalidNibble { token_index: count, byte: lo })
+        }
+    }
+
+    state nibble_hi(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        hi: u8,
+        lo: u8
+    ) -> HexPatternParseResult {
+        transition hi == 88 {
+            true -> nibble_lo(rest, out_pattern, out_mask, count, 0, true, lo)
+            false -> nibble_lo(rest, out_pattern, out_mask, count, ConversionsFromHexPattern::hex_value(hi), false, lo)
+        }
+    }
+
+    state nibble_lo(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        hi_nib: u8 [0..=15],
+        hi_wild: bool,
+        lo: u8
+    ) -> HexPatternParseResult {
+        transition lo == 88 {
+            true -> pack(rest, out_pattern, out_mask, count, hi_nib, hi_wild, 0, true)
+            false -> pack(rest, out_pattern, out_mask, count, hi_nib, hi_wild, ConversionsFromHexPattern::hex_value(lo), false)
+        }
+    }
+
+    // byte_value = (hi << 4) | lo; mask = 0xFF / 0xF0 / 0x0F / 0x00 by wild pair.
+    state pack(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        hi_nib: u8 [0..=15],
+        hi_wild: bool,
+        lo_nib: u8 [0..=15],
+        lo_wild: bool
+    ) -> HexPatternParseResult {
+        let byte_value: u8 = (hi_nib << 4) | lo_nib;
+        transition hi_wild {
+            true -> mask_lo(rest, out_pattern, out_mask, count, byte_value, 0, lo_wild)
+            false -> mask_lo(rest, out_pattern, out_mask, count, byte_value, 240, lo_wild)
+        }
+    }
+
+    state mask_lo(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        byte_value: u8,
+        mask_hi: u8,
+        lo_wild: bool
+    ) -> HexPatternParseResult {
+        transition lo_wild {
+            true -> store(rest, out_pattern, out_mask, count, byte_value, mask_hi)
+            false -> store(rest, out_pattern, out_mask, count, byte_value, mask_hi | 15)
+        }
+    }
+
+    // Vec::push parity: both outputs must have room for the next token.
+    state store(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        byte_value: u8,
+        mask_byte: u8
+    ) -> HexPatternParseResult {
+        transition count < out_pattern.len && count < out_mask.len {
+            true -> write(rest, out_pattern, out_mask, count, byte_value, mask_byte)
+            false -> reject(HexPatternParseError::OutputFull)
+        }
+    }
+
+    state write(
+        rest: &[u8],
+        out_pattern: &mut [u8],
+        out_mask: &mut [u8],
+        count: u64,
+        byte_value: u8,
+        mask_byte: u8
+    ) -> HexPatternParseResult {
+        out_pattern[count] = byte_value;
+        out_mask[count] = mask_byte;
+        transition { _ -> scan(rest, out_pattern, out_mask, ((count as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+
+    state finish(count: u64) -> HexPatternParseResult {
+        transition count > 0 {
+            true -> ok(count)
+            false -> reject(HexPatternParseError::NoTokens)
+        }
+    }
+
+    state ok(count: u64) -> HexPatternParseResult {
+        HexPatternParseResult::Ok { count: count }
+    }
+
+    state reject(error: HexPatternParseError) -> HexPatternParseResult {
+        HexPatternParseResult::Error { error: error }
+    }
+}
+
+// Upstream: mask.iter().any(|b| *b != 0xFF).
+pub machine ConversionsFromHexPattern::has_wildcards(mask: &[u8]) -> bool {
+    transition mask.len > 0 {
+        true -> head(mask[0], mask[1..])
+        false -> (false)
+    }
+
+    state head(byte: u8, rest: &[u8]) -> bool {
+        transition byte == 255 {
+            true -> tail(rest)
+            false -> (true)
+        }
+    }
+
+    state tail(rest: &[u8]) -> bool {
+        transition rest.len > 0 {
+            true -> head(rest[0], rest[1..])
+            false -> (false)
+        }
+    }
+}
+
+// In-package exercise of the whole path: parses "00 xx 7x FB A1" into the
+// paired buffers, expects Ok(5) with pattern {00,00,70,FB,A1} and mask
+// {FF,00,F0,FF,FF}, a literal "DE FF" parse with the has_wildcards gate off,
+// a rejected non-hex input ("GG" -> InvalidNibble at token 0, byte 'G'), and
+// an empty input refused as EmptyInput. Checked here because &mut-slice
+// machine calls do not cross the package boundary under selected ProgramEntry
+// establishment, so squalr-tests cannot host this yet -- same edge the
+// wire-codec exercise names.
+pub machine ConversionsFromHexPattern::parse_consistent() -> bool {
+    let input: [u8; 14] = [48, 48, 32, 120, 120, 32, 55, 120, 32, 70, 66, 32, 65, 49];
+    let mut pattern: [u8; 5] = [0, 0, 0, 0, 0];
+    let mut mask: [u8; 5] = [0, 0, 0, 0, 0];
+    let parsed: HexPatternParseResult =
+        ConversionsFromHexPattern::parse(&input, &mut pattern, &mut mask);
+    let buffers_ok: bool =
+        pattern[0] == 0 && pattern[1] == 0 && pattern[2] == 112 && pattern[3] == 251 && pattern[4] == 161
+        && mask[0] == 255 && mask[1] == 0 && mask[2] == 240 && mask[3] == 255 && mask[4] == 255;
+    let wild: bool = ConversionsFromHexPattern::has_wildcards(&mask);
+
+    let exact: [u8; 5] = [68, 69, 32, 70, 70];
+    let mut flat_pattern: [u8; 4] = [0, 0, 0, 0];
+    let mut flat_mask: [u8; 4] = [0, 0, 0, 0];
+    let literal: HexPatternParseResult =
+        ConversionsFromHexPattern::parse(&exact, &mut flat_pattern, &mut flat_mask);
+    let flat_ok: bool =
+        flat_pattern[0] == 222 && flat_pattern[1] == 255
+        && flat_mask[0] == 255 && flat_mask[1] == 255
+        && !ConversionsFromHexPattern::has_wildcards(&flat_mask);
+
+    let bad_input: [u8; 2] = [71, 71];
+    let rejected: HexPatternParseResult =
+        ConversionsFromHexPattern::parse(&bad_input, &mut flat_pattern, &mut flat_mask);
+    let empty: [u8; 0] = [];
+    let refused: HexPatternParseResult =
+        ConversionsFromHexPattern::parse(&empty, &mut flat_pattern, &mut flat_mask);
+
+    transition buffers_ok && wild && flat_ok {
+        true -> parsed_ok(parsed, literal, rejected, refused)
+        false -> (false)
+    }
+
+    state parsed_ok(
+        parsed: HexPatternParseResult,
+        literal: HexPatternParseResult,
+        rejected: HexPatternParseResult,
+        refused: HexPatternParseResult
+    ) -> bool {
+        transition parsed {
+            HexPatternParseResult::Ok { count } -> literal_ok(count, literal, rejected, refused)
+            HexPatternParseResult::Error { error as _ } -> (false)
+        }
+    }
+
+    state literal_ok(
+        count: u64,
+        literal: HexPatternParseResult,
+        rejected: HexPatternParseResult,
+        refused: HexPatternParseResult
+    ) -> bool {
+        transition literal {
+            HexPatternParseResult::Ok { count as literal_count } ->
+                rejected_err(count == 5 && literal_count == 2, rejected, refused)
+            HexPatternParseResult::Error { error as _ } -> (false)
+        }
+    }
+
+    state rejected_err(
+        prefix_ok: bool,
+        rejected: HexPatternParseResult,
+        refused: HexPatternParseResult
+    ) -> bool {
+        transition rejected {
+            HexPatternParseResult::Error { error } -> refused_err(prefix_ok, error, refused)
+            HexPatternParseResult::Ok { count as _ } -> (false)
+        }
+    }
+
+    state refused_err(
+        prefix_ok: bool,
+        error: HexPatternParseError,
+        refused: HexPatternParseResult
+    ) -> bool {
+        transition refused {
+            HexPatternParseResult::Error { error as refused_error } ->
+                final_check(prefix_ok, error, refused_error)
+            HexPatternParseResult::Ok { count as _ } -> (false)
+        }
+    }
+
+    state final_check(
+        prefix_ok: bool,
+        error: HexPatternParseError,
+        refused_error: HexPatternParseError
+    ) -> bool {
+        transition error {
+            HexPatternParseError::InvalidNibble { token_index, byte } ->
+                final_nibble(prefix_ok, token_index, byte, refused_error)
+            _ -> (false)
+        }
+    }
+
+    state final_nibble(
+        prefix_ok: bool,
+        token_index: u64,
+        byte: u8,
+        refused_error: HexPatternParseError
+    ) -> bool {
+        transition refused_error {
+            HexPatternParseError::EmptyInput -> (prefix_ok && token_index == 0 && byte == 71)
+            _ -> (false)
+        }
+    }
+}
