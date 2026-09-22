@@ -1,0 +1,152 @@
+use omega_language_std::console;
+use omega::language::core::service;
+use squalr_engine::src::cli_scan_driver::cli_scan_driver::CliScanDriver;
+use squalr_engine::src::cli_scan_driver::cli_scan_driver::HeadlessScanReport;
+
+data Main {
+    console: Service<Console>;
+}
+
+// DEVIATION (blocked, compiler pin 13433c1a): this entry cannot establish a
+// ProgramEntry at the pinned toolchain. Any machine in the entry's reachable
+// call graph that takes a borrow/slice parameter loses the entry attachment
+// identity ("selected ProgramEntry establishment rejoins 0 Terminal attachment
+// identities") — micro-probed in isolation (plain calls and field receivers
+// establish; a `&` param anywhere in the transitive graph, `.len` returns, and
+// lets of array-carrying records all fail). The ported scan path is built on
+// borrows end to end, so no faithful shape establishes at this rev; the fence
+// is a fenced Omega-side deficiency (TASKS.md tracks the attachment row in t2c
+// execution/unit/composed_control). Newer revs are unusable: the Fused
+// provider-plan regression rejects omega-language-std from ~109a587d25 onward.
+// Headless scalar-scan entry for the CLI leg: the driver seeds a supplied
+// snapshot, runs u64 == 0x1122334455667788 through the element-scan path, and
+// the CLI reports each matching region (base + size) then exits 0 when the
+// produced regions match the fixture's expectation (base 0x1000 size 8 and
+// base 0x1010 size 8) or 1 otherwise.
+machine Main::main(&mut self) reaches Console {
+    transition {
+        _ -> scan()
+    }
+    state scan(&mut self) {
+        let mut scan_driver: CliScanDriver = CliScanDriver::new();
+        let report: HeadlessScanReport = scan_driver.run_headless_scalar_scan();
+        transition {
+            _ -> banner(report)
+        }
+    }
+    state banner(&mut self, report: HeadlessScanReport) {
+        self.console.write_line("squalr-cli: headless scalar scan over a supplied snapshot");
+        self.console.write_line("scan: u64 == 0x1122334455667788 over one 32-byte region at 0x1000");
+        transition {
+            _ -> report_matches(report)
+        }
+    }
+    state report_matches(&mut self, report: HeadlessScanReport) {
+        self.console.write("match: base=");
+        transition {
+            _ -> emit_digit(report.get_first_filter_base(), 10000000000000000000, false, 0, report)
+        }
+    }
+    state emit_digit(
+        &mut self,
+        value: u64,
+        divisor: u64,
+        started: bool,
+        phase: u64,
+        report: HeadlessScanReport
+    ) {
+        transition divisor == 0 {
+            true -> emit_done(phase, report)
+            _ -> emit_step(value, divisor, started, phase, report)
+        }
+    }
+    state emit_step(
+        &mut self,
+        value: u64,
+        divisor: u64,
+        started: bool,
+        phase: u64,
+        report: HeadlessScanReport
+    ) {
+        let scaled: u64 = ((value as u64 in Saturating) / (divisor as u64 in Saturating)) as u64;
+        let digit: u64 = ((scaled as u64 in Saturating) % (10 as u64 in Saturating)) as u64;
+        transition digit > 0 || started || divisor == 1 {
+            true -> emit_write(digit, value, divisor, phase, report)
+            _ -> emit_next(value, divisor, started, phase, report)
+        }
+    }
+    state emit_write(
+        &mut self,
+        digit: u64,
+        value: u64,
+        divisor: u64,
+        phase: u64,
+        report: HeadlessScanReport
+    ) {
+        let code: i32 = ((digit as i32 in Saturating) + (48 as i32 in Saturating)) as i32;
+        self.console.write_byte(code);
+        transition {
+            _ -> emit_next(value, divisor, true, phase, report)
+        }
+    }
+    state emit_next(
+        &mut self,
+        value: u64,
+        divisor: u64,
+        started: bool,
+        phase: u64,
+        report: HeadlessScanReport
+    ) {
+        let next_divisor: u64 = ((divisor as u64 in Saturating) / (10 as u64 in Saturating)) as u64;
+        transition {
+            _ -> emit_digit(value, next_divisor, started, phase, report)
+        }
+    }
+    state emit_done(&mut self, phase: u64, report: HeadlessScanReport) {
+        transition phase {
+            0 -> report_first_size(report)
+            1 -> report_second_intro(report)
+            2 -> report_second_size(report)
+            _ -> verify(report)
+        }
+    }
+    state report_first_size(&mut self, report: HeadlessScanReport) {
+        self.console.write(" size=");
+        transition {
+            _ -> emit_digit(report.get_first_filter_size(), 10000000000000000000, false, 1, report)
+        }
+    }
+    state report_second_intro(&mut self, report: HeadlessScanReport) {
+        self.console.write_line("");
+        self.console.write("match: base=");
+        transition {
+            _ -> emit_digit(report.get_second_filter_base(), 10000000000000000000, false, 2, report)
+        }
+    }
+    state report_second_size(&mut self, report: HeadlessScanReport) {
+        self.console.write(" size=");
+        transition {
+            _ -> emit_digit(report.get_second_filter_size(), 10000000000000000000, false, 3, report)
+        }
+    }
+    state verify(&mut self, report: HeadlessScanReport) {
+        self.console.write_line("");
+        let result_count: u64 = report.get_result_count();
+        let first_base: u64 = report.get_first_filter_base();
+        let first_size: u64 = report.get_first_filter_size();
+        let second_base: u64 = report.get_second_filter_base();
+        let second_size: u64 = report.get_second_filter_size();
+        transition result_count == 2 && first_base == 4096 && first_size == 8 && second_base == 4112 && second_size == 8 {
+            true -> passed()
+            _ -> failed()
+        }
+    }
+    state passed(&mut self) {
+        self.console.write_line("Squalr headless scan: PASS");
+        self.console.exit_process(0);
+    }
+    state failed(&mut self) {
+        self.console.write_line("FAIL: headless scalar scan did not produce the expected regions");
+        self.console.exit_process(1);
+    }
+}
