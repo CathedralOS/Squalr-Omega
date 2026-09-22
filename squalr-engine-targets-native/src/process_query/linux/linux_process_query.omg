@@ -5,6 +5,11 @@ use omega::language::core::service;
 use squalr_engine_api::src::structures::memory::bitness::Bitness;
 use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
 use squalr_engine_api::src::structures::processes::process_info::ProcessInfo;
+use squalr_engine_targets::src::process_query::process_query_error::ProcessQueryError;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessNameSearch;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryLimit;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryOptions;
+use squalr_engine_targets::src::process_query::process_query_options::RequiredProcessId;
 use squalr_engine_targets::src::target_providers::OpenedProcessResult;
 use squalr_engine_targets::src::target_providers::ProcessListOutcome;
 use squalr_engine_targets::src::target_providers::ProcessQueryOutcome;
@@ -15,10 +20,11 @@ use src::proc_paths::ProcName;
 // upstream), close_process (upstream's unconditional Ok), the ELF-header
 // target-architecture read of /proc/<pid>/exe with upstream's host fallback,
 // and is_process_alive as the procfs existence check standing in for
-// upstream's kill(pid, 0). start/stop_monitoring and the full get_processes
-// enumeration (sysinfo's /proc sweep with names) are declared on the trait and
-// stay NotImplemented here until the enumeration's buffer contract settles —
-// they are not silently faked.
+// upstream's kill(pid, 0). get_processes is the sysinfo /proc sweep
+// (numeric directory entries, comm names, upstream filter order);
+// start/stop_monitoring are upstream's unconditional Ok(()) no-ops.
+// The windowed/icon legs stay unported — get_processes reports them
+// honestly rather than silently filtering (see the machine's comment).
 pub data LinuxProcessQuery {
     host: Service<FilesystemHost>;
     proc_fd: i32;
@@ -28,6 +34,34 @@ pub data LinuxProcessQuery {
     scratch: i32;
     name: ProcName;
     bitness: Bitness;
+    // get_processes enumeration registers — the cursors a captured closure
+    // over `out` would hold in upstream, one enumeration per call.
+    dir_buf: [u8; 512];
+    rd_position: i64;
+    dir_off: u64;
+    dir_total: u64;
+    rec_end: u64;
+    reclen: u64;
+    emitted: u64;
+    want_limit: u64;
+    scan_idx: u64;
+    pid_val: u64;
+    pid_digits: u64;
+    cand_pid: u32;
+    bad_entry: bool;
+    req_filter: bool;
+    req_pid: u32;
+    search_active: bool;
+    match_case: bool;
+    search_bytes: [u8; 256];
+    search_len: u64;
+    comm_fd: i32;
+    comm_buf: [u8; 64];
+    comm_len: u64;
+    match_pos: u64;
+    cmp_pos: u64;
+    byte_a: u8;
+    byte_b: u8;
 }
 
 pub linux_x86_64 machine LinuxProcessQuery::open_process(
@@ -179,5 +213,482 @@ invokes FilesystemHost;
 
     state dead(&mut self) -> bool {
         false
+    }
+}
+
+// Upstream's start/stop_monitoring are unconditional Ok(()) no-ops — the
+// Linux implementation "exposes immediate operations only" — so the Omega
+// port reports Succeeded identically. The provider contract's process_id
+// argument is accepted and unused, as upstream's no-arg monitor is.
+pub linux_x86_64 machine LinuxProcessQuery::start_monitoring(&mut self, process_id: u32) -> ProcessQueryOutcome {
+    ProcessQueryOutcome::Succeeded
+}
+
+pub linux_x86_64 machine LinuxProcessQuery::stop_monitoring(&mut self) -> ProcessQueryOutcome {
+    ProcessQueryOutcome::Succeeded
+}
+
+// Guarded scratch-buffer reads: an out-of-window position yields 0, which is
+// never a digit and never matches a needle byte — unreachable on well-formed
+// dirents, where rec_end <= dir_total <= 512 bounds every name byte read.
+machine LinuxProcessQuery::dir_byte_at(&mut self, position: u64) -> u8 {
+    transition position < 512 {
+        true -> dir_get(position)
+        false -> dir_miss()
+    }
+    state dir_get(&mut self, position: u64) -> u8 { self.dir_buf[position] }
+    state dir_miss(&mut self) -> u8 { 0 }
+}
+
+machine LinuxProcessQuery::comm_byte_at(&mut self, position: u64) -> u8 {
+    transition position < 64 {
+        true -> comm_get(position)
+        false -> comm_miss()
+    }
+    state comm_get(&mut self, position: u64) -> u8 { self.comm_buf[position] }
+    state comm_miss(&mut self) -> u8 { 0 }
+}
+
+machine LinuxProcessQuery::search_byte_at(&mut self, position: u64) -> u8 {
+    transition position < 256 {
+        true -> search_get(position)
+        false -> search_miss()
+    }
+    state search_get(&mut self, position: u64) -> u8 { self.search_bytes[position] }
+    state search_miss(&mut self) -> u8 { 0 }
+}
+
+// ASCII-only lowercase, matching upstream's to_ascii_lowercase on the
+// process_name_matches_filter case-insensitive contains.
+machine LinuxProcessQuery::byte_lower(&mut self, byte: u8) -> u8 {
+    transition byte >= 65 && byte <= 90 {
+        true -> fold(byte)
+        false -> same(byte)
+    }
+    state fold(&mut self, byte: u8) -> u8 {
+        ((((byte as u64) as u64 in Wrapping) + (32 as u64 in Wrapping)) as u64) as u8
+    }
+    state same(&mut self, byte: u8) -> u8 {
+        byte
+    }
+}
+
+// ProcessQueryer::get_processes for linux_x86_64 — the sysinfo /proc sweep:
+// walk /proc's numeric directory entries, read each task's comm name, then
+// apply the upstream option filters in upstream order: required_process_id,
+// search_name/match_case as `contains`, limit as `take(limit)`. Entries
+// whose comm cannot be opened or read (the process exited mid-sweep) are
+// dropped — sysinfo leaves the same half-dead processes out of its
+// snapshot. A dirent that fails framing or a read_dir error closes the
+// directory and reports Internal rather than returning a half-filled list.
+// `Listed.count` is the number of ProcessInfo written into `out`;
+// `truncated` is set exactly when the enumeration had more matches than
+// `out` could hold — hitting the caller's `limit` is deliberate early stop,
+// not truncation.
+//
+// Bounded like the other GUI-facing legs: window detection
+// (collect_unix_socket_snapshot + fd-link + environ machinery) is not
+// ported, so `require_windowed` reports NotImplemented instead of emitting
+// a silently-filtered list (the FromModules precedent), and emitted
+// entries carry is_windowed=false as a named gap rather than a computed
+// answer. `fetch_icons` is a no-op because the icon payload type is absent
+// from the ported ProcessInfo.
+pub linux_x86_64 machine LinuxProcessQuery::get_processes(
+    &mut self,
+    options: ProcessQueryOptions,
+    out: &mut [ProcessInfo]
+) -> ProcessListOutcome
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.emitted = 0;
+    self.dir_off = 0;
+    self.dir_total = 0;
+    self.rd_position = 0;
+    self.match_case = options.match_case;
+    transition options.require_windowed {
+        true -> windowed_gap(out)
+        false -> split_required(options, out)
+    }
+
+    state windowed_gap(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        ProcessListOutcome::Failed { error: ProcessQueryError::NotImplemented }
+    }
+
+    state split_required(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition options.required_process_id {
+            RequiredProcessId::Any -> required_none(options, out)
+            RequiredProcessId::Required { process_id } -> required_pid(options, out, process_id)
+        }
+    }
+
+    state required_none(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.req_filter = false;
+        self.req_pid = 0;
+        transition { _ -> split_search(options, out) }
+    }
+
+    state required_pid(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo], process_id: u32) -> ProcessListOutcome {
+        self.req_filter = true;
+        self.req_pid = process_id;
+        transition { _ -> split_search(options, out) }
+    }
+
+    state split_search(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition options.search_name {
+            ProcessNameSearch::Any -> search_none(options, out)
+            ProcessNameSearch::Named { name, name_len } -> search_named(options, out, name, name_len)
+        }
+    }
+
+    state search_none(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.search_active = false;
+        self.search_len = 0;
+        transition { _ -> split_limit(options, out) }
+    }
+
+    state search_named(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo], name: [u8; 256], name_len: u64) -> ProcessListOutcome {
+        self.search_active = true;
+        self.search_len = 0;
+        transition { _ -> needle_copy(options, out, name, name_len, 0) }
+    }
+
+    state needle_copy(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo], name: [u8; 256], name_len: u64, position: u64) -> ProcessListOutcome {
+        transition position < name_len && position < 256 {
+            true -> needle_store(options, out, name, name_len, position)
+            false -> split_limit(options, out)
+        }
+    }
+
+    state needle_store(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo], name: [u8; 256], name_len: u64, position: u64) -> ProcessListOutcome {
+        self.search_bytes[position] = name[position];
+        self.search_len = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> needle_copy(options, out, name, name_len, position + 1) }
+    }
+
+    state split_limit(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition options.limit {
+            ProcessQueryLimit::Unlimited -> limit_none(out)
+            ProcessQueryLimit::Limited { limit } -> limit_some(out, limit)
+        }
+    }
+
+    state limit_none(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.want_limit = 18446744073709551615u64;
+        transition { _ -> open_proc(out) }
+    }
+
+    state limit_some(&mut self, out: &mut [ProcessInfo], limit: u64) -> ProcessListOutcome {
+        self.want_limit = limit;
+        transition { _ -> open_proc(out) }
+    }
+
+    state open_proc(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.proc_fd = self.host.open("/proc", 65536);
+        transition self.proc_fd >= 0 {
+            true -> fill(out)
+            false -> fail_internal()
+        }
+    }
+
+    state fill(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.dir_off = 0;
+        self.count = self.host.read_dir(self.proc_fd, &mut self.dir_buf, 512, &mut self.rd_position);
+        transition self.count > 0 {
+            true -> count_fill(out)
+            false -> fill_done(out)
+        }
+    }
+
+    state count_fill(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.dir_total = (self.count as u64 in Trapping) as u64;
+        transition { _ -> record_walk(out) }
+    }
+
+    state fill_done(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.count == 0 {
+            true -> listed_close(out)
+            false -> fail_close(out)
+        }
+    }
+
+    state record_walk(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.dir_off < self.dir_total {
+            true -> header_bound(out)
+            false -> fill(out)
+        }
+    }
+
+    // getdents64 record: d_reclen is the little-endian u16 at +16, the
+    // NUL-terminated name starts at +19.
+    state header_bound(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.dir_off + 19 <= self.dir_total {
+            true -> read_reclen_lo(out)
+            false -> fail_close(out)
+        }
+    }
+
+    state read_reclen_lo(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scan_idx = ((self.dir_off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64;
+        self.byte_a = self.dir_byte_at(self.scan_idx);
+        transition { _ -> read_reclen_hi(out) }
+    }
+
+    state read_reclen_hi(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scan_idx = ((self.scan_idx as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        self.byte_b = self.dir_byte_at(self.scan_idx);
+        self.reclen = (((((self.byte_b as u64) as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64 as u64 in Wrapping) + ((self.byte_a as u64) as u64 in Wrapping)) as u64;
+        self.rec_end = ((self.dir_off as u64 in Wrapping) + (self.reclen as u64 in Wrapping)) as u64;
+        transition self.reclen >= 20 && self.rec_end <= self.dir_total {
+            true -> entry_begin(out)
+            false -> fail_close(out)
+        }
+    }
+
+    // Entry name -> pid: any non-digit byte (or a name longer than u32 can
+    // hold) drops the entry, exactly like upstream's name.parse::<u32>.
+    state entry_begin(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scan_idx = ((self.dir_off as u64 in Wrapping) + (19 as u64 in Wrapping)) as u64;
+        self.pid_val = 0;
+        self.pid_digits = 0;
+        self.bad_entry = false;
+        transition { _ -> name_step(out) }
+    }
+
+    state name_step(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.scan_idx < self.rec_end {
+            true -> name_byte(out)
+            false -> entry_decide(out)
+        }
+    }
+
+    state name_byte(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.byte_a = self.dir_byte_at(self.scan_idx);
+        transition self.byte_a == 0 {
+            true -> entry_decide(out)
+            false -> name_digit(out)
+        }
+    }
+
+    state name_digit(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.byte_a >= 48 && self.byte_a <= 57 {
+            true -> digit_take(out)
+            false -> mark_bad(out)
+        }
+    }
+
+    state digit_take(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.pid_digits < 10 {
+            true -> digit_add(out)
+            false -> mark_bad(out)
+        }
+    }
+
+    state digit_add(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.pid_val = ((((self.pid_val as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64 as u64 in Wrapping) + ((((self.byte_a as u64) as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64 as u64 in Wrapping)) as u64;
+        self.pid_digits = ((self.pid_digits as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        self.scan_idx = ((self.scan_idx as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> name_step(out) }
+    }
+
+    state mark_bad(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.bad_entry = true;
+        transition { _ -> advance(out) }
+    }
+
+    state entry_decide(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition !self.bad_entry && self.pid_digits > 0 && self.pid_val <= 4294967295u64 {
+            true -> check_required(out)
+            false -> advance(out)
+        }
+    }
+
+    state check_required(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.cand_pid = (self.pid_val as u32 in Trapping) as u32;
+        transition !self.req_filter || self.cand_pid == self.req_pid {
+            true -> comm_open(out)
+            false -> advance(out)
+        }
+    }
+
+    // Name source: /proc/<pid>/comm (sysinfo's task name; the trailing
+    // newline is stripped). open_at is relative to the already-open /proc
+    // dirfd, so no absolute path joins are needed.
+    state comm_open(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.name = ProcName::for_process(self.cand_pid, 99, 111, 109, 109, 4);
+        transition self.name.len <= 48 {
+            true -> comm_open_at(out)
+            false -> advance(out)
+        }
+    }
+
+    state comm_open_at(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.comm_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..self.name.len], 0);
+        transition self.comm_fd >= 0 {
+            true -> comm_read(out)
+            false -> advance(out)
+        }
+    }
+
+    state comm_read(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.count = self.host.read(self.comm_fd, &mut self.comm_buf, 64);
+        self.scratch = self.host.close(self.comm_fd);
+        transition self.count > 0 {
+            true -> comm_scan_begin(out)
+            false -> advance(out)
+        }
+    }
+
+    state comm_scan_begin(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scan_idx = 0;
+        transition { _ -> comm_scan(out) }
+    }
+
+    state comm_scan(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.scan_idx < (self.count as u64 in Trapping) as u64 && self.scan_idx < 64 {
+            true -> comm_byte(out)
+            false -> comm_named(out)
+        }
+    }
+
+    state comm_byte(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.byte_a = self.comm_byte_at(self.scan_idx);
+        transition self.byte_a == 10 {
+            true -> comm_named(out)
+            false -> comm_next(out)
+        }
+    }
+
+    state comm_next(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scan_idx = ((self.scan_idx as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> comm_scan(out) }
+    }
+
+    state comm_named(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.comm_len = self.scan_idx;
+        transition self.comm_len <= 64 {
+            true -> search_check(out)
+            false -> advance(out)
+        }
+    }
+
+    state search_check(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.search_active {
+            true -> match_begin(out)
+            false -> emit_check(out)
+        }
+    }
+
+    // process_name_matches_filter: `contains` over the comm bytes — exact
+    // bytes under match_case, ASCII-lowercased on both sides otherwise.
+    state match_begin(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.match_pos = 0;
+        transition { _ -> match_step(out) }
+    }
+
+    state match_step(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.match_pos + self.search_len <= self.comm_len {
+            true -> cmp_begin(out)
+            false -> advance(out)
+        }
+    }
+
+    state cmp_begin(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.cmp_pos = 0;
+        transition { _ -> cmp_step(out) }
+    }
+
+    state cmp_step(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.cmp_pos < self.search_len {
+            true -> cmp_pair(out)
+            false -> emit_check(out)
+        }
+    }
+
+    state cmp_pair(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scan_idx = ((self.match_pos as u64 in Wrapping) + (self.cmp_pos as u64 in Wrapping)) as u64;
+        self.byte_a = self.comm_byte_at(self.scan_idx);
+        self.byte_b = self.search_byte_at(self.cmp_pos);
+        transition self.match_case {
+            true -> cmp_raw(out)
+            false -> cmp_fold(out)
+        }
+    }
+
+    state cmp_fold(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.byte_a = self.byte_lower(self.byte_a);
+        self.byte_b = self.byte_lower(self.byte_b);
+        transition { _ -> cmp_raw(out) }
+    }
+
+    state cmp_raw(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.byte_a == self.byte_b {
+            true -> cmp_next(out)
+            false -> match_restart(out)
+        }
+    }
+
+    state cmp_next(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.cmp_pos = ((self.cmp_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> cmp_step(out) }
+    }
+
+    state match_restart(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.match_pos = ((self.match_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> match_step(out) }
+    }
+
+    state emit_check(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition { _ -> emit_len(out, self.emitted, self.comm_len) }
+    }
+
+    state emit_len(&mut self, out: &mut [ProcessInfo], emitted: u64, name_len: u64) -> ProcessListOutcome {
+        transition emitted < out.len && name_len <= 64 {
+            true -> emit(out, emitted, name_len)
+            false -> emit_miss(out)
+        }
+    }
+
+    state emit(&mut self, out: &mut [ProcessInfo], emitted: u64, name_len: u64) -> ProcessListOutcome {
+        out[emitted] = ProcessInfo::new_named(self.cand_pid, self.comm_buf[0..name_len], false);
+        self.emitted = ((emitted as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition self.emitted < self.want_limit {
+            true -> advance(out)
+            false -> listed_close(out)
+        }
+    }
+
+    state emit_miss(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        transition self.emitted < out.len {
+            true -> advance(out)
+            false -> truncated_close(out)
+        }
+    }
+
+    state advance(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.dir_off = ((self.dir_off as u64 in Wrapping) + (self.reclen as u64 in Wrapping)) as u64;
+        transition { _ -> record_walk(out) }
+    }
+
+    state listed_close(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scratch = self.host.close(self.proc_fd);
+        self.proc_fd = -1;
+        ProcessListOutcome::Listed { count: self.emitted, truncated: false }
+    }
+
+    state truncated_close(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scratch = self.host.close(self.proc_fd);
+        self.proc_fd = -1;
+        ProcessListOutcome::Listed { count: self.emitted, truncated: true }
+    }
+
+    state fail_close(&mut self, out: &mut [ProcessInfo]) -> ProcessListOutcome {
+        self.scratch = self.host.close(self.proc_fd);
+        self.proc_fd = -1;
+        ProcessListOutcome::Failed { error: ProcessQueryError::Internal }
+    }
+
+    state fail_internal(&mut self) -> ProcessListOutcome {
+        ProcessListOutcome::Failed { error: ProcessQueryError::Internal }
     }
 }
