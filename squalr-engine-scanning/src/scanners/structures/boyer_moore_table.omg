@@ -1,0 +1,543 @@
+module src::scanners::structures::boyer_moore_table;
+
+// Port of boyer_moore_table.rs: Boyer-Moore bad-character and good-suffix
+// shift tables for byte-pattern scans. Every produced shift is rounded up to
+// the scan's memory alignment so candidate strides stay aligned, and the
+// saturating arithmetic of upstream is preserved.
+//
+// Storage: upstream's mismatch_index_table is Vec<Option<usize>> of exactly
+// 256 entries, so it lands as a fixed [OptionalIndex; 256] (u64 carries the
+// usize pattern indexes; a local enum because Optional<generic> is not
+// matchable downstream — same translation as EmittedRegion). Omitting it in
+// the literal yields the all-empty table through the first case's zero
+// representation. matching_suffix_shift_table is Vec<u64> of pattern_length
+// cells — Omega has no growable owner yet (Allocation<T>/Arena surface), so
+// the caller lends the backing as a borrow-carrying field: same extent
+// [0, pattern_length), same contents, the table borrows it instead of owning
+// a heap allocation. Callers lend a backing of at least scan_pattern.len
+// cells; inside build_table each write arm states the table bound it needs
+// literally. (Omega requires clauses cannot compare two `.len` operands, so
+// the len<=len preconditions of upstream's private helpers are enforced by
+// the per-index guards instead of being restated as contracts.)
+//
+// Upstream's is_prefix/suffix_length/round_up_to_alignment are Self::statics;
+// the two looping helpers take &mut self here so their loops live in ordinary
+// machine states.
+pub data OptionalIndex [copy] {
+    case Empty;
+    case Present(index: u64);
+}
+
+pub data BoyerMooreTable<'shift> {
+    mismatch_index_table: [OptionalIndex; 256];
+    matching_suffix_shift_table: &'shift mut [u64];
+    pattern_length: u64;
+    aligned_pattern_length: u64;
+}
+
+pub machine BoyerMooreTable::new<'shift>(
+    scan_pattern: &[u8],
+    matching_suffix_shift_table: &'shift mut [u64],
+    memory_alignment: u64
+) -> BoyerMooreTable<'shift>
+requires
+    memory_alignment > 0
+{
+    let aligned_len: u64 =
+        BoyerMooreTable::round_up_to_alignment(scan_pattern.len, memory_alignment);
+    let mut table: BoyerMooreTable<'shift> = BoyerMooreTable {
+        matching_suffix_shift_table: matching_suffix_shift_table,
+        pattern_length: scan_pattern.len,
+        aligned_pattern_length: aligned_len,
+    };
+    table.build_table(scan_pattern, memory_alignment);
+    table
+}
+
+// Bad Character Rule shift: how far the comparison window advances on a byte
+// mismatch at mismatch_pattern_index. u8 widens below 256, so the bounded
+// entry read is dispatched to a case helper.
+pub machine BoyerMooreTable::get_mismatch_shift(
+    &self,
+    value: u8,
+    mismatch_pattern_index: u64,
+    memory_alignment: u64
+) -> u64
+requires
+    memory_alignment > 0
+{
+    transition (value as u64) < 256 && 0 <= (value as u64) {
+        true -> BoyerMooreTable::mismatch_case(
+            (self.mismatch_index_table[(value as u64)]),
+            mismatch_pattern_index,
+            memory_alignment
+        )
+        false -> BoyerMooreTable::mismatch_absent(mismatch_pattern_index, memory_alignment)
+        _ -> BoyerMooreTable::mismatch_absent(mismatch_pattern_index, memory_alignment)
+    }
+}
+
+// Good Suffix Rule shift for a match confirmed through pattern_index.
+pub machine BoyerMooreTable::get_good_suffix_shift(
+    &self,
+    pattern_index: u64
+) -> u64 {
+    transition pattern_index + 1 < self.pattern_length
+        && pattern_index < self.matching_suffix_shift_table.len {
+        true -> (self.matching_suffix_shift_table[pattern_index])
+        false -> 0
+        _ -> 0
+    }
+}
+
+// Shift that never skips a pending partial match: the smaller of the two rules
+// when a good-suffix shift exists, floored at the memory alignment.
+pub machine BoyerMooreTable::get_safe_mismatch_shift(
+    &self,
+    value: u8,
+    mismatch_pattern_index: u64,
+    memory_alignment: u64
+) -> u64
+requires
+    memory_alignment > 0
+{
+    let bad_char_shift: u64 =
+        self.get_mismatch_shift(value, mismatch_pattern_index, memory_alignment);
+    let good_suffix_shift: u64 =
+        self.get_good_suffix_shift(mismatch_pattern_index + 1);
+    transition good_suffix_shift > 0 {
+        true -> BoyerMooreTable::u64_max(
+            BoyerMooreTable::u64_min(bad_char_shift, good_suffix_shift),
+            memory_alignment
+        )
+        false -> BoyerMooreTable::u64_max(bad_char_shift, memory_alignment)
+        _ -> BoyerMooreTable::u64_max(bad_char_shift, memory_alignment)
+    }
+}
+
+pub machine BoyerMooreTable::get_aligned_pattern_length(&self) -> u64 {
+    self.aligned_pattern_length
+}
+
+// Fills both tables for scan_pattern, in upstream's two passes.
+machine BoyerMooreTable::build_table(
+    &mut self,
+    scan_pattern: &[u8],
+    memory_alignment: u64
+)
+requires
+    memory_alignment > 0
+{
+    transition { _ -> mismatch_fill(scan_pattern, memory_alignment, 0) }
+
+    // Mismatch (Bad Character Rule) table: the rightmost pattern index of each
+    // byte value, last write winning like upstream's forward pass.
+    state mismatch_fill(&mut self, scan_pattern: &[u8], memory_alignment: u64, index: u64)
+    requires
+        memory_alignment > 0
+    {
+        transition index < scan_pattern.len {
+            true -> mismatch_store(scan_pattern, memory_alignment, index)
+            false -> shift_init(scan_pattern, memory_alignment, 0)
+            _ -> shift_init(scan_pattern, memory_alignment, 0)
+        }
+    }
+
+    state mismatch_store(&mut self, scan_pattern: &[u8], memory_alignment: u64, index: u64 [0..scan_pattern.len])
+    requires
+        memory_alignment > 0
+    {
+        let byte: u64 = scan_pattern[index] as u64;
+        transition byte < 256 {
+            true -> mismatch_commit(scan_pattern, memory_alignment, index, byte)
+            false -> shift_init(scan_pattern, memory_alignment, 0)
+            _ -> shift_init(scan_pattern, memory_alignment, 0)
+        }
+    }
+
+    state mismatch_commit(&mut self, scan_pattern: &[u8], memory_alignment: u64, index: u64, byte: u64 [0..256])
+    requires
+        memory_alignment > 0
+    {
+        self.mismatch_index_table[byte] = OptionalIndex::Present { index: index };
+        transition {
+            _ -> mismatch_fill(
+                scan_pattern,
+                memory_alignment,
+                ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+
+    // Matching (good) Suffix Rule table, seeded with the whole-pattern shift.
+    state shift_init(&mut self, scan_pattern: &[u8], memory_alignment: u64, index: u64)
+    requires
+        memory_alignment > 0
+    {
+        let aligned_length: u64 =
+            BoyerMooreTable::round_up_to_alignment(scan_pattern.len, memory_alignment);
+        transition index < scan_pattern.len && index < self.matching_suffix_shift_table.len {
+            true -> shift_init_store(
+                scan_pattern,
+                memory_alignment,
+                index,
+                aligned_length,
+                &mut self.matching_suffix_shift_table
+            )
+            false -> prefix_probe(scan_pattern, memory_alignment)
+            _ -> prefix_probe(scan_pattern, memory_alignment)
+        }
+    }
+
+    state shift_init_store(&mut self, scan_pattern: &[u8], memory_alignment: u64, index: u64 [0..table.len], aligned_length: u64, table: &mut [u64])
+    requires
+        memory_alignment > 0
+    {
+        table[index] = aligned_length;
+        transition {
+            _ -> shift_init(
+                scan_pattern,
+                memory_alignment,
+                ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+
+    // Upstream `for start_index in (0..pattern_length).rev()`: skipped when the
+    // pattern is empty, otherwise walked downward from pattern_length - 1.
+    state prefix_probe(&mut self, scan_pattern: &[u8], memory_alignment: u64)
+    requires
+        memory_alignment > 0
+    {
+        transition scan_pattern.len > 0 {
+            true -> prefix_pass(
+                scan_pattern,
+                memory_alignment,
+                ((scan_pattern.len as u64 in Saturating) - (1 as u64 in Saturating)) as u64
+            )
+            false -> suffix_pass(scan_pattern, memory_alignment, 0)
+            _ -> suffix_pass(scan_pattern, memory_alignment, 0)
+        }
+    }
+
+    state prefix_pass(&mut self, scan_pattern: &[u8], memory_alignment: u64, start_index: u64)
+    requires
+        memory_alignment > 0
+    {
+        transition start_index < scan_pattern.len && start_index <= scan_pattern.len {
+            true -> prefix_check(scan_pattern, memory_alignment, start_index)
+            false -> suffix_pass(scan_pattern, memory_alignment, 0)
+            _ -> suffix_pass(scan_pattern, memory_alignment, 0)
+        }
+    }
+
+    state prefix_check(&mut self, scan_pattern: &[u8], memory_alignment: u64, start_index: u64)
+    requires
+        memory_alignment > 0,
+        start_index <= scan_pattern.len
+    {
+        transition self.is_prefix(scan_pattern, start_index, scan_pattern.len) {
+            true -> prefix_min(scan_pattern, memory_alignment, start_index)
+            false -> prefix_next(scan_pattern, memory_alignment, start_index)
+            _ -> prefix_next(scan_pattern, memory_alignment, start_index)
+        }
+    }
+
+    // A suffix that is also a prefix allows shift = pattern_length - start_index.
+    state prefix_min(&mut self, scan_pattern: &[u8], memory_alignment: u64, start_index: u64)
+    requires
+        memory_alignment > 0
+    {
+        let raw_shift: u64 =
+            ((scan_pattern.len as u64 in Saturating) - (start_index as u64 in Saturating)) as u64;
+        let aligned_shift: u64 = BoyerMooreTable::round_up_to_alignment(raw_shift, memory_alignment);
+        transition start_index < self.matching_suffix_shift_table.len {
+            true -> prefix_min_write(
+                scan_pattern,
+                memory_alignment,
+                start_index,
+                aligned_shift,
+                &mut self.matching_suffix_shift_table
+            )
+            false -> prefix_next(scan_pattern, memory_alignment, start_index)
+            _ -> prefix_next(scan_pattern, memory_alignment, start_index)
+        }
+    }
+
+    state prefix_min_write(&mut self, scan_pattern: &[u8], memory_alignment: u64, start_index: u64 [0..table.len], aligned_shift: u64, table: &mut [u64])
+    requires
+        memory_alignment > 0
+    {
+        let current: u64 = table[start_index];
+        table[start_index] =
+            BoyerMooreTable::u64_min(current, aligned_shift);
+        transition { _ -> prefix_next(scan_pattern, memory_alignment, start_index) }
+    }
+
+    state prefix_next(&mut self, scan_pattern: &[u8], memory_alignment: u64, start_index: u64)
+    requires
+        memory_alignment > 0
+    {
+        transition start_index > 0 {
+            true -> prefix_pass(scan_pattern, memory_alignment, start_index - 1)
+            false -> suffix_pass(scan_pattern, memory_alignment, 0)
+            _ -> suffix_pass(scan_pattern, memory_alignment, 0)
+        }
+    }
+
+    // Second pass over 0..pattern_length_minus_one: shifts from actual suffix
+    // matches, taking the smaller of the two upstream options.
+    state suffix_pass(&mut self, scan_pattern: &[u8], memory_alignment: u64, pattern_index: u64)
+    requires
+        memory_alignment > 0
+    {
+        let pattern_length_minus_one: u64 =
+            ((scan_pattern.len as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition pattern_index < pattern_length_minus_one && pattern_index < scan_pattern.len {
+            true -> suffix_step(scan_pattern, memory_alignment, pattern_index, pattern_length_minus_one)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state suffix_step(&mut self, scan_pattern: &[u8], memory_alignment: u64, pattern_index: u64 [0..scan_pattern.len], pattern_length_minus_one: u64)
+    requires
+        memory_alignment > 0,
+        pattern_index < scan_pattern.len
+    {
+        let matching_suffix_len: u64 =
+            self.suffix_length(scan_pattern, pattern_index, scan_pattern.len);
+        let shift_table_index: u64 =
+            ((pattern_length_minus_one as u64 in Saturating) - (matching_suffix_len as u64 in Saturating)) as u64;
+        let option_a: u64 =
+            ((scan_pattern.len as u64 in Saturating) - (matching_suffix_len as u64 in Saturating)) as u64;
+        let option_b_span: u64 =
+            ((pattern_length_minus_one as u64 in Saturating) - (pattern_index as u64 in Saturating)) as u64;
+        let option_b: u64 =
+            ((option_b_span as u64 in Saturating) + (matching_suffix_len as u64 in Saturating)) as u64;
+        let shift: u64 = BoyerMooreTable::u64_min(option_a, option_b);
+        let aligned_shift: u64 = BoyerMooreTable::round_up_to_alignment(shift, memory_alignment);
+        transition shift_table_index < self.matching_suffix_shift_table.len {
+            true -> suffix_min_write(
+                scan_pattern,
+                memory_alignment,
+                pattern_index,
+                shift_table_index,
+                aligned_shift,
+                &mut self.matching_suffix_shift_table
+            )
+            false -> suffix_pass(
+                scan_pattern,
+                memory_alignment,
+                ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+            _ -> suffix_pass(
+                scan_pattern,
+                memory_alignment,
+                ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+
+    state suffix_min_write(&mut self, scan_pattern: &[u8], memory_alignment: u64, pattern_index: u64, shift_table_index: u64 [0..table.len], aligned_shift: u64, table: &mut [u64])
+    requires
+        memory_alignment > 0
+    {
+        let current: u64 = table[shift_table_index];
+        table[shift_table_index] =
+            BoyerMooreTable::u64_min(current, aligned_shift);
+        transition {
+            _ -> suffix_pass(
+                scan_pattern,
+                memory_alignment,
+                ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// Upstream Self::is_prefix: whether the suffix of `array` starting at
+// suffix_start is also a prefix. &mut self only hosts the loop states;
+// `forward`/`reverse` carry the upstream index pair (index, suffix_start +
+// index) so both element reads are proven-bounded places.
+machine BoyerMooreTable::is_prefix(
+    &mut self,
+    array: &[u8],
+    suffix_start: u64,
+    pattern_length: u64
+) -> bool
+requires
+    suffix_start <= pattern_length
+{
+    transition { _ -> walk(array, suffix_start, pattern_length - suffix_start, 0) }
+
+    state walk(&mut self, array: &[u8], reverse: u64, suffix_len: u64, forward: u64) -> bool {
+        transition forward < suffix_len && forward < array.len && reverse < array.len {
+            true -> compare(array, reverse, suffix_len, forward)
+            false -> true
+            _ -> true
+        }
+    }
+
+    state compare(&mut self, array: &[u8], reverse: u64 [0..array.len], suffix_len: u64, forward: u64 [0..array.len]) -> bool {
+        transition array[forward] != array[reverse] {
+            true -> false
+            false -> walk(array, reverse + 1, suffix_len, forward + 1)
+            _ -> walk(array, reverse + 1, suffix_len, forward + 1)
+        }
+    }
+}
+
+// Upstream Self::suffix_length: length of the suffix match ending at
+// match_pos, comparing backward from the pattern's last byte.
+machine BoyerMooreTable::suffix_length(
+    &mut self,
+    array: &[u8],
+    match_pos: u64,
+    pattern_length: u64
+) -> u64
+requires
+    match_pos < pattern_length
+{
+    transition {
+        _ -> walk(
+            array,
+            match_pos,
+            pattern_length,
+            ((pattern_length as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+            0
+        )
+    }
+
+    state walk(&mut self, array: &[u8], suffix_index: u64, pattern_length: u64, pattern_end_index: u64, length: u64) -> u64 {
+        transition suffix_index < pattern_length && pattern_end_index < pattern_length
+            && suffix_index < array.len && pattern_end_index < array.len {
+            true -> compare(array, suffix_index, pattern_length, pattern_end_index, length)
+            false -> length
+            _ -> length
+        }
+    }
+
+    state compare(&mut self, array: &[u8], suffix_index: u64, pattern_length: u64, pattern_end_index: u64, length: u64) -> u64
+    requires
+        suffix_index < array.len,
+        pattern_end_index < array.len
+    {
+        transition array[suffix_index] == array[pattern_end_index] {
+            true -> step(array, suffix_index, pattern_length, pattern_end_index, length)
+            false -> length
+            _ -> length
+        }
+    }
+
+    // Upstream increments before the zero-edge break, then walks both indexes
+    // down while bytes keep matching.
+    state step(&mut self, array: &[u8], suffix_index: u64, pattern_length: u64, pattern_end_index: u64, length: u64) -> u64 {
+        let next_length: u64 = ((length as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition suffix_index == 0 || pattern_end_index == 0 {
+            true -> next_length
+            false -> walk(
+                array,
+                ((suffix_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+                pattern_length,
+                ((pattern_end_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+                next_length
+            )
+            _ -> walk(
+                array,
+                ((suffix_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+                pattern_length,
+                ((pattern_end_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+                next_length
+            )
+        }
+    }
+}
+
+machine BoyerMooreTable::mismatch_case(
+    entry: OptionalIndex,
+    mismatch_pattern_index: u64,
+    memory_alignment: u64
+) -> u64
+requires
+    memory_alignment > 0
+{
+    transition entry {
+        OptionalIndex::Present { index } ->
+            BoyerMooreTable::mismatch_present(index, mismatch_pattern_index, memory_alignment)
+        OptionalIndex::Empty ->
+            BoyerMooreTable::mismatch_absent(mismatch_pattern_index, memory_alignment)
+        _ ->
+            BoyerMooreTable::mismatch_absent(mismatch_pattern_index, memory_alignment)
+    }
+}
+
+machine BoyerMooreTable::mismatch_present(
+    rightmost: u64,
+    mismatch_pattern_index: u64,
+    memory_alignment: u64
+) -> u64
+requires
+    memory_alignment > 0
+{
+    transition rightmost < mismatch_pattern_index {
+        true -> BoyerMooreTable::round_up_to_alignment(
+            BoyerMooreTable::u64_max(
+                ((mismatch_pattern_index as u64 in Saturating) - (rightmost as u64 in Saturating)) as u64,
+                1
+            ),
+            memory_alignment
+        )
+        false -> BoyerMooreTable::round_up_to_alignment(1, memory_alignment)
+        _ -> BoyerMooreTable::round_up_to_alignment(1, memory_alignment)
+    }
+}
+
+machine BoyerMooreTable::mismatch_absent(
+    mismatch_pattern_index: u64,
+    memory_alignment: u64
+) -> u64
+requires
+    memory_alignment > 0
+{
+    BoyerMooreTable::round_up_to_alignment(
+        BoyerMooreTable::u64_max(
+            ((mismatch_pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            1
+        ),
+        memory_alignment
+    )
+}
+
+// Upstream usize::min / usize::max over the u64 shift domain.
+machine BoyerMooreTable::u64_min(a: u64, b: u64) -> u64 {
+    transition a < b {
+        true -> a
+        false -> b
+        _ -> b
+    }
+}
+
+machine BoyerMooreTable::u64_max(a: u64, b: u64) -> u64 {
+    transition a > b {
+        true -> a
+        false -> b
+        _ -> b
+    }
+}
+
+// Upstream Self::round_up_to_alignment: value rounded up to a multiple of
+// alignment; exact when already aligned. The addend is bounded by alignment;
+// the final add keeps upstream's usize wrap domain.
+machine BoyerMooreTable::round_up_to_alignment(value: u64, alignment: u64) -> u64
+requires
+    alignment > 0
+{
+    let remainder: u64 = value % alignment;
+    let padding: u64 =
+        (((alignment as u64 in Saturating) - (remainder as u64 in Saturating)) as u64) % alignment;
+    ((value as u64 in Wrapping) + (padding as u64 in Wrapping)) as u64
+}
