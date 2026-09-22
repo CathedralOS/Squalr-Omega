@@ -1,6 +1,9 @@
 module src::structures::snapshots::snapshot;
 
 use omega::language::core::option;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::structures::scanning::filters::snapshot_region_filter_collection::FilterSlot;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
 use src::structures::snapshots::snapshot_region::SnapshotRegion;
 
 // Port of Snapshot. Upstream owns Vec<SnapshotRegion> and a BTreeSet<u64> of
@@ -294,6 +297,88 @@ pub machine Snapshot::get_structural_number_of_results<'regions, 'order, 'delete
     }
 }
 
+// First two filter bounds of one region's first scan-result collection,
+// flattened to [base0, size0, base1, size1] — the headless report leg reads
+// the produced regions through this so the borrow of the result storage stays
+// inside the snapshot package (the same-boundary rule that also shapes
+// publish_cell_results).
+pub machine Snapshot::get_region_filter_bounds_at<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &self,
+    ordinal: u64
+) -> [u64; 4] {
+    let region_result: Optional<&SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>> = self.get_region_at(ordinal);
+    transition region_result {
+        Optional::Some { value } -> collections(value)
+        Optional::None -> (missing())
+        _ -> (missing())
+    }
+    state collections(&self, region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>) -> [u64; 4] {
+        let collection_count: u64 = region.get_scan_result_collection_count();
+        transition collection_count > 0 {
+            true -> slice(region)
+            _ -> (missing())
+        }
+    }
+    state slice(&self, region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>) -> [u64; 4] {
+        let collections: &'cols [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>] = region.get_scan_result_collections();
+        transition 0 < collections.len {
+            true -> first(collections)
+            _ -> (missing())
+        }
+    }
+    state first(
+        &self,
+        collections: &'cols [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>]
+    ) -> [u64; 4] {
+        let first_slot: FilterSlot<'filters> = collections[0].get_filter_at(0);
+        transition first_slot {
+            FilterSlot::Present { filter } -> read_first(collections, filter)
+            FilterSlot::Missing -> (missing())
+            _ -> (missing())
+        }
+    }
+    state read_first(
+        &self,
+        collections: &'cols [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        filter: &'filters SnapshotRegionFilter
+    ) -> [u64; 4] {
+        let first_base: u64 = filter.get_base_address();
+        let first_size: u64 = filter.get_region_size();
+        transition {
+            _ -> second(collections, first_base, first_size)
+        }
+    }
+    state second(
+        &self,
+        collections: &'cols [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        first_base: u64,
+        first_size: u64
+    ) -> [u64; 4] {
+        let second_slot: FilterSlot<'filters> = collections[0].get_filter_at(1);
+        transition second_slot {
+            FilterSlot::Present { filter } -> read_second(filter, first_base, first_size)
+            FilterSlot::Missing -> (partial(first_base, first_size))
+            _ -> (partial(first_base, first_size))
+        }
+    }
+    state read_second(
+        &self,
+        filter: &'filters SnapshotRegionFilter,
+        first_base: u64,
+        first_size: u64
+    ) -> [u64; 4] {
+        let second_base: u64 = filter.get_base_address();
+        let second_size: u64 = filter.get_region_size();
+        ([first_base, first_size, second_base, second_size])
+    }
+    state partial(&self, first_base: u64, first_size: u64) -> [u64; 4] {
+        ([first_base, first_size, 0, 0])
+    }
+    state missing(&self) -> [u64; 4] {
+        ([0, 0, 0, 0])
+    }
+}
+
 // Visible result count: structural minus tombstoned indices in range.
 pub machine Snapshot::get_number_of_results<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&self) -> u64 {
     transition {
@@ -420,18 +505,19 @@ pub machine Snapshot::clear_deleted_scan_result_indices<'regions, 'order, 'delet
 
 // Upstream commit rebuilds filters to fold tombstones into the structural
 // layout — that rebuild (per-collection remove_results_at_indices filter
-// splitting) is not ported yet. The reachable contract is ported: an empty
-// tombstone set is a 0-returning no-op; a non-empty set crashes rather than
-// silently pretending the rebuild happened.
-pub machine Snapshot::commit_deleted_scan_result_indices<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self) -> u64
-crashes Abort
-{
+// splitting) is not ported yet. DEVIATION: a non-empty tombstone set returns
+// 0 leaving the tombstones uncommitted (previously this arm crashed, but a
+// crash-carrying machine cannot sit under a ProgramEntry at this compiler
+// pin — "selected ProgramEntry establishment rejoins 0 Terminal attachment
+// identities" — and no ported path can install tombstones today, since
+// delete_scan_result has no callers, so the arm is unreachable).
+pub machine Snapshot::commit_deleted_scan_result_indices<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(&mut self) -> u64 {
     transition self.deleted_count > 0 {
         true -> unported()
         _ -> (0)
     }
     state unported(&self) -> u64 {
-        crash Abort;
+        (0)
     }
 }
 
