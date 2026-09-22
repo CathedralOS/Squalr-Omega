@@ -4,9 +4,8 @@ use src::structures::scanning::comparisons::scan_compare_type_delta::ScanCompare
 use src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
 use src::structures::scanning::comparisons::scan_compare_type_relative::ScanCompareTypeRelative;
 
-// Port of ScanCompareType: the comparison selector shared by constraints.
-// `ScanCompareType::from_str` (the CLI's "==", "!=", "+x", ... spellings) is
-// deferred to the CLI leg, which owns the string surface.
+// Port of ScanCompareType: the comparison selector shared by constraints,
+// including `FromStr` for the CLI's "==", "!=", "+x", ... spellings.
 pub data ScanCompareType [copy] {
     case Immediate(compare_type: ScanCompareTypeImmediate);
     case Relative(compare_type: ScanCompareTypeRelative);
@@ -33,4 +32,153 @@ pub machine ScanCompareType::compare(
             compare_type.compare(current_value, previous_value, operand_value)
         )
     }
+}
+
+// Upstream `FromStr`: the parse result, with `Invalid` first so an untouched
+// value reads as failure (the OpenResult zero-case convention). Upstream's
+// `ParseScanCompareTypeError` is a unit struct whose only payload is the
+// Display text "Invalid comparison type"; `Invalid` drops that message —
+// named deviation.
+pub data ScanCompareTypeParseResult [copy] {
+    case Invalid;
+    case Parsed(compare_type: ScanCompareType);
+}
+
+// Upstream `FromStr::from_str`: only the spelled byte strings "=="/"!="/">"/
+// ">="/"<"/"<="/"c"/"u"/"+"/"-"/"+x"/"-x" parse; every other length or byte is
+// the `_` refusal. Authored text is a byte domain in Omega, so spellings
+// match on byte values ('!' 33, '+' 43, '-' 45, '<' 60, '=' 61, '>' 62,
+// 'c' 99, 'u' 117, 'x' 120).
+pub machine ScanCompareType::from_str(text: &[u8]) -> ScanCompareTypeParseResult {
+    transition text.len > 0 {
+        true -> nonempty(text[0], text)
+        false -> invalid()
+    }
+    state nonempty(head: u8, text: &[u8]) -> ScanCompareTypeParseResult {
+        transition text.len >= 2 {
+            true -> spelled(head, text[1], text)
+            false -> single(head)
+        }
+    }
+    state spelled(head: u8, second: u8, text: &[u8]) -> ScanCompareTypeParseResult {
+        transition text.len >= 3 {
+            true -> invalid()
+            false -> double(head, second)
+        }
+    }
+    state single(byte: u8) -> ScanCompareTypeParseResult {
+        transition byte {
+            62 -> parsed(ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::GreaterThan })
+            60 -> parsed(ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::LessThan })
+            99 -> parsed(ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Changed })
+            117 -> parsed(ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Unchanged })
+            43 -> parsed(ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Increased })
+            45 -> parsed(ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Decreased })
+            _ -> invalid()
+        }
+    }
+    state double(first: u8, second: u8) -> ScanCompareTypeParseResult {
+        transition first {
+            61 -> tail(second, 61, ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::Equal })
+            33 -> tail(second, 61, ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::NotEqual })
+            62 -> tail(second, 61, ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::GreaterThanOrEqual })
+            60 -> tail(second, 61, ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::LessThanOrEqual })
+            43 -> tail(second, 120, ScanCompareType::Delta { compare_type: ScanCompareTypeDelta::IncreasedByX })
+            45 -> tail(second, 120, ScanCompareType::Delta { compare_type: ScanCompareTypeDelta::DecreasedByX })
+            _ -> invalid()
+        }
+    }
+    state tail(second: u8, want: u8, matched: ScanCompareType) -> ScanCompareTypeParseResult {
+        transition second == want {
+            true -> parsed(matched)
+            false -> invalid()
+        }
+    }
+    state parsed(compare_type: ScanCompareType) -> ScanCompareTypeParseResult {
+        ScanCompareTypeParseResult::Parsed { compare_type: compare_type }
+    }
+    state invalid() -> ScanCompareTypeParseResult { ScanCompareTypeParseResult::Invalid }
+}
+
+// Exercise support: a flat discriminant over the parse result so the
+// consistency check can name each expected variant without nested payload
+// patterns (unsupported at this pin). Invalid and the eight delta variants
+// `from_str` never produces share probe 0; the 12 producible variants are
+// numbered in upstream match-arm order.
+machine ScanCompareTypeParseResult::variant_probe(&self) -> u64 {
+    transition self {
+        ScanCompareTypeParseResult::Invalid -> (0)
+        ScanCompareTypeParseResult::Parsed { compare_type } -> outer(compare_type)
+    }
+    state outer(compare_type: ScanCompareType) -> u64 {
+        transition compare_type {
+            ScanCompareType::Immediate { compare_type } -> immediate(compare_type)
+            ScanCompareType::Relative { compare_type } -> relative(compare_type)
+            ScanCompareType::Delta { compare_type } -> delta(compare_type)
+        }
+    }
+    state immediate(inner: ScanCompareTypeImmediate) -> u64 {
+        transition inner {
+            ScanCompareTypeImmediate::Equal -> (1)
+            ScanCompareTypeImmediate::NotEqual -> (2)
+            ScanCompareTypeImmediate::GreaterThan -> (3)
+            ScanCompareTypeImmediate::GreaterThanOrEqual -> (4)
+            ScanCompareTypeImmediate::LessThan -> (5)
+            ScanCompareTypeImmediate::LessThanOrEqual -> (6)
+        }
+    }
+    state relative(inner: ScanCompareTypeRelative) -> u64 {
+        transition inner {
+            ScanCompareTypeRelative::Changed -> (7)
+            ScanCompareTypeRelative::Unchanged -> (8)
+            ScanCompareTypeRelative::Increased -> (9)
+            ScanCompareTypeRelative::Decreased -> (10)
+        }
+    }
+    state delta(inner: ScanCompareTypeDelta) -> u64 {
+        transition inner {
+            ScanCompareTypeDelta::IncreasedByX -> (11)
+            ScanCompareTypeDelta::DecreasedByX -> (12)
+            _ -> (0)
+        }
+    }
+}
+
+// In-package exercise: every spelled byte string parses to its variant and
+// each refusal shape (unknown head byte, wrong tail byte, wrong length)
+// returns Invalid. Checked here because `&`-receiver calls on byte slices do
+// not cross the package boundary under selected ProgramEntry establishment,
+// so squalr-tests cannot host this yet — same edge the alignment exercise
+// names.
+pub machine ScanCompareType::from_str_consistent() -> bool {
+    let eq: [u8; 2] = [61, 61];
+    let not_eq: [u8; 2] = [33, 61];
+    let gt: [u8; 1] = [62];
+    let gte: [u8; 2] = [62, 61];
+    let lt: [u8; 1] = [60];
+    let lte: [u8; 2] = [60, 61];
+    let changed: [u8; 1] = [99];
+    let unchanged: [u8; 1] = [117];
+    let increased: [u8; 1] = [43];
+    let decreased: [u8; 1] = [45];
+    let increased_by: [u8; 2] = [43, 120];
+    let decreased_by: [u8; 2] = [45, 120];
+    let bad_head: [u8; 1] = [122];
+    let bad_tail: [u8; 2] = [61, 120];
+    let bad_length: [u8; 3] = [61, 61, 61];
+    ScanCompareType::from_str(&eq).variant_probe() == 1 &&
+    ScanCompareType::from_str(&not_eq).variant_probe() == 2 &&
+    ScanCompareType::from_str(&gt).variant_probe() == 3 &&
+    ScanCompareType::from_str(&gte).variant_probe() == 4 &&
+    ScanCompareType::from_str(&lt).variant_probe() == 5 &&
+    ScanCompareType::from_str(&lte).variant_probe() == 6 &&
+    ScanCompareType::from_str(&changed).variant_probe() == 7 &&
+    ScanCompareType::from_str(&unchanged).variant_probe() == 8 &&
+    ScanCompareType::from_str(&increased).variant_probe() == 9 &&
+    ScanCompareType::from_str(&decreased).variant_probe() == 10 &&
+    ScanCompareType::from_str(&increased_by).variant_probe() == 11 &&
+    ScanCompareType::from_str(&decreased_by).variant_probe() == 12 &&
+    ScanCompareType::from_str(&bad_head).variant_probe() == 0 &&
+    ScanCompareType::from_str(&bad_tail).variant_probe() == 0 &&
+    ScanCompareType::from_str(&bad_length).variant_probe() == 0
 }
