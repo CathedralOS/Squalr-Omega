@@ -8,6 +8,12 @@ use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filte
 use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::FilterSlot;
 use src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
 use src::scanners::scalar::scanner_scalar_single_element::ScannerScalarSingleElement;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
@@ -23,6 +29,8 @@ use src::scanners::structures::snapshot_region_filter_run_length_encoder::Snapsh
 // dispatch yields a driver drained uniformly via `next`. `kind` selects which
 // field is live — a tag rather than a payload case so `next` can mutate the
 // active scanner in place through `self`.
+pub data ElementScanDispatcher {}
+
 pub data ScalarRegionScanKind [copy] {
     case Iterative;
     case SingleElement;
@@ -35,12 +43,20 @@ pub data ScalarRegionScan {
     pending_region: SnapshotRegionFilter;
 }
 
+// DEVIATION (language): Optional<ScalarRegionScan> scrutinees fail to type in
+// state scope, so the dispatch result arrives as a slot enum instead of
+// Optional (same shape upstream's Option<T> already had).
+pub data ScalarScanSlot {
+    case Ready(scan: ScalarRegionScan);
+    case NoScan;
+}
+
 pub machine ElementScanDispatcher::dispatch_scalar_region(
     snapshot_region_filter: &SnapshotRegionFilter,
     snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
     single_current_value: u64,
     single_previous_value: u64
-) -> Optional<ScalarRegionScan>
+) -> ScalarScanSlot
 crashes Abort
 {
     let planned: PlannedScanType =
@@ -53,10 +69,10 @@ crashes Abort
             single_current_value,
             single_previous_value
         )
-        PlannedScanType::Invalid -> (Optional::None)
-        PlannedScanType::Vector { scan_type, vectorization_size } -> (Optional::None)
-        PlannedScanType::ByteArray { scan_type } -> (Optional::None)
-        _ -> (Optional::None)
+        PlannedScanType::Invalid -> (ScalarScanSlot::NoScan)
+        PlannedScanType::Vector { scan_type, vectorization_size } -> (ScalarScanSlot::NoScan)
+        PlannedScanType::ByteArray { scan_type } -> (ScalarScanSlot::NoScan)
+        _ -> (ScalarScanSlot::NoScan)
     }
 
     state scalar_kind(
@@ -65,11 +81,11 @@ crashes Abort
         snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
         single_current_value: u64,
         single_previous_value: u64
-    ) -> Optional<ScalarRegionScan> {
+    ) -> ScalarScanSlot {
         transition scan_type {
             PlannedScanTypeScalar::ScalarIterative -> (
-                Optional::Some {
-                    value: ScalarRegionScan {
+                ScalarScanSlot::Ready {
+                    scan: ScalarRegionScan {
                         kind: ScalarRegionScanKind::Iterative,
                         iterative_scan: ScalarIterativeScan::new(
                             snapshot_region_filter,
@@ -94,7 +110,7 @@ crashes Abort
         snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
         single_current_value: u64,
         single_previous_value: u64
-    ) -> Optional<ScalarRegionScan> {
+    ) -> ScalarScanSlot {
         let emitted: EmittedRegion = ScannerScalarSingleElement::scan_region(
             snapshot_region_filter,
             snapshot_filter_element_scan_plan,
@@ -110,11 +126,11 @@ crashes Abort
 
     state single_with(
         region: SnapshotRegionFilter
-    ) -> Optional<ScalarRegionScan> {
+    ) -> ScalarScanSlot {
         // The pending single-shot result rides beside an unused iterative
         // driver; the tag gates which path `next` takes.
-        Optional::Some {
-            value: ScalarRegionScan {
+        ScalarScanSlot::Ready {
+            scan: ScalarRegionScan {
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
                 has_single_pending: true,
@@ -123,9 +139,9 @@ crashes Abort
         }
     }
 
-    state single_empty() -> Optional<ScalarRegionScan> {
-        Optional::Some {
-            value: ScalarRegionScan {
+    state single_empty() -> ScalarScanSlot {
+        ScalarScanSlot::Ready {
+            scan: ScalarRegionScan {
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
                 has_single_pending: false,
@@ -188,6 +204,1286 @@ pub machine ScalarRegionScan::next(
         self.has_single_pending = false;
         EmittedRegion::Region {
             region: SnapshotRegionFilter::clone(&self.pending_region)
+        }
+    }
+}
+
+
+
+// ── Collection-level dispatch ─────────────────────────────────────────────
+// Port of ElementScanDispatcher::dispatch_scan plus the sequential per-filter
+// constraint loop (dispatch_scan_for_snapshot_filter_collection, ANDed
+// constraints) restricted to the scalar leg. Scan-type selection mirrors
+// RuleMapScanType's scalar fallback: an input filter is scanned by the
+// iterative scalar scanner whenever the validity gate passes — current values
+// present, and previous values present when the compare needs them — which is
+// upstream's universal-correct scanner (the byte-array/vector legs are
+// optimizations over the same semantics and remain unported).
+//
+// DEVIATION (language): the input collection is read-shared and the output
+// lands in caller-owned flat extents (out_filters at filter_base,
+// out_runs at run_base) instead of a swapped-in SnapshotRegionScanResults —
+// a region's loan window cannot be held open across both the byte views the
+// scan reads and the &mut cells it writes. Each input filter yields one
+// output run (upstream's Vec<Filter> per input filter); empty results emit
+// no run, matching upstream's filter_map drop.
+
+pub data BatchScanOutcome {
+    output_filter_count: u64;
+    output_run_count: u64;
+}
+
+// Which ping-pong extent carries a finished chain and how long it is.
+pub data FilterScanOutcome {
+    filter_count: u64;
+    from_chain_a: bool;
+}
+
+// Decodes a little-endian element window: out[i] is the unit_size-byte value
+// at byte_offset + i*unit_size; bytes past the window read as zero so a
+// truncated tail can never false-match a nonzero operand.
+machine decode_region_elements(
+    bytes: &[u8],
+    byte_offset: u64,
+    unit_size: u64,
+    element_count: u64,
+    out: &mut [u64]
+) -> u64 {
+    transition {
+        _ -> decode_next(bytes, byte_offset, unit_size, element_count, out, 0)
+    }
+    state decode_next(
+        bytes: &[u8],
+        byte_offset: u64,
+        unit_size: u64,
+        element_count: u64,
+        out: &mut [u64],
+        element_index: u64
+    ) -> u64 {
+        transition element_index < element_count {
+            true -> in_extent(bytes, byte_offset, unit_size, element_count, out, element_index)
+            _ -> (element_index)
+        }
+    }
+    state in_extent(
+        bytes: &[u8],
+        byte_offset: u64,
+        unit_size: u64,
+        element_count: u64,
+        out: &mut [u64],
+        element_index: u64
+    ) -> u64 {
+        transition element_index < out.len {
+            true -> fold_byte(bytes, byte_offset, unit_size, element_count, out, element_index, 0, 0)
+            _ -> (element_index)
+        }
+    }
+    state fold_byte(
+        bytes: &[u8],
+        byte_offset: u64,
+        unit_size: u64,
+        element_count: u64,
+        out: &mut [u64],
+        element_index: u64,
+        byte_cursor: u64,
+        accumulated: u64
+    ) -> u64 {
+        transition byte_cursor < unit_size {
+            true -> gate_byte(bytes, byte_offset, unit_size, element_count, out, element_index, byte_cursor, accumulated)
+            _ -> store_gate(out, element_index, accumulated)
+        }
+    }
+    state gate_byte(
+        bytes: &[u8],
+        byte_offset: u64,
+        unit_size: u64,
+        element_count: u64,
+        out: &mut [u64],
+        element_index: u64,
+        byte_cursor: u64,
+        accumulated: u64
+    ) -> u64 {
+        let element_stride: u64 = ((element_index as u64 in Saturating) * (unit_size as u64 in Saturating)) as u64;
+        let element_base: u64 = ((byte_offset as u64 in Saturating) + (element_stride as u64 in Saturating)) as u64;
+        let byte_index: u64 = ((element_base as u64 in Saturating) + (byte_cursor as u64 in Saturating)) as u64;
+        let next_cursor: u64 = ((byte_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition byte_index < bytes.len {
+            true -> shift_byte(bytes, byte_offset, unit_size, element_count, out, element_index, byte_cursor, accumulated, byte_index)
+            _ -> fold_byte(bytes, byte_offset, unit_size, element_count, out, element_index, next_cursor, accumulated)
+        }
+    }
+    state shift_byte(
+        bytes: &[u8],
+        byte_offset: u64,
+        unit_size: u64,
+        element_count: u64,
+        out: &mut [u64],
+        element_index: u64,
+        byte_cursor: u64,
+        accumulated: u64,
+        byte_index: u64 [0..bytes.len]
+    ) -> u64 {
+        let shifted: u64 = ((bytes[byte_index] as u64 in Wrapping) << ((byte_cursor as u64 in Saturating) * (8 as u64 in Saturating))) as u64;
+        let next_accumulated: u64 = ((accumulated as u64 in Saturating) | (shifted as u64 in Saturating)) as u64;
+        let next_cursor: u64 = ((byte_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        fold_byte(bytes, byte_offset, unit_size, element_count, out, element_index, next_cursor, next_accumulated)
+    }
+    state store_gate(
+        out: &mut [u64],
+        element_index: u64,
+        element_value: u64
+    ) -> u64 {
+        transition element_index < out.len {
+            true -> store(out, element_index, element_value)
+            _ -> (element_index)
+        }
+    }
+    state store(
+        out: &mut [u64],
+        element_index: u64 [0..out.len],
+        element_value: u64
+    ) -> u64 {
+        out[element_index] = element_value;
+        ((element_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+    }
+}
+
+// Whether a compare kind needs the previous-value window (Relative and Delta
+// compares do; Immediate does not), mirroring RuleMapScanType's validity gate.
+machine compare_needs_previous(compare_type: ScanCompareType) -> bool {
+    transition compare_type {
+        ScanCompareType::Immediate { compare_type } -> (false)
+        ScanCompareType::Relative { compare_type } -> (true)
+        ScanCompareType::Delta { compare_type } -> (true)
+        _ -> (true)
+    }
+}
+
+// Drains one scan's emitted regions into an extent, returning the new fill
+// count. Upstream's flat_map over the scanner; here the scanner is pulled.
+machine drain_scan(
+    scan: &mut ScalarRegionScan,
+    out_chain: &mut [SnapshotRegionFilter],
+    count: u64,
+    scratch_current: &mut [u64],
+    scratch_previous: &mut [u64]
+) -> u64
+crashes Abort
+{
+    transition {
+        _ -> pull(scan, &mut out_chain, count, &mut scratch_current, &mut scratch_previous)
+    }
+    state pull(
+        scan: &mut ScalarRegionScan,
+        out_chain: &mut [SnapshotRegionFilter],
+        count: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64]
+    ) -> u64 {
+        let emitted: EmittedRegion = scan.next(scratch_current, scratch_previous);
+        transition emitted {
+            EmittedRegion::Region { region } -> gate(scan, &mut out_chain, count, region, &mut scratch_current, &mut scratch_previous)
+            EmittedRegion::Empty -> (count)
+            _ -> (count)
+        }
+    }
+    state gate(
+        scan: &mut ScalarRegionScan,
+        out_chain: &mut [SnapshotRegionFilter],
+        count: u64,
+        region: SnapshotRegionFilter,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64]
+    ) -> u64 {
+        transition count < out_chain.len {
+            true -> write(scan, &mut out_chain, count, region, &mut scratch_current, &mut scratch_previous)
+            _ -> (count)
+        }
+    }
+    state write(
+        scan: &mut ScalarRegionScan,
+        out_chain: &mut [SnapshotRegionFilter],
+        count: u64 [0..out_chain.len],
+        region: SnapshotRegionFilter,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64]
+    ) -> u64 {
+        out_chain[count] = region;
+        pull(scan, &mut out_chain, ((count as u64 in Saturating) + (1 as u64 in Saturating)) as u64, &mut scratch_current, &mut scratch_previous)
+    }
+}
+
+// Runs one input filter through the sequential ANDed constraint chain
+// (upstream's per-filter flat_map over constraints). The live chain ping-pongs
+// between chain_a and chain_b; the return record names the surviving extent.
+machine run_filter_constraint_chain<'type_id, 'bytes, 'mask>(
+    filter: &SnapshotRegionFilter,
+    constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+    constraint_count: u64,
+    memory_alignment: MemoryAlignment,
+    has_previous_values: bool,
+    region_current_bytes: &[u8],
+    region_previous_bytes: &[u8],
+    region_base_address: u64,
+    scratch_current: &mut [u64],
+    scratch_previous: &mut [u64],
+    chain_a: &mut [SnapshotRegionFilter],
+    chain_b: &mut [SnapshotRegionFilter]
+) -> FilterScanOutcome
+crashes Abort
+{
+    transition {
+        _ -> seed_gate(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b)
+    }
+    state seed_gate(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter]
+    ) -> FilterScanOutcome {
+        transition 0 < chain_a.len {
+            true -> write_seed(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, 0)
+            _ -> (FilterScanOutcome { filter_count: 0, from_chain_a: true })
+        }
+    }
+    state write_seed(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        seed_slot: u64 [0..chain_a.len]
+    ) -> FilterScanOutcome {
+        chain_a[seed_slot] = SnapshotRegionFilter::clone(filter);
+        transition {
+            _ -> fold_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, 0, 1)
+        }
+    }
+    state fold_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraint_count {
+            true -> gate_chain_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count)
+            _ -> (FilterScanOutcome { filter_count: a_count, from_chain_a: true })
+        }
+    }
+    state gate_chain_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraints.len {
+            true -> per_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, 0, 0)
+            _ -> (FilterScanOutcome { filter_count: a_count, from_chain_a: true })
+        }
+    }
+    state per_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition chain_cursor < a_count {
+            true -> bound_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+            _ -> done_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count)
+        }
+    }
+    state bound_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition chain_cursor < chain_a.len {
+            true -> cgate_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+            _ -> done_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count)
+        }
+    }
+    state compare_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64 [0..constraints.len],
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        let compare_type: ScanCompareType = constraints[constraint_index].get_scan_compare_type();
+        let needs_previous: bool = compare_needs_previous(compare_type);
+        transition needs_previous && !has_previous_values {
+            true -> (FilterScanOutcome { filter_count: 0, from_chain_a: true })
+            _ -> decode_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+        }
+    }
+    state cgate_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraints.len {
+            true -> compare_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+            _ -> (FilterScanOutcome { filter_count: 0, from_chain_a: true })
+        }
+    }
+    state decode_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition chain_cursor < chain_a.len {
+            true -> dgate_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+            _ -> next_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+        }
+    }
+    state dgate_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraints.len {
+            true -> decode_indexed_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+            _ -> next_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+        }
+    }
+    state decode_indexed_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64 [0..constraints.len],
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        let constraint: &ScanConstraintFinalized<'type_id, 'bytes, 'mask> = &constraints[constraint_index];
+        let unit_size: u64 = constraint.get_unit_size_in_bytes();
+        let compare_type: ScanCompareType = constraint.get_scan_compare_type();
+        let operand_value: u64 = DataValue::get_value_as_u64(constraint.get_data_value());
+        let has_scan_function: bool = constraint.has_scan_function_scalar();
+        let scan_function: ScanFunctionScalar = constraint.get_scan_function_scalar();
+        let mut filter_plan: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::new(
+            compare_type,
+            operand_value,
+            unit_size,
+            has_scan_function,
+            scan_function,
+            memory_alignment
+        );
+        filter_plan.set_planned_scan_type(PlannedScanType::Scalar { scan_type: PlannedScanTypeScalar::ScalarIterative });
+        transition chain_cursor < chain_a.len {
+            true -> dispatch_one_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count, filter_plan)
+            _ -> (FilterScanOutcome { filter_count: a_count, from_chain_a: true })
+        }
+    }
+    state dispatch_one_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64 [0..chain_a.len],
+        b_count: u64,
+        filter_plan: SnapshotFilterElementScanPlan
+    ) -> FilterScanOutcome {
+        let input_filter: &SnapshotRegionFilter = &chain_a[chain_cursor];
+        let filter_base: u64 = input_filter.get_base_address();
+        let unit_size: u64 = filter_plan.get_unit_size_in_bytes();
+        let element_count: u64 = input_filter.get_element_count(unit_size, memory_alignment);
+        let byte_offset: u64 = ((filter_base as u64 in Saturating) - (region_base_address as u64 in Saturating)) as u64;
+        let decoded_current: u64 = decode_region_elements(region_current_bytes, byte_offset, unit_size, element_count, &mut scratch_current);
+        let decoded_previous: u64 = decode_region_elements(region_previous_bytes, byte_offset, unit_size, element_count, &mut scratch_previous);
+        let scan_result: ScalarScanSlot = ElementScanDispatcher::dispatch_scalar_region(
+            input_filter,
+            &filter_plan,
+            decoded_current,
+            decoded_previous
+        );
+        transition scan_result {
+            ScalarScanSlot::Ready { scan } -> drain_call_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count, scan)
+            ScalarScanSlot::NoScan -> next_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+            _ -> next_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, b_count)
+        }
+    }
+    state drain_call_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64,
+        scan_in: ScalarRegionScan
+    ) -> FilterScanOutcome {
+        let mut scan: ScalarRegionScan = scan_in;
+        let emitted_to: u64 = drain_scan(&mut scan, &mut chain_b, b_count, &mut scratch_current, &mut scratch_previous);
+        transition {
+            _ -> next_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, chain_cursor, emitted_to)
+        }
+    }
+    state next_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64,
+        chain_cursor: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        let next_cursor: u64 = ((chain_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> per_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count, next_cursor, b_count)
+        }
+    }
+    state done_a(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition b_count > 0 {
+            true -> fold_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, ((constraint_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, b_count)
+            _ -> (FilterScanOutcome { filter_count: 0, from_chain_a: true })
+        }
+    }
+    state fold_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraint_count {
+            true -> gate_chain_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count)
+            _ -> (FilterScanOutcome { filter_count: b_count, from_chain_a: false })
+        }
+    }
+    state gate_chain_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraints.len {
+            true -> per_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, 0, 0)
+            _ -> (FilterScanOutcome { filter_count: b_count, from_chain_a: false })
+        }
+    }
+    state per_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition chain_cursor < b_count {
+            true -> bound_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+            _ -> done_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count)
+        }
+    }
+    state bound_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition chain_cursor < chain_b.len {
+            true -> cgate_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+            _ -> done_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, a_count)
+        }
+    }
+    state compare_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64 [0..constraints.len],
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        let compare_type: ScanCompareType = constraints[constraint_index].get_scan_compare_type();
+        let needs_previous: bool = compare_needs_previous(compare_type);
+        transition needs_previous && !has_previous_values {
+            true -> (FilterScanOutcome { filter_count: 0, from_chain_a: false })
+            _ -> decode_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+        }
+    }
+    state cgate_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraints.len {
+            true -> compare_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+            _ -> (FilterScanOutcome { filter_count: 0, from_chain_a: false })
+        }
+    }
+    state decode_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition chain_cursor < chain_b.len {
+            true -> dgate_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+            _ -> next_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+        }
+    }
+    state dgate_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition constraint_index < constraints.len {
+            true -> decode_indexed_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+            _ -> next_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+        }
+    }
+    state decode_indexed_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64 [0..constraints.len],
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        let constraint: &ScanConstraintFinalized<'type_id, 'bytes, 'mask> = &constraints[constraint_index];
+        let unit_size: u64 = constraint.get_unit_size_in_bytes();
+        let compare_type: ScanCompareType = constraint.get_scan_compare_type();
+        let operand_value: u64 = DataValue::get_value_as_u64(constraint.get_data_value());
+        let has_scan_function: bool = constraint.has_scan_function_scalar();
+        let scan_function: ScanFunctionScalar = constraint.get_scan_function_scalar();
+        let mut filter_plan: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::new(
+            compare_type,
+            operand_value,
+            unit_size,
+            has_scan_function,
+            scan_function,
+            memory_alignment
+        );
+        filter_plan.set_planned_scan_type(PlannedScanType::Scalar { scan_type: PlannedScanTypeScalar::ScalarIterative });
+        transition chain_cursor < chain_b.len {
+            true -> dispatch_one_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count, filter_plan)
+            _ -> (FilterScanOutcome { filter_count: b_count, from_chain_a: false })
+        }
+    }
+    state dispatch_one_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64 [0..chain_b.len],
+        a_count: u64,
+        filter_plan: SnapshotFilterElementScanPlan
+    ) -> FilterScanOutcome {
+        let input_filter: &SnapshotRegionFilter = &chain_b[chain_cursor];
+        let filter_base: u64 = input_filter.get_base_address();
+        let unit_size: u64 = filter_plan.get_unit_size_in_bytes();
+        let element_count: u64 = input_filter.get_element_count(unit_size, memory_alignment);
+        let byte_offset: u64 = ((filter_base as u64 in Saturating) - (region_base_address as u64 in Saturating)) as u64;
+        let decoded_current: u64 = decode_region_elements(region_current_bytes, byte_offset, unit_size, element_count, &mut scratch_current);
+        let decoded_previous: u64 = decode_region_elements(region_previous_bytes, byte_offset, unit_size, element_count, &mut scratch_previous);
+        let scan_result: ScalarScanSlot = ElementScanDispatcher::dispatch_scalar_region(
+            input_filter,
+            &filter_plan,
+            decoded_current,
+            decoded_previous
+        );
+        transition scan_result {
+            ScalarScanSlot::Ready { scan } -> drain_call_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count, scan)
+            ScalarScanSlot::NoScan -> next_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+            _ -> next_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, a_count)
+        }
+    }
+    state drain_call_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64,
+        scan_in: ScalarRegionScan
+    ) -> FilterScanOutcome {
+        let mut scan: ScalarRegionScan = scan_in;
+        let emitted_to: u64 = drain_scan(&mut scan, &mut chain_a, a_count, &mut scratch_current, &mut scratch_previous);
+        transition {
+            _ -> next_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, chain_cursor, emitted_to)
+        }
+    }
+    state next_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        b_count: u64,
+        chain_cursor: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        let next_cursor: u64 = ((chain_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> per_b(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, constraint_index, b_count, next_cursor, a_count)
+        }
+    }
+    state done_b(
+        filter: &SnapshotRegionFilter,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        constraint_index: u64,
+        a_count: u64
+    ) -> FilterScanOutcome {
+        transition a_count > 0 {
+            true -> fold_a(filter, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, ((constraint_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, a_count)
+            _ -> (FilterScanOutcome { filter_count: 0, from_chain_a: false })
+        }
+    }
+}
+
+// Writes a finished chain into the caller-owned output extents: one filter
+// slot per surviving filter starting at filter_base, then one run length at
+// run_base. Returns the post-write cursors relative to the caller's windows.
+machine commit_chain<'chain>(
+    source_chain: &'chain [SnapshotRegionFilter],
+    filter_count: u64,
+    out_filters: &mut [SnapshotRegionFilter],
+    filter_base: u64,
+    out_runs: &mut [u64],
+    run_base: u64
+) -> u64 {
+    transition {
+        _ -> copy_gate(source_chain, &mut out_filters, filter_base, 0, filter_count, &mut out_runs, run_base)
+    }
+    state copy_gate(
+        source_chain: &'chain [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        filter_base: u64,
+        copy_cursor: u64,
+        filter_count: u64,
+        out_runs: &mut [u64],
+        run_base: u64
+    ) -> u64 {
+        transition copy_cursor < filter_count {
+            true -> bound_copy(source_chain, &mut out_filters, filter_base, copy_cursor, filter_count, &mut out_runs, run_base)
+            _ -> commit_run(&mut out_runs, run_base, filter_count, ((filter_base as u64 in Saturating) + (filter_count as u64 in Saturating)) as u64)
+        }
+    }
+    state bound_copy(
+        source_chain: &'chain [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        filter_base: u64,
+        copy_cursor: u64,
+        filter_count: u64,
+        out_runs: &mut [u64],
+        run_base: u64
+    ) -> u64 {
+        let out_slot: u64 = ((filter_base as u64 in Saturating) + (copy_cursor as u64 in Saturating)) as u64;
+        transition copy_cursor < source_chain.len {
+            true -> copy_one(source_chain, &mut out_filters, filter_base, copy_cursor, filter_count, &mut out_runs, run_base)
+            _ -> commit_run(&mut out_runs, run_base, filter_count, out_slot)
+        }
+    }
+    state copy_one(
+        source_chain: &'chain [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        filter_base: u64,
+        copy_cursor: u64 [0..source_chain.len],
+        filter_count: u64,
+        out_runs: &mut [u64],
+        run_base: u64
+    ) -> u64 {
+        let out_slot: u64 = ((filter_base as u64 in Saturating) + (copy_cursor as u64 in Saturating)) as u64;
+        let copied_filter: SnapshotRegionFilter = SnapshotRegionFilter::clone(&source_chain[copy_cursor]);
+        transition out_slot < out_filters.len {
+            true -> write_one(&mut out_filters, out_slot, copied_filter, source_chain, filter_base, copy_cursor, filter_count, &mut out_runs, run_base)
+            _ -> copy_gate(source_chain, &mut out_filters, filter_base, ((copy_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64, filter_count, &mut out_runs, run_base)
+        }
+    }
+    state write_one(
+        out_filters: &mut [SnapshotRegionFilter],
+        out_slot: u64 [0..out_filters.len],
+        copied_filter: SnapshotRegionFilter,
+        source_chain: &'chain [SnapshotRegionFilter],
+        filter_base: u64,
+        copy_cursor: u64,
+        filter_count: u64,
+        out_runs: &mut [u64],
+        run_base: u64
+    ) -> u64 {
+        out_filters[out_slot] = copied_filter;
+        let next_copy: u64 = ((copy_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> copy_gate(source_chain, &mut out_filters, filter_base, next_copy, filter_count, &mut out_runs, run_base)
+        }
+    }
+    state commit_run(
+        out_runs: &mut [u64],
+        run_base: u64,
+        filter_count: u64,
+        next_filter_offset: u64
+    ) -> u64 {
+        transition run_base < out_runs.len {
+            true -> write_run(&mut out_runs, run_base, filter_count, next_filter_offset)
+            _ -> (next_filter_offset)
+        }
+    }
+    state write_run(
+        out_runs: &mut [u64],
+        run_base: u64 [0..out_runs.len],
+        filter_count: u64,
+        next_filter_offset: u64
+    ) -> u64 {
+        out_runs[run_base] = filter_count;
+        (next_filter_offset)
+    }
+}
+
+// Per-collection dispatch: ANDs each input filter through the constraint
+// chain and commits the survivors under (filter_base, run_base) in the
+// caller-owned output extents.
+pub machine ElementScanDispatcher::dispatch_scan<'type_id, 'filters, 'runs, 'bytes, 'mask>(
+    input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+    constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+    constraint_count: u64,
+    memory_alignment: MemoryAlignment,
+    has_current_values: bool,
+    has_previous_values: bool,
+    region_current_bytes: &[u8],
+    region_previous_bytes: &[u8],
+    region_base_address: u64,
+    scratch_current: &mut [u64],
+    scratch_previous: &mut [u64],
+    chain_a: &mut [SnapshotRegionFilter],
+    chain_b: &mut [SnapshotRegionFilter],
+    out_filters: &mut [SnapshotRegionFilter],
+    filter_base: u64,
+    out_runs: &mut [u64],
+    run_base: u64
+) -> BatchScanOutcome
+crashes Abort
+{
+    transition has_current_values {
+        true -> filter_loop(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, 0, filter_base, run_base)
+        _ -> (BatchScanOutcome { output_filter_count: 0, output_run_count: 0 })
+    }
+    state filter_loop(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64
+    ) -> BatchScanOutcome {
+        let input_filter_count: u64 = input_collection.get_filter_count();
+        transition filter_index < input_filter_count {
+            true -> load_filter(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor)
+            _ -> (BatchScanOutcome { output_filter_count: out_filter_cursor, output_run_count: out_run_cursor })
+        }
+    }
+    state load_filter(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64
+    ) -> BatchScanOutcome {
+        let filter_result: FilterSlot = input_collection.get_filter_at(filter_index);
+        transition filter_result {
+            FilterSlot::Present { filter } -> chain_filter(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor, filter)
+            FilterSlot::Missing -> (BatchScanOutcome { output_filter_count: out_filter_cursor, output_run_count: out_run_cursor })
+            _ -> (BatchScanOutcome { output_filter_count: out_filter_cursor, output_run_count: out_run_cursor })
+        }
+    }
+    state chain_filter(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64,
+        filter: &SnapshotRegionFilter
+    ) -> BatchScanOutcome {
+        let outcome: FilterScanOutcome = run_filter_constraint_chain(
+            filter,
+            constraints,
+            constraint_count,
+            memory_alignment,
+            has_previous_values,
+            region_current_bytes,
+            region_previous_bytes,
+            region_base_address,
+            scratch_current,
+            scratch_previous,
+            chain_a,
+            chain_b
+        );
+        transition outcome.from_chain_a {
+            true -> emit_a(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor, outcome)
+            _ -> emit_b(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor, outcome)
+        }
+    }
+    state emit_a(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64,
+        outcome: FilterScanOutcome
+    ) -> BatchScanOutcome {
+        transition outcome.filter_count > 0 {
+            true -> copy_a(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor, outcome)
+            _ -> next_filter(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor)
+        }
+    }
+    state copy_a(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64,
+        outcome: FilterScanOutcome
+    ) -> BatchScanOutcome {
+        let next_filters: u64 = commit_chain(
+            chain_a,
+            outcome.filter_count,
+            out_filters,
+            out_filter_cursor,
+            out_runs,
+            out_run_cursor
+        );
+        let next_runs: u64 = ((out_run_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> next_filter(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, next_filters, next_runs)
+        }
+    }
+    state emit_b(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64,
+        outcome: FilterScanOutcome
+    ) -> BatchScanOutcome {
+        transition outcome.filter_count > 0 {
+            true -> copy_b(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor, outcome)
+            _ -> next_filter(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, out_filter_cursor, out_run_cursor)
+        }
+    }
+    state copy_b(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64,
+        outcome: FilterScanOutcome
+    ) -> BatchScanOutcome {
+        let next_filters: u64 = commit_chain(
+            chain_b,
+            outcome.filter_count,
+            out_filters,
+            out_filter_cursor,
+            out_runs,
+            out_run_cursor
+        );
+        let next_runs: u64 = ((out_run_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> next_filter(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, filter_index, next_filters, next_runs)
+        }
+    }
+    state next_filter(
+        input_collection: &SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        constraints: &[ScanConstraintFinalized<'type_id, 'bytes, 'mask>],
+        constraint_count: u64,
+        memory_alignment: MemoryAlignment,
+        has_previous_values: bool,
+        region_current_bytes: &[u8],
+        region_previous_bytes: &[u8],
+        region_base_address: u64,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        out_runs: &mut [u64],
+        filter_index: u64,
+        out_filter_cursor: u64,
+        out_run_cursor: u64
+    ) -> BatchScanOutcome {
+        let next_index: u64 = ((filter_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> filter_loop(input_collection, constraints, constraint_count, memory_alignment, has_previous_values, region_current_bytes, region_previous_bytes, region_base_address, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, &mut out_runs, next_index, out_filter_cursor, out_run_cursor)
         }
     }
 }

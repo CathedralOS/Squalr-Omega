@@ -4,6 +4,7 @@ use omega::language::core::option;
 use src::structures::memory::normalized_region;
 use src::structures::data_types::data_type_ref::DataTypeRef;
 use src::structures::results::snapshot_region_scan_results::SnapshotRegionFilterBounds;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
 use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
 
 machine min_u64(left: u64, right: u64) -> u64 {
@@ -426,20 +427,381 @@ pub machine SnapshotRegion::get_scan_result_collection_at<'current, 'previous, '
     }
 }
 
-// Exclusive access to one collection by slot index.
-pub machine SnapshotRegion::mutate_scan_result_collection_at<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+// Exclusive access to one collection by slot index. DEVIATION (language):
+// Applies one cell's computed filters and run lengths to the scan-result
+// collection at collection_index, then tightens the collection's live window
+// to the copied counts (upstream's post-scan results publish onto the
+// region). The collection's &mut borrow is reacquired inside this machine so
+// the caller's region loan never spans the slot scrutinee.
+pub machine SnapshotRegion::publish_cell_results<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
     &mut self,
-    collection_index: u64
-) -> Optional<&mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>> {
-    transition collection_index < self.scan_result_collection_count && collection_index < self.scan_result_filter_collections.len {
-        true -> in_extent(&mut self.scan_result_filter_collections, collection_index)
-        _ -> (Optional::None)
+    collection_index: u64,
+    cell_filters: &[SnapshotRegionFilter],
+    cell_filter_base: u64,
+    cell_runs: &[u64],
+    cell_run_base: u64,
+    filter_count: u64,
+    run_count: u64
+) {
+    transition {
+        _ -> collection_slot(collection_index, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count)
     }
-    state in_extent(
+    state collection_slot(
         &mut self,
-        collections: &mut [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
-        collection_index: u64 [0..collections.len]
-    ) -> Optional<&mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>> {
-        (Optional::Some { value: &mut collections[collection_index] })
+        collection_index: u64,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64
+    ) {
+        let collection_bound: u64 = self.scan_result_collection_count;
+        transition collection_index < collection_bound {
+            true -> fill_bound(&mut self.scan_result_filter_collections, collection_index, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count)
+            _ -> done()
+        }
+    }
+    state fill_bound(
+        &mut self,
+        collections: &'current mut [SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        collection_index: u64,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64
+    ) {
+        transition collection_index < collections.len {
+            true -> fill_gate(&mut collections[collection_index], cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, 0)
+            _ -> done()
+        }
+    }
+    state fill_gate(
+        &mut self,
+        collection: &'current mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64,
+        cursor: u64
+    ) {
+        transition cursor < filter_count {
+            true -> filter_bound(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, cursor)
+            _ -> run_gate(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, 0)
+        }
+    }
+    state filter_bound(
+        &mut self,
+        collection: &'current mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64,
+        cursor: u64
+    ) {
+        let source_index: u64 = ((cell_filter_base as u64 in Saturating) + (cursor as u64 in Saturating)) as u64;
+        transition source_index < cell_filters.len {
+            true -> filter_one(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, cursor, source_index)
+            _ -> run_gate(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, cursor)
+        }
+    }
+    state filter_one(
+        &mut self,
+        collection: &'current mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64,
+        cursor: u64,
+        source_index: u64 [0..cell_filters.len]
+    ) {
+        collection.set_filter_at(cursor, SnapshotRegionFilter::clone(&cell_filters[source_index]));
+        let next_cursor: u64 = ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> fill_gate(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, next_cursor)
+        }
+    }
+    state run_gate(
+        &mut self,
+        collection: &'current mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64,
+        cursor: u64
+    ) {
+        transition cursor < run_count {
+            true -> run_bound(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, cursor)
+            _ -> seal(&mut collection, filter_count, run_count)
+        }
+    }
+    state run_bound(
+        &mut self,
+        collection: &'current mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64,
+        cursor: u64
+    ) {
+        let source_index: u64 = ((cell_run_base as u64 in Saturating) + (cursor as u64 in Saturating)) as u64;
+        transition source_index < cell_runs.len {
+            true -> run_one(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, cursor, source_index)
+            _ -> seal(&mut collection, filter_count, run_count)
+        }
+    }
+    state run_one(
+        &mut self,
+        collection: &'current mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        cell_filters: &[SnapshotRegionFilter],
+        cell_filter_base: u64,
+        cell_runs: &[u64],
+        cell_run_base: u64,
+        filter_count: u64,
+        run_count: u64,
+        cursor: u64,
+        source_index: u64 [0..cell_runs.len]
+    ) {
+        collection.set_run_length_at(cursor, cell_runs[source_index]);
+        let next_cursor: u64 = ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> run_gate(&mut collection, cell_filters, cell_filter_base, cell_runs, cell_run_base, filter_count, run_count, next_cursor)
+        }
+    }
+    state seal(
+        &mut self,
+        collection: &'current mut SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>,
+        filter_count: u64,
+        run_count: u64
+    ) {
+        collection.set_window(0, filter_count, 0, run_count);
+        transition {
+            _ -> done()
+        }
+    }
+    state done() {
+    }
+}
+
+// Shifts values left by start_offset, keeping keep_count bytes from the
+// shifted start (upstream's drain(..start_offset) + truncate(keep_count)).
+machine shift_extent_left(values: &mut [u8], start_offset: u64, keep_count: u64) {
+    transition {
+        _ -> copy(values, start_offset, keep_count, 0)
+    }
+    state copy(values: &mut [u8], start_offset: u64, keep_count: u64, cursor: u64) {
+        transition cursor < keep_count {
+            true -> bound_dest(values, start_offset, keep_count, cursor)
+            _ -> idle()
+        }
+    }
+    state bound_dest(values: &mut [u8], start_offset: u64, keep_count: u64, cursor: u64) {
+        transition cursor < values.len {
+            true -> bound_source(values, start_offset, keep_count, cursor)
+            _ -> idle()
+        }
+    }
+    state bound_source(values: &mut [u8], start_offset: u64, keep_count: u64, cursor: u64) {
+        let source_index: u64 = ((start_offset as u64 in Saturating) + (cursor as u64 in Saturating)) as u64;
+        transition source_index < values.len && cursor < values.len {
+            true -> move_byte(values, start_offset, keep_count, cursor, source_index)
+            _ -> next_byte(values, start_offset, keep_count, cursor)
+        }
+    }
+    state move_byte(
+        values: &mut [u8],
+        start_offset: u64,
+        keep_count: u64,
+        cursor: u64 [0..values.len],
+        source_index: u64 [0..values.len]
+    ) {
+        let moved_byte: u8 = values[source_index];
+        values[cursor] = moved_byte;
+        transition {
+            _ -> next_byte(values, start_offset, keep_count, cursor)
+        }
+    }
+    state next_byte(values: &mut [u8], start_offset: u64, keep_count: u64, cursor: u64) {
+        let next_cursor: u64 = ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> copy(values, start_offset, keep_count, next_cursor)
+        }
+    }
+    state idle() {
+    }
+}
+
+// Compacts boundaries in place, keeping only those inside [low, high]
+// (upstream's retain); returns the surviving count.
+machine retain_boundaries(boundaries: &mut [u64], boundary_count: u64, low: u64, high: u64) -> u64 {
+    transition {
+        _ -> scan(boundaries, boundary_count, low, high, 0, 0)
+    }
+    state scan(
+        boundaries: &mut [u64],
+        boundary_count: u64,
+        low: u64,
+        high: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        transition read_index < boundary_count {
+            true -> bound_read(boundaries, boundary_count, low, high, read_index, write_index)
+            _ -> (write_index)
+        }
+    }
+    state bound_read(
+        boundaries: &mut [u64],
+        boundary_count: u64,
+        low: u64,
+        high: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        transition read_index < boundaries.len {
+            true -> probe(boundaries, boundary_count, low, high, read_index, write_index)
+            _ -> (write_index)
+        }
+    }
+    state probe(
+        boundaries: &mut [u64],
+        boundary_count: u64,
+        low: u64,
+        high: u64,
+        read_index: u64 [0..boundaries.len],
+        write_index: u64
+    ) -> u64 {
+        let boundary: u64 = boundaries[read_index];
+        transition boundary >= low && boundary <= high && read_index < boundaries.len {
+            true -> bound_write(boundaries, boundary_count, low, high, read_index, write_index, boundary)
+            _ -> next_read(boundaries, boundary_count, low, high, read_index, write_index)
+        }
+    }
+    state bound_write(
+        boundaries: &mut [u64],
+        boundary_count: u64,
+        low: u64,
+        high: u64,
+        read_index: u64 [0..boundaries.len],
+        write_index: u64,
+        boundary: u64
+    ) -> u64 {
+        transition write_index < boundaries.len && read_index < boundaries.len {
+            true -> write(boundaries, boundary_count, low, high, read_index, write_index, boundary)
+            _ -> next_read(boundaries, boundary_count, low, high, read_index, write_index)
+        }
+    }
+    state write(
+        boundaries: &mut [u64],
+        boundary_count: u64,
+        low: u64,
+        high: u64,
+        read_index: u64 [0..boundaries.len],
+        write_index: u64 [0..boundaries.len],
+        boundary: u64
+    ) -> u64 {
+        boundaries[write_index] = boundary;
+        let next_write: u64 = ((write_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> next_read(boundaries, boundary_count, low, high, read_index, next_write)
+        }
+    }
+    state next_read(
+        boundaries: &mut [u64],
+        boundary_count: u64,
+        low: u64,
+        high: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        let next_read_index: u64 = ((read_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> scan(boundaries, boundary_count, low, high, next_read_index, write_index)
+        }
+    }
+}
+
+// Port of upstream resize_to_filters: shrink the region to the bounds of its
+// surviving filters — rebased normalized region, value windows drained from
+// the left and truncated, page boundaries outside the range dropped. When no
+// results remain the region's size collapses to zero and discard_empty_regions
+// reclaims it.
+pub machine SnapshotRegion::resize_to_filters<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    &mut self
+) {
+    let original_base_address: u64 = self.normalized_region.get_base_address();
+    let filter_bounds: SnapshotRegionFilterBounds = self.get_scan_result_filter_bounds();
+    let new_region_size: u64 = ((filter_bounds.maximum_address as u64 in Saturating) - (filter_bounds.minimum_address as u64 in Saturating)) as u64;
+    transition new_region_size > 0 {
+        true -> apply(original_base_address, filter_bounds.minimum_address, filter_bounds.maximum_address, new_region_size)
+        _ -> zero_out()
+    }
+
+    state apply(&mut self, original_base_address: u64, lowest: u64, highest: u64, new_region_size: u64) {
+        self.normalized_region.set_base_address(lowest);
+        self.normalized_region.set_region_size(new_region_size);
+        let start_offset: u64 = ((lowest as u64 in Saturating) - (original_base_address as u64 in Saturating)) as u64;
+        let remaining_current: u64 = ((self.current_values_len as u64 in Saturating) - (start_offset as u64 in Saturating)) as u64;
+        let remaining_previous: u64 = ((self.previous_values_len as u64 in Saturating) - (start_offset as u64 in Saturating)) as u64;
+        self.current_values_len = min_u64(remaining_current, new_region_size);
+        self.previous_values_len = min_u64(remaining_previous, new_region_size);
+        transition {
+            _ -> shift_current(start_offset, self.current_values_len, lowest, highest, 0)
+        }
+    }
+
+    state shift_current(
+        &mut self,
+        start_offset: u64,
+        keep_count: u64,
+        lowest: u64,
+        highest: u64,
+        _unused: u64
+    ) {
+        let shifted: u64 = 0;
+        shift_extent_left(&mut self.current_values, start_offset, keep_count);
+        transition {
+            _ -> shift_previous(start_offset, self.previous_values_len, lowest, highest)
+        }
+    }
+
+    state shift_previous(&mut self, start_offset: u64, keep_count: u64, lowest: u64, highest: u64) {
+        shift_extent_left(&mut self.previous_values, start_offset, keep_count);
+        transition {
+            _ -> trim_boundaries(lowest, highest)
+        }
+    }
+
+    state trim_boundaries(&mut self, lowest: u64, highest: u64) {
+        let surviving: u64 = retain_boundaries(&mut self.page_boundaries, self.page_boundary_count, lowest, highest);
+        self.page_boundary_count = surviving;
+        transition {
+            _ -> idle()
+        }
+    }
+
+    state zero_out(&mut self) {
+        self.current_values_len = 0;
+        self.previous_values_len = 0;
+        self.page_boundary_count = 0;
+        self.normalized_region.set_region_size(0);
+        transition {
+            _ -> idle()
+        }
+    }
+
+    state idle(&mut self) {
     }
 }

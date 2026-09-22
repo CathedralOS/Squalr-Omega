@@ -1,0 +1,1062 @@
+module src::element_scans::element_scanner;
+
+use omega::language::core::option;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::snapshots::snapshot::MutatedRegion;
+use squalr_engine_api::src::structures::snapshots::snapshot::RegionRef;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::IndexSlot;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ConstraintSetSlot;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::DataTypeScanConstraints;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use src::scanners::element_scan_dispatcher::BatchScanOutcome;
+use src::scanners::element_scan_dispatcher::ElementScanDispatcher;
+use src::scanners::scan_control::ScanControl;
+use src::element_scans::element_scan_report::ElementScanReport;
+
+pub data ElementScanner {}
+
+// Port of ElementScanner::scan_snapshot over the package's extents model,
+// split into a read phase and a publish phase: upstream reads region bytes,
+// writes the produced SnapshotRegionScanResults onto the region, then
+// resizes — one region cannot be lent & and &mut concurrently, so the
+// compute phase decodes against the region's & views while writing into
+// driver-owned flat extents, and the publish phase copies those extents
+// through publish_cell_results, sets the live collection count,
+// and runs resize_to_filters.
+//
+// Per-region mapping (upstream scan_region): initialize_scan_results is the
+// driver's seed of input_collections (one collection per data type,
+// populated at snapshot construction); refresh is the byte views below;
+// each input collection dispatches through ElementScanDispatcher::dispatch_
+// scan and publishes into the region's fixed results extent; the per-region
+// resize is resize_to_filters. The region then either retains results or
+// collapses for discard_empty_regions, matching upstream's flow.
+
+machine compute_region<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols, 'plan_bytes, 'plan_mask, 'cons, 'sets>(
+    region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+    input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+    in_base: u64,
+    in_count: u64,
+    element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+    scratch_current: &mut [u64],
+    scratch_previous: &mut [u64],
+    chain_a: &mut [SnapshotRegionFilter],
+    chain_b: &mut [SnapshotRegionFilter],
+    out_filters: &mut [SnapshotRegionFilter],
+    cell_filters_stride: u64,
+    out_runs: &mut [u64],
+    cell_runs_stride: u64,
+    cell_filter_counts: &mut [u64],
+    cell_run_counts: &mut [u64]
+) -> u64
+crashes Abort
+{
+    let has_current: bool = region.has_current_values();
+    let has_previous: bool = region.has_previous_values();
+    let region_base: u64 = region.get_base_address();
+    let region_current: &[u8] = region.get_current_values();
+    let region_previous: &[u8] = region.get_previous_values();
+    let alignment: MemoryAlignment = element_scan_plan.get_memory_alignment();
+    transition {
+        _ -> collection_loop(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, 0, 0)
+    }
+    state collection_loop(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64
+    ) -> u64 {
+        transition collection_index < in_count {
+            true -> index_in(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+            _ -> (produced)
+        }
+    }
+    state index_in(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64
+    ) -> u64 {
+        let in_index: u64 = ((in_base as u64 in Saturating) + (collection_index as u64 in Saturating)) as u64;
+        transition in_index < input_collections.len {
+            true -> read_type(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, in_index)
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+        }
+    }
+    state read_type(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64,
+        in_index: u64
+    ) -> u64 {
+        transition in_index < input_collections.len {
+            true -> read_type_indexed(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, in_index)
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+        }
+    }
+    state read_type_indexed(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64,
+        in_index: u64 [0..input_collections.len]
+    ) -> u64 {
+        let data_type: &DataTypeRef = input_collections[in_index].get_data_type_ref();
+        let set_index_result: IndexSlot = element_scan_plan.find_constraint_set_index(
+            data_type
+        );
+        transition set_index_result {
+            IndexSlot::Found { index } -> read_set(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, in_index, index)
+            IndexSlot::Missing -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+        }
+    }
+    state read_set(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64,
+        in_index: u64,
+        set_index: u64
+    ) -> u64 {
+        let set_result: ConstraintSetSlot<'cons, 'type_id, 'plan_bytes, 'plan_mask, 'cons> = element_scan_plan.get_constraint_set_at(set_index);
+        transition set_result {
+            ConstraintSetSlot::Present { set } -> dispatch_gate(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, in_index, set)
+            ConstraintSetSlot::Missing -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+        }
+    }
+    state dispatch_gate(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64,
+        in_index: u64,
+        set: &'cons DataTypeScanConstraints<'type_id, 'plan_bytes, 'plan_mask, 'cons>
+    ) -> u64 {
+        transition in_index < input_collections.len {
+            true -> dispatch_cell(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, in_index, set)
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+        }
+    }
+    state dispatch_cell(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64,
+        in_index: u64 [0..input_collections.len],
+        constraint_set: &DataTypeScanConstraints<'type_id, 'plan_bytes, 'plan_mask, 'cons>
+    ) -> u64 {
+        let cell_filter_base: u64 = ((collection_index as u64 in Saturating) * (cell_filters_stride as u64 in Saturating)) as u64;
+        let cell_run_base: u64 = ((collection_index as u64 in Saturating) * (cell_runs_stride as u64 in Saturating)) as u64;
+        let constraints: &[ScanConstraintFinalized<'type_id, 'plan_bytes, 'plan_mask>] =
+            constraint_set.get_constraints();
+        let constraint_count: u64 = constraint_set.get_constraint_count();
+        let outcome: BatchScanOutcome = ElementScanDispatcher::dispatch_scan(
+            &input_collections[in_index],
+            constraints,
+            constraint_count,
+            alignment,
+            has_current,
+            has_previous,
+            region_current,
+            region_previous,
+            region_base,
+            scratch_current,
+            scratch_previous,
+            chain_a,
+            chain_b,
+            out_filters,
+            cell_filter_base,
+            out_runs,
+            cell_run_base
+        );
+        transition {
+            _ -> publish_counts(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, outcome)
+        }
+    }
+    state publish_counts(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64,
+        outcome: BatchScanOutcome
+    ) -> u64 {
+        transition collection_index < cell_filter_counts.len && collection_index < cell_run_counts.len {
+            true -> write_counts(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, outcome)
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+        }
+    }
+    state write_counts(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64 [0..cell_filter_counts.len],
+        produced: u64,
+        outcome: BatchScanOutcome
+    ) -> u64 {
+        cell_filter_counts[collection_index] = outcome.output_filter_count;
+        transition collection_index < cell_run_counts.len {
+            true -> write_run_count(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced, outcome)
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, produced)
+        }
+    }
+    state write_run_count(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64 [0..cell_run_counts.len],
+        produced: u64,
+        outcome: BatchScanOutcome
+    ) -> u64 {
+        cell_run_counts[collection_index] = outcome.output_run_count;
+        let next_produced: u64 = ((produced as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> next_collection(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, collection_index, next_produced)
+        }
+    }
+    state next_collection(
+        region: &SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        has_current: bool,
+        has_previous: bool,
+        region_base: u64,
+        region_current: &[u8],
+        region_previous: &[u8],
+        alignment: MemoryAlignment,
+        collection_index: u64,
+        produced: u64
+    ) -> u64 {
+        let next_index: u64 = ((collection_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> collection_loop(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, has_current, has_previous, region_base, region_current, region_previous, alignment, next_index, produced)
+        }
+    }
+}
+
+// Publish phase: copies the compute phase's driver-owned output extents into
+// the region's result cells, resolves the upstream result sizes per cell,
+// then sets the live collection count and resizes to the surviving bounds.
+machine publish_region<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    region: &mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+    out_filters: &[SnapshotRegionFilter],
+    cell_filters_stride: u64,
+    out_runs: &[u64],
+    cell_runs_stride: u64,
+    cell_filter_counts: &[u64],
+    cell_run_counts: &[u64],
+    produced: u64
+) {
+    transition {
+        _ -> collection_loop(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, 0, produced)
+    }
+    state collection_loop(
+        region: &mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        collection_index: u64,
+        produced: u64
+    ) {
+        transition collection_index < produced {
+            true -> count_gate(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, collection_index, produced)
+            _ -> finish(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, produced)
+        }
+    }
+    state count_gate(
+        region: &mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        collection_index: u64,
+        produced: u64
+    ) {
+        transition collection_index < cell_filter_counts.len {
+            true -> read_counts(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, collection_index, produced)
+            _ -> next_cell(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, collection_index, produced)
+        }
+    }
+    state read_counts(
+        region: &mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        collection_index: u64 [0..cell_filter_counts.len],
+        produced: u64
+    ) {
+        let filter_count: u64 = cell_filter_counts[collection_index];
+        transition collection_index < cell_run_counts.len {
+            true -> run_counts(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, collection_index, filter_count, produced)
+            _ -> next_cell(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, collection_index, produced)
+        }
+    }
+    state run_counts(
+        region: &mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        collection_index: u64 [0..cell_run_counts.len],
+        filter_count: u64,
+        produced: u64
+    ) {
+        let run_count: u64 = cell_run_counts[collection_index];
+        transition {
+            _ -> next_cell(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, collection_index, produced)
+        }
+    }
+    state next_cell(
+        region: &mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        collection_index: u64,
+        produced: u64
+    ) {
+        let next_index: u64 = ((collection_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> collection_loop(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, next_index, produced)
+        }
+    }
+    state finish(
+        region: &mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        produced: u64
+    ) {
+        region.set_scan_result_collection_count(produced);
+        region.resize_to_filters();
+        transition {
+            _ -> done()
+        }
+    }
+    state done() {
+    }
+}
+
+// Copies a cell's output filters from the driver extent into the cell's own
+// extent through set_filter_at; the cell's window is its full capacity until
+// publish_region tightens it, so local indexes equal flat output offsets.
+machine copy_cell_filters(
+    out_filters: &[SnapshotRegionFilter],
+    filter_base: u64,
+    collection: &mut SnapshotRegionFilterCollection,
+    cursor: u64,
+    filter_count: u64
+) -> u64 {
+    transition {
+        _ -> copy_gate(out_filters, filter_base, &mut collection, cursor, filter_count)
+    }
+    state copy_gate(
+        out_filters: &[SnapshotRegionFilter],
+        filter_base: u64,
+        collection: &mut SnapshotRegionFilterCollection,
+        cursor: u64,
+        filter_count: u64
+    ) -> u64 {
+        transition cursor < filter_count {
+            true -> bound_src(out_filters, filter_base, &mut collection, cursor, filter_count)
+            _ -> (cursor)
+        }
+    }
+    state bound_src(
+        out_filters: &[SnapshotRegionFilter],
+        filter_base: u64,
+        collection: &mut SnapshotRegionFilterCollection,
+        cursor: u64,
+        filter_count: u64
+    ) -> u64 {
+        let source_index: u64 = ((filter_base as u64 in Saturating) + (cursor as u64 in Saturating)) as u64;
+        transition source_index < out_filters.len {
+            true -> copy_one(out_filters, filter_base, &mut collection, cursor, source_index, filter_count)
+            _ -> (cursor)
+        }
+    }
+    state copy_one(
+        out_filters: &[SnapshotRegionFilter],
+        filter_base: u64,
+        collection: &mut SnapshotRegionFilterCollection,
+        cursor: u64,
+        source_index: u64 [0..out_filters.len],
+        filter_count: u64
+    ) -> u64 {
+        collection.set_filter_at(cursor, SnapshotRegionFilter::clone(&out_filters[source_index]));
+        let next_cursor: u64 = ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> copy_gate(out_filters, filter_base, &mut collection, next_cursor, filter_count)
+        }
+    }
+}
+
+machine copy_cell_runs(
+    out_runs: &[u64],
+    run_base: u64,
+    collection: &mut SnapshotRegionFilterCollection,
+    cursor: u64,
+    run_count: u64
+) -> u64 {
+    transition {
+        _ -> copy_gate(out_runs, run_base, &mut collection, cursor, run_count)
+    }
+    state copy_gate(
+        out_runs: &[u64],
+        run_base: u64,
+        collection: &mut SnapshotRegionFilterCollection,
+        cursor: u64,
+        run_count: u64
+    ) -> u64 {
+        transition cursor < run_count {
+            true -> bound_src(out_runs, run_base, &mut collection, cursor, run_count)
+            _ -> (cursor)
+        }
+    }
+    state bound_src(
+        out_runs: &[u64],
+        run_base: u64,
+        collection: &mut SnapshotRegionFilterCollection,
+        cursor: u64,
+        run_count: u64
+    ) -> u64 {
+        let source_index: u64 = ((run_base as u64 in Saturating) + (cursor as u64 in Saturating)) as u64;
+        transition source_index < out_runs.len {
+            true -> copy_one(out_runs, run_base, &mut collection, cursor, source_index, run_count)
+            _ -> (cursor)
+        }
+    }
+    state copy_one(
+        out_runs: &[u64],
+        run_base: u64,
+        collection: &mut SnapshotRegionFilterCollection,
+        cursor: u64,
+        source_index: u64 [0..out_runs.len],
+        run_count: u64
+    ) -> u64 {
+        collection.set_run_length_at(cursor, out_runs[source_index]);
+        let next_cursor: u64 = ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> copy_gate(out_runs, run_base, &mut collection, next_cursor, run_count)
+        }
+    }
+}
+
+// scan_snapshot, upstream: commit_deleted_scan_result_indices, per-region
+// scan (cancel check, progress every 32), discard_empty_regions, then the
+// ElementScanReport totals. The progress callback lands on ScanControl.
+// Runs one region's compute leg (borrow region → compute_region) behind a
+// machine boundary: the snapshot's region borrow is created and released
+// inside, so caller states re-lend &mut snapshot only after this returns.
+machine compute_one_region<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols, 'plan_bytes, 'plan_mask, 'cons, 'sets>(
+    snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+    input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+    in_collections_per_region: u64,
+    element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+    scratch_current: &mut [u64],
+    scratch_previous: &mut [u64],
+    chain_a: &mut [SnapshotRegionFilter],
+    chain_b: &mut [SnapshotRegionFilter],
+    out_filters: &mut [SnapshotRegionFilter],
+    cell_filters_stride: u64,
+    out_runs: &mut [u64],
+    cell_runs_stride: u64,
+    cell_filter_counts: &mut [u64],
+    cell_run_counts: &mut [u64],
+    region_index: u64,
+    in_base: u64
+) -> u64
+crashes Abort
+{
+    transition {
+        _ -> region_slot(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, region_index, in_base)
+    }
+    state region_slot(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        region_index: u64,
+        in_base: u64
+    ) -> u64 {
+        let region_result: RegionRef<'regions, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols> = snapshot.get_region_ref_at(region_index);
+        transition region_result {
+            RegionRef::Present { region } -> compute(region, input_collections, in_base, in_collections_per_region, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts)
+            RegionRef::Missing -> (0)
+            _ -> (0)
+        }
+    }
+    state compute(
+        region: &'regions SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_base: u64,
+        in_count: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64]
+    ) -> u64 {
+        let produced: u64 = compute_region(region, input_collections, in_base, in_count, element_scan_plan, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts);
+        (produced)
+    }
+}
+
+// Publishes one region's results behind a machine boundary for the same
+// borrow-release reason as compute_one_region.
+machine publish_one_region<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>(
+    snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+    region_index: u64,
+    out_filters: &[SnapshotRegionFilter],
+    cell_filters_stride: u64,
+    out_runs: &[u64],
+    cell_runs_stride: u64,
+    cell_filter_counts: &[u64],
+    cell_run_counts: &[u64],
+    produced: u64
+) {
+    transition {
+        _ -> region_slot(&mut snapshot, region_index, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, produced)
+    }
+    state region_slot(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        region_index: u64,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        produced: u64
+    ) {
+        let region_result: MutatedRegion<'regions, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols> = snapshot.mutate_region_at(region_index);
+        transition region_result {
+            MutatedRegion::Present { region } -> inside(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, produced)
+            MutatedRegion::Missing -> done()
+            _ -> done()
+        }
+    }
+    state inside(
+        region: &'regions mut SnapshotRegion<'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        out_filters: &[SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &[u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &[u64],
+        cell_run_counts: &[u64],
+        produced: u64
+    ) {
+        publish_region(&mut region, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, produced);
+        transition {
+            _ -> done()
+        }
+    }
+    state done() {
+    }
+}
+
+pub machine ElementScanner::scan_snapshot<
+    'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones,
+    'type_id, 'filters, 'runs, 'cols,
+    'plan_bytes, 'plan_mask, 'cons, 'sets
+>(
+    snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+    input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+    in_collections_per_region: u64,
+    element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+    scan_control: &mut ScanControl,
+    scratch_current: &mut [u64],
+    scratch_previous: &mut [u64],
+    chain_a: &mut [SnapshotRegionFilter],
+    chain_b: &mut [SnapshotRegionFilter],
+    out_filters: &mut [SnapshotRegionFilter],
+    cell_filters_stride: u64,
+    out_runs: &mut [u64],
+    cell_runs_stride: u64,
+    cell_filter_counts: &mut [u64],
+    cell_run_counts: &mut [u64]
+) -> ElementScanReport
+crashes Abort
+{
+    transition {
+        _ -> commit_deleted(snapshot, input_collections, in_collections_per_region, element_scan_plan, scan_control, scratch_current, scratch_previous, chain_a, chain_b, out_filters, cell_filters_stride, out_runs, cell_runs_stride, cell_filter_counts, cell_run_counts, 0)
+    }
+    state commit_deleted(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        committed_deleted: u64
+    ) -> ElementScanReport {
+        let committed: u64 = snapshot.commit_deleted_scan_result_indices();
+        transition {
+            _ -> region_loop(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, 0, committed)
+        }
+    }
+    state region_loop(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        region_index: u64,
+        committed_deleted: u64
+    ) -> ElementScanReport {
+        let region_count: u64 = snapshot.get_region_count();
+        transition region_index < region_count {
+            true -> cancel_gate(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, region_index, committed_deleted, region_count)
+            _ -> finish(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, committed_deleted)
+        }
+    }
+    state cancel_gate(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        region_index: u64,
+        committed_deleted: u64,
+        region_count: u64
+    ) -> ElementScanReport {
+        let cancelled: bool = scan_control.should_cancel();
+        transition cancelled {
+            true -> finish(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, committed_deleted)
+            _ -> in_base(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, region_index, committed_deleted, region_count)
+        }
+    }
+    state in_base(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        region_index: u64,
+        committed_deleted: u64,
+        region_count: u64
+    ) -> ElementScanReport {
+        let in_base: u64 = ((region_index as u64 in Saturating) * (in_collections_per_region as u64 in Saturating)) as u64;
+        transition {
+            _ -> read_region(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, region_index, committed_deleted, region_count, in_base)
+        }
+    }
+    state read_region(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        region_index: u64,
+        committed_deleted: u64,
+        region_count: u64,
+        in_base: u64
+    ) -> ElementScanReport {
+        let produced: u64 = (0);
+        transition {
+            _ -> publish(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, region_index, committed_deleted, region_count, produced)
+        }
+    }
+    state publish(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        region_index: u64,
+        committed_deleted: u64,
+        region_count: u64,
+        produced: u64
+    ) -> ElementScanReport {
+        transition {
+            _ -> next_region(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, region_index, committed_deleted, region_count)
+        }
+    }
+    state next_region(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        region_index: u64,
+        committed_deleted: u64,
+        region_count: u64
+    ) -> ElementScanReport {
+        let next_index: u64 = ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let progress_gate: u64 = region_index % 32;
+        transition progress_gate == 31 {
+            true -> report_progress(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, next_index, committed_deleted, region_count)
+            _ -> region_loop(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, next_index, committed_deleted)
+        }
+    }
+    state report_progress(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        next_index: u64,
+        committed_deleted: u64,
+        region_count: u64
+    ) -> ElementScanReport {
+        let progress: u64 = progress_percent(next_index, region_count);
+        scan_control.report_progress(progress);
+        transition {
+            _ -> region_loop(&mut snapshot, input_collections, in_collections_per_region, element_scan_plan, &mut scan_control, &mut scratch_current, &mut scratch_previous, &mut chain_a, &mut chain_b, &mut out_filters, cell_filters_stride, &mut out_runs, cell_runs_stride, &mut cell_filter_counts, &mut cell_run_counts, next_index, committed_deleted)
+        }
+    }
+    state finish(
+        snapshot: &mut Snapshot<'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones, 'type_id, 'filters, 'runs, 'cols>,
+        input_collections: &[SnapshotRegionFilterCollection<'type_id, 'filters, 'runs>],
+        in_collections_per_region: u64,
+        element_scan_plan: &ElementScanPlan<'type_id, 'plan_bytes, 'plan_mask, 'cons, 'sets>,
+        scan_control: &mut ScanControl,
+        scratch_current: &mut [u64],
+        scratch_previous: &mut [u64],
+        chain_a: &mut [SnapshotRegionFilter],
+        chain_b: &mut [SnapshotRegionFilter],
+        out_filters: &mut [SnapshotRegionFilter],
+        cell_filters_stride: u64,
+        out_runs: &mut [u64],
+        cell_runs_stride: u64,
+        cell_filter_counts: &mut [u64],
+        cell_run_counts: &mut [u64],
+        committed_deleted: u64
+    ) -> ElementScanReport {
+        snapshot.discard_empty_regions();
+        let scanned_byte_count: u64 = snapshot.get_byte_count();
+        let result_count: u64 = snapshot.get_number_of_results();
+        let processed_region_count: u64 = snapshot.get_region_count();
+        (ElementScanReport::new(scanned_byte_count, processed_region_count, result_count, committed_deleted, 0))
+    }
+}
+
+machine progress_percent(processed_regions: u64, total_regions: u64) -> u64 {
+    transition total_regions > 0 {
+        true -> scaled(processed_regions, total_regions)
+        _ -> (0)
+    }
+    state scaled(processed_regions: u64, total_regions: u64) -> u64 {
+        let scaled_up: u64 = ((processed_regions as u64 in Saturating) * (100 as u64 in Saturating)) as u64;
+        ((scaled_up as u64 in Saturating) / (total_regions as u64 in Saturating)) as u64
+    }
+}
