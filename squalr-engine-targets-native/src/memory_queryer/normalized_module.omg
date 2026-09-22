@@ -1,0 +1,148 @@
+module src::memory_queryer::normalized_module;
+
+
+// Port of squalr-engine-api structures/memory/normalized_module.rs, kept in
+// this provider package because squalr-engine-api is outside this leg's
+// writable surface. Shape and semantics preserved:
+//   - module_name is a bounded byte buffer (Omega has no growable String;
+//     256 bytes covers every real module basename — Linux NAME_MAX is 255).
+//   - The enum stays case data; Hash/Eq derives have no Omega analogue and
+//     no consumer here needs them.
+// Companion case data carries the Option results of the module ops upstream
+// puts on MemoryQueryerTrait (module stream step, resolve results).
+
+pub data ModuleAddressDisplay [copy] {
+    case ModuleRelative;
+    case AbsoluteAddress;
+}
+
+pub data NormalizedModule {
+    // Upstream stores base_region: NormalizedRegion here. The api type's
+    // `NormalizedRegion::new` constructor is not callable cross-package
+    // (its namespace collides with the attached-machine scope at the use
+    // boundary), so the region is stored flattened as its two fields and
+    // its accessors are mirrored below (get_end_address saturating,
+    // contains_address end-inclusive) with identical semantics.
+    base_address: u64;
+    region_size: u64;
+    module_name: [u8; 256];
+    name_len: u64;
+    module_address_display: ModuleAddressDisplay;
+}
+
+// One pulled module (upstream's Vec<NormalizedModule> consumer iteration).
+pub data ModuleStreamStep [copy] {
+    case Module;
+    case Finished;
+    case Failed;
+}
+
+// Option<u64> of upstream's resolve_module_address (only `None` on u64
+// overflow — an unresolved identifier resolves to `offset` itself, since
+// upstream's resolve_module returns 0 there and 0 + offset cannot fail).
+pub data ResolvedModuleAddress [copy] {
+    case Resolved(address: u64);
+    case Unresolvable;
+}
+
+// Option<(String, u64)> of upstream's address_to_module: Hit carries the
+// address-relative offset and the NormalizedModule out-parameter carries
+// the module (its name field is the upstream String payload).
+pub data AddressModuleResult [copy] {
+    case Hit(offset: u64);
+    case Miss;
+}
+
+pub machine NormalizedModule::new(name: &[u8], base_address: u64, region_size: u64) -> NormalizedModule {
+    let mut module: NormalizedModule = NormalizedModule {
+        base_address: base_address,
+        region_size: region_size,
+        name_len: 0,
+        module_address_display: ModuleAddressDisplay::ModuleRelative
+    };
+    module.set_module_name(name);
+    module
+}
+
+pub machine NormalizedModule::new_with_display(
+    name: &[u8],
+    base_address: u64,
+    region_size: u64,
+    module_address_display: ModuleAddressDisplay
+) -> NormalizedModule {
+    let mut module: NormalizedModule = NormalizedModule {
+        base_address: base_address,
+        region_size: region_size,
+        name_len: 0,
+        module_address_display: module_address_display
+    };
+    module.set_module_name(name);
+    module
+}
+
+// Element read on a caller-bounded slice — the requires clause discharges
+// the slice index; the caller proves position < name.len.
+machine NormalizedModule::byte_at(&mut self, name: &[u8], position: u64) -> u8
+requires
+    position < name.len;
+{
+    name[position]
+}
+
+pub machine NormalizedModule::set_module_name(&mut self, name: &[u8]) {
+    transition { _ -> copy(name, 0) }
+    state copy(&mut self, name: &[u8], position: u64) {
+        transition position < name.len && position < 256 {
+            true -> store(name, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, name: &[u8], position: u64) {
+        self.module_name[position] = self.byte_at(name, position);
+        transition { _ -> copy(name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state finish(&mut self, count: u64) {
+        self.name_len = count;
+    }
+}
+
+pub machine NormalizedModule::get_module_name_len(&self) -> u64 {
+    self.name_len
+}
+
+pub machine NormalizedModule::get_base_address(&self) -> u64 {
+    self.base_address
+}
+
+pub machine NormalizedModule::set_base_address(&mut self, base_address: u64) {
+    self.base_address = base_address;
+}
+
+pub machine NormalizedModule::get_region_size(&self) -> u64 {
+    self.region_size
+}
+
+pub machine NormalizedModule::set_region_size(&mut self, region_size: u64) {
+    self.region_size = region_size;
+}
+
+pub machine NormalizedModule::get_end_address(&self) -> u64 {
+    ((self.base_address as u64 in Saturating) + (self.region_size as u64 in Saturating)) as u64
+}
+
+pub machine NormalizedModule::contains_address(&self, address: u64) -> bool {
+    address >= self.base_address && address <= self.get_end_address()
+}
+
+pub machine NormalizedModule::get_module_address_display(&self) -> ModuleAddressDisplay {
+    self.module_address_display
+}
+
+pub machine NormalizedModule::set_module_address_display(&mut self, module_address_display: ModuleAddressDisplay) {
+    self.module_address_display = module_address_display;
+}
+
+// Upstream's into_base_region/get_base_region is not exposed: constructing a
+// cross-package NormalizedRegion value is impossible here (see the field
+// comment), and no consumer in this port needs the wrapper — the base
+// address and size above carry the identical information.
