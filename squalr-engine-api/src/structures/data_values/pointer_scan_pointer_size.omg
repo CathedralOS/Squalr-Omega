@@ -1,0 +1,274 @@
+module src::structures::data_values::pointer_scan_pointer_size;
+
+use omega::language::core::option;
+use src::structures::memory::bitness::Bitness;
+
+// Port of structures/data_values/pointer_scan_pointer_size.rs: the byte width
+// a pointer has inside the scanned process — 32-bit or 64-bit, in the
+// process's own endianness (the `be` variants are big-endian spellings).
+pub data PointerScanPointerSize [copy] {
+    case Pointer24be;
+    case Pointer24;
+    case Pointer32be;
+    case Pointer32;
+    case Pointer64be;
+    case Pointer64;
+}
+
+// Bespoke parse carrier: Optional is not matchable in this pin, so internal
+// consumption goes through this data; `from_str` keeps the Optional surface
+// and `from_str_window` is the matchable workhorse. `Refused` is upstream's
+// Err.
+pub data PointerScanPointerSizeParse [copy] {
+    case Refused;
+    case Parsed(value: PointerScanPointerSize);
+}
+
+// Upstream `Default` — the platform pointer size.
+pub machine PointerScanPointerSize::default() -> PointerScanPointerSize {
+    PointerScanPointerSize::Pointer64
+}
+
+// Upstream `all` — every spelling the CLI accepts.
+pub machine PointerScanPointerSize::all() -> [PointerScanPointerSize; 6] {
+    [PointerScanPointerSize::Pointer24be,
+     PointerScanPointerSize::Pointer24,
+     PointerScanPointerSize::Pointer32be,
+     PointerScanPointerSize::Pointer32,
+     PointerScanPointerSize::Pointer64be,
+     PointerScanPointerSize::Pointer64]
+}
+
+// Upstream `get_size_in_bytes` — 24-bit pointers count as 3 bytes.
+pub machine PointerScanPointerSize::get_size_in_bytes(&self) -> u64 {
+    transition self {
+        PointerScanPointerSize::Pointer24be -> (3)
+        PointerScanPointerSize::Pointer24 -> (3)
+        PointerScanPointerSize::Pointer32be -> (4)
+        PointerScanPointerSize::Pointer32 -> (4)
+        PointerScanPointerSize::Pointer64be -> (8)
+        PointerScanPointerSize::Pointer64 -> (8)
+    }
+}
+
+// Upstream `from_process_bitness`.
+pub machine PointerScanPointerSize::from_process_bitness(bitness: Bitness) -> PointerScanPointerSize {
+    transition bitness {
+        Bitness::Bit32 -> (PointerScanPointerSize::Pointer32)
+        Bitness::Bit64 -> (PointerScanPointerSize::Pointer64)
+    }
+}
+
+// Upstream `Display` spellings, kept on the data for write paths.
+pub machine PointerScanPointerSize::spelling(&self) -> &[u8] {
+    transition self {
+        PointerScanPointerSize::Pointer24be -> ("24be")
+        PointerScanPointerSize::Pointer24 -> ("24")
+        PointerScanPointerSize::Pointer32be -> ("32be")
+        PointerScanPointerSize::Pointer32 -> ("32")
+        PointerScanPointerSize::Pointer64be -> ("64be")
+        PointerScanPointerSize::Pointer64 -> ("64")
+    }
+}
+
+// ASCII whitespace per upstream `str::trim` on the ASCII range — named
+// deviation: multi-byte UTF-8 whitespace is out of byte-domain scope.
+machine byte_is_space(byte: u8) -> bool {
+    byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 || byte == 32
+}
+
+// First index >= cursor inside `end` that is not ASCII whitespace, or `end`.
+machine trim_left(text: &[u8], cursor: u64, end: u64) -> u64 {
+    transition { _ -> probe(text, cursor, end) }
+    state probe(text: &[u8], cursor: u64, end: u64) -> u64 {
+        transition cursor < end && cursor < text.len {
+            true -> space(text, cursor, end)
+            false -> (cursor)
+        }
+    }
+    state space(text: &[u8], cursor: u64, end: u64) -> u64 {
+        transition byte_is_space(text[cursor]) {
+            true -> probe(text, cursor + 1, end)
+            false -> (cursor)
+        }
+    }
+}
+
+// One past the last non-whitespace byte inside `end`, or `start`.
+// The trailing byte is read through `look`/`peek` so every slice index stays
+// a plain variable — computed index expressions are not provable in this pin.
+machine trim_right(text: &[u8], start: u64, end: u64) -> u64 {
+    transition { _ -> edge(text, start, end) }
+    state edge(text: &[u8], start: u64, end: u64) -> u64 {
+        transition end > start && end >= 1 {
+            true -> look(text, start, end, end - 1)
+            false -> (end)
+        }
+    }
+    state look(text: &[u8], start: u64, end: u64, last: u64) -> u64 {
+        transition last < text.len {
+            true -> peek(text, start, end, last, text[last])
+            false -> (end)
+        }
+    }
+    state peek(text: &[u8], start: u64, end: u64, last: u64, byte: u8) -> u64 {
+        transition byte_is_space(byte) {
+            true -> edge(text, start, last)
+            false -> (end)
+        }
+    }
+}
+
+// ASCII lowercase of one byte — upstream `to_ascii_lowercase` is
+// byte-per-byte, so folding the input is equivalent to lowercasing it.
+machine ascii_lower(byte: u8) -> u8 {
+    transition byte >= 65 && byte <= 90 {
+        true -> (byte + 32)
+        false -> (byte)
+    }
+}
+
+// True when text[start..end] spells exactly `expected` after ASCII
+// lowercasing (upstream lowercases the whole string then matches).
+machine matches_lower(text: &[u8], expected: &[u8], start: u64, end: u64) -> bool {
+    transition { _ -> compare(text, expected, start, end, 0) }
+    state compare(text: &[u8], expected: &[u8], at: u64, end: u64, offset: u64) -> bool {
+        transition offset < expected.len {
+            true -> window(text, expected, at, end, offset)
+            false -> done(at, end)
+        }
+    }
+    state window(text: &[u8], expected: &[u8], at: u64, end: u64, offset: u64) -> bool {
+        transition at < end && at < text.len {
+            true -> check(text, expected, at, end, offset, text[at], expected[offset])
+            false -> (false)
+        }
+    }
+    state check(text: &[u8], expected: &[u8], at: u64, end: u64, offset: u64,
+                at_value: u8, expected_value: u8) -> bool {
+        transition ascii_lower(at_value) == expected_value {
+            true -> compare(text, expected, at + 1, end, offset + 1)
+            false -> (false)
+        }
+    }
+    // The spelling consumed the window exactly — no leftover bytes.
+    state done(at: u64, end: u64) -> bool {
+        transition at == end {
+            true -> (true)
+            false -> (false)
+        }
+    }
+}
+
+// Upstream `FromStr`: `string.trim().to_ascii_lowercase()` matched against
+// the fixed spelling set. '3'|'24' are 24-bit aliases of the same width.
+pub machine PointerScanPointerSize::from_str(text: &[u8]) -> Optional<PointerScanPointerSize> {
+    transition { _ -> wrap(PointerScanPointerSize::from_str_window(text, 0, text.len)) }
+    state wrap(result: PointerScanPointerSizeParse) -> Optional<PointerScanPointerSize> {
+        transition result {
+            PointerScanPointerSizeParse::Parsed { value } -> (Optional::Some { value: value })
+            PointerScanPointerSizeParse::Refused -> (Optional::None)
+        }
+    }
+}
+
+// The trimmed-window parse — container_type consumes a sub-window for
+// '*(size)', so this is the matchable workhorse; from_str is the thin
+// Optional wrapper upstream's API spells.
+pub machine PointerScanPointerSize::from_str_window(
+    text: &[u8],
+    window_start: u64,
+    window_end: u64
+) -> PointerScanPointerSizeParse {
+    transition { _ -> trimmed(text, window_start, window_end,
+                              trim_left(text, window_start, window_end)) }
+    state trimmed(text: &[u8], window_start: u64, window_end: u64, start: u64) -> PointerScanPointerSizeParse {
+        let end: u64 = trim_right(text, start, window_end);
+        transition { _ -> spelled(text, start, end) }
+    }
+    state spelled(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "3", start, end) || matches_lower(text, "24", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer24 })
+            false -> be24(text, start, end)
+        }
+    }
+    state be24(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "3be", start, end) || matches_lower(text, "24be", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer24be })
+            false -> p32(text, start, end)
+        }
+    }
+    state p32(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "4", start, end) || matches_lower(text, "32", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer32 })
+            false -> be32(text, start, end)
+        }
+    }
+    state be32(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "4be", start, end) || matches_lower(text, "32be", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer32be })
+            false -> p64(text, start, end)
+        }
+    }
+    state p64(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "8", start, end) || matches_lower(text, "64", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer64 })
+            false -> be64(text, start, end)
+        }
+    }
+    state be64(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "8be", start, end) || matches_lower(text, "64be", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer64be })
+            false -> unsigned(text, start, end)
+        }
+    }
+    state unsigned(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "u32", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer32 })
+            false -> unsigned_be(text, start, end)
+        }
+    }
+    state unsigned_be(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "u32be", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer32be })
+            false -> unsigned64(text, start, end)
+        }
+    }
+    state unsigned64(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "u64", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer64 })
+            false -> unsigned64_be(text, start, end)
+        }
+    }
+    state unsigned64_be(text: &[u8], start: u64, end: u64) -> PointerScanPointerSizeParse {
+        transition matches_lower(text, "u64be", start, end) {
+            true -> (PointerScanPointerSizeParse::Parsed { value: PointerScanPointerSize::Pointer64be })
+            false -> (PointerScanPointerSizeParse::Refused)
+        }
+    }
+}
+
+// In-package exercise of the window parse, including trim and case folding —
+// kept in-package because Optional is not matchable across the package
+// boundary in this pin.
+pub machine PointerScanPointerSize::from_str_consistent() -> bool {
+    let p64: PointerScanPointerSizeParse = PointerScanPointerSize::from_str_window("u64", 0, 3);
+    let p32be: PointerScanPointerSizeParse = PointerScanPointerSize::from_str_window("  32BE ", 0, 7);
+    let bad: PointerScanPointerSizeParse = PointerScanPointerSize::from_str_window("128", 0, 3);
+    let empty: PointerScanPointerSizeParse = PointerScanPointerSize::from_str_window("", 0, 0);
+    size_of(p64, 8) && size_of(p32be, 4) && refused(bad) && refused(empty)
+}
+
+machine size_of(result: PointerScanPointerSizeParse, size: u64) -> bool {
+    transition result {
+        PointerScanPointerSizeParse::Parsed { value } -> (value.get_size_in_bytes() == size)
+        PointerScanPointerSizeParse::Refused -> (false)
+    }
+}
+
+machine refused(result: PointerScanPointerSizeParse) -> bool {
+    transition result {
+        PointerScanPointerSizeParse::Parsed { value } -> (false)
+        PointerScanPointerSizeParse::Refused -> (true)
+    }
+}
