@@ -1,0 +1,266 @@
+module src::cli_scan_driver::cli_scan_driver;
+
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::memory::normalized_region;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_types::floating_point_tolerance::FloatingPointTolerance;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint::ScanConstraint;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::FilterSlot;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use squalr_engine_api::src::structures::scanning::memory_read_mode::MemoryReadMode;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::DataTypeScanConstraints;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::snapshots::snapshot::MutatedRegion;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use squalr_engine_scanning::src::element_scans::element_scan_report::ElementScanReport;
+use squalr_engine_scanning::src::scanners::scan_control::ScanControl;
+use src::command_executors::scan::element_scan::element_scan_request_executor::ElementScanRequestExecutor;
+
+// Headless CLI scan driver — the supplied-snapshot testing adapter for the
+// scalar scan path. Upstream's scan leg builds its snapshot from a live
+// process's memory pages and seeds each region through
+// initialize_scan_results; the supplied snapshot stands in for that target
+// leg (AGENTS.md allows supplied snapshots as test adapters). The driver
+// owns the flat storage that the port's borrowed-extent structures need,
+// seeds one region of known little-endian u64 elements, runs a u64 == value
+// immediate scan through the request executor, and reports the produced
+// result count plus the first two matched filter bounds so the CLI can
+// print and assert them.
+pub data CliScanDriver {
+    region_current_bytes: [u8; 32];
+    region_previous_bytes: [u8; 8];
+    page_boundaries: [u64; 8];
+    page_tombstones: [u64; 8];
+    deleted_result_indices: [u64; 8];
+    region_order: [u64; 4];
+    collection_filters: [SnapshotRegionFilter; 16];
+    collection_runs: [u64; 8];
+    input_filters: [SnapshotRegionFilter; 8];
+    input_runs: [u64; 8];
+    type_id_input: [u8; 3];
+    type_id_set: [u8; 3];
+    type_id_value: [u8; 3];
+    type_id_output: [u8; 3];
+    value_bytes: [u8; 8];
+    mask_bytes: [u8; 8];
+    scratch_current: [u64; 16];
+    scratch_previous: [u64; 16];
+    chain_a: [SnapshotRegionFilter; 16];
+    chain_b: [SnapshotRegionFilter; 16];
+    out_filters: [SnapshotRegionFilter; 16];
+    out_runs: [u64; 8];
+    cell_filter_counts: [u64; 4];
+    cell_run_counts: [u64; 4];
+}
+
+// Compact scan outcome for the CLI to print and assert on. The two matched
+// filter bounds are the first two surviving filters of the region's first
+// scan-result collection; a field stays 0 when fewer matches were produced.
+pub data HeadlessScanReport {
+    scanned_byte_count: u64;
+    processed_region_count: u64;
+    result_count: u64;
+    first_filter_base: u64;
+    first_filter_size: u64;
+    second_filter_base: u64;
+    second_filter_size: u64;
+}
+
+pub machine HeadlessScanReport::get_scanned_byte_count(&self) -> u64 {
+    (self.scanned_byte_count)
+}
+
+pub machine HeadlessScanReport::get_processed_region_count(&self) -> u64 {
+    (self.processed_region_count)
+}
+
+pub machine HeadlessScanReport::get_result_count(&self) -> u64 {
+    (self.result_count)
+}
+
+pub machine HeadlessScanReport::get_first_filter_base(&self) -> u64 {
+    (self.first_filter_base)
+}
+
+pub machine HeadlessScanReport::get_first_filter_size(&self) -> u64 {
+    (self.first_filter_size)
+}
+
+pub machine HeadlessScanReport::get_second_filter_base(&self) -> u64 {
+    (self.second_filter_base)
+}
+
+pub machine HeadlessScanReport::get_second_filter_size(&self) -> u64 {
+    (self.second_filter_size)
+}
+
+pub machine CliScanDriver::new() -> CliScanDriver {
+    (CliScanDriver {
+        region_current_bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        region_previous_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+        page_boundaries: [0, 0, 0, 0, 0, 0, 0, 0],
+        page_tombstones: [0, 0, 0, 0, 0, 0, 0, 0],
+        deleted_result_indices: [0, 0, 0, 0, 0, 0, 0, 0],
+        region_order: [0, 0, 0, 0],
+        collection_filters: [SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }],
+        collection_runs: [0, 0, 0, 0, 0, 0, 0, 0],
+        input_filters: [SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }],
+        input_runs: [0, 0, 0, 0, 0, 0, 0, 0],
+        type_id_input: [0, 0, 0],
+        type_id_set: [0, 0, 0],
+        type_id_value: [0, 0, 0],
+        type_id_output: [0, 0, 0],
+        value_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+        mask_bytes: [0, 0, 0, 0, 0, 0, 0, 0],
+        scratch_current: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        scratch_previous: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        chain_a: [SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }],
+        chain_b: [SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }],
+        out_filters: [SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }, SnapshotRegionFilter { filter_range: normalized_region::NormalizedRegion { base_address: 0, region_size: 0 } }],
+        out_runs: [0, 0, 0, 0, 0, 0, 0, 0],
+        cell_filter_counts: [0, 0, 0, 0],
+        cell_run_counts: [0, 0, 0, 0],
+    })
+}
+
+machine missing_headless_report(scanned: u64, processed: u64, results: u64) -> HeadlessScanReport {
+    (HeadlessScanReport {
+        scanned_byte_count: scanned,
+        processed_region_count: processed,
+        result_count: results,
+        first_filter_base: 0,
+        first_filter_size: 0,
+        second_filter_base: 0,
+        second_filter_size: 0,
+    })
+}
+
+machine partial_headless_report(
+    scanned: u64,
+    processed: u64,
+    results: u64,
+    first_filter_base: u64,
+    first_filter_size: u64
+) -> HeadlessScanReport {
+    (HeadlessScanReport {
+        scanned_byte_count: scanned,
+        processed_region_count: processed,
+        result_count: results,
+        first_filter_base: first_filter_base,
+        first_filter_size: first_filter_size,
+        second_filter_base: 0,
+        second_filter_size: 0,
+    })
+}
+
+// Runs the headless scalar scan end to end over the supplied snapshot: seed
+// input collections (upstream's initialize_scan_results shape — one
+// collection per data type holding a single whole-region filter run), then
+// ElementScanner::scan_snapshot through the request executor, then read the
+// region's published scan-result collection back.
+pub machine CliScanDriver::run_headless_scalar_scan<
+    'regions, 'order, 'deleted, 'current, 'previous, 'boundaries, 'tombstones,
+    'type_id, 'filters, 'runs, 'cols,
+    'plan_bytes, 'plan_mask, 'cons, 'sets
+>(
+    &mut self
+) -> HeadlessScanReport
+{
+    // Supplied snapshot fixture: one region at 0x1000 holding four
+    // little-endian u64 elements; elements 0 and 2 equal the scan value
+    // 0x1122334455667788, elements 1 and 3 do not.
+    self.region_current_bytes = [136, 119, 102, 85, 68, 51, 34, 17, 170, 170, 170, 170, 170, 170, 170, 170, 136, 119, 102, 85, 68, 51, 34, 17, 187, 187, 187, 187, 187, 187, 187, 187];
+    self.region_previous_bytes = [0, 0, 0, 0, 0, 0, 0, 0];
+    self.type_id_input = [117, 54, 52];
+    self.type_id_set = [117, 54, 52];
+    self.type_id_value = [117, 54, 52];
+    self.type_id_output = [117, 54, 52];
+    self.value_bytes = [136, 119, 102, 85, 68, 51, 34, 17];
+    self.mask_bytes = [0, 0, 0, 0, 0, 0, 0, 0];
+    self.region_order[0] = 0;
+    let input_type_ref: DataTypeRef = DataTypeRef::new(&mut self.type_id_input);
+    let mut input_collections: [SnapshotRegionFilterCollection; 1];
+    input_collections[0] = SnapshotRegionFilterCollection::new(&mut self.input_filters, &mut self.input_runs, input_type_ref, MemoryAlignment::Alignment8, 8);
+    input_collections[0].set_window(0, 1, 0, 1);
+    input_collections[0].set_run_length_at(0, 1);
+    let seed_filter: SnapshotRegionFilter = SnapshotRegionFilter::new(4096, 32);
+    input_collections[0].set_filter_at(0, seed_filter);
+    input_collections[0].recount_results();
+    let value_type_ref: DataTypeRef = DataTypeRef::new(&mut self.type_id_value);
+    let data_value: DataValue = DataValue::new(value_type_ref, &mut self.value_bytes);
+    let compare_type: ScanCompareType = ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::Equal };
+    let tolerance: FloatingPointTolerance = FloatingPointTolerance::default();
+    let constraint: ScanConstraint = ScanConstraint::new(compare_type, data_value, tolerance, &mut self.mask_bytes);
+    let finalized: ScanConstraintFinalized = ScanConstraintFinalized::new(constraint, 8, 8, true, ScanFunctionScalar::Immediate);
+    let mut constraint_storage: [ScanConstraintFinalized; 1];
+    constraint_storage[0] = finalized;
+    let set_type_ref: DataTypeRef = DataTypeRef::new(&mut self.type_id_set);
+    let mut set_storage: [DataTypeScanConstraints; 1];
+    set_storage[0] = DataTypeScanConstraints {
+        data_type_ref: set_type_ref,
+        constraints: &mut constraint_storage,
+        constraint_count: 1,
+    };
+    let read_mode: MemoryReadMode = MemoryReadMode::Skip;
+    let plan: ElementScanPlan = ElementScanPlan::new(&mut set_storage, 1, MemoryAlignment::Alignment8, tolerance, read_mode, true, false);
+    let output_type_ref: DataTypeRef = DataTypeRef::new(&mut self.type_id_output);
+    let mut output_collections: [SnapshotRegionFilterCollection; 1];
+    output_collections[0] = SnapshotRegionFilterCollection::new(&mut self.collection_filters, &mut self.collection_runs, output_type_ref, MemoryAlignment::Alignment8, 8);
+    let region_bounds: normalized_region::NormalizedRegion = normalized_region::NormalizedRegion { base_address: 4096, region_size: 32 };
+    let mut regions: [SnapshotRegion; 1];
+    regions[0] = SnapshotRegion::new(
+        region_bounds,
+        &mut self.region_current_bytes,
+        32,
+        &mut self.region_previous_bytes,
+        0,
+        &mut self.page_boundaries,
+        0,
+        &mut self.page_tombstones,
+        0,
+        &mut output_collections,
+        0
+    );
+    let region_extent: &mut [SnapshotRegion] = &mut regions;
+    let order: &mut [u64] = &mut self.region_order;
+    let deleted: &mut [u64] = &mut self.deleted_result_indices;
+    let mut snapshot: Snapshot = Snapshot::new(region_extent, order, 1, deleted);
+    let mut scan_control: ScanControl = ScanControl::new(false);
+    let scan_report: ElementScanReport = ElementScanRequestExecutor::execute_snapshot_scan(
+        &mut snapshot,
+        &input_collections,
+        1,
+        &plan,
+        &mut scan_control,
+        &mut self.scratch_current,
+        &mut self.scratch_previous,
+        &mut self.chain_a,
+        &mut self.chain_b,
+        &mut self.out_filters,
+        16,
+        &mut self.out_runs,
+        8,
+        &mut self.cell_filter_counts,
+        &mut self.cell_run_counts
+    );
+    let bounds: [u64; 4] = snapshot.get_region_filter_bounds_at(0);
+    let result_count: u64 = snapshot.get_number_of_results();
+    let scanned: u64 = scan_report.get_scanned_byte_count();
+    let processed: u64 = scan_report.get_processed_region_count();
+    (HeadlessScanReport {
+        scanned_byte_count: scanned,
+        processed_region_count: processed,
+        result_count: result_count,
+        first_filter_base: bounds[0],
+        first_filter_size: bounds[1],
+        second_filter_base: bounds[2],
+        second_filter_size: bounds[3],
+    })
+}
