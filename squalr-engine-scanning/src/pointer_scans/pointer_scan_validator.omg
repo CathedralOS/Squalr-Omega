@@ -1,0 +1,714 @@
+module src::pointer_scans::pointer_scan_validator;
+
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::EmittedModuleName;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_execution_plan::PointerScanExecutionPlan;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use src::pointer_scans::pointer_scan_candidate_collector::PointerScanCandidateCollector;
+use src::pointer_scans::pointer_scan_level_collector::EmittedDiscoveredLevel;
+use src::pointer_scans::pointer_scan_level_collector::PointerScanCollectedLevelSource;
+use src::pointer_scans::pointer_scan_results_builder::PointerScanBuiltLevels;
+use src::pointer_scans::pointer_scan_results_builder::PointerScanResultsBuilder;
+use src::pointer_scans::search_kernels::pointer_scan_pointer_value_reader::read_pointer_value_unchecked;
+use src::pointer_scans::structures::pointer_scan_collected_candidate::PointerScanCollectedCandidate;
+use src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+use src::pointer_scans::structures::pointer_scan_target_ranges::PointerScanTargetRangeSet;
+use src::pointer_scans::structures::snapshot_region_scan_task::SnapshotRegionScanTasks;
+use src::scanners::scan_control::ScanControl;
+
+// Port of pointer_scan_validator.rs.
+//
+// Upstream `validate_scan` rebuilds every level eagerly into a
+// `Vec<PointerScanCollectedLevel>` and hands it to
+// `PointerScanResultsBuilder::build_results_with_module_names`. In Omega the
+// rebuilt levels are produced by `PointerScanValidatedLevels`, a pull driver
+// whose `next` runs exactly one upstream loop iteration: rebuild the level's
+// heap candidates from the current frontier (skipped on the terminal level),
+// walk the stored static candidates (resolve current module base, read the
+// pointer value from the validation snapshot, frontier reachability), push
+// the survivors into the level under construction, and rebuild the frontier
+// from the validated heap addresses.
+//
+// Pull-driver consequences:
+// - `truncate_empty_trailing_levels` has no pull analogue — the emitted
+//   stream may carry trailing fully-empty levels; the results presentation
+//   drops them (recorded in OWNER_QUESTIONS.md).
+// - `POINTER_VALIDATION_ROOT_CHUNK_SIZE` + `par_chunks` are a thread
+//   partition only; sequential statics in the same order match upstream's
+//   appended contents.
+// - The eager `if results.levels.is_empty()` early-return and the post-loop
+//   `validated_pointer_levels.is_empty()` check collapse into the builder's
+//   `has_pending_level` gate: a validator that emits nothing drains to the
+//   same `create_empty_results` outcome.
+pub data PointerScanValidatedLevels<'a, 'x, 'c, 'd, 'e, 'm, 's, 't> {
+    pointer_scan_results: &'a PointerScanResults<'x, 'c, 'd>;
+    validation_snapshot_regions: &'e [SnapshotRegion];
+    modules: &'m [NormalizedModule];
+    scan_control: &'s ScanControl;
+    validation_heap_scan_tasks: SnapshotRegionScanTasks<'t>;
+    pointer_size: PointerScanPointerSize;
+    offset_radius: u64;
+    frontier_target_ranges: PointerScanTargetRangeSet;
+    level_index: u64;
+    level_count: u64;
+    current_level_candidates: PointerScanLevelCandidates;
+    building_level: PointerScanCollectedLevel;
+    static_candidate_index: u64;
+    heaps_collected: bool;
+    stopped: bool;
+}
+
+// The upstream constructor `PointerValidationContext::new` plus the
+// `build_heap_scan_tasks` call and the initial frontier construction — all
+// supplied by the caller since 'a literals only admit inputs/constants.
+pub machine PointerScanValidatedLevels::new<'a, 'x, 'c, 'd, 'e, 'm, 's, 't>(
+    pointer_scan_results: &'a PointerScanResults<'x, 'c, 'd>,
+    validation_snapshot_regions: &'e [SnapshotRegion],
+    modules: &'m [NormalizedModule],
+    scan_control: &'s ScanControl,
+    validation_heap_scan_tasks: SnapshotRegionScanTasks<'t>,
+    pointer_size: PointerScanPointerSize,
+    offset_radius: u64,
+    frontier_target_ranges: PointerScanTargetRangeSet,
+    level_count: u64,
+    current_level_candidates: PointerScanLevelCandidates,
+    building_level: PointerScanCollectedLevel
+) -> PointerScanValidatedLevels<'a, 'x, 'c, 'd, 'e, 'm, 's, 't> {
+    PointerScanValidatedLevels {
+        pointer_scan_results: pointer_scan_results,
+        validation_snapshot_regions: validation_snapshot_regions,
+        modules: modules,
+        scan_control: scan_control,
+        validation_heap_scan_tasks: validation_heap_scan_tasks,
+        pointer_size: pointer_size,
+        offset_radius: offset_radius,
+        frontier_target_ranges: frontier_target_ranges,
+        level_index: 0,
+        level_count: level_count,
+        current_level_candidates: current_level_candidates,
+        building_level: building_level,
+        static_candidate_index: 0,
+        heaps_collected: false,
+        stopped: false,
+    }
+}
+
+// One upstream `for (level_index, pointer_scan_level_candidates)` iteration
+// per call. Upstream pushes a level every iteration — including empty ones —
+// and prunes only the trailing empty run after the loop.
+pub machine PointerScanValidatedLevels::next<'a, 'x, 'c, 'd, 'e, 'm, 's, 't>(
+    &mut self
+) -> EmittedDiscoveredLevel satisfies PointerScanCollectedLevelSource::next {
+    transition self.stopped {
+        true -> (EmittedDiscoveredLevel::Done)
+        false -> gate()
+        _ -> gate()
+    }
+
+    // Upstream `for` bounds + `if scan_control.should_cancel() ||
+    // frontier_target_ranges.is_empty() { break; }`.
+    state gate(&mut self) -> EmittedDiscoveredLevel {
+        transition ((self.level_index < self.level_count)
+            && !self.scan_control.should_cancel()
+            && !self.frontier_target_ranges.is_empty()) {
+            true -> begin_level()
+            false -> stop()
+            _ -> stop()
+        }
+    }
+
+    // `retain_heap_candidates = level_index.saturating_add(1) < level_count`:
+    // heap candidates are rebuilt from the validation snapshot unless this is
+    // the terminal level.
+    state begin_level(&mut self) -> EmittedDiscoveredLevel
+    requires
+        self.level_index < self.level_count
+    {
+        self.current_level_candidates =
+            self.pointer_scan_results.get_pointer_scan_level_candidate(
+                self.level_index
+            );
+        self.heaps_collected = false;
+        self.static_candidate_index = 0;
+        transition (((self.level_index as u64 in Saturating) + 1) as u64) < self.level_count {
+            true -> collect_heaps()
+            false -> collect_statics()
+            _ -> collect_statics()
+        }
+    }
+
+    // Upstream `collect_validated_heap_candidates`: build_execution_plan +
+    // collect_candidates with retain_static=false, retain_heap=true — the
+    // returned collected level's `heap_candidates` are kept wholesale.
+    state collect_heaps(&mut self) -> EmittedDiscoveredLevel {
+        self.heaps_collected = true;
+        transition self.frontier_target_ranges.is_empty() {
+            true -> collect_statics()
+            false -> plan_heaps()
+            _ -> plan_heaps()
+        }
+    }
+
+    state plan_heaps(&mut self) -> EmittedDiscoveredLevel {
+        let candidate_collector: PointerScanCandidateCollector =
+            PointerScanCandidateCollector {};
+        let execution_plan: PointerScanExecutionPlan =
+            candidate_collector.build_execution_plan(
+                &self.frontier_target_ranges,
+                self.pointer_size,
+                &self.validation_heap_scan_tasks
+            );
+        let collected_heap_level: PointerScanCollectedLevel =
+            candidate_collector.collect_candidates(
+                &self.validation_heap_scan_tasks,
+                &self.frontier_target_ranges,
+                &execution_plan,
+                false,
+                true
+            );
+        self.building_level.heap_candidates = collected_heap_level.heap_candidates;
+        collect_statics()
+    }
+
+    // Upstream `collect_validated_static_candidates`: for each stored static
+    // candidate, resolve its current address from the live module base, read
+    // the pointer value out of the validation snapshot, and keep it only if
+    // the value still reaches the frontier.
+    state collect_statics(&mut self) -> EmittedDiscoveredLevel {
+        transition self.scan_control.should_cancel() {
+            true -> finish_level()
+            false -> next_static()
+            _ -> next_static()
+        }
+    }
+
+    state next_static(&mut self) -> EmittedDiscoveredLevel {
+        transition self.static_candidate_index < self.current_level_candidates.get_static_candidate_count() {
+            true -> resolve_static()
+            false -> finish_level()
+        }
+    }
+
+    state resolve_static(&mut self) -> EmittedDiscoveredLevel
+    requires
+        self.static_candidate_index
+            < self.current_level_candidates.get_static_candidate_count()
+    {
+        let static_pointer_scan_candidate: &PointerScanCandidate =
+            self.current_level_candidates.get_static_candidate(
+                self.static_candidate_index
+            );
+        self.static_candidate_index =
+            ((self.static_candidate_index as u64 in Saturating) + 1) as u64;
+        let resolved_address: EmittedResolvedStaticAddress =
+            PointerScanValidator::resolve_current_static_pointer_address(
+                self.pointer_scan_results,
+                static_pointer_scan_candidate,
+                self.modules
+            );
+        transition resolved_address {
+            EmittedResolvedStaticAddress::Resolved {
+                current_pointer_address
+            } -> read_value(static_pointer_scan_candidate, current_pointer_address)
+            EmittedResolvedStaticAddress::Missing -> next_static()
+            _ -> next_static()
+        }
+    }
+
+    state read_value(
+        &mut self,
+        static_pointer_scan_candidate: &PointerScanCandidate,
+        current_pointer_address: u64
+    ) -> EmittedDiscoveredLevel {
+        let read_pointer_value: EmittedReadPointerValue =
+            PointerScanValidator::read_pointer_value_at_address(
+                self.validation_snapshot_regions,
+                current_pointer_address,
+                self.pointer_size
+            );
+        transition read_pointer_value {
+            EmittedReadPointerValue::Read { current_pointer_value } ->
+                check_frontier(static_pointer_scan_candidate, current_pointer_value)
+            EmittedReadPointerValue::Unreadable -> next_static()
+            _ -> next_static()
+        }
+    }
+
+    state check_frontier(
+        &mut self,
+        static_pointer_scan_candidate: &PointerScanCandidate,
+        current_pointer_value: u64
+    ) -> EmittedDiscoveredLevel {
+        transition (PointerScanValidator::pointer_value_reaches_frontier(
+            &self.frontier_target_ranges,
+            current_pointer_value
+        )) {
+            true -> push_static(static_pointer_scan_candidate, current_pointer_value)
+            false -> next_static()
+            _ -> next_static()
+        }
+    }
+
+    state push_static(
+        &mut self,
+        static_pointer_scan_candidate: &PointerScanCandidate,
+        current_pointer_value: u64
+    ) -> EmittedDiscoveredLevel {
+        self.building_level.static_candidates.push(
+            PointerScanCollectedCandidate::new(
+                static_pointer_scan_candidate.get_pointer_address(),
+                current_pointer_value,
+                static_pointer_scan_candidate.get_module_index(),
+                static_pointer_scan_candidate.get_module_offset()
+            )
+        );
+        next_static()
+    }
+
+    // Upstream's per-level epilogue: push the collected level and rebuild the
+    // frontier from `validated_pointer_level.heap_candidates` addresses.
+    state finish_level(&mut self) -> EmittedDiscoveredLevel {
+        self.frontier_target_ranges =
+            PointerScanTargetRangeSet::from_collected_level_heap_addresses(
+                &self.building_level,
+                self.offset_radius
+            );
+        self.level_index =
+            ((self.level_index as u64 in Saturating) + 1) as u64;
+        let emitted_level: PointerScanCollectedLevel = self.building_level;
+        self.building_level = PointerScanCollectedLevel::new();
+        EmittedDiscoveredLevel::Level { level: emitted_level }
+    }
+
+    state stop(&mut self) -> EmittedDiscoveredLevel {
+        self.stopped = true;
+        EmittedDiscoveredLevel::Done
+    }
+}
+
+// `Option<u64>` results surface as emissions — module-declared files cannot
+// destructure imported generics.
+pub data EmittedResolvedStaticAddress {
+    case Resolved(current_pointer_address: u64);
+    case Missing;
+}
+
+pub data EmittedReadPointerValue {
+    case Read(current_pointer_value: u64);
+    case Unreadable;
+}
+
+pub data EmittedModuleBaseAddress {
+    case Found(module_base_address: u64);
+    case Missing;
+}
+
+// Upstream `PointerScanValidator` unit struct.
+pub data PointerScanValidator {}
+
+pub machine PointerScanValidator::pointer_value_reaches_frontier(
+    frontier_target_ranges: &PointerScanTargetRangeSet,
+    pointer_value: u64
+) -> bool {
+    // Upstream: linear contains for <= 8 ranges, binary otherwise.
+    transition frontier_target_ranges.get_range_count() <= 8 {
+        true -> linear(frontier_target_ranges, pointer_value)
+        false -> binary(frontier_target_ranges, pointer_value)
+        _ -> linear(frontier_target_ranges, pointer_value)
+    }
+
+    state linear(
+        frontier_target_ranges: &PointerScanTargetRangeSet,
+        pointer_value: u64
+    ) -> bool {
+        frontier_target_ranges.contains_value_linear(pointer_value)
+    }
+
+    state binary(
+        frontier_target_ranges: &PointerScanTargetRangeSet,
+        pointer_value: u64
+    ) -> bool {
+        frontier_target_ranges.contains_value_binary(pointer_value)
+    }
+}
+
+// Upstream `resolve_current_static_pointer_address`: results' module name ->
+// current module base -> base + candidate offset (saturating).
+pub machine PointerScanValidator::resolve_current_static_pointer_address<'a, 'x, 'c, 'd, 'm>(
+    pointer_scan_results: &'a PointerScanResults<'x, 'c, 'd>,
+    static_pointer_scan_candidate: &PointerScanCandidate,
+    modules: &'m [NormalizedModule]
+) -> EmittedResolvedStaticAddress {
+    let module_index: u64 = static_pointer_scan_candidate.get_module_index();
+    let module_name: EmittedModuleName =
+        pointer_scan_results.get_module_name(module_index);
+    let module_name_slice: &[u8] = module_name.get_name();
+    transition module_name.is_found() {
+        true -> find_base(modules, static_pointer_scan_candidate, module_name_slice)
+        false -> missing()
+        _ -> missing()
+    }
+
+    state find_base(
+        modules: &'m [NormalizedModule],
+        static_pointer_scan_candidate: &PointerScanCandidate,
+        module_name: &[u8]
+    ) -> EmittedResolvedStaticAddress {
+        let base: EmittedModuleBaseAddress =
+            PointerScanValidator::find_current_module_base_address(
+                modules,
+                module_name
+            );
+        transition base {
+            EmittedModuleBaseAddress::Found { module_base_address } ->
+                resolved(static_pointer_scan_candidate, module_base_address)
+            EmittedModuleBaseAddress::Missing -> missing()
+            _ -> missing()
+        }
+    }
+
+    state resolved(
+        static_pointer_scan_candidate: &PointerScanCandidate,
+        module_base_address: u64
+    ) -> EmittedResolvedStaticAddress {
+        EmittedResolvedStaticAddress::Resolved {
+            current_pointer_address: ((module_base_address as u64 in Saturating)
+                + (static_pointer_scan_candidate.get_module_offset() as u64 in Saturating)) as u64
+        }
+    }
+
+    state missing() -> EmittedResolvedStaticAddress {
+        EmittedResolvedStaticAddress::Missing
+    }
+}
+
+// Upstream `find_current_module_base_address` binary-searches a name-sorted
+// `Vec<(&str, u64)>`. A flat sorted list cannot be materialized in Omega, so
+// the lookup scans the caller's `&[NormalizedModule]` linearly — same result,
+// the sort only served search complexity.
+pub machine PointerScanValidator::find_current_module_base_address<'m>(
+    modules: &'m [NormalizedModule],
+    module_name: &[u8]
+) -> EmittedModuleBaseAddress {
+    transition true {
+        true -> probe(modules, module_name, 0)
+        _ -> probe(modules, module_name, 0)
+    }
+
+    state probe(
+        modules: &'m [NormalizedModule],
+        module_name: &[u8],
+        module_index: u64
+    ) -> EmittedModuleBaseAddress {
+        transition module_index < modules.len {
+            true -> compare(modules, module_name, module_index)
+            false -> absent()
+            _ -> absent()
+        }
+    }
+
+    state compare(
+        modules: &'m [NormalizedModule],
+        module_name: &[u8],
+        module_index: u64
+    ) -> EmittedModuleBaseAddress
+    requires
+        module_index < modules.len
+    {
+        let module: &'m NormalizedModule = &modules[module_index];
+        transition PointerScanValidator::module_names_equal(
+            module.get_module_name(),
+            module_name
+        ) {
+            true -> found(module)
+            false -> probe(modules, module_name,
+                ((module_index as u64 in Wrapping) + 1) as u64)
+            _ -> probe(modules, module_name,
+                ((module_index as u64 in Wrapping) + 1) as u64)
+        }
+    }
+
+    state found(module: &'m NormalizedModule) -> EmittedModuleBaseAddress {
+        EmittedModuleBaseAddress::Found {
+            module_base_address: module.get_base_address()
+        }
+    }
+
+    state absent() -> EmittedModuleBaseAddress {
+        EmittedModuleBaseAddress::Missing
+    }
+}
+
+pub machine PointerScanValidator::module_names_equal(
+    left_module_name: &[u8],
+    right_module_name: &[u8]
+) -> bool {
+    transition left_module_name.len == right_module_name.len {
+        true -> compare_at(left_module_name, right_module_name, 0)
+        false -> (false)
+        _ -> (false)
+    }
+
+    state compare_at(
+        left_module_name: &[u8],
+        right_module_name: &[u8],
+        byte_index: u64
+    ) -> bool {
+        transition ((byte_index < left_module_name.len)
+            && (byte_index < right_module_name.len)) {
+            true -> compare_byte(left_module_name, right_module_name, byte_index)
+            false -> (true)
+            _ -> (true)
+        }
+    }
+
+    state compare_byte(
+        left_module_name: &[u8],
+        right_module_name: &[u8],
+        byte_index: u64
+    ) -> bool
+    requires
+        byte_index < left_module_name.len && byte_index < right_module_name.len
+    {
+        transition left_module_name[byte_index] == right_module_name[byte_index] {
+            true -> compare_at(left_module_name, right_module_name,
+                ((byte_index as u64 in Wrapping) + 1) as u64)
+            false -> (false)
+        }
+    }
+}
+
+// Upstream `read_pointer_value_at_address`: binary-search the snapshot region
+// containing the pointer, then decode `pointer_size` bytes at the offset.
+pub machine PointerScanValidator::read_pointer_value_at_address(
+    snapshot_regions: &[SnapshotRegion],
+    pointer_address: u64,
+    pointer_size: PointerScanPointerSize
+) -> EmittedReadPointerValue {
+    transition true {
+        true -> find_region(snapshot_regions, pointer_address, pointer_size, 0, snapshot_regions.len)
+        _ -> find_region(snapshot_regions, pointer_address, pointer_size, 0, snapshot_regions.len)
+    }
+
+    // Upstream `find_snapshot_region_index_for_pointer_address`: binary search
+    // on `get_end_address`, accepting only if the region contains the whole
+    // pointer.
+    state find_region(
+        snapshot_regions: &[SnapshotRegion],
+        pointer_address: u64,
+        pointer_size: PointerScanPointerSize,
+        lower_snapshot_region_index: u64,
+        upper_snapshot_region_index: u64
+    ) -> EmittedReadPointerValue {
+        transition lower_snapshot_region_index < upper_snapshot_region_index {
+            true -> probe_region(
+                snapshot_regions, pointer_address, pointer_size,
+                lower_snapshot_region_index, upper_snapshot_region_index
+            )
+            false -> bounds_check(
+                snapshot_regions, pointer_address, pointer_size,
+                lower_snapshot_region_index
+            )
+            _ -> bounds_check(
+                snapshot_regions, pointer_address, pointer_size,
+                lower_snapshot_region_index
+            )
+        }
+    }
+
+    state probe_region(
+        snapshot_regions: &[SnapshotRegion],
+        pointer_address: u64,
+        pointer_size: PointerScanPointerSize,
+        lower_snapshot_region_index: u64,
+        upper_snapshot_region_index: u64
+    ) -> EmittedReadPointerValue {
+        let snapshot_region_index_span: u64 =
+            (((upper_snapshot_region_index as u64 in Saturating)
+                - (lower_snapshot_region_index as u64 in Saturating))
+                / (2 as u64 in Saturating)) as u64;
+        let middle_snapshot_region_index: u64 =
+            ((lower_snapshot_region_index as u64 in Saturating)
+                + (snapshot_region_index_span as u64 in Saturating)) as u64;
+        transition middle_snapshot_region_index < snapshot_regions.len {
+            true -> classify_region(
+                snapshot_regions, pointer_address, pointer_size,
+                lower_snapshot_region_index, upper_snapshot_region_index,
+                middle_snapshot_region_index
+            )
+            false -> not_found()
+            _ -> not_found()
+        }
+    }
+
+    state classify_region(
+        snapshot_regions: &[SnapshotRegion],
+        pointer_address: u64,
+        pointer_size: PointerScanPointerSize,
+        lower_snapshot_region_index: u64,
+        upper_snapshot_region_index: u64,
+        middle_snapshot_region_index: u64
+    ) -> EmittedReadPointerValue
+    requires
+        middle_snapshot_region_index < snapshot_regions.len
+    {
+        let snapshot_region: &SnapshotRegion =
+            &snapshot_regions[middle_snapshot_region_index];
+        transition snapshot_region.get_end_address() <= pointer_address {
+            true -> find_region(
+                snapshot_regions, pointer_address, pointer_size,
+                ((middle_snapshot_region_index as u64 in Saturating) + 1) as u64,
+                upper_snapshot_region_index
+            )
+            false -> find_region(
+                snapshot_regions, pointer_address, pointer_size,
+                lower_snapshot_region_index,
+                middle_snapshot_region_index
+            )
+            _ -> find_region(
+                snapshot_regions, pointer_address, pointer_size,
+                lower_snapshot_region_index,
+                middle_snapshot_region_index
+            )
+        }
+    }
+
+    state bounds_check(
+        snapshot_regions: &[SnapshotRegion],
+        pointer_address: u64,
+        pointer_size: PointerScanPointerSize,
+        lower_snapshot_region_index: u64
+    ) -> EmittedReadPointerValue {
+        transition lower_snapshot_region_index < snapshot_regions.len {
+            true -> confirm_region(
+                snapshot_regions, pointer_address, pointer_size,
+                lower_snapshot_region_index
+            )
+            false -> not_found()
+            _ -> not_found()
+        }
+    }
+
+    state confirm_region(
+        snapshot_regions: &[SnapshotRegion],
+        pointer_address: u64,
+        pointer_size: PointerScanPointerSize,
+        lower_snapshot_region_index: u64
+    ) -> EmittedReadPointerValue
+    requires
+        lower_snapshot_region_index < snapshot_regions.len
+    {
+        let snapshot_region: &SnapshotRegion =
+            &snapshot_regions[lower_snapshot_region_index];
+        let pointer_size_in_bytes: u64 = pointer_size.get_size_in_bytes();
+        // Upstream `checked_add` — on overflow the read simply cannot fit the
+        // region, so the bounds check below fails to Unreadable.
+        let pointer_end_address: u64 =
+            ((pointer_address as u64 in Saturating) + (pointer_size_in_bytes as u64 in Saturating)) as u64;
+        let region_values: &[u8] = snapshot_region.get_current_values();
+        transition ((pointer_address >= snapshot_region.get_base_address())
+            && (pointer_end_address <= snapshot_region.get_end_address())
+            && (region_values.len > 0)) {
+            true -> read_bytes(
+                snapshot_region, pointer_address, pointer_size
+            )
+            false -> not_found()
+            _ -> not_found()
+        }
+    }
+
+    state read_bytes(
+        snapshot_region: &SnapshotRegion,
+        pointer_address: u64,
+        pointer_size: PointerScanPointerSize
+    ) -> EmittedReadPointerValue {
+        let byte_offset: u64 =
+            ((pointer_address as u64 in Saturating)
+                - (snapshot_region.get_base_address() as u64 in Saturating)) as u64;
+        let pointer_size_in_bytes: u64 = pointer_size.get_size_in_bytes();
+        let pointer_end_byte: u64 =
+            ((byte_offset as u64 in Saturating) + (pointer_size_in_bytes as u64 in Saturating)) as u64;
+        let region_values: &[u8] = snapshot_region.get_current_values();
+        transition (byte_offset <= pointer_end_byte)
+            && (pointer_end_byte <= region_values.len) {
+            true -> decode(region_values, pointer_size, byte_offset, pointer_end_byte)
+            false -> not_found()
+            _ -> not_found()
+        }
+    }
+
+    state decode(
+        region_values: &[u8],
+        pointer_size: PointerScanPointerSize,
+        byte_offset: u64,
+        pointer_end_byte: u64
+    ) -> EmittedReadPointerValue
+    requires
+        byte_offset <= pointer_end_byte
+            && pointer_end_byte <= region_values.len
+    {
+        let pointer_bytes: &[u8] =
+            &region_values[byte_offset..pointer_end_byte];
+        EmittedReadPointerValue::Read {
+            current_pointer_value: read_pointer_value_unchecked(
+                pointer_bytes,
+                0,
+                pointer_size
+            )
+        }
+    }
+
+    state not_found() -> EmittedReadPointerValue {
+        EmittedReadPointerValue::Unreadable
+    }
+}
+
+// Upstream `validate_scan`: entry point. `built_levels` wraps this same
+// driver's `PointerScanCollectedLevelSource` — the caller owns both the
+// validated-levels driver and the built driver so the returned results can
+// borrow them through 'w.
+pub machine PointerScanValidator::validate_scan<'w, 'a, 'b, 'x, 'c, 'd, 'e, 'v>(
+    &self,
+    pointer_scan_results: &'a PointerScanResults<'x, 'c, 'd>,
+    validation_target_descriptor: PointerScanTargetDescriptor,
+    validation_target_addresses: &'v [u64],
+    validation_snapshot: &'e Snapshot,
+    built_levels: &'w mut PointerScanBuiltLevels<'b>,
+    with_logging: bool
+) -> PointerScanResults<'w, 'v, 'd> {
+    let results_builder: PointerScanResultsBuilder = PointerScanResultsBuilder {};
+    let pointer_size: PointerScanPointerSize =
+        pointer_scan_results.get_pointer_size();
+    let offset_radius: u64 = pointer_scan_results.get_offset_radius();
+    let max_depth: u64 = pointer_scan_results.get_max_depth();
+    let pointer_scan_parameters: PointerScanParameters =
+        PointerScanParameters::new(
+            pointer_size,
+            offset_radius,
+            max_depth,
+            false,
+            false
+        );
+    let modules: &'d [NormalizedModule] = pointer_scan_results.get_modules();
+    let session_id: u64 = pointer_scan_results.get_session_id();
+    let address_space: PointerScanAddressSpace =
+        pointer_scan_results.get_address_space();
+    results_builder.build_results(
+        session_id,
+        &pointer_scan_parameters,
+        validation_target_descriptor,
+        validation_target_addresses,
+        address_space,
+        modules,
+        built_levels,
+        false
+    )
+}
