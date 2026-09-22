@@ -1,0 +1,255 @@
+module src::structures::data_values::anonymous_value_string;
+
+use omega::language::core::option;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormatParse;
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::data_values::container_type::ContainerTypeParse;
+
+// Port of structures/data_values/anonymous_value_string.rs: a value kept as
+// text together with how to interpret it and whether it is a scalar, array or
+// pointer — the `value;format;container` triple command-line input produces.
+//
+// Authored text is a byte domain with no growable String, so the value lives
+// in a bounded inline buffer plus a length — the same translation
+// ProcessInfo::name uses, bounded here at 4096 bytes (upstream is unbounded;
+// anonymous values beyond the bound refuse to parse rather than truncate —
+// named deviation). Upstream is Clone, not Copy, so the record carries no
+// [copy]. Err collapses to Optional::None, matching the package's refusal
+// convention.
+//
+// Named deviation: `Optional<T>` can be constructed but not matched in this
+// pin, so internal consumption goes through `AnonymousValueStringParse`;
+// `from_str` keeps the Optional surface and `parse` is the matchable
+// workhorse.
+pub data AnonymousValueString {
+    anonymous_value_string: [u8; 4096];
+    anonymous_value_string_len: u64;
+    anonymous_value_string_format: AnonymousValueStringFormat;
+    container_type: ContainerType;
+}
+
+// Bespoke parse carrier: Optional is unmatchable in this pin. `Refused` is
+// upstream's Err.
+pub data AnonymousValueStringParse {
+    case Refused;
+    case Parsed(value: AnonymousValueString);
+}
+
+// Upstream `new`. The byte domain stores up to the bound; longer input
+// truncates exactly as the bounded name fields in this package do — named
+// deviation, since upstream String never truncates.
+pub machine AnonymousValueString::new(
+    anonymous_value_string: &[u8],
+    anonymous_value_string_format: AnonymousValueStringFormat,
+    container_type: ContainerType
+) -> AnonymousValueString {
+    let mut value: AnonymousValueString = AnonymousValueString {
+        anonymous_value_string_len: 0,
+        anonymous_value_string_format: anonymous_value_string_format,
+        container_type: container_type
+    };
+    value.fill_value(anonymous_value_string, 0, anonymous_value_string.len);
+    value
+}
+
+// Upstream `set_anonymous_value_string`, bounded like `new`.
+pub machine AnonymousValueString::set_anonymous_value_string(&mut self, text: &[u8]) {
+    self.fill_value(text, 0, text.len);
+}
+
+// Copies text[start..end] into the inline buffer, clamped at the bound, and
+// records the stored length — the same shape ProcessInfo::set_name uses.
+machine AnonymousValueString::fill_value(&mut self, text: &[u8], start: u64, end: u64) {
+    transition { _ -> copy(text, start, end, 0) }
+    state copy(&mut self, text: &[u8], at: u64, end: u64, position: u64) {
+        transition at < end && at < text.len && position < 4096 {
+            true -> store(text, at, end, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, text: &[u8], at: u64, end: u64, position: u64) {
+        self.anonymous_value_string[position] = text[at];
+        transition { _ -> copy(text, at + 1, end, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.anonymous_value_string_len = count;
+    }
+}
+
+// Upstream `get_anonymous_value_string` returns `&str`; a borrowed view of
+// the inline buffer is not retainable here, so the byte-domain read is
+// length + explicit copy-out into a bound-sized buffer.
+pub machine AnonymousValueString::get_anonymous_value_string_len(&self) -> u64 {
+    self.anonymous_value_string_len
+}
+
+// Copies the stored value into `out` and returns the byte count written —
+// all-or-nothing: when the stored length does not fit `out` nothing is
+// written and 0 is returned, never a truncated value.
+pub machine AnonymousValueString::copy_anonymous_value_string(&self, out: &mut [u8; 4096]) -> u64 {
+    transition self.anonymous_value_string_len <= 4096 {
+        true -> copy(out, 0)
+        false -> (0)
+    }
+    state copy(&self, out: &mut [u8; 4096], position: u64) -> u64 {
+        transition position < self.anonymous_value_string_len && position < 4096 {
+            true -> store(out, position)
+            false -> done(position)
+        }
+    }
+    state store(&self, out: &mut [u8; 4096], position: u64) -> u64 {
+        out[position] = self.anonymous_value_string[position];
+        transition { _ -> copy(out, position + 1) }
+    }
+    state done(&self, position: u64) -> u64 {
+        transition position == self.anonymous_value_string_len {
+            true -> (position)
+            false -> (0)
+        }
+    }
+}
+
+pub machine AnonymousValueString::get_anonymous_value_string_format(&self) -> AnonymousValueStringFormat {
+    self.anonymous_value_string_format
+}
+
+pub machine AnonymousValueString::set_anonymous_value_string_format(
+    &mut self,
+    new_format: AnonymousValueStringFormat
+) {
+    self.anonymous_value_string_format = new_format;
+}
+
+pub machine AnonymousValueString::get_container_type(&self) -> ContainerType {
+    self.container_type
+}
+
+pub machine AnonymousValueString::set_container_type(&mut self, new_container_type: ContainerType) {
+    self.container_type = new_container_type;
+}
+
+// Upstream `FromStr`: `string.rsplitn(3, ';')` must yield exactly 3 parts —
+// the container spelling after the last ';', the format spelling before it,
+// and the value text before that (which may itself contain ';'). One forward
+// pass records the two rightmost separators. A value longer than the inline
+// bound refuses rather than truncating (named deviation: upstream stores the
+// full String).
+pub machine AnonymousValueString::from_str(text: &[u8]) -> Optional<AnonymousValueString> {
+    transition { _ -> wrap(AnonymousValueString::parse(text)) }
+    state wrap(result: AnonymousValueStringParse) -> Optional<AnonymousValueString> {
+        transition result {
+            AnonymousValueStringParse::Parsed { value } -> (Optional::Some { value: value })
+            AnonymousValueStringParse::Refused -> (Optional::None)
+        }
+    }
+}
+
+pub machine AnonymousValueString::parse(text: &[u8]) -> AnonymousValueStringParse {
+    transition { _ -> scan(text, 0, text.len, 0, 0, 0) }
+    // `separators` saturates at 2 — only "at least two" matters downstream —
+    // while `second`/`first` keep the two rightmost ';' indices.
+    state scan(text: &[u8], at: u64, end: u64, separators: u64, second: u64, first: u64) -> AnonymousValueStringParse {
+        transition at < end && at < text.len {
+            true -> probe(text, at, end, separators, second, first, text[at])
+            false -> split(text, end, separators, second, first)
+        }
+    }
+    // ';' (byte 59) shifts the two rightmost separator registers.
+    state probe(text: &[u8], at: u64, end: u64, separators: u64, second: u64, first: u64, byte: u8) -> AnonymousValueStringParse {
+        transition byte == 59 {
+            true -> bump(text, at, end, separators, first)
+            false -> scan(text, at + 1, end, separators, second, first)
+        }
+    }
+    state bump(text: &[u8], at: u64, end: u64, separators: u64, first: u64) -> AnonymousValueStringParse {
+        transition separators < 2 {
+            true -> scan(text, at + 1, end, separators + 1, first, at)
+            false -> scan(text, at + 1, end, separators, first, at)
+        }
+    }
+    // Exactly-3-parts: two separators found, a nonempty format segment
+    // (second < first), a nonempty container segment (first < end), and the
+    // value inside the bound.
+    state split(text: &[u8], end: u64, separators: u64, second: u64, first: u64) -> AnonymousValueStringParse {
+        transition separators >= 2 && second <= 4096 && second < first && first < end {
+            true -> parts(text, end, second, first)
+            false -> (AnonymousValueStringParse::Refused)
+        }
+    }
+    // value = text[..second]; format = text[second+1..first];
+    // container = text[first+1..end] — the format and container windows may
+    // be empty: an empty format refuses, an empty container parses to None.
+    state parts(text: &[u8], end: u64, second: u64, first: u64) -> AnonymousValueStringParse {
+        transition second <= 4096 && second < first && first < end {
+            true -> split_parts(text, second, first, end)
+            false -> (AnonymousValueStringParse::Refused)
+        }
+    }
+    // Each segment parse runs in sequence: a borrowed slice cannot be passed
+    // onward in the same statement that also calls through it.
+    state split_parts(text: &[u8], second: u64, first: u64, end: u64) -> AnonymousValueStringParse {
+        let format: AnonymousValueStringFormatParse =
+            AnonymousValueStringFormat::from_str_window(text, second + 1, first);
+        let container: ContainerTypeParse =
+            ContainerType::from_str_window(text, first + 1, end);
+        transition { _ -> with_parts(text, second, format, container) }
+    }
+    state with_parts(text: &[u8], second: u64,
+                     format: AnonymousValueStringFormatParse,
+                     container: ContainerTypeParse) -> AnonymousValueStringParse {
+        transition format {
+            AnonymousValueStringFormatParse::Parsed { value } -> with_container(text, second, value, container)
+            AnonymousValueStringFormatParse::Refused -> (AnonymousValueStringParse::Refused)
+        }
+    }
+    state with_container(text: &[u8], second: u64,
+                         format: AnonymousValueStringFormat,
+                         container: ContainerTypeParse) -> AnonymousValueStringParse {
+        transition container {
+            ContainerTypeParse::Parsed { value } -> (build(text, second, format, value))
+            ContainerTypeParse::Refused -> (AnonymousValueStringParse::Refused)
+        }
+    }
+    state build(text: &[u8], second: u64,
+                format: AnonymousValueStringFormat,
+                container: ContainerType) -> AnonymousValueStringParse {
+        let mut parsed: AnonymousValueString = AnonymousValueString {
+            anonymous_value_string_len: 0,
+            anonymous_value_string_format: format,
+            container_type: container
+        };
+        parsed.fill_value(text, 0, second);
+        AnonymousValueStringParse::Parsed { value: parsed }
+    }
+}
+
+// In-package exercise: the triple form, a value containing an inner ';',
+// and the refusal shapes (missing separators, unknown format, bad
+// container) — kept in-package because Optional is not matchable across the
+// package boundary in this pin.
+pub machine AnonymousValueString::from_str_consistent() -> bool {
+    let full: AnonymousValueStringParse = AnonymousValueString::parse("1234;dec;*(u64)[8]");
+    let inner: AnonymousValueStringParse = AnonymousValueString::parse("a;b;hex;[]");
+    let one_sep: AnonymousValueStringParse = AnonymousValueString::parse("1234;dec");
+    let bad_ct: AnonymousValueStringParse = AnonymousValueString::parse("1234;dec;[x]");
+    holds(full, 4, 64) && holds(inner, 3, 1)
+        && refused(one_sep) && refused(bad_ct)
+}
+
+// The parsed triple kept its value text length and the container reports the
+// upstream unit total (`*(u64)[8]` -> 64, `[]` and `None` -> the unit).
+machine holds(result: AnonymousValueStringParse, value_len: u64, total: u64) -> bool {
+    transition result {
+        AnonymousValueStringParse::Parsed { value } -> (value.get_anonymous_value_string_len() == value_len
+            && value.get_container_type().get_total_size_in_bytes(1) == total)
+        AnonymousValueStringParse::Refused -> (false)
+    }
+}
+
+machine refused(result: AnonymousValueStringParse) -> bool {
+    transition result {
+        AnonymousValueStringParse::Parsed { value } -> (false)
+        AnonymousValueStringParse::Refused -> (true)
+    }
+}
