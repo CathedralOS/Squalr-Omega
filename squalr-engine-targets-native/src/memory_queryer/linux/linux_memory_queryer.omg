@@ -1,0 +1,860 @@
+module src::memory_queryer::linux::linux_memory_queryer;
+
+use omega_language_std::filesystem_host;
+use omega::language::core::service;
+use squalr_engine_api::src::structures::memory::bitness::Bitness;
+use squalr_engine_api::src::structures::memory::normalized_region;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_targets::src::target_providers::MemoryBoundsOpen;
+use squalr_engine_targets::src::target_providers::MemoryBoundsStep;
+use src::memory_queryer::memory_protection_enum::MemoryProtectionEnum;
+use src::memory_queryer::memory_queryer_trait::MemoryQueryerTrait;
+use src::memory_queryer::memory_type_enum::MemoryTypeEnum;
+use src::memory_queryer::region_bounds_handling::RegionBoundsHandling;
+use src::proc_paths::ProcName;
+
+// Port of memory_queryer/linux/linux_memory_queryer.rs, streaming.
+// Upstream parses the whole of /proc/<pid>/maps into a Vec<NormalizedRegion>
+// per call; Omega has no growable Vec, so the equivalent object is a
+// provider-owned enumeration: open_virtual_pages stores the filter set,
+// next_virtual_page yields one NormalizedRegion per maps line that passes the
+// same filters (in the same ascending kernel order), and close_enumeration
+// releases the descriptor. One enumeration is live per instance; upstream's
+// Vec permits independent collections, so this is a recorded translation
+// (callers enumerate serially — same contract PORTING.md demands).
+//
+// Line grammar (identical to upstream's split): "<hex>-<hex> <4 perms>
+// <hex offset> <dev> <inode> [pathname]"; a line is a region when end > start.
+// Permission bits match MemoryProtectionEnum: r=READ w=WRITE x=EXECUTE
+// p=COPY_ON_WRITE. Type: empty pathname -> NONE; pathname + 'p' -> PRIVATE
+// unless the path is absolute and 'x' set -> IMAGE; otherwise MAPPED.
+pub data LinuxMemoryQueryer {
+    host: Service<FilesystemHost>;
+
+    // /proc dirfd + open maps fd + the rolling parse buffer.
+    proc_fd: i32;
+    maps_fd: i32;
+    buffer: [u8; 4096];
+    buffered: u64;
+    cursor: u64;
+    at_eof: bool;
+
+    // Filter set captured at open (upstream's get_virtual_pages args).
+    required_bits: u32;
+    excluded_bits: u32;
+    allowed_bits: u32;
+    range_start: u64;
+    range_end: u64;
+    bounds_handling: RegionBoundsHandling;
+    suppress_all: bool;
+
+    // Per-line parse registers.
+    line_start: u64;
+    line_end: u64;
+    region_start: u64;
+    region_end: u64;
+    line_perms: u32;
+    line_type: u32;
+    tok_index: u64;
+    pathname_len: u64;
+    emit_base: u64;
+    src_index: u64;
+    emit_size: u64;
+    scan_pos: u64;
+    io_count: i64;
+    scratch: i32;
+    name: ProcName;
+    // is_address_writable's private scan state.
+    walk_region: normalized_region::NormalizedRegion;
+    write_hit: bool;
+}
+
+pub linux_x86_64 machine LinuxMemoryQueryer::open_virtual_pages(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    required_protection: MemoryProtectionEnum,
+    excluded_protection: MemoryProtectionEnum,
+    allowed_types: MemoryTypeEnum,
+    start_address: u64,
+    end_address: u64,
+    region_bounds_handling: RegionBoundsHandling
+) -> MemoryBoundsOpen
+satisfies MemoryQueryerTrait::open_virtual_pages
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.required_bits = required_protection.bits();
+    self.excluded_bits = excluded_protection.bits();
+    self.allowed_bits = allowed_types.bits();
+    self.range_start = start_address;
+    self.range_end = end_address;
+    self.bounds_handling = region_bounds_handling;
+    self.buffered = 0;
+    self.cursor = 0;
+    self.at_eof = false;
+    self.suppress_all = false;
+    self.maps_fd = -1;
+    transition start_address >= end_address {
+        true -> empty_open()
+        false -> open_proc(process_info)
+    }
+
+    state open_proc(&mut self, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        self.proc_fd = self.host.open("/proc", 65536);
+        transition self.proc_fd >= 0 {
+            true -> open_maps(process_info)
+            false -> fail()
+        }
+    }
+
+    state open_maps(&mut self, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        let pid: u32 = process_info.get_process_id_raw();
+        self.name = ProcName::for_process(pid, 109, 97, 112, 115, 4);
+        transition self.name.len <= 48 {
+            true -> open_maps_at(process_info, self.name.len)
+            false -> open_maps_at(process_info, 48)
+        }
+    }
+
+    state open_maps_at(&mut self, process_info: &OpenedProcessInfo, name_len: u64) -> MemoryBoundsOpen {
+        self.maps_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 0);
+        self.scratch = self.host.close(self.proc_fd);
+        transition self.maps_fd >= 0 {
+            true -> opened()
+            false -> fail()
+        }
+    }
+
+    state opened(&mut self) -> MemoryBoundsOpen {
+        MemoryBoundsOpen::Opened
+    }
+
+    // start >= end: upstream returns an empty Vec — an enumeration whose
+    // first step is Finished.
+    state empty_open(&mut self) -> MemoryBoundsOpen {
+        MemoryBoundsOpen::Opened
+    }
+
+    state fail(&mut self) -> MemoryBoundsOpen {
+        MemoryBoundsOpen::Failed
+    }
+}
+
+// FromVirtualModules' empty Vec and any other deliberately-empty stream.
+pub linux_x86_64 machine LinuxMemoryQueryer::open_suppressed(&mut self) {
+    self.maps_fd = -1;
+    self.suppress_all = true;
+}
+
+pub linux_x86_64 machine LinuxMemoryQueryer::close_enumeration(
+    &mut self
+)
+satisfies MemoryQueryerTrait::close_enumeration
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition self.maps_fd >= 0 {
+        true -> close_it()
+        false -> noop()
+    }
+    state close_it(&mut self) {
+        self.scratch = self.host.close(self.maps_fd);
+        self.maps_fd = -1;
+        transition { _ -> noop() }
+    }
+    state noop(&mut self) {
+    }
+}
+
+pub linux_x86_64 machine LinuxMemoryQueryer::next_virtual_page(
+    &mut self,
+    region: &mut normalized_region::NormalizedRegion
+) -> MemoryBoundsStep
+satisfies MemoryQueryerTrait::next_virtual_page
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition self.suppress_all || self.maps_fd < 0 {
+        true -> finished(region)
+        false -> ensure_line(region)
+    }
+
+    state finished(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        MemoryBoundsStep::Finished
+    }
+
+    state failed(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.close_enumeration();
+        MemoryBoundsStep::Failed
+    }
+
+    // Ensure buffer[cursor:] holds a full line (or is at EOF with a tail).
+    state ensure_line(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.at_eof {
+            true -> eof_tail(region)
+            false -> scan_newline(region)
+        }
+    }
+
+    state eof_tail(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.cursor < self.buffered {
+            true -> emit_line(region)
+            false -> finish_close(region)
+        }
+    }
+
+    state finish_close(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.close_enumeration();
+        transition { _ -> finished(region) }
+    }
+
+    state scan_newline(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = self.cursor;
+        transition { _ -> scan_step(region) }
+    }
+
+    state scan_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.scan_pos < self.buffered {
+            true -> scan_byte(region)
+            false -> need_fill(region)
+        }
+    }
+
+    state scan_byte(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(self.scan_pos) == 10 {
+            true -> have_line(region)
+            false -> scan_advance(region)
+        }
+    }
+
+    state scan_advance(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> scan_step(region) }
+    }
+
+    state have_line(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_start = self.cursor;
+        self.line_end = self.scan_pos;
+        transition { _ -> parse_line(region) }
+    }
+
+    // No newline in the window: compact the tail to the front, refill, or
+    // fail if a single line exceeds the buffer.
+    state need_fill(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.cursor > 0 {
+            true -> compact(region)
+            false -> grow_or_fail(region)
+        }
+    }
+
+    state compact(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.tok_index = 0;
+        transition { _ -> compact_step(region) }
+    }
+
+    state compact_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.cursor + self.tok_index < self.buffered {
+            true -> compact_byte(region)
+            false -> compact_done(region)
+        }
+    }
+
+    state compact_byte(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.src_index = ((self.cursor as u64 in Wrapping) + (self.tok_index as u64 in Wrapping)) as u64;
+        transition self.tok_index < 4096 {
+            true -> compact_src(region)
+            false -> failed(region)
+        }
+    }
+
+    state compact_src(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.src_index < 4096 {
+            true -> compact_move(region)
+            false -> failed(region)
+        }
+    }
+
+    state compact_move(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.buffer[self.tok_index] = self.buffer[self.src_index];
+        self.tok_index = ((self.tok_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> compact_step(region) }
+    }
+
+    state compact_done(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.buffered = self.tok_index;
+        self.cursor = 0;
+        transition { _ -> refill(region) }
+    }
+
+    state grow_or_fail(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buffered < 4096 {
+            true -> refill(region)
+            false -> failed(region)
+        }
+    }
+
+    state refill(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buffered <= 4096 {
+            true -> refill_do(region)
+            false -> failed(region)
+        }
+    }
+
+    state refill_do(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.io_count = self.host.read(self.maps_fd, self.buffer[self.buffered..4096], ((4096 as u64 in Wrapping) - (self.buffered as u64 in Wrapping)) as u64);
+        transition self.io_count > 0 {
+            true -> refilled(region)
+            false -> empty_or_eof(region)
+        }
+    }
+
+    state refilled(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.buffered = ((self.buffered as u64 in Wrapping) + (self.io_count as u64 as u64 in Wrapping)) as u64;
+        transition { _ -> scan_newline(region) }
+    }
+
+    state empty_or_eof(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.io_count == 0 {
+            true -> mark_eof(region)
+            false -> failed(region)
+        }
+    }
+
+    state mark_eof(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.at_eof = true;
+        transition self.cursor < self.buffered {
+            true -> emit_line(region)
+            false -> finish_close(region)
+        }
+    }
+
+    state emit_line(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        // Tail line without a trailing newline.
+        self.line_start = self.cursor;
+        self.line_end = self.buffered;
+        transition { _ -> parse_line(region) }
+    }
+
+    // <hex>-<hex> <4 perms> then skip 3 whitespace-separated tokens, then the
+    // optional pathname — identical fields to upstream's split_whitespace.
+    state parse_line(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = self.line_start;
+        self.region_start = 0;
+        self.region_end = 0;
+        self.line_perms = 0;
+        self.line_type = 0;
+        self.pathname_len = 0;
+        transition { _ -> hex_start(region) }
+    }
+
+    state hex_start(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.hex_digit_at(self.scan_pos) != 16 {
+            true -> hex_start_step(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state hex_start_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.hex_digit_at(self.scan_pos) != 16 {
+            true -> hex_start_take(region)
+            false -> dash_or_fail(region)
+        }
+    }
+
+    state hex_start_take(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.region_start = ((((self.region_start as u64 in Wrapping) * (16 as u64 in Wrapping)) as u64 as u64 in Wrapping) + (self.hex_digit_at(self.scan_pos) as u64 in Wrapping)) as u64;
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> hex_start_step(region) }
+    }
+
+    state dash_or_fail(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(self.scan_pos) == 45 {
+            true -> start_end_hex(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state start_end_hex(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> hex_end_step(region) }
+    }
+
+    state hex_end_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.hex_digit_at(self.scan_pos) != 16 {
+            true -> hex_end_take(region)
+            false -> space_then_perms(region)
+        }
+    }
+
+    state hex_end_take(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.region_end = ((((self.region_end as u64 in Wrapping) * (16 as u64 in Wrapping)) as u64 as u64 in Wrapping) + (self.hex_digit_at(self.scan_pos) as u64 in Wrapping)) as u64;
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> hex_end_step(region) }
+    }
+
+    // Upstream keeps the line only when end > start.
+    state space_then_perms(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.region_end > self.region_start {
+            true -> skip_space(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state skip_space(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(self.scan_pos) == 32 && self.scan_pos < self.line_end {
+            true -> skip_space_step(region)
+            false -> read_perms(region)
+        }
+    }
+
+    state skip_space_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> skip_space(region) }
+    }
+
+    state read_perms(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        // r w x p are at scan_pos..scan_pos+4 in maps; '-' is 45.
+        self.line_perms = 0;
+        transition { _ -> perm_r(region) }
+    }
+
+    state perm_r(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(self.scan_pos) == 114 {
+            true -> perm_r_set(region)
+            false -> perm_w(region)
+        }
+    }
+
+    state perm_r_set(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_perms = self.line_perms | 1;
+        transition { _ -> perm_w(region) }
+    }
+
+    state perm_w(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) == 119 {
+            true -> perm_w_set(region)
+            false -> perm_x(region)
+        }
+    }
+
+    state perm_w_set(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_perms = self.line_perms | 2;
+        transition { _ -> perm_x(region) }
+    }
+
+    state perm_x(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(((self.scan_pos as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64) == 120 {
+            true -> perm_x_set(region)
+            false -> perm_p(region)
+        }
+    }
+
+    state perm_x_set(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_perms = self.line_perms | 4;
+        transition { _ -> perm_p(region) }
+    }
+
+    state perm_p(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(((self.scan_pos as u64 in Wrapping) + (3 as u64 in Wrapping)) as u64) == 112 {
+            true -> perm_p_set(region)
+            false -> after_perms(region)
+        }
+    }
+
+    state perm_p_set(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_perms = self.line_perms | 8;
+        transition { _ -> after_perms(region) }
+    }
+
+    state after_perms(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (4 as u64 in Wrapping)) as u64;
+        self.tok_index = 0;
+        transition { _ -> skip_token(region) }
+    }
+
+    // Skip 3 tokens: offset, dev, inode.
+    state skip_token(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.tok_index < 3 {
+            true -> skip_token_ws(region)
+            false -> pathname_seek(region)
+        }
+    }
+
+    state skip_token_ws(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(self.scan_pos) == 32 && self.scan_pos < self.line_end {
+            true -> skip_token_ws_step(region)
+            false -> skip_token_body(region)
+        }
+    }
+
+    state skip_token_ws_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> skip_token_ws(region) }
+    }
+
+    state skip_token_body(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(self.scan_pos) != 32 && self.scan_pos < self.line_end {
+            true -> skip_token_body_step(region)
+            false -> token_done(region)
+        }
+    }
+
+    state skip_token_body_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> skip_token_body(region) }
+    }
+
+    state token_done(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.tok_index = ((self.tok_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> skip_token(region) }
+    }
+
+    state pathname_seek(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.buf_byte_at(self.scan_pos) == 32 && self.scan_pos < self.line_end {
+            true -> pathname_seek_step(region)
+            false -> classify_type(region)
+        }
+    }
+
+    state pathname_seek_step(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_pos = ((self.scan_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> pathname_seek(region) }
+    }
+
+    // pathname is everything from scan_pos to line_end (may be empty).
+    state classify_type(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.pathname_len = ((self.line_end as u64 in Wrapping) - (self.scan_pos as u64 in Wrapping)) as u64;
+        transition self.pathname_len == 0 {
+            true -> type_none(region)
+            false -> type_from_perms(region)
+        }
+    }
+
+    state type_none(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_type = 1;
+        transition { _ -> apply_filters(region) }
+    }
+
+    // 'p' + non-absolute -> PRIVATE; absolute path + 'x' -> IMAGE; else MAPPED.
+    // Absolute => first pathname byte '/'; upstream: is_image checks
+    // pathname + executable bit; shared object guard '.so' is not in this
+    // maps-line view (upstream uses the same perms/path rule in this file).
+    state type_from_perms(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition (self.line_perms & 4) != 0 && self.buf_byte_at(self.scan_pos) == 47 {
+            true -> type_image(region)
+            false -> type_private_or_mapped(region)
+        }
+    }
+
+    state type_image(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_type = 4;
+        transition { _ -> apply_filters(region) }
+    }
+
+    state type_private_or_mapped(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition (self.line_perms & 8) != 0 {
+            true -> type_private(region)
+            false -> type_mapped(region)
+        }
+    }
+
+    state type_private(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_type = 2;
+        transition { _ -> apply_filters(region) }
+    }
+
+    state type_mapped(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.line_type = 8;
+        transition { _ -> apply_filters(region) }
+    }
+
+    // Upstream's is_included_in_filters: required ⊆ perms, excluded ∩ perms = ∅,
+    // type ∩ allowed ≠ ∅. For empty pathname upstream type is NONE only when
+    // perms carry no p/s bit — mirrored by type_none for empty names.
+    state apply_filters(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition (self.line_perms & self.required_bits) == self.required_bits && (self.line_perms & self.excluded_bits) == 0 && (self.line_type & self.allowed_bits) != 0 {
+            true -> filter_bounds(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state filter_bounds(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.region_end <= self.range_start || self.region_start >= self.range_end {
+            true -> consume_line(region)
+            false -> apply_bounds_handling(region)
+        }
+    }
+
+    state apply_bounds_handling(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.bounds_handling {
+            RegionBoundsHandling::Exclude -> bounds_exclude(region)
+            RegionBoundsHandling::Include -> emit(region)
+            RegionBoundsHandling::Resize -> bounds_resize(region)
+        }
+    }
+
+    // Region overlaps but isn't fully inside -> dropped.
+    state bounds_exclude(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.region_start >= self.range_start && self.region_end <= self.range_end {
+            true -> emit(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state bounds_resize(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.region_start < self.range_start {
+            true -> resize_base(region)
+            false -> resize_end_check(region)
+        }
+    }
+
+    state resize_base(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.region_start = self.range_start;
+        transition { _ -> resize_end_check(region) }
+    }
+
+    state resize_end_check(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.region_end > self.range_end {
+            true -> resize_end(region)
+            false -> emit(region)
+        }
+    }
+
+    state resize_end(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.region_end = self.range_end;
+        transition { _ -> emit(region) }
+    }
+
+    state emit(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.emit_base = self.region_start;
+        self.emit_size = ((self.region_end as u64 in Wrapping) - (self.region_start as u64 in Wrapping)) as u64;
+        region.set_base_address(self.emit_base);
+        region.set_region_size(self.emit_size);
+        transition { _ -> consume_line_region(region) }
+    }
+
+    state consume_line_region(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.consume_line_position();
+        transition { _ -> region_ready(region) }
+    }
+
+    state region_ready(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        MemoryBoundsStep::Region
+    }
+
+    state consume_line(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.consume_line_position();
+        transition { _ -> ensure_line(region) }
+    }
+}
+
+// cursor := line_end + 1 (past the newline) — or EOF-tail, which empties the
+// window so the next ensure_line hits finish_close.
+machine LinuxMemoryQueryer::consume_line_position(&mut self) {
+    transition self.line_end < self.buffered {
+        true -> step_past()
+        false -> drain()
+    }
+    state step_past(&mut self) {
+        self.cursor = ((self.line_end as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> noop() }
+    }
+    state drain(&mut self) {
+        self.cursor = self.buffered;
+        transition { _ -> noop() }
+    }
+    state noop(&mut self) {
+    }
+}
+
+
+// Guarded buffer access: all positions are proof-checked against the fixed
+// window before indexing. Out-of-window reads yield 0 (a byte that never
+// matches a maps-field classifier) and writes are dropped — unreachable on a
+// well-formed line because callers bound positions by line_end <= buffered.
+machine LinuxMemoryQueryer::buf_byte_at(&mut self, position: u64) -> u8 {
+    transition position < 4096 {
+        true -> buf_get(position)
+        false -> buf_miss()
+    }
+    state buf_get(&mut self, position: u64) -> u8 { self.buffer[position] }
+    state buf_miss(&mut self) -> u8 { 0 }
+}
+
+
+// 16 when the byte isn't a hex digit or is out of window bounds.
+machine LinuxMemoryQueryer::hex_digit_at(&mut self, position: u64) -> u64 {
+    transition position >= self.line_end || position >= 4096 {
+        true -> out()
+        false -> check(position)
+    }
+    state out(&self) -> u64 {
+        16
+    }
+    state check(&self, position: u64) -> u64 {
+        transition self.buffer[position] >= 48 && self.buffer[position] <= 57 {
+            true -> digit(position)
+            false -> alpha(position)
+        }
+    }
+    state digit(&self, position: u64) -> u64 {
+        ((self.buffer[position] as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64
+    }
+    state alpha(&self, position: u64) -> u64 {
+        transition self.buffer[position] >= 97 && self.buffer[position] <= 102 {
+            true -> lower(position)
+            false -> upper(position)
+        }
+    }
+    state lower(&self, position: u64) -> u64 {
+        ((self.buffer[position] as u64 in Wrapping) - (87 as u64 in Wrapping)) as u64
+    }
+    state upper(&self, position: u64) -> u64 {
+        transition self.buffer[position] >= 65 && self.buffer[position] <= 70 {
+            true -> upper_val(position)
+            false -> out()
+        }
+    }
+    state upper_val(&self, position: u64) -> u64 {
+        ((self.buffer[position] as u64 in Wrapping) - (55 as u64 in Wrapping)) as u64
+    }
+}
+
+// get_all_virtual_pages -> the unfiltered stream upstream's get_virtual_pages
+// produces when all bits pass: empty protection sets, all types, [0, max).
+pub linux_x86_64 machine LinuxMemoryQueryer::get_all_virtual_pages(
+    &mut self,
+    process_info: &OpenedProcessInfo
+) -> MemoryBoundsOpen
+satisfies MemoryQueryerTrait::get_all_virtual_pages
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let required: MemoryProtectionEnum = MemoryProtectionEnum::empty();
+    let excluded: MemoryProtectionEnum = MemoryProtectionEnum::none();
+    let t_none: MemoryTypeEnum = MemoryTypeEnum::none();
+    let t_private: MemoryTypeEnum = MemoryTypeEnum::private();
+    let t_image: MemoryTypeEnum = MemoryTypeEnum::image();
+    let t_mapped: MemoryTypeEnum = MemoryTypeEnum::mapped();
+    let allowed_np: MemoryTypeEnum = t_none.union(t_private);
+    let allowed_npi: MemoryTypeEnum = allowed_np.union(t_image);
+    let allowed: MemoryTypeEnum = allowed_npi.union(t_mapped);
+    let maximum: u64 = self.get_maximum_address(process_info);
+    self.open_virtual_pages(
+        process_info,
+        required,
+        excluded,
+        allowed,
+        0,
+        maximum,
+        RegionBoundsHandling::Exclude
+    )
+}
+
+pub linux_x86_64 machine LinuxMemoryQueryer::is_address_writable(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    address: u64
+) -> bool
+satisfies MemoryQueryerTrait::is_address_writable
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    // Upstream: `any()` over a freshly parsed maps Vec — a containing region
+    // with WRITE. Same predicate here via a private WRITE-required
+    // enumeration; first containing hit wins. This reuses the provider's
+    // single parse state — no other enumeration may be live during the call.
+    let maximum: u64 = self.get_maximum_address(process_info);
+    let required: MemoryProtectionEnum = MemoryProtectionEnum::write();
+    let excluded: MemoryProtectionEnum = MemoryProtectionEnum::none();
+    let t_none: MemoryTypeEnum = MemoryTypeEnum::none();
+    let t_private: MemoryTypeEnum = MemoryTypeEnum::private();
+    let t_image: MemoryTypeEnum = MemoryTypeEnum::image();
+    let t_mapped: MemoryTypeEnum = MemoryTypeEnum::mapped();
+    let allowed_np: MemoryTypeEnum = t_none.union(t_private);
+    let allowed_npi: MemoryTypeEnum = allowed_np.union(t_image);
+    let allowed: MemoryTypeEnum = allowed_npi.union(t_mapped);
+    let open: MemoryBoundsOpen = self.open_virtual_pages(
+        process_info,
+        required,
+        excluded,
+        allowed,
+        0,
+        maximum,
+        RegionBoundsHandling::Exclude
+    );
+    transition open {
+        MemoryBoundsOpen::Opened -> begin(address)
+        MemoryBoundsOpen::Failed -> done()
+    }
+
+    state begin(&mut self, address: u64) -> bool {
+        self.write_hit = false;
+        transition { _ -> pull(address) }
+    }
+
+    state pull(&mut self, address: u64) -> bool {
+        self.walk_region.set_base_address(0);
+        self.walk_region.set_region_size(0);
+        let step: MemoryBoundsStep = self.next_virtual_page(&mut self.walk_region);
+        transition step {
+            MemoryBoundsStep::Region -> check(address)
+            MemoryBoundsStep::Finished -> finish()
+            MemoryBoundsStep::Failed -> finish()
+        }
+    }
+
+    state check(&mut self, address: u64) -> bool {
+        transition self.walk_region.get_base_address() <= address && address < self.walk_region.get_end_address() {
+            true -> hit()
+            false -> pull(address)
+        }
+    }
+
+    state hit(&mut self) -> bool {
+        self.close_enumeration();
+        transition { _ -> yielded() }
+    }
+
+    state yielded(&mut self) -> bool {
+        true
+    }
+
+    state finish(&mut self) -> bool {
+        transition { _ -> done() }
+    }
+
+    state done(&mut self) -> bool {
+        false
+    }
+}
+
+pub linux_x86_64 machine LinuxMemoryQueryer::get_maximum_address(
+    &self,
+    process_info: &OpenedProcessInfo
+) -> u64
+satisfies MemoryQueryerTrait::get_maximum_address
+{
+    transition process_info.get_bitness() {
+        Bitness::Bit32 -> (4294967295)
+        Bitness::Bit64 -> (140737488355327)
+    }
+}
+
+pub linux_x86_64 machine LinuxMemoryQueryer::get_min_usermode_address(
+    &self,
+    process_info: &OpenedProcessInfo
+) -> u64
+satisfies MemoryQueryerTrait::get_min_usermode_address
+{
+    0
+}
+
+pub linux_x86_64 machine LinuxMemoryQueryer::get_max_usermode_address(
+    &self,
+    process_info: &OpenedProcessInfo
+) -> u64
+satisfies MemoryQueryerTrait::get_max_usermode_address
+{
+    self.get_maximum_address(process_info)
+}
