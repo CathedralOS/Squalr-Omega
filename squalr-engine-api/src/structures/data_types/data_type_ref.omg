@@ -1,0 +1,322 @@
+module src::structures::data_types::data_type_ref;
+
+// Port of structures/data_types/data_type_ref.rs: a handle to a registered
+// DataType carried by its authored id text. Upstream owns a String; Omega has
+// no growable owner yet (Allocation<T>/Arena surface), so the id rides as a
+// caller-lent byte view — the same translation as TrackableTask name bytes.
+// The weak-registry-handle semantics (a disabled plugin's id still
+// deserializes) hold unchanged: the id is text, nothing here dereferences it.
+// `PartialEq` is upstream's String equality, byte for byte.
+//
+// Bounds discipline: every index/slice in this file happens inside a
+// transition guard establishing the bound fact on a lent slice parameter —
+// the compiler proves guards only where they dominate the access, and
+// requires-clauses are checked by fact matching (no arithmetic reasoning),
+// so trims and entry scans are positional cursor walks rather than computed
+// subslices.
+pub data DataTypeRef<'a> {
+    data_type_id: &'a [u8];
+}
+
+// Upstream `DataTypeRef::new`.
+pub machine DataTypeRef::new<'a>(data_type_id: &'a [u8]) -> DataTypeRef<'a> {
+    DataTypeRef { data_type_id: data_type_id }
+}
+
+// Upstream `get_data_type_id`.
+pub machine DataTypeRef::get_data_type_id<'a>(&self) -> &'a [u8] {
+    self.data_type_id
+}
+
+// Upstream `PartialEq` (String equality): same length and same bytes.
+pub machine DataTypeRef::equals<'a>(&self, other: &DataTypeRef<'a>) -> bool {
+    let left: &[u8] = self.data_type_id;
+    let right: &[u8] = other.data_type_id;
+    transition left.len == right.len {
+        true -> walk(left, right, 0)
+        false -> (false)
+        _ -> (false)
+    }
+
+    state walk(left: &[u8], right: &[u8], index: u64) -> bool {
+        transition index < left.len && index < right.len {
+            true -> step(left, right, index)
+            false -> (true)
+            _ -> (true)
+        }
+    }
+
+    state step(left: &[u8], right: &[u8], index: u64) -> bool {
+        transition left[index] == right[index] {
+            true -> walk(left, right, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            false -> (false)
+        }
+    }
+}
+
+// Upstream `get_base_data_type_id`: the id text before the first '{',
+// whitespace-trimmed, falling back to the trimmed full id when no '{' is
+// present or the base would be empty. `str::trim` trims Unicode whitespace;
+// the ASCII whitespace class (space and control 0x09..=0x0D) covers authored
+// type ids — named deviation for non-ASCII whitespace.
+pub machine DataTypeRef::get_base_data_type_id<'a>(&self) -> &'a [u8] {
+    let id: &'a [u8] = self.data_type_id;
+    transition { _ -> find(id, 0) }
+
+    state find(id: &'a [u8], at: u64) -> &'a [u8] {
+        transition at < id.len {
+            true -> check(id, at)
+            false -> whole(id)
+            _ -> whole(id)
+        }
+    }
+
+    state check(id: &'a [u8], at: u64) -> &'a [u8] {
+        transition id[at] == 123 {
+            true -> base(id, at)
+            false -> find(id, ((at as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state base(id: &'a [u8], at: u64) -> &'a [u8] {
+        transition at <= id.len {
+            true -> trim_prefix(id, at)
+            false -> whole(id)
+            _ -> whole(id)
+        }
+    }
+
+    state trim_prefix(id: &'a [u8], top: u64) -> &'a [u8] {
+        let prefix: &'a [u8] = &id[0..top];
+        transition { _ -> trim_lo(prefix, 0, 0, 0, false, false) }
+    }
+
+    state whole(id: &'a [u8]) -> &'a [u8] {
+        transition { _ -> trim_lo(id, 0, 0, 0, false, false) }
+    }
+
+    // Positional trim: `pos` walks forward, `lo` records the first
+    // non-space position, `hi` records one past the last non-space.
+    state trim_lo(
+        text: &'a [u8],
+        pos: u64,
+        lo: u64,
+        hi: u64,
+        seen_lo: bool,
+        seen_hi: bool
+    ) -> &'a [u8] {
+        transition pos < text.len {
+            true -> classify(text, pos, lo, hi, seen_lo, seen_hi)
+            false -> emit(text, lo, hi, seen_lo, seen_hi)
+            _ -> emit(text, lo, hi, seen_lo, seen_hi)
+        }
+    }
+
+    state classify(
+        text: &'a [u8],
+        pos: u64,
+        lo: u64,
+        hi: u64,
+        seen_lo: bool,
+        seen_hi: bool
+    ) -> &'a [u8] {
+        transition DataTypeRef::is_space(text[pos]) {
+            true -> space_step(text, pos, lo, hi, seen_lo, seen_hi)
+            false -> non_space_step(text, pos, lo, hi, seen_lo, seen_hi)
+        }
+    }
+
+    state space_step(
+        text: &'a [u8],
+        pos: u64,
+        lo: u64,
+        hi: u64,
+        seen_lo: bool,
+        seen_hi: bool
+    ) -> &'a [u8] {
+        transition seen_lo {
+            true -> advance_hi(text, pos, lo, hi, seen_lo)
+            false -> trim_lo(text, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, lo, hi, seen_lo, seen_hi)
+            _ -> trim_lo(text, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, lo, hi, seen_lo, seen_hi)
+        }
+    }
+
+    // After the first non-space, spaces only advance the cursor — `hi`
+    // stays behind the last non-space.
+    state advance_hi(
+        text: &'a [u8],
+        pos: u64,
+        lo: u64,
+        hi: u64,
+        seen_lo: bool
+    ) -> &'a [u8] {
+        transition { _ -> trim_lo(text, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, lo, hi, seen_lo, false) }
+    }
+
+    state non_space_step(
+        text: &'a [u8],
+        pos: u64,
+        lo: u64,
+        hi: u64,
+        seen_lo: bool,
+        seen_hi: bool
+    ) -> &'a [u8] {
+        transition seen_lo {
+            true -> trim_lo(text, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, lo, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, seen_lo, true)
+            false -> trim_lo(text, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, pos, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, true)
+            _ -> trim_lo(text, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, pos, ((pos as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, true)
+        }
+    }
+
+    state emit(
+        text: &'a [u8],
+        lo: u64,
+        hi: u64,
+        seen_lo: bool,
+        seen_hi: bool
+    ) -> &'a [u8] {
+        transition lo <= hi && hi <= text.len {
+            true -> (&text[lo..hi])
+            false -> empty(text)
+            _ -> empty(text)
+        }
+    }
+
+    state empty(text: &'a [u8]) -> &'a [u8] {
+        transition 0 <= text.len {
+            true -> (&text[0..0])
+            false -> (text)
+            _ -> (text)
+        }
+    }
+}
+
+// Upstream `has_flag`: a `{flag,...}` parameter suffix containing the exact
+// flag name (whitespace-trimmed) among its comma-separated entries. Upstream
+// `strip_suffix('}')` means only a '}'-terminated suffix counts; the walk
+// here is positional — each entry is compared with leading/trailing
+// whitespace skipped, so a '}' mid-id still ends the parameter list (the
+// non-}'-terminated case yields no matching entry, same as upstream).
+pub machine DataTypeRef::has_flag<'a>(&self, flag_name: &[u8]) -> bool {
+    let id: &'a [u8] = self.data_type_id;
+    transition { _ -> find(id, flag_name, 0) }
+
+    state find(id: &'a [u8], flag_name: &[u8], at: u64) -> bool {
+        transition at < id.len {
+            true -> check(id, flag_name, at)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    state check(id: &'a [u8], flag_name: &[u8], at: u64) -> bool {
+        transition id[at] == 123 {
+            true -> expect_entry(id, flag_name, at + 1)
+            false -> find(id, flag_name, ((at as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    // Entry start: skip leading whitespace (upstream trims each entry).
+    state expect_entry(id: &'a [u8], flag_name: &[u8], cursor: u64) -> bool {
+        transition cursor < id.len {
+            true -> classify_entry(id, flag_name, cursor)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    state classify_entry(id: &'a [u8], flag_name: &[u8], cursor: u64) -> bool {
+        transition DataTypeRef::is_space(id[cursor]) {
+            true -> expect_entry(id, flag_name, ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            false -> match_entry(id, flag_name, cursor, 0)
+        }
+    }
+
+    // Positional compare of the flag bytes against the entry.
+    state match_entry(id: &'a [u8], flag_name: &[u8], cursor: u64, flag_index: u64) -> bool {
+        transition flag_index < flag_name.len {
+            true -> cmp(id, flag_name, cursor, flag_index)
+            false -> tail_check(id, cursor)
+            _ -> tail_check(id, cursor)
+        }
+    }
+
+    state cmp(id: &'a [u8], flag_name: &[u8], cursor: u64, flag_index: u64) -> bool {
+        transition cursor < id.len {
+            true -> byte_cmp(id, flag_name, cursor, flag_index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    state byte_cmp(id: &'a [u8], flag_name: &[u8], cursor: u64, flag_index: u64) -> bool {
+        transition id[cursor] == flag_name[flag_index] {
+            true -> match_entry(id, flag_name, ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((flag_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            false -> skip_entry(id, flag_name, ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    // Flag bytes consumed — the entry ends here iff only whitespace and a
+    // ',' or '}' remain (upstream's trimmed-entry comparison).
+    state tail_check(id: &'a [u8], cursor: u64) -> bool {
+        transition cursor < id.len {
+            true -> tail_byte(id, cursor)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    state tail_byte(id: &'a [u8], cursor: u64) -> bool {
+        transition id[cursor] == 44 {
+            true -> (true)
+            false -> tail_close(id, cursor)
+        }
+    }
+
+    state tail_close(id: &'a [u8], cursor: u64) -> bool {
+        transition id[cursor] == 125 {
+            true -> (true)
+            false -> tail_space(id, cursor)
+        }
+    }
+
+    state tail_space(id: &'a [u8], cursor: u64) -> bool {
+        transition DataTypeRef::is_space(id[cursor]) {
+            true -> tail_check(id, ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            false -> (false)
+        }
+    }
+
+    // Mismatch: skip to the next ',' or '}' boundary.
+    state skip_entry(id: &'a [u8], flag_name: &[u8], cursor: u64) -> bool {
+        transition cursor < id.len {
+            true -> skip_byte(id, flag_name, cursor)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    state skip_byte(id: &'a [u8], flag_name: &[u8], cursor: u64) -> bool {
+        transition id[cursor] == 44 {
+            true -> expect_entry(id, flag_name, ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            false -> skip_close(id, flag_name, cursor)
+        }
+    }
+
+    state skip_close(id: &'a [u8], flag_name: &[u8], cursor: u64) -> bool {
+        transition id[cursor] == 125 {
+            true -> (false)
+            false -> skip_entry(id, flag_name, ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+}
+
+// Upstream `with_flag`/`without_flag`/`set_flag_value` rebuild the id by
+// string concatenation, which needs a growable owner; deferred until the
+// registry leg lends or owns id storage. `with_container_type` construction
+// is likewise deferred (the ContainerType spelling side is already ported in
+// data_values).
+
+machine DataTypeRef::is_space(byte: u8) -> bool {
+    byte == 32 || (byte >= 9 && byte <= 13)
+}

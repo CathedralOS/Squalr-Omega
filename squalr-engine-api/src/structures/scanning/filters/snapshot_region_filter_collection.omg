@@ -1,0 +1,364 @@
+module src::structures::scanning::filters::snapshot_region_filter_collection;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+
+// Port of structures/scanning/filters/snapshot_region_filter_collection.rs:
+// the per-data-type set of filters (scan results) scanners discover.
+//
+// Storage: upstream keeps `Vec<Vec<SnapshotRegionFilter>>`; the outer vector
+// exists only to shard rayon partitions, and iter()/par_iter() flatten it into
+// the same base-ascending sequence. The scalar leg is sequential, so the
+// collection holds the flattened list directly as a caller-lent slice —
+// same contents, same order, one partition. Nested partitioning arrives with
+// the parallel-scanning leg (named deviation).
+//
+// Upstream `new` consults SymbolRegistry for the data type's unit size; the
+// registry is not yet ported, so the caller supplies
+// `result_value_size_in_bytes` explicitly (the finalized constraint's
+// unit size — same value the registry would return).
+pub data SnapshotRegionFilterCollection<'a, 't> {
+    snapshot_region_filters: &'a [SnapshotRegionFilter];
+    data_type_ref: DataTypeRef<'t>;
+    memory_alignment: MemoryAlignment;
+    result_value_size_in_bytes: u64;
+    result_container_type: ContainerType;
+    number_of_results: u64;
+}
+
+// Upstream `new` — unit size resolved by the registry upstream; supplied
+// here as `result_value_size_in_bytes` (see storage note above).
+pub machine SnapshotRegionFilterCollection::new<'a, 't>(
+    snapshot_region_filters: &'a [SnapshotRegionFilter],
+    data_type_ref: DataTypeRef<'t>,
+    memory_alignment: MemoryAlignment,
+    result_value_size_in_bytes: u64
+) -> SnapshotRegionFilterCollection<'a, 't>
+crashes Abort
+{
+    let counted_results: u64 = SnapshotRegionFilterCollection::count_results(
+        snapshot_region_filters,
+        result_value_size_in_bytes,
+        memory_alignment,
+        0,
+        0
+    );
+    SnapshotRegionFilterCollection::new_with_result_size(
+        snapshot_region_filters,
+        data_type_ref,
+        memory_alignment,
+        result_value_size_in_bytes,
+        counted_results
+    )
+}
+
+// Upstream `new_with_result_size`. The retain/sort steps upstream performs
+// on the nested vectors are pushed to the caller's mutable backing via
+// `normalize_filters` (a slice cannot re-sort itself through a shared view),
+// so the lent view here is already base-ascending with no sub-result-size
+// filters. `number_of_results` arrives precomputed (upstream counts inside
+// the constructor; a local computed here can't be proved to outlive the
+// returned view, so callers run `count_results` first — the value is the
+// same element-count sum).
+pub machine SnapshotRegionFilterCollection::new_with_result_size<'a, 't>(
+    snapshot_region_filters: &'a [SnapshotRegionFilter],
+    data_type_ref: DataTypeRef<'t>,
+    memory_alignment: MemoryAlignment,
+    result_value_size_in_bytes: u64,
+    number_of_results: u64
+) -> SnapshotRegionFilterCollection<'a, 't> {
+    SnapshotRegionFilterCollection {
+        snapshot_region_filters: snapshot_region_filters,
+        data_type_ref: data_type_ref,
+        memory_alignment: memory_alignment,
+        result_value_size_in_bytes: result_value_size_in_bytes,
+        result_container_type: ContainerType::None,
+        number_of_results: number_of_results,
+    }
+}
+
+// The retain/sort half of upstream `new_with_result_size`, run in place on
+// caller-owned filter storage before the collection view is built:
+// drops filters smaller than the logical result width (trailing windows
+// that cannot materialize a result), then sorts base-ascending. Compaction
+// preserves relative order, so the insert pass is upstream's sort_by_key on
+// a mostly-sorted list. Returns the live filter count; callers view
+// `filters[0..live]` afterward.
+pub machine SnapshotRegionFilterCollection::normalize_filters(
+    filters: &mut [SnapshotRegionFilter],
+    result_value_size_in_bytes: u64
+) -> u64 {
+    let live: u64 = SnapshotRegionFilterCollection::compact(
+        filters,
+        result_value_size_in_bytes,
+        0,
+        0
+    );
+    SnapshotRegionFilterCollection::sort(filters, live, 1);
+    live
+}
+
+// In-place retain: keeps each filter whose region can hold one result.
+machine SnapshotRegionFilterCollection::compact(
+    filters: &mut [SnapshotRegionFilter],
+    result_value_size_in_bytes: u64,
+    read_index: u64,
+    write_index: u64
+) -> u64 {
+    transition read_index < filters.len {
+        true -> step(filters, result_value_size_in_bytes, read_index, write_index)
+        false -> (write_index)
+    }
+
+    state step(
+        filters: &mut [SnapshotRegionFilter],
+        result_value_size_in_bytes: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        let region_size: u64 = filters[read_index].get_region_size();
+        transition region_size >= result_value_size_in_bytes && write_index < filters.len && read_index < filters.len {
+            true -> keep(filters, result_value_size_in_bytes, read_index, write_index)
+            false -> compact(filters, result_value_size_in_bytes, ((read_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, write_index)
+        }
+    }
+
+    state keep(
+        filters: &mut [SnapshotRegionFilter],
+        result_value_size_in_bytes: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        let kept: SnapshotRegionFilter = SnapshotRegionFilter::clone(&filters[read_index]);
+        filters[write_index] = kept;
+        transition { _ -> compact(filters, result_value_size_in_bytes, ((read_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((write_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+// Insertion pass over the live prefix: filter[k] walks left while the
+// previous base address is greater — upstream sort_by_key is stable, and a
+// compacted emitted list is already sorted except across partition seams.
+machine SnapshotRegionFilterCollection::sort(
+    filters: &mut [SnapshotRegionFilter],
+    live: u64,
+    index: u64
+) {
+    transition index < live {
+        true -> sift(filters, live, index)
+        false -> (0)
+    }
+
+    state sift(filters: &mut [SnapshotRegionFilter], live: u64, index: u64) {
+        SnapshotRegionFilterCollection::sift_left(filters, index);
+        transition { _ -> sort(filters, live, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+machine SnapshotRegionFilterCollection::sift_left(
+    filters: &mut [SnapshotRegionFilter],
+    index: u64
+) {
+    transition index > 0 {
+        true -> compare(filters, index)
+        false -> (0)
+    }
+
+    state compare(filters: &mut [SnapshotRegionFilter], index: u64) {
+        let previous_index: u64 = ((index as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition index < filters.len && previous_index < filters.len {
+            true -> read_bases(filters, index, previous_index)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+
+    state read_bases(
+        filters: &mut [SnapshotRegionFilter],
+        index: u64,
+        previous_index: u64
+    ) {
+        let previous_base: u64 = filters[previous_index].get_base_address();
+        let current_base: u64 = filters[index].get_base_address();
+        transition previous_base > current_base {
+            true -> swap(filters, index, previous_index)
+            false -> (0)
+        }
+    }
+
+    // Filter elements are not [copy] (the numbered region underneath does
+    // not admit it), so the swap runs as u64 field writes through element
+    // access — no borrowed value is ever held across a mutation.
+    state swap(
+        filters: &mut [SnapshotRegionFilter],
+        index: u64,
+        previous_index: u64
+    ) {
+        let current_base: u64 = filters[index].get_base_address();
+        let current_end: u64 = filters[index].get_end_address();
+        let previous_base: u64 = filters[previous_index].get_base_address();
+        let previous_end: u64 = filters[previous_index].get_end_address();
+        filters[index].set_base_address(previous_base);
+        filters[index].set_end_address(previous_end);
+        filters[previous_index].set_base_address(current_base);
+        filters[previous_index].set_end_address(current_end);
+        transition { _ -> sift_left(filters, previous_index) }
+    }
+}
+
+// Σ get_element_count(result_value_size, alignment) over the view.
+machine SnapshotRegionFilterCollection::count_results(
+    filters: &[SnapshotRegionFilter],
+    result_value_size_in_bytes: u64,
+    memory_alignment: MemoryAlignment,
+    index: u64,
+    running: u64
+) -> u64
+crashes Abort
+{
+    transition index < filters.len {
+        true -> step(filters, result_value_size_in_bytes, memory_alignment, index, running)
+        false -> (running)
+    }
+
+    state step(
+        filters: &[SnapshotRegionFilter],
+        result_value_size_in_bytes: u64,
+        memory_alignment: MemoryAlignment,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        let element_count: u64 = filters[index].get_element_count(
+            result_value_size_in_bytes,
+            memory_alignment
+        );
+        transition { _ -> count_results(
+            filters,
+            result_value_size_in_bytes,
+            memory_alignment,
+            ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            ((running as u64 in Saturating) + (element_count as u64 in Saturating)) as u64
+        ) }
+    }
+}
+
+// Upstream `get_filter_minimum_address`: O(1) first-filter base, 0 when
+// empty — holds because the view is sorted.
+pub machine SnapshotRegionFilterCollection::get_filter_minimum_address(&self) -> u64 {
+    transition self.snapshot_region_filters.len > 0 {
+        true -> (self.snapshot_region_filters[0].get_base_address())
+        false -> (0)
+    }
+}
+
+// Upstream `get_filter_maximum_address`: O(1) last-filter end, 0 when empty.
+pub machine SnapshotRegionFilterCollection::get_filter_maximum_address(&self) -> u64 {
+    let filters: &[SnapshotRegionFilter] = self.snapshot_region_filters;
+    transition filters.len > 0 {
+        true -> last(filters)
+        false -> (0)
+        _ -> (0)
+    }
+
+    state last(filters: &[SnapshotRegionFilter]) -> u64 {
+        let last_index: u64 = ((filters.len as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition last_index < filters.len {
+            true -> end(filters, last_index)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+
+    state end(filters: &[SnapshotRegionFilter], last_index: u64) -> u64 {
+        filters[last_index].get_end_address()
+    }
+}
+
+// Upstream `get_number_of_results`.
+pub machine SnapshotRegionFilterCollection::get_number_of_results(&self) -> u64 {
+    self.number_of_results
+}
+
+// Upstream `get_data_type_ref`.
+pub machine SnapshotRegionFilterCollection::get_data_type_ref<'t>(&self) -> DataTypeRef<'t> {
+    DataTypeRef::new(self.data_type_ref.get_data_type_id())
+}
+
+// Upstream `get_memory_alignment`.
+pub machine SnapshotRegionFilterCollection::get_memory_alignment(&self) -> MemoryAlignment {
+    self.memory_alignment
+}
+
+// Upstream `get_result_value_size_in_bytes`.
+pub machine SnapshotRegionFilterCollection::get_result_value_size_in_bytes(&self) -> u64 {
+    self.result_value_size_in_bytes
+}
+
+// Upstream `get_result_container_type`.
+pub machine SnapshotRegionFilterCollection::get_result_container_type(&self) -> ContainerType {
+    self.result_container_type
+}
+
+// Upstream `with_result_container_type` (consume + set + return).
+pub machine SnapshotRegionFilterCollection::with_result_container_type<'a, 't>(
+    self,
+    result_container_type: ContainerType
+) -> SnapshotRegionFilterCollection<'a, 't> {
+    SnapshotRegionFilterCollection {
+        snapshot_region_filters: self.snapshot_region_filters,
+        data_type_ref: self.data_type_ref,
+        memory_alignment: self.memory_alignment,
+        result_value_size_in_bytes: self.result_value_size_in_bytes,
+        result_container_type: result_container_type,
+        number_of_results: self.number_of_results,
+    }
+}
+
+// Upstream `iter().len()` surface: the flat filter count.
+pub machine SnapshotRegionFilterCollection::get_filter_count(&self) -> u64 {
+    self.snapshot_region_filters.len
+}
+
+// The lent filter view itself for sequential iteration (upstream `iter()`).
+pub machine SnapshotRegionFilterCollection::get_filters<'a>(&self) -> &'a [SnapshotRegionFilter] {
+    self.snapshot_region_filters
+}
+
+// Upstream `create_filter_segment`: the contiguous kept run of
+// `segment_result_count` candidate elements beginning at
+// `segment_start_result_index` inside the filter — used by the
+// remove-at-indices rebuild (deletion leg). Element `i` sits at
+// base + i*max(alignment,1); a kept run's byte coverage is
+// result_value_size + (count-1)*alignment.
+pub machine SnapshotRegionFilterCollection::create_filter_segment(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    segment_start_result_index: u64,
+    segment_result_count: u64,
+    result_value_size_in_bytes: u64,
+    memory_alignment: MemoryAlignment
+) -> SnapshotRegionFilter {
+    let alignment_bytes: u64 = memory_alignment.get_size_in_bytes();
+    let memory_alignment_in_bytes: u64 =
+        SnapshotRegionFilterCollection::u64_max(alignment_bytes, 1);
+    let covered: u64 = ((segment_start_result_index as u64 in Saturating)
+        * (memory_alignment_in_bytes as u64 in Saturating)) as u64;
+    let segment_base_address: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+        + (covered as u64 in Saturating)) as u64;
+    let tail: u64 = (((segment_result_count as u64 in Saturating) - (1 as u64 in Saturating))
+        * (memory_alignment_in_bytes as u64 in Saturating)) as u64;
+    let segment_size_in_bytes: u64 = ((result_value_size_in_bytes as u64 in Saturating)
+        + (tail as u64 in Saturating)) as u64;
+    SnapshotRegionFilter::new(segment_base_address, segment_size_in_bytes)
+}
+
+machine SnapshotRegionFilterCollection::u64_max(left: u64, right: u64) -> u64 {
+    transition left > right {
+        true -> (left)
+        false -> (right)
+    }
+}
+
+// Upstream `remove_results_at_indices` / `par_iter` are deferred:
+// the deletion leg rebuilds collections with removed segments, and the
+// nested Vec<Vec> sharding is meaningful only to rayon (storage note).

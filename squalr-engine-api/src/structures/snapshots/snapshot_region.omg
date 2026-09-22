@@ -1,0 +1,618 @@
+module src::structures::snapshots::snapshot_region;
+
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::memory::normalized_region;
+use src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+
+// Port of structures/snapshots/snapshot_region.rs: one address-bounded
+// region of a snapshot plus its captured bytes and scan results.
+//
+// Storage: upstream owns Vec<u8> byte buffers and Vec<Vec<..>> result
+// storage; Omega has no growable owner yet, so the caller lends the byte
+// backing and the results value rides as a field. `resize_to_filters`
+// upstream drains/truncates the vectors; the equivalent windowed
+// representation keeps the lent backing intact and advances
+// `*_values_offset` while clamping `*_values_size` — element reads map
+// through the same base-relative byte offsets upstream uses (observable
+// contents are identical; only which backing bytes are dead differs).
+//
+// Lifetimes: the language requires each borrowed input to name its own
+// lifetime — 'a covers the current-values window, 'p the previous-values
+// window, 'r the results collection backing, 't the data-type ids inside
+// the collections. `&self` readers return those field lifetimes directly.
+//
+// `page_boundaries`/`page_boundary_tombstones` (live-I/O collected-page
+// tracking) are deferred: supplied-bytes regions collect everything, so
+// get_collected_byte_count reduces to min(live, region size).
+//
+// Mutation: writes of borrow-carrying fields on machines attached to the
+// data type are fenced ("persistent loans"), so the two stores live as
+// module-level machines taking `&mut SnapshotRegion` — the same receiver
+// upstream's `&mut self` methods imply, spelled out as a parameter.
+pub data SnapshotRegion<'a, 'p, 'r, 't> {
+    normalized_region: normalized_region::NormalizedRegion;
+    current_values: &'a [u8];
+    current_values_offset: u64;
+    current_values_size: u64;
+    previous_values: &'p [u8];
+    previous_values_offset: u64;
+    previous_values_size: u64;
+    scan_results: SnapshotRegionScanResults<'r, 't>;
+}
+
+// Upstream `SnapshotRegion::new(normalized_region, page_boundaries)` —
+// page-boundary tracking is deferred (header note); the caller supplies the
+// initial scan-results view (an empty one for a fresh region) and lent byte
+// backings, which may be zero-length for absent values.
+pub machine SnapshotRegion::new<'a, 'p, 'r, 't>(
+    normalized_region: normalized_region::NormalizedRegion,
+    current_values: &'a [u8],
+    previous_values: &'p [u8],
+    scan_results: SnapshotRegionScanResults<'r, 't>
+) -> SnapshotRegion<'a, 'p, 'r, 't> {
+    SnapshotRegion {
+        normalized_region: normalized_region,
+        current_values: current_values,
+        current_values_offset: 0,
+        current_values_size: current_values.len,
+        previous_values: previous_values,
+        previous_values_offset: 0,
+        previous_values_size: previous_values.len,
+        scan_results: scan_results,
+    }
+}
+
+// Upstream `from_bytes`: a standalone region over caller-provided current
+// bytes; upstream clones the Vec, ours keeps the lent view (the caller keeps
+// the backing alive).
+pub machine SnapshotRegion::from_bytes<'a, 'p, 'r, 't>(
+    base_address: u64,
+    current_values: &'a [u8],
+    previous_values: &'p [u8],
+    scan_results: SnapshotRegionScanResults<'r, 't>
+) -> SnapshotRegion<'a, 'p, 'r, 't> {
+    SnapshotRegion::new(
+        normalized_region::NormalizedRegion {
+            base_address: base_address,
+            region_size: current_values.len,
+        },
+        current_values,
+        previous_values,
+        scan_results
+    )
+}
+
+// Upstream `from_current_and_previous_bytes`; region size is the larger of
+// the two value lengths exactly as upstream computes it.
+pub machine SnapshotRegion::from_current_and_previous_bytes<'a, 'p, 'r, 't>(
+    base_address: u64,
+    current_values: &'a [u8],
+    previous_values: &'p [u8],
+    scan_results: SnapshotRegionScanResults<'r, 't>
+) -> SnapshotRegion<'a, 'p, 'r, 't> {
+    let region_size: u64 = u64_max(current_values.len, previous_values.len);
+    SnapshotRegion::new(
+        normalized_region::NormalizedRegion {
+            base_address: base_address,
+            region_size: region_size,
+        },
+        current_values,
+        previous_values,
+        scan_results
+    )
+}
+
+// Upstream `get_current_values`: the live window over the lent backing.
+pub machine SnapshotRegion::get_current_values<'a>(&self) -> &'a [u8] {
+    let values: &'a [u8] = self.current_values;
+    let offset: u64 = self.current_values_offset;
+    let size: u64 = self.current_values_size;
+    let end: u64 = ((offset as u64 in Saturating) + (size as u64 in Saturating)) as u64;
+    transition offset <= end && end <= values.len {
+        true -> (&values[offset..end])
+        false -> empty(values)
+        _ -> empty(values)
+    }
+
+    state empty(values: &'a [u8]) -> &'a [u8] {
+        transition 0 <= values.len {
+            true -> (&values[0..0])
+            false -> (values)
+            _ -> (values)
+        }
+    }
+}
+
+// Upstream `get_previous_values`.
+pub machine SnapshotRegion::get_previous_values<'p>(&self) -> &'p [u8] {
+    let values: &'p [u8] = self.previous_values;
+    let offset: u64 = self.previous_values_offset;
+    let size: u64 = self.previous_values_size;
+    let end: u64 = ((offset as u64 in Saturating) + (size as u64 in Saturating)) as u64;
+    transition offset <= end && end <= values.len {
+        true -> (&values[offset..end])
+        false -> empty(values)
+        _ -> empty(values)
+    }
+
+    state empty(values: &'p [u8]) -> &'p [u8] {
+        transition 0 <= values.len {
+            true -> (&values[0..0])
+            false -> (values)
+            _ -> (values)
+        }
+    }
+}
+
+// Upstream `has_current_values`.
+pub machine SnapshotRegion::has_current_values(&self) -> bool {
+    self.current_values_size > 0
+}
+
+// Upstream `has_previous_values`.
+pub machine SnapshotRegion::has_previous_values(&self) -> bool {
+    self.previous_values_size > 0
+}
+
+pub machine SnapshotRegion::get_base_address(&self) -> u64 {
+    self.normalized_region.get_base_address()
+}
+
+// Upstream `get_end_address` (saturating).
+pub machine SnapshotRegion::get_end_address(&self) -> u64 {
+    ((self.normalized_region.get_base_address() as u64 in Saturating)
+        + (self.normalized_region.get_region_size() as u64 in Saturating)) as u64
+}
+
+pub machine SnapshotRegion::get_region_size(&self) -> u64 {
+    self.normalized_region.get_region_size()
+}
+
+// Upstream `get_collected_byte_count`: with no page boundaries/tombstones
+// (supplied bytes collect everything), min(live bytes, region size).
+pub machine SnapshotRegion::get_collected_byte_count(&self) -> u64 {
+    let region_size: u64 = self.normalized_region.get_region_size();
+    transition self.current_values_size == 0 {
+        true -> (0)
+        false -> (u64_min(self.current_values_size, region_size))
+        _ -> (u64_min(self.current_values_size, region_size))
+    }
+}
+
+// Upstream `get_current_values_filter_pointer`, exposed as a slice view:
+// the live current-values bytes starting at the filter's base.
+pub machine SnapshotRegion::get_current_values_at_filter<'a>(
+    &self,
+    snapshot_region_filter: &SnapshotRegionFilter
+) -> &'a [u8] {
+    let values: &'a [u8] = self.current_values;
+    let base_address: u64 = self.get_base_address();
+    let filter_offset: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+        - (base_address as u64 in Saturating)) as u64;
+    let offset: u64 = ((self.current_values_offset as u64 in Saturating)
+        + (filter_offset as u64 in Saturating)) as u64;
+    let top: u64 = ((self.current_values_offset as u64 in Saturating)
+        + (self.current_values_size as u64 in Saturating)) as u64;
+    transition offset <= values.len && offset <= top && top <= values.len {
+        true -> (&values[offset..top])
+        false -> empty(values)
+        _ -> empty(values)
+    }
+
+    state empty(values: &'a [u8]) -> &'a [u8] {
+        transition 0 <= values.len {
+            true -> (&values[0..0])
+            false -> (values)
+            _ -> (values)
+        }
+    }
+}
+
+// Upstream `get_previous_values_filter_pointer` equivalent.
+pub machine SnapshotRegion::get_previous_values_at_filter<'p>(
+    &self,
+    snapshot_region_filter: &SnapshotRegionFilter
+) -> &'p [u8] {
+    let values: &'p [u8] = self.previous_values;
+    let base_address: u64 = self.get_base_address();
+    let filter_offset: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+        - (base_address as u64 in Saturating)) as u64;
+    let offset: u64 = ((self.previous_values_offset as u64 in Saturating)
+        + (filter_offset as u64 in Saturating)) as u64;
+    let top: u64 = ((self.previous_values_offset as u64 in Saturating)
+        + (self.previous_values_size as u64 in Saturating)) as u64;
+    transition offset <= values.len && offset <= top && top <= values.len {
+        true -> (&values[offset..top])
+        false -> empty(values)
+        _ -> empty(values)
+    }
+
+    state empty(values: &'p [u8]) -> &'p [u8] {
+        transition 0 <= values.len {
+            true -> (&values[0..0])
+            false -> (values)
+            _ -> (values)
+        }
+    }
+}
+
+// Element decode for the scalar scan path: upstream scanners reinterpret
+// raw bytes at each candidate stride; Omega has no typed unaligned loads
+// into caller windows, so the equivalent is an explicit little-endian read
+// of `unit_size_in_bytes` (<= 8; wider units land with the vector leg) per
+// element. Element `index` starts at filter base + index*alignment — the
+// same candidate-stride coverage upstream's get_element_count admits.
+// Returns the number of elements written (bounded by `elements.len`).
+pub machine SnapshotRegion::read_current_elements<'a>(
+    &self,
+    snapshot_region_filter: &SnapshotRegionFilter,
+    unit_size_in_bytes: u64,
+    memory_alignment: MemoryAlignment,
+    elements: &mut [u64]
+) -> u64
+crashes Abort
+{
+    let element_count: u64 = snapshot_region_filter.get_element_count(
+        unit_size_in_bytes,
+        memory_alignment
+    );
+    let stride: u64 = memory_alignment.get_size_in_bytes();
+    let base_address: u64 = self.get_base_address();
+    let filter_offset: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+        - (base_address as u64 in Saturating)) as u64;
+    let start_offset: u64 = ((self.current_values_offset as u64 in Saturating)
+        + (filter_offset as u64 in Saturating)) as u64;
+    let live_top: u64 = ((self.current_values_offset as u64 in Saturating)
+        + (self.current_values_size as u64 in Saturating)) as u64;
+    decode_elements(
+        self.current_values,
+        start_offset,
+        live_top,
+        stride,
+        unit_size_in_bytes,
+        element_count,
+        elements,
+        0
+    )
+}
+
+// Same decode over the previous-values window.
+pub machine SnapshotRegion::read_previous_elements<'p>(
+    &self,
+    snapshot_region_filter: &SnapshotRegionFilter,
+    unit_size_in_bytes: u64,
+    memory_alignment: MemoryAlignment,
+    elements: &mut [u64]
+) -> u64
+crashes Abort
+{
+    let element_count: u64 = snapshot_region_filter.get_element_count(
+        unit_size_in_bytes,
+        memory_alignment
+    );
+    let stride: u64 = memory_alignment.get_size_in_bytes();
+    let base_address: u64 = self.get_base_address();
+    let filter_offset: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+        - (base_address as u64 in Saturating)) as u64;
+    let start_offset: u64 = ((self.previous_values_offset as u64 in Saturating)
+        + (filter_offset as u64 in Saturating)) as u64;
+    let live_top: u64 = ((self.previous_values_offset as u64 in Saturating)
+        + (self.previous_values_size as u64 in Saturating)) as u64;
+    decode_elements(
+        self.previous_values,
+        start_offset,
+        live_top,
+        stride,
+        unit_size_in_bytes,
+        element_count,
+        elements,
+        0
+    )
+}
+
+// Sequential decode: element `index` reads `unit` bytes at
+// start_offset + index*stride — every index access runs inside a
+// same-shaped `position < values.len` guard (the only bounds the prover
+// admits), so positions past the live window read as skipped.
+machine decode_elements<'a>(
+    values: &'a [u8],
+    start_offset: u64,
+    live_top: u64,
+    stride: u64,
+    unit_size_in_bytes: u64,
+    element_count: u64,
+    elements: &mut [u64],
+    index: u64
+) -> u64 {
+    transition index < element_count && index < elements.len {
+        true -> decode_one(values, start_offset, live_top, stride, unit_size_in_bytes, element_count, elements, index)
+        false -> (index)
+        _ -> (index)
+    }
+
+    state decode_one(
+        values: &'a [u8],
+        start_offset: u64,
+        live_top: u64,
+        stride: u64,
+        unit_size_in_bytes: u64,
+        element_count: u64,
+        elements: &mut [u64],
+        index: u64
+    ) -> u64 {
+        let position: u64 = ((start_offset as u64 in Saturating)
+            + ((index as u64 in Saturating) * (stride as u64 in Saturating))) as u64;
+        transition { _ -> read_byte(values, position, live_top, unit_size_in_bytes, 0, 0, elements, index, element_count, start_offset, stride) }
+    }
+
+    // Little-endian decode of `unit` bytes starting at `position` — bytes
+    // past `live_top` read 0 (upstream bounds element reads to covered
+    // ranges, so a partially-covered element only observes in-window
+    // bytes). The byte walk and the element store live as states inside
+    // this machine: two mutually-calling machines cannot share a
+    // termination ranking the checker accepts, and a caller-side index
+    // write after a call to a proof-using machine loses its fact.
+    state read_byte(
+        values: &'a [u8],
+        position: u64,
+        live_top: u64,
+        unit: u64,
+        byte_index: u64,
+        running: u64,
+        elements: &mut [u64],
+        element_index: u64,
+        element_count: u64,
+        start_offset: u64,
+        stride: u64
+    ) -> u64 {
+        transition byte_index < unit && byte_index < 8 {
+            true -> take(values, position, live_top, unit, byte_index, running, elements, element_index, element_count, start_offset, stride)
+            false -> store(values, live_top, unit, elements, element_index, element_count, start_offset, stride, running)
+            _ -> store(values, live_top, unit, elements, element_index, element_count, start_offset, stride, running)
+        }
+    }
+
+    state take(
+        values: &'a [u8],
+        position: u64,
+        live_top: u64,
+        unit: u64,
+        byte_index: u64,
+        running: u64,
+        elements: &mut [u64],
+        element_index: u64,
+        element_count: u64,
+        start_offset: u64,
+        stride: u64
+    ) -> u64 {
+        let at: u64 = ((position as u64 in Saturating) + (byte_index as u64 in Saturating)) as u64;
+        transition at < live_top && at < values.len {
+            true -> shift(values, position, live_top, unit, byte_index, running, elements, element_index, element_count, start_offset, stride, at)
+            false -> read_byte(values, position, live_top, unit, ((byte_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, running, elements, element_index, element_count, start_offset, stride)
+            _ -> read_byte(values, position, live_top, unit, ((byte_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, running, elements, element_index, element_count, start_offset, stride)
+        }
+    }
+
+    state shift(
+        values: &'a [u8],
+        position: u64,
+        live_top: u64,
+        unit: u64,
+        byte_index: u64,
+        running: u64,
+        elements: &mut [u64],
+        element_index: u64,
+        element_count: u64,
+        start_offset: u64,
+        stride: u64,
+        at: u64
+    ) -> u64 {
+        let byte_value: u64 = values[at] as u64;
+        let shift_bits: u64 = ((byte_index as u64 in Saturating) * (8 as u64 in Saturating)) as u64;
+        let shifted: u64 = byte_value << shift_bits;
+        let next_running: u64 = ((running as u64 in Saturating) + (shifted as u64 in Saturating)) as u64;
+        transition { _ -> read_byte(values, position, live_top, unit, ((byte_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, next_running, elements, element_index, element_count, start_offset, stride) }
+    }
+
+    // Store the decoded element and resume the element walk. The index
+    // fact for `elements` arrives from the entry guard.
+    state store(
+        values: &'a [u8],
+        live_top: u64,
+        unit: u64,
+        elements: &mut [u64],
+        element_index: u64,
+        element_count: u64,
+        start_offset: u64,
+        stride: u64,
+        running: u64
+    ) -> u64 {
+        elements[element_index] = running;
+        transition { _ -> decode_elements(values, start_offset, live_top, stride, unit, element_count, elements, ((element_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `initialize_scan_results`: seeds one whole-region filter per
+// data type — but only when no results exist yet, which is what makes
+// successive scans keep scanning the prior filter ranges. The seeded
+// collections are caller-materialized (no growable storage): callers build
+// one collection per data type over SnapshotRegionFilter::new(base, size).
+pub machine SnapshotRegion::initialize_scan_results<'a, 'p, 'r, 't>(
+    region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+    seeded_scan_results: SnapshotRegionScanResults<'r, 't>
+) {
+    let collection_count: u64 = region.scan_results.get_collection_count();
+    transition collection_count > 0 {
+        true -> done()
+        false -> seed(region, seeded_scan_results)
+        _ -> seed(region, seeded_scan_results)
+    }
+
+    state seed(
+        region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+        seeded_scan_results: SnapshotRegionScanResults<'r, 't>
+    ) {
+        store_scan_results(region, seeded_scan_results);
+        transition { _ -> done() }
+    }
+
+    state done() {
+    }
+}
+
+// Free-machine half of the store: attached machines may not write a
+// borrow-carrying field ("persistent loans"), so the assignment itself
+// lives here — the same write upstream's `&mut self` implies.
+machine store_scan_results<'a, 'p, 'r, 't>(
+    region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+    scan_results: SnapshotRegionScanResults<'r, 't>
+) {
+    region.scan_results = scan_results;
+}
+
+// Upstream `get_scan_results`, returned as a fresh view value — `&self`
+// carries 'r/'t, and the view reads the same lent collections either way.
+pub machine SnapshotRegion::get_scan_results<'r, 't>(&self) -> SnapshotRegionScanResults<'r, 't> {
+    SnapshotRegionScanResults::new(self.scan_results.get_filter_collections())
+}
+
+// Upstream derived `Clone`: `&self` carries all four lifetimes, so the
+// rebuilt record reads the same lent windows as the source.
+pub machine SnapshotRegion::clone_region<'a, 'p, 'r, 't>(&self) -> SnapshotRegion<'a, 'p, 'r, 't> {
+    SnapshotRegion {
+        // Rebuilt rather than copied: `NormalizedRegion` is [copy] in its
+        // own module, but the checker does not treat the imported type as
+        // copyable through `&self` here.
+        normalized_region: normalized_region::NormalizedRegion {
+            base_address: self.normalized_region.get_base_address(),
+            region_size: self.normalized_region.get_region_size(),
+        },
+        current_values: self.current_values,
+        current_values_offset: self.current_values_offset,
+        current_values_size: self.current_values_size,
+        previous_values: self.previous_values,
+        previous_values_offset: self.previous_values_offset,
+        previous_values_size: self.previous_values_size,
+        scan_results: SnapshotRegionScanResults::new(self.scan_results.get_filter_collections()),
+    }
+}
+
+// Upstream `set_scan_results`: assign then constrict the region (and its
+// captured-byte windows) to the surviving filter bounds.
+pub machine SnapshotRegion::set_scan_results<'a, 'p, 'r, 't>(
+    region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+    scan_results: SnapshotRegionScanResults<'r, 't>
+) {
+    store_scan_results(region, scan_results);
+    SnapshotRegion::resize_to_filters(region);
+}
+
+// Upstream `resize_to_filters`, windowed: instead of draining/truncating
+// vectors, advance each view offset by the released prefix and clamp the
+// live size to the new region extent (identical observable bytes).
+machine SnapshotRegion::resize_to_filters<'a, 'p, 'r, 't>(
+    region: &mut SnapshotRegion<'a, 'p, 'r, 't>
+) {
+    let filter_lowest_address: u64 = region.scan_results.get_filter_bounds_low();
+    let filter_highest_address: u64 = region.scan_results.get_filter_bounds_high();
+    let original_base_address: u64 = region.normalized_region.get_base_address();
+    let new_region_size: u64 = ((filter_highest_address as u64 in Saturating)
+        - (filter_lowest_address as u64 in Saturating)) as u64;
+    transition new_region_size <= 0 {
+        true -> empty(region)
+        false -> shrink(region, filter_lowest_address, new_region_size, original_base_address)
+        _ -> shrink(region, filter_lowest_address, new_region_size, original_base_address)
+    }
+
+    state empty(region: &mut SnapshotRegion<'a, 'p, 'r, 't>) {
+        // Upstream clears both vectors; the windowed equivalent collapses
+        // the live sizes (the lent backing is untouched dead storage).
+        region.current_values_size = 0;
+        region.previous_values_size = 0;
+        region.normalized_region.set_region_size(0);
+        transition { _ -> done() }
+    }
+
+    state shrink(
+        region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+        lowest: u64,
+        new_region_size: u64,
+        original_base: u64
+    ) {
+        let start_offset: u64 = ((lowest as u64 in Saturating) - (original_base as u64 in Saturating)) as u64;
+        region.normalized_region.set_base_address(lowest);
+        region.normalized_region.set_region_size(new_region_size);
+        transition { _ -> shift_current(region, start_offset, new_region_size) }
+    }
+
+    state shift_current(
+        region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+        start_offset: u64,
+        new_region_size: u64
+    ) {
+        transition region.current_values_size > 0 {
+            true -> do_shift_current(region, start_offset, new_region_size)
+            false -> shift_previous(region, start_offset, new_region_size)
+            _ -> shift_previous(region, start_offset, new_region_size)
+        }
+    }
+
+    state do_shift_current(
+        region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+        start_offset: u64,
+        new_region_size: u64
+    ) {
+        region.current_values_offset = ((region.current_values_offset as u64 in Saturating) + (start_offset as u64 in Saturating)) as u64;
+        let remaining: u64 = ((region.current_values_size as u64 in Saturating)
+            - (start_offset as u64 in Saturating)) as u64;
+        region.current_values_size = u64_min(remaining, new_region_size);
+        transition { _ -> shift_previous(region, start_offset, new_region_size) }
+    }
+
+    state shift_previous(
+        region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+        start_offset: u64,
+        new_region_size: u64
+    ) {
+        transition region.previous_values_size > 0 {
+            true -> do_shift_previous(region, start_offset, new_region_size)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state do_shift_previous(
+        region: &mut SnapshotRegion<'a, 'p, 'r, 't>,
+        start_offset: u64,
+        new_region_size: u64
+    ) {
+        region.previous_values_offset = ((region.previous_values_offset as u64 in Saturating) + (start_offset as u64 in Saturating)) as u64;
+        let remaining: u64 = ((region.previous_values_size as u64 in Saturating)
+            - (start_offset as u64 in Saturating)) as u64;
+        region.previous_values_size = u64_min(remaining, new_region_size);
+        transition { _ -> done() }
+    }
+
+    state done() {
+    }
+}
+
+machine u64_max(left: u64, right: u64) -> u64 {
+    transition left > right {
+        true -> (left)
+        false -> (right)
+        _ -> (right)
+    }
+}
+
+machine u64_min(left: u64, right: u64) -> u64 {
+    transition left < right {
+        true -> (left)
+        false -> (right)
+        _ -> (right)
+    }
+}
+
+// Upstream `remove_scan_results_by_global_indices` is deferred to the
+// result-deletion leg (collection rebuild needs its own lent storage).
