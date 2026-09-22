@@ -10,6 +10,11 @@ use squalr_engine_targets::src::target_providers::MemoryBoundsStep;
 use src::memory_queryer::memory_protection_enum::MemoryProtectionEnum;
 use src::memory_queryer::memory_queryer_trait::MemoryQueryerTrait;
 use src::memory_queryer::memory_type_enum::MemoryTypeEnum;
+use src::memory_queryer::normalized_module::AddressModuleResult;
+use src::memory_queryer::normalized_module::ModuleAddressDisplay;
+use src::memory_queryer::normalized_module::ModuleStreamStep;
+use src::memory_queryer::normalized_module::NormalizedModule;
+use src::memory_queryer::normalized_module::ResolvedModuleAddress;
 use src::memory_queryer::region_bounds_handling::RegionBoundsHandling;
 use src::proc_paths::ProcName;
 
@@ -67,6 +72,46 @@ pub data LinuxMemoryQueryer {
     // is_address_writable's private scan state.
     walk_region: normalized_region::NormalizedRegion;
     write_hit: bool;
+
+    // Module aggregation — upstream's get_modules materializes a
+    // Vec<NormalizedModule> in two passes over one parse of maps; with no
+    // growable Vec the port keeps a bounded provider-owned table (512
+    // entries, 32KiB deduplicated path slab) built by two sweeps of one open
+    // maps fd: pass 1 collects the deduplicated executable+absolute path
+    // set, seek(0) rewinds the same descriptor, pass 2 merges min(start) /
+    // max(end) for every region whose normalized path is in the set. A maps
+    // file mutating between sweeps can shift the merged bounds — recorded
+    // translation (upstream's single snapshot cannot change mid-build).
+    scan_kind: u8;          // 0 region lines, 1 module pass A, 2 module pass B
+    mod_count: u64;
+    mod_lo: [u64; 512];
+    mod_hi: [u64; 512];
+    mod_off: [u64; 512];
+    mod_len: [u64; 512];
+    mod_hash: [u64; 512];
+    mod_paths: [u8; 32768];
+    mod_paths_len: u64;
+    mod_emit: u64;
+    mod_mark: [u8; 512];
+    mod_modules_out: bool;  // next_virtual_page emits module base regions
+    non_modules: bool;      // emit filter: drop bases inside the module set
+    canon: [u8; 4096];      // canonical (space-collapsed, (deleted)-stripped) path
+    canon_len: u64;
+    hash: u64;
+    found_index: u64;
+    sel_index: u64;
+    id_lo: u64;
+    id_hi: u64;
+    byte_pos: u64;
+    ident_lo: u64;
+    ident_hi: u64;
+    have_sel: bool;
+    space_run: bool;
+    k_index: u64;
+    cmp_i: u64;
+    cmp_j: u64;
+    byte: u8;
+    peer_byte: u8;
 }
 
 pub linux_x86_64 machine LinuxMemoryQueryer::open_virtual_pages(
@@ -94,6 +139,9 @@ invokes FilesystemHost;
     self.at_eof = false;
     self.suppress_all = false;
     self.maps_fd = -1;
+    self.scan_kind = 0;
+    self.mod_modules_out = false;
+    self.non_modules = false;
     transition start_address >= end_address {
         true -> empty_open()
         false -> open_proc(process_info)
@@ -144,6 +192,9 @@ invokes FilesystemHost;
 pub linux_x86_64 machine LinuxMemoryQueryer::open_suppressed(&mut self) {
     self.maps_fd = -1;
     self.suppress_all = true;
+    self.scan_kind = 0;
+    self.mod_modules_out = false;
+    self.non_modules = false;
 }
 
 pub linux_x86_64 machine LinuxMemoryQueryer::close_enumeration(
@@ -174,9 +225,22 @@ satisfies MemoryQueryerTrait::next_virtual_page
 reaches FilesystemHost
 invokes FilesystemHost;
 {
-    transition self.suppress_all || self.maps_fd < 0 {
-        true -> finished(region)
-        false -> ensure_line(region)
+    transition self.mod_modules_out {
+        true -> module_emit(region)
+        false -> entry_guard(region)
+    }
+
+    // FromModules: the module table drains as NormalizedRegion rows —
+    // upstream's get_modules().into_iter().map(into_base_region).
+    state module_emit(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.next_module_region(region)
+    }
+
+    state entry_guard(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.suppress_all || self.maps_fd < 0 {
+            true -> finished(region)
+            false -> ensure_line(region)
+        }
     }
 
     state finished(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
@@ -203,7 +267,33 @@ invokes FilesystemHost;
         }
     }
 
+    // Module pass A reaches EOF inside the same call: rewind the open
+    // descriptor and run pass B (upstream's second pass over its parsed
+    // Vec). Any other enumeration mode closes as before.
     state finish_close(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.scan_kind == 1 {
+            true -> rewind_pass_b(region)
+            false -> finish_close_do(region)
+        }
+    }
+
+    state rewind_pass_b(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.io_count = self.host.seek(self.maps_fd, 0, 0);
+        transition self.io_count >= 0 {
+            true -> pass_b_reset(region)
+            false -> failed(region)
+        }
+    }
+
+    state pass_b_reset(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.scan_kind = 2;
+        self.buffered = 0;
+        self.cursor = 0;
+        self.at_eof = false;
+        transition { _ -> ensure_line(region) }
+    }
+
+    state finish_close_do(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
         self.close_enumeration();
         transition { _ -> finished(region) }
     }
@@ -275,7 +365,7 @@ invokes FilesystemHost;
     }
 
     state compact_move(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
-        self.buffer[self.tok_index] = self.buffer[self.src_index];
+        self.buf_put(self.tok_index, self.buf_byte_at(self.src_index));
         self.tok_index = ((self.tok_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> compact_step(region) }
     }
@@ -524,10 +614,132 @@ invokes FilesystemHost;
     // pathname is everything from scan_pos to line_end (may be empty).
     state classify_type(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
         self.pathname_len = ((self.line_end as u64 in Wrapping) - (self.scan_pos as u64 in Wrapping)) as u64;
+        transition self.scan_kind == 0 {
+            true -> type_check(region)
+            false -> module_line(region)
+        }
+    }
+
+    state type_check(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
         transition self.pathname_len == 0 {
             true -> type_none(region)
             false -> type_from_perms(region)
         }
+    }
+
+    // Module aggregation tails — no region is emitted in scan_kind != 0;
+    // the line feeds the module table and the same call keeps draining.
+    state module_line(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.scan_kind == 1 {
+            true -> mod_pass_a(region)
+            false -> mod_pass_b(region)
+        }
+    }
+
+    // Pass A: upstream is_module_region — executable bit (perms[2] == 'x')
+    // && absolute pathname. The canonicalized path is the dedupe key.
+    state mod_pass_a(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition (self.line_perms & 4) != 0 {
+            true -> mod_a_canon(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state mod_a_canon(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.canon_path();
+        transition self.canon_len > 0 && self.canon_at(0) == 47 {
+            true -> mod_a_insert(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state mod_a_insert(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.hash_path();
+        transition self.table_find() {
+            true -> consume_line(region)
+            false -> mod_a_room(region)
+        }
+    }
+
+    // Bounded-table overflow is a named failure — a silently partial path
+    // set would produce a silently partial module list.
+    state mod_a_room(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.mod_count < 512 && ((self.mod_paths_len as u64 in Wrapping) + (self.canon_len as u64 in Wrapping)) as u64 <= 32768 {
+            true -> mod_a_store(region)
+            false -> failed(region)
+        }
+    }
+
+    state mod_a_store(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.mod_off[self.mod_count] = self.mod_paths_len;
+        self.mod_len[self.mod_count] = self.canon_len;
+        self.mod_hash[self.mod_count] = self.hash;
+        self.mod_lo[self.mod_count] = 18446744073709551615;
+        self.mod_hi[self.mod_count] = 0;
+        self.mod_mark[self.mod_count] = 0;
+        self.k_index = 0;
+        transition { _ -> mod_slab(region) }
+    }
+
+    state mod_slab(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.k_index < self.canon_len {
+            true -> mod_slab_byte(region)
+            false -> mod_slab_done(region)
+        }
+    }
+
+    state mod_slab_byte(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.mod_path_set(((self.mod_paths_len as u64 in Wrapping) + (self.k_index as u64 in Wrapping)) as u64, self.canon_at(self.k_index));
+        self.k_index = ((self.k_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> mod_slab(region) }
+    }
+
+    state mod_slab_done(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.mod_paths_len = ((self.mod_paths_len as u64 in Wrapping) + (self.canon_len as u64 in Wrapping)) as u64;
+        self.mod_count = ((self.mod_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> consume_line(region) }
+    }
+
+    // Pass B: upstream merges min(start) / max(end) for every region whose
+    // normalized pathname is in the collected set — any permissions.
+    state mod_pass_b(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.canon_path();
+        transition self.canon_len > 0 {
+            true -> mod_b_find(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state mod_b_find(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.hash_path();
+        transition self.table_find() {
+            true -> mod_b_merge(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state mod_b_merge(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.region_start < self.mod_lo_at(self.found_index) {
+            true -> mod_b_lo(region)
+            false -> mod_b_hi(region)
+        }
+    }
+
+    state mod_b_lo(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.mod_lo_put(self.found_index, self.region_start);
+        transition { _ -> mod_b_hi(region) }
+    }
+
+    state mod_b_hi(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.region_end > self.mod_hi_at(self.found_index) {
+            true -> mod_b_hi_set(region)
+            false -> consume_line(region)
+        }
+    }
+
+    state mod_b_hi_set(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.mod_hi_put(self.found_index, self.region_end);
+        transition { _ -> consume_line(region) }
     }
 
     state type_none(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
@@ -568,11 +780,12 @@ invokes FilesystemHost;
         transition { _ -> apply_filters(region) }
     }
 
-    // Upstream's is_included_in_filters: required ⊆ perms, excluded ∩ perms = ∅,
-    // type ∩ allowed ≠ ∅. For empty pathname upstream type is NONE only when
-    // perms carry no p/s bit — mirrored by type_none for empty names.
+    // Upstream's matches_protection_filters + matches_type_filters, exactly:
+    // READ is unconditionally required; a non-empty required set needs any
+    // overlap ((perms & required) != 0); a non-empty excluded set needs no
+    // overlap; an empty allowed-type set admits every type.
     state apply_filters(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
-        transition (self.line_perms & self.required_bits) == self.required_bits && (self.line_perms & self.excluded_bits) == 0 && (self.line_type & self.allowed_bits) != 0 {
+        transition (self.line_perms & 1) != 0 && (self.required_bits == 0 || (self.line_perms & self.required_bits) != 0) && (self.excluded_bits == 0 || (self.line_perms & self.excluded_bits) == 0) && (self.allowed_bits == 0 || (self.line_type & self.allowed_bits) != 0) {
             true -> filter_bounds(region)
             false -> consume_line(region)
         }
@@ -628,6 +841,22 @@ invokes FilesystemHost;
     state emit(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
         self.emit_base = self.region_start;
         self.emit_size = ((self.region_end as u64 in Wrapping) - (self.region_start as u64 in Wrapping)) as u64;
+        transition self.non_modules {
+            true -> module_base_check(region)
+            false -> emit_write(region)
+        }
+    }
+
+    // FromNonModules: upstream drops every page whose (post-bounds) base
+    // address is in the module base-address set.
+    state module_base_check(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        transition self.base_in_modules() {
+            true -> consume_line(region)
+            false -> emit_write(region)
+        }
+    }
+
+    state emit_write(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
         region.set_base_address(self.emit_base);
         region.set_region_size(self.emit_size);
         transition { _ -> consume_line_region(region) }
@@ -857,4 +1086,1037 @@ pub linux_x86_64 machine LinuxMemoryQueryer::get_max_usermode_address(
 satisfies MemoryQueryerTrait::get_max_usermode_address
 {
     self.get_maximum_address(process_info)
+}
+
+// The "/proc" dirfd + "<pid>/maps" open shared by the module passes —
+// identical to open_virtual_pages' preamble, minus the filter capture.
+machine LinuxMemoryQueryer::acquire_maps(
+    &mut self,
+    process_info: &OpenedProcessInfo
+) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.buffered = 0;
+    self.cursor = 0;
+    self.at_eof = false;
+    self.suppress_all = false;
+    self.maps_fd = -1;
+    transition { _ -> open_proc(process_info) }
+
+    state open_proc(&mut self, process_info: &OpenedProcessInfo) -> bool {
+        self.proc_fd = self.host.open("/proc", 65536);
+        transition self.proc_fd >= 0 {
+            true -> open_maps(process_info)
+            false -> miss()
+        }
+    }
+
+    state open_maps(&mut self, process_info: &OpenedProcessInfo) -> bool {
+        let pid: u32 = process_info.get_process_id_raw();
+        self.name = ProcName::for_process(pid, 109, 97, 112, 115, 4);
+        transition self.name.len <= 48 {
+            true -> open_maps_at(self.name.len)
+            false -> open_maps_at(48)
+        }
+    }
+
+    state open_maps_at(&mut self, name_len: u64) -> bool {
+        self.maps_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 0);
+        self.scratch = self.host.close(self.proc_fd);
+        transition self.maps_fd >= 0 {
+            true -> yes()
+            false -> miss()
+        }
+    }
+
+    state yes(&mut self) -> bool {
+        true
+    }
+
+    state miss(&mut self) -> bool {
+        false
+    }
+}
+
+// Upstream get_modules: parse_proc_maps -> build_modules_from_regions. The
+// stream form is a drained two-pass scan (pass A collects the path set, the
+// fd rewinds, pass B merges bounds); each next_module then emits the next
+// lowest-base entry — the upstream Vec's sort_by_key(base) order. A maps
+// open failure yields upstream's empty Vec: an empty stream, not an error.
+// Bounded-table overflow during pass A is the named failure path.
+pub linux_x86_64 machine LinuxMemoryQueryer::open_modules(
+    &mut self,
+    process_info: &OpenedProcessInfo
+) -> MemoryBoundsOpen
+satisfies MemoryQueryerTrait::open_modules
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.mod_count = 0;
+    self.mod_paths_len = 0;
+    self.mod_emit = 0;
+    self.mod_modules_out = false;
+    self.non_modules = false;
+    self.scan_kind = 1;
+    transition self.acquire_maps(process_info) {
+        true -> drain()
+        false -> suppressed()
+    }
+
+    state drain(&mut self) -> MemoryBoundsOpen {
+        let step: MemoryBoundsStep = self.next_virtual_page(&mut self.walk_region);
+        transition step {
+            MemoryBoundsStep::Region -> drain()
+            MemoryBoundsStep::Finished -> built()
+            MemoryBoundsStep::Failed -> failed()
+        }
+    }
+
+    state built(&mut self) -> MemoryBoundsOpen {
+        self.scan_kind = 0;
+        MemoryBoundsOpen::Opened
+    }
+
+    state suppressed(&mut self) -> MemoryBoundsOpen {
+        self.suppress_all = true;
+        self.scan_kind = 0;
+        self.mod_count = 0;
+        MemoryBoundsOpen::Opened
+    }
+
+    state failed(&mut self) -> MemoryBoundsOpen {
+        self.scan_kind = 0;
+        MemoryBoundsOpen::Failed
+    }
+}
+
+// FromModules: the module stream drained as bare base regions.
+pub linux_x86_64 machine LinuxMemoryQueryer::open_module_regions(
+    &mut self,
+    process_info: &OpenedProcessInfo
+) -> MemoryBoundsOpen
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let open: MemoryBoundsOpen = self.open_modules(process_info);
+    transition open {
+        MemoryBoundsOpen::Opened -> out_mode()
+        MemoryBoundsOpen::Failed -> fail()
+    }
+
+    state out_mode(&mut self) -> MemoryBoundsOpen {
+        self.mod_modules_out = true;
+        MemoryBoundsOpen::Opened
+    }
+
+    state fail(&mut self) -> MemoryBoundsOpen {
+        MemoryBoundsOpen::Failed
+    }
+}
+
+// FromNonModules: build the module base set, then run the usermode page
+// enumeration with the base-exclusion filter on (upstream's exact filter:
+// required/excluded empty, types NONE|PRIVATE|IMAGE, [0, max_usermode),
+// bounds Exclude). An unreadable maps file yields an empty set upstream —
+// the port proceeds with an empty table, so every usermode page passes.
+pub linux_x86_64 machine LinuxMemoryQueryer::open_nonmodule_pages(
+    &mut self,
+    process_info: &OpenedProcessInfo
+) -> MemoryBoundsOpen
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.mod_count = 0;
+    self.mod_paths_len = 0;
+    self.mod_emit = 0;
+    self.mod_modules_out = false;
+    self.non_modules = false;
+    self.scan_kind = 1;
+    transition self.acquire_maps(process_info) {
+        true -> drain(process_info)
+        false -> pages_open(process_info)
+    }
+
+    state drain(&mut self, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        let step: MemoryBoundsStep = self.next_virtual_page(&mut self.walk_region);
+        transition step {
+            MemoryBoundsStep::Region -> drain(process_info)
+            MemoryBoundsStep::Finished -> pages_open(process_info)
+            MemoryBoundsStep::Failed -> fail()
+        }
+    }
+
+    state pages_open(&mut self, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        self.scan_kind = 0;
+        let required: MemoryProtectionEnum = MemoryProtectionEnum::empty();
+        let excluded: MemoryProtectionEnum = MemoryProtectionEnum::empty();
+        let type_none: MemoryTypeEnum = MemoryTypeEnum::none();
+        let type_private: MemoryTypeEnum = MemoryTypeEnum::private();
+        let type_image: MemoryTypeEnum = MemoryTypeEnum::image();
+        let allowed_partial: MemoryTypeEnum = type_none.union(type_private);
+        let allowed: MemoryTypeEnum = allowed_partial.union(type_image);
+        let maximum: u64 = self.get_max_usermode_address(process_info);
+        let open: MemoryBoundsOpen = self.open_virtual_pages(
+            process_info,
+            required,
+            excluded,
+            allowed,
+            0,
+            maximum,
+            RegionBoundsHandling::Exclude
+        );
+        transition open {
+            MemoryBoundsOpen::Opened -> on()
+            MemoryBoundsOpen::Failed -> fail()
+        }
+    }
+
+    state on(&mut self) -> MemoryBoundsOpen {
+        self.non_modules = true;
+        MemoryBoundsOpen::Opened
+    }
+
+    state fail(&mut self) -> MemoryBoundsOpen {
+        MemoryBoundsOpen::Failed
+    }
+}
+
+// Selection-min over unmarked entries — the upstream sort_by_key(base) drain
+// (entries with hi <= lo never materialize upstream: their size is 0).
+machine LinuxMemoryQueryer::emit_min(&mut self) -> bool {
+    transition self.mod_emit < self.mod_count {
+        true -> scan()
+        false -> miss()
+    }
+
+    state scan(&mut self) -> bool {
+        self.k_index = 0;
+        self.have_sel = false;
+        transition { _ -> step() }
+    }
+
+    state step(&mut self) -> bool {
+        transition self.k_index < self.mod_count {
+            true -> consider()
+            false -> verdict()
+        }
+    }
+
+    state consider(&mut self) -> bool {
+        transition self.mod_mark_at(self.k_index) == 0 && self.mod_lo_at(self.k_index) < self.mod_hi_at(self.k_index) {
+            true -> candidate()
+            false -> advance()
+        }
+    }
+
+    state candidate(&mut self) -> bool {
+        transition self.have_sel == false || self.mod_lo_at(self.k_index) < self.mod_lo_at(self.sel_index) {
+            true -> take()
+            false -> advance()
+        }
+    }
+
+    state take(&mut self) -> bool {
+        self.sel_index = self.k_index;
+        self.have_sel = true;
+        transition { _ -> advance() }
+    }
+
+    state advance(&mut self) -> bool {
+        self.k_index = ((self.k_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> step() }
+    }
+
+    state verdict(&mut self) -> bool {
+        self.have_sel
+    }
+
+    state miss(&mut self) -> bool {
+        false
+    }
+}
+
+// Basename bounds for the selected entry — upstream's Path::file_name with
+// the full-path fallback (a name that's all separators, or no separator,
+// yields the whole path).
+machine LinuxMemoryQueryer::module_name_bounds(&mut self) {
+    self.emit_base = self.mod_off_at(self.sel_index);
+    self.emit_size = ((self.emit_base as u64 in Wrapping) + (self.mod_len_at(self.sel_index) as u64 in Wrapping)) as u64;
+    transition { _ -> trim_slash() }
+
+    // file_name ignores trailing separators.
+    state trim_slash(&mut self) {
+        transition self.emit_size > self.emit_base && self.mod_path_at(((self.emit_size as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64) == 47 {
+            true -> trim_step()
+            false -> scan_back()
+        }
+    }
+
+    state trim_step(&mut self) {
+        self.emit_size = ((self.emit_size as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition { _ -> trim_slash() }
+    }
+
+    state scan_back(&mut self) {
+        self.k_index = self.emit_size;
+        transition { _ -> back_step() }
+    }
+
+    state back_step(&mut self) {
+        transition self.k_index > self.emit_base {
+            true -> back_byte()
+            false -> whole()
+        }
+    }
+
+    state back_byte(&mut self) {
+        self.k_index = ((self.k_index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition self.mod_path_at(self.k_index) == 47 {
+            true -> named()
+            false -> back_step()
+        }
+    }
+
+    state named(&mut self) {
+        self.id_lo = ((self.k_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        self.id_hi = self.emit_size;
+        transition { _ -> done() }
+    }
+
+    state whole(&mut self) {
+        transition self.emit_size > self.emit_base {
+            true -> bounded()
+            false -> fallback()
+        }
+    }
+
+    state bounded(&mut self) {
+        self.id_lo = self.emit_base;
+        self.id_hi = self.emit_size;
+        transition { _ -> done() }
+    }
+
+    state fallback(&mut self) {
+        self.id_lo = self.mod_off_at(self.sel_index);
+        self.id_hi = ((self.id_lo as u64 in Wrapping) + (self.mod_len_at(self.sel_index) as u64 in Wrapping)) as u64;
+        transition { _ -> done() }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// Upstream resolve compares module_name().trim(): an ASCII-whitespace trim
+// (space/tab/LF/CR) applied to the selected name bounds at compare time.
+machine LinuxMemoryQueryer::ws_trim_bounds(&mut self) {
+    transition { _ -> ws_front() }
+
+    state ws_front(&mut self) {
+        self.byte = self.mod_path_at(self.id_lo);
+        transition self.id_lo < self.id_hi && self.is_ws(self.byte) {
+            true -> ws_front_step()
+            false -> ws_back()
+        }
+    }
+
+    state ws_front_step(&mut self) {
+        self.id_lo = ((self.id_lo as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> ws_front() }
+    }
+
+    state ws_back(&mut self) {
+        self.byte = self.mod_path_at(((self.id_hi as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+        transition self.id_hi > self.id_lo && self.is_ws(self.byte) {
+            true -> ws_back_step()
+            false -> done()
+        }
+    }
+
+    state ws_back_step(&mut self) {
+        self.id_hi = ((self.id_hi as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition { _ -> ws_back() }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+machine LinuxMemoryQueryer::is_ws(&mut self, byte: u8) -> bool {
+    byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12
+}
+
+// Write the selected table entry's basename + merged region into `module`
+// (upstream NormalizedModule::new(name, lo, hi - lo)). set_module_name owns
+// the bounded copy into the fixed name buffer.
+machine LinuxMemoryQueryer::fill_module(&mut self, module: &mut NormalizedModule) {
+    self.module_name_bounds();
+    transition { _ -> bounds_ok(module) }
+
+    state bounds_ok(&mut self, module: &mut NormalizedModule) {
+        transition self.id_lo <= self.id_hi && self.id_hi <= self.mod_paths.len {
+            true -> fill(module)
+            false -> done()
+        }
+    }
+
+    state fill(&mut self, module: &mut NormalizedModule) {
+        module.set_module_name(self.mod_paths[self.id_lo..self.id_hi]);
+        module.set_base_address(self.mod_lo_at(self.sel_index));
+        module.set_region_size(((self.mod_hi_at(self.sel_index) as u64 in Wrapping) - (self.mod_lo_at(self.sel_index) as u64 in Wrapping)) as u64);
+        module.set_module_address_display(ModuleAddressDisplay::ModuleRelative);
+        transition { _ -> done() }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// The get_modules stream: each call yields the next lowest-base module.
+pub linux_x86_64 machine LinuxMemoryQueryer::next_module(
+    &mut self,
+    module: &mut NormalizedModule
+) -> ModuleStreamStep
+satisfies MemoryQueryerTrait::next_module
+{
+    transition self.emit_min() {
+        true -> emit(module)
+        false -> fin()
+    }
+
+    state emit(&mut self, module: &mut NormalizedModule) -> ModuleStreamStep {
+        self.mod_mark_put(self.sel_index);
+        self.mod_emit = ((self.mod_emit as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        self.fill_module(module);
+        transition { _ -> yielded() }
+    }
+
+    state yielded(&mut self) -> ModuleStreamStep {
+        ModuleStreamStep::Module
+    }
+
+    state fin(&mut self) -> ModuleStreamStep {
+        ModuleStreamStep::Finished
+    }
+}
+
+// One module entry as a bare NormalizedRegion (FromModules' drain).
+machine LinuxMemoryQueryer::next_module_region(
+    &mut self,
+    region: &mut normalized_region::NormalizedRegion
+) -> MemoryBoundsStep {
+    transition self.emit_min() {
+        true -> emit(region)
+        false -> fin()
+    }
+
+    state emit(&mut self, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
+        self.mod_mark_put(self.sel_index);
+        self.mod_emit = ((self.mod_emit as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        region.set_base_address(self.mod_lo_at(self.sel_index));
+        region.set_region_size(((self.mod_hi_at(self.sel_index) as u64 in Wrapping) - (self.mod_lo_at(self.sel_index) as u64 in Wrapping)) as u64);
+        transition { _ -> yielded() }
+    }
+
+    state yielded(&mut self) -> MemoryBoundsStep {
+        MemoryBoundsStep::Region
+    }
+
+    state fin(&mut self) -> MemoryBoundsStep {
+        MemoryBoundsStep::Finished
+    }
+}
+
+// FromNonModules' emit filter: emit_base equals a module base address.
+machine LinuxMemoryQueryer::base_in_modules(&mut self) -> bool {
+    self.k_index = 0;
+    transition { _ -> scan() }
+
+    state scan(&mut self) -> bool {
+        transition self.k_index < self.mod_count {
+            true -> cmp()
+            false -> miss()
+        }
+    }
+
+    state cmp(&mut self) -> bool {
+        transition self.mod_lo_at(self.k_index) < self.mod_hi_at(self.k_index) && self.mod_lo_at(self.k_index) == self.emit_base {
+            true -> hit()
+            false -> step()
+        }
+    }
+
+    state step(&mut self) -> bool {
+        self.k_index = ((self.k_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> scan() }
+    }
+
+    state hit(&mut self) -> bool {
+        true
+    }
+
+    state miss(&mut self) -> bool {
+        false
+    }
+}
+
+// The canonical module key for the current line's pathname: collapse every
+// run of spaces/tabs to one space (upstream's split_whitespace + join(" "))
+// and strip a trailing " (deleted)" (upstream's normalize_module_path).
+machine LinuxMemoryQueryer::canon_path(&mut self) {
+    self.canon_len = 0;
+    self.space_run = false;
+    self.k_index = 0;
+    transition { _ -> step() }
+
+    state step(&mut self) {
+        transition self.k_index < self.pathname_len {
+            true -> canon_byte()
+            false -> strip()
+        }
+    }
+
+    state canon_byte(&mut self) {
+        self.byte = self.buf_byte_at(((self.scan_pos as u64 in Wrapping) + (self.k_index as u64 in Wrapping)) as u64);
+        transition self.byte == 32 || self.byte == 9 {
+            true -> space()
+            false -> put()
+        }
+    }
+
+    state space(&mut self) {
+        transition self.space_run {
+            true -> adv()
+            false -> space_put()
+        }
+    }
+
+    state space_put(&mut self) {
+        transition self.canon_len < 4096 {
+            true -> space_store()
+            false -> adv()
+        }
+    }
+
+    state space_store(&mut self) {
+        self.canon_set(self.canon_len, 32);
+        self.canon_len = ((self.canon_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        self.space_run = true;
+        transition { _ -> adv() }
+    }
+
+    state put(&mut self) {
+        transition self.canon_len < 4096 {
+            true -> byte_store()
+            false -> adv()
+        }
+    }
+
+    state byte_store(&mut self) {
+        self.canon_set(self.canon_len, self.byte);
+        self.canon_len = ((self.canon_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        self.space_run = false;
+        transition { _ -> adv() }
+    }
+
+    state adv(&mut self) {
+        self.k_index = ((self.k_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> step() }
+    }
+
+    // " (deleted)" — 32,100,101,108,101,116,101,100,41, plus its leading
+    // space at index canon_len - 10.
+    state strip(&mut self) {
+        transition self.canon_len >= 10 && self.canon_at(((self.canon_len as u64 in Wrapping) - (10 as u64 in Wrapping)) as u64) == 32 && self.canon_at(((self.canon_len as u64 in Wrapping) - (9 as u64 in Wrapping)) as u64) == 100 && self.canon_at(((self.canon_len as u64 in Wrapping) - (8 as u64 in Wrapping)) as u64) == 101 && self.canon_at(((self.canon_len as u64 in Wrapping) - (7 as u64 in Wrapping)) as u64) == 108 && self.canon_at(((self.canon_len as u64 in Wrapping) - (6 as u64 in Wrapping)) as u64) == 101 && self.canon_at(((self.canon_len as u64 in Wrapping) - (5 as u64 in Wrapping)) as u64) == 116 && self.canon_at(((self.canon_len as u64 in Wrapping) - (4 as u64 in Wrapping)) as u64) == 101 && self.canon_at(((self.canon_len as u64 in Wrapping) - (3 as u64 in Wrapping)) as u64) == 100 && self.canon_at(((self.canon_len as u64 in Wrapping) - (2 as u64 in Wrapping)) as u64) == 41 && self.canon_at(((self.canon_len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64) == 41 {
+            true -> strip_do()
+            false -> done()
+        }
+    }
+
+    state strip_do(&mut self) {
+        self.canon_len = ((self.canon_len as u64 in Wrapping) - (10 as u64 in Wrapping)) as u64;
+        transition { _ -> done() }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// Dedupe hash over the canonical key (any uniform hash — byte equality is
+// still the authority; the hash only prunes compares).
+machine LinuxMemoryQueryer::hash_path(&mut self) {
+    self.hash = 5381;
+    self.k_index = 0;
+    transition { _ -> step() }
+
+    state step(&mut self) {
+        transition self.k_index < self.canon_len {
+            true -> mix()
+            false -> done()
+        }
+    }
+
+    state mix(&mut self) {
+        self.hash = ((((self.hash as u64 in Wrapping) * (65599 as u64 in Wrapping)) as u64 as u64 in Wrapping) + (self.canon_at(self.k_index) as u64 in Wrapping)) as u64;
+        self.k_index = ((self.k_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> step() }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// Table lookup for the current canon+hash: linear scan, byte-equal compare.
+machine LinuxMemoryQueryer::table_find(&mut self) -> bool {
+    self.k_index = 0;
+    transition { _ -> scan() }
+
+    state scan(&mut self) -> bool {
+        transition self.k_index < self.mod_count {
+            true -> hash_cmp()
+            false -> miss()
+        }
+    }
+
+    state hash_cmp(&mut self) -> bool {
+        transition self.mod_hash_at(self.k_index) == self.hash && self.mod_len_at(self.k_index) == self.canon_len {
+            true -> byte_cmp()
+            false -> advance()
+        }
+    }
+
+    state byte_cmp(&mut self) -> bool {
+        self.cmp_j = 0;
+        transition { _ -> byte_scan() }
+    }
+
+    state byte_scan(&mut self) -> bool {
+        transition self.cmp_j < self.canon_len {
+            true -> byte_eq()
+            false -> hit()
+        }
+    }
+
+    state byte_eq(&mut self) -> bool {
+        transition self.mod_path_at(((self.mod_off_at(self.k_index) as u64 in Wrapping) + (self.cmp_j as u64 in Wrapping)) as u64) == self.canon_at(self.cmp_j) {
+            true -> byte_step()
+            false -> advance()
+        }
+    }
+
+    state byte_step(&mut self) -> bool {
+        self.cmp_j = ((self.cmp_j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> byte_scan() }
+    }
+
+    state hit(&mut self) -> bool {
+        self.found_index = self.k_index;
+        transition { _ -> yes() }
+    }
+
+    state advance(&mut self) -> bool {
+        self.k_index = ((self.k_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> scan() }
+    }
+
+    state yes(&mut self) -> bool {
+        true
+    }
+
+    state miss(&mut self) -> bool {
+        false
+    }
+}
+
+// Upstream resolve_module: identifier.trim(), then the first module (in the
+// upstream Vec's base-sorted order) whose trimmed name equals the identifier
+// case-insensitively; unresolved -> 0.
+pub linux_x86_64 machine LinuxMemoryQueryer::resolve_module(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    identifier: &[u8]
+) -> u64
+satisfies MemoryQueryerTrait::resolve_module
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.ident_lo = 0;
+    self.ident_hi = identifier.len;
+    transition { _ -> trim_front(process_info, identifier) }
+
+    state trim_front(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        transition self.ident_lo < self.ident_hi && self.ident_lo < identifier.len {
+            true -> tf_cmp(process_info, identifier)
+            false -> trim_back(process_info, identifier)
+        }
+    }
+
+    state tf_cmp(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        self.byte = self.byte_at(identifier, self.ident_lo);
+        transition self.is_space(self.byte) {
+            true -> trim_front_step(process_info, identifier)
+            false -> trim_back(process_info, identifier)
+        }
+    }
+
+    state trim_front_step(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        self.ident_lo = ((self.ident_lo as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> trim_front(process_info, identifier) }
+    }
+
+    state trim_back(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        self.byte_pos = ((self.ident_hi as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition self.ident_hi > self.ident_lo && self.byte_pos < identifier.len {
+            true -> tb_cmp(process_info, identifier)
+            false -> non_empty(process_info, identifier)
+        }
+    }
+
+    state tb_cmp(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        self.byte = self.byte_at(identifier, self.byte_pos);
+        transition self.is_space(self.byte) {
+            true -> trim_back_step(process_info, identifier)
+            false -> non_empty(process_info, identifier)
+        }
+    }
+
+    state trim_back_step(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        self.ident_hi = ((self.ident_hi as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition { _ -> trim_back(process_info, identifier) }
+    }
+
+    state non_empty(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        transition self.ident_lo < self.ident_hi {
+            true -> build(process_info, identifier)
+            false -> miss()
+        }
+    }
+
+    state build(&mut self, process_info: &OpenedProcessInfo, identifier: &[u8]) -> u64 {
+        let open: MemoryBoundsOpen = self.open_modules(process_info);
+        transition open {
+            MemoryBoundsOpen::Opened -> scan(identifier)
+            MemoryBoundsOpen::Failed -> miss()
+        }
+    }
+
+    state scan(&mut self, identifier: &[u8]) -> u64 {
+        transition self.emit_min() {
+            true -> compare(identifier)
+            false -> miss()
+        }
+    }
+
+    state compare(&mut self, identifier: &[u8]) -> u64 {
+        self.mod_mark_put(self.sel_index);
+        self.mod_emit = ((self.mod_emit as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        self.module_name_bounds();
+        self.ws_trim_bounds();
+        transition self.name_eq(identifier) {
+            true -> hit()
+            false -> scan(identifier)
+        }
+    }
+
+    state hit(&mut self) -> u64 {
+        self.mod_lo_at(self.sel_index)
+    }
+
+    state miss(&mut self) -> u64 {
+        0
+    }
+}
+
+// Case-insensitive compare: the selected module's basename (id_lo..id_hi in
+// the slab) against identifier[ident_lo..ident_hi].
+machine LinuxMemoryQueryer::name_eq(&mut self, identifier: &[u8]) -> bool {
+    transition ((self.id_hi as u64 in Wrapping) - (self.id_lo as u64 in Wrapping)) as u64 == ((self.ident_hi as u64 in Wrapping) - (self.ident_lo as u64 in Wrapping)) as u64 {
+        true -> begin(identifier)
+        false -> miss()
+    }
+
+    state begin(&mut self, identifier: &[u8]) -> bool {
+        self.cmp_i = 0;
+        transition { _ -> scan(identifier) }
+    }
+
+    state scan(&mut self, identifier: &[u8]) -> bool {
+        transition (((self.id_lo as u64 in Wrapping) + (self.cmp_i as u64 in Wrapping)) as u64) < self.id_hi {
+            true -> byte_cmp(identifier)
+            false -> hit()
+        }
+    }
+
+    state byte_cmp(&mut self, identifier: &[u8]) -> bool {
+        self.byte_pos = ((self.ident_lo as u64 in Wrapping) + (self.cmp_i as u64 in Wrapping)) as u64;
+        self.byte = self.mod_path_at(((self.id_lo as u64 in Wrapping) + (self.cmp_i as u64 in Wrapping)) as u64);
+        self.byte = self.lower_fold(self.byte);
+        transition self.byte_pos < identifier.len {
+            true -> ident_cmp(identifier)
+            false -> miss()
+        }
+    }
+
+    state ident_cmp(&mut self, identifier: &[u8]) -> bool {
+        self.peer_byte = self.byte_at(identifier, self.byte_pos);
+        self.peer_byte = self.lower_fold(self.peer_byte);
+        transition self.byte == self.peer_byte {
+            true -> step(identifier)
+            false -> miss()
+        }
+    }
+
+    state step(&mut self, identifier: &[u8]) -> bool {
+        self.cmp_i = ((self.cmp_i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> scan(identifier) }
+    }
+
+    state hit(&mut self) -> bool {
+        true
+    }
+
+    state miss(&mut self) -> bool {
+        false
+    }
+}
+
+machine LinuxMemoryQueryer::is_space(&mut self, byte: u8) -> bool {
+    byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12
+}
+
+machine LinuxMemoryQueryer::lower_fold(&mut self, byte: u8) -> u8 {
+    transition byte >= 65 && byte <= 90 {
+        true -> fold(byte)
+        false -> same(byte)
+    }
+
+    state fold(&mut self, byte: u8) -> u8 {
+        ((byte as u8 in Wrapping) + (32 as u8 in Wrapping)) as u8
+    }
+
+    state same(&mut self, byte: u8) -> u8 {
+        byte
+    }
+}
+
+// resolve_module_address = resolve_module(...).checked_add(offset): only a
+// u64 overflow is Unresolvable — an unknown module resolves to `offset`
+// itself (base 0), exactly as upstream.
+pub linux_x86_64 machine LinuxMemoryQueryer::resolve_module_address(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    identifier: &[u8],
+    offset: u64
+) -> ResolvedModuleAddress
+satisfies MemoryQueryerTrait::resolve_module_address
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let base: u64 = self.resolve_module(process_info, identifier);
+    let sum: u64 = ((base as u64 in Wrapping) + (offset as u64 in Wrapping)) as u64;
+    transition sum < base {
+        true -> unresolvable()
+        false -> resolved(sum)
+    }
+
+    state resolved(&mut self, address: u64) -> ResolvedModuleAddress {
+        ResolvedModuleAddress::Resolved { address: address }
+    }
+
+    state unresolvable(&mut self) -> ResolvedModuleAddress {
+        ResolvedModuleAddress::Unresolvable
+    }
+}
+
+// Upstream address_to_module: the first (base-sorted) module containing the
+// address; Hit carries address - base and fills `module` with the entry.
+pub linux_x86_64 machine LinuxMemoryQueryer::address_to_module(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    address: u64,
+    module: &mut NormalizedModule
+) -> AddressModuleResult
+satisfies MemoryQueryerTrait::address_to_module
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let open: MemoryBoundsOpen = self.open_modules(process_info);
+    transition open {
+        MemoryBoundsOpen::Opened -> scan(address, module)
+        MemoryBoundsOpen::Failed -> miss()
+    }
+
+    state scan(&mut self, address: u64, module: &mut NormalizedModule) -> AddressModuleResult {
+        transition self.emit_min() {
+            true -> contains(address, module)
+            false -> miss()
+        }
+    }
+
+    state contains(&mut self, address: u64, module: &mut NormalizedModule) -> AddressModuleResult {
+        self.mod_mark_put(self.sel_index);
+        self.mod_emit = ((self.mod_emit as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        // contains_address is end-inclusive upstream: [base, base+size] —
+        // the merged hi is base+size, so the bound is <= not <.
+        transition self.mod_lo_at(self.sel_index) <= address && address <= self.mod_hi_at(self.sel_index) {
+            true -> hit(address, module)
+            false -> scan(address, module)
+        }
+    }
+
+    state hit(&mut self, address: u64, module: &mut NormalizedModule) -> AddressModuleResult {
+        self.fill_module(module);
+        let offset: u64 = ((address as u64 in Wrapping) - (self.mod_lo_at(self.sel_index) as u64 in Wrapping)) as u64;
+        AddressModuleResult::Hit { offset: offset }
+    }
+
+    state miss(&mut self) -> AddressModuleResult {
+        AddressModuleResult::Miss
+    }
+}
+
+// Bounded accessors for the module tables: positions arrive as ordinary args
+// (computed expressions allowed); the internal guard discharges the index
+// proof. Out-of-range reads yield a sentinel that cannot match a live query
+// (mark→1 "used", lo→u64::MAX, hi→0, off→slab end, len/hash→0, path byte→0);
+// writes out of range are dropped (unreachable by construction).
+machine LinuxMemoryQueryer::mod_lo_at(&mut self, index: u64) -> u64 {
+    transition index < 512 {
+        true -> hit(index)
+        false -> miss()
+    }
+    state hit(&mut self, index: u64) -> u64 { self.mod_lo[index] }
+    state miss(&mut self) -> u64 { 18446744073709551615 }
+}
+
+machine LinuxMemoryQueryer::mod_hi_at(&mut self, index: u64) -> u64 {
+    transition index < 512 {
+        true -> hit(index)
+        false -> miss()
+    }
+    state hit(&mut self, index: u64) -> u64 { self.mod_hi[index] }
+    state miss(&mut self) -> u64 { 0 }
+}
+
+machine LinuxMemoryQueryer::mod_off_at(&mut self, index: u64) -> u64 {
+    transition index < 512 {
+        true -> hit(index)
+        false -> miss()
+    }
+    state hit(&mut self, index: u64) -> u64 { self.mod_off[index] }
+    state miss(&mut self) -> u64 { 32768 }
+}
+
+machine LinuxMemoryQueryer::mod_len_at(&mut self, index: u64) -> u64 {
+    transition index < 512 {
+        true -> hit(index)
+        false -> miss()
+    }
+    state hit(&mut self, index: u64) -> u64 { self.mod_len[index] }
+    state miss(&mut self) -> u64 { 0 }
+}
+
+machine LinuxMemoryQueryer::mod_hash_at(&mut self, index: u64) -> u64 {
+    transition index < 512 {
+        true -> hit(index)
+        false -> miss()
+    }
+    state hit(&mut self, index: u64) -> u64 { self.mod_hash[index] }
+    state miss(&mut self) -> u64 { 0 }
+}
+
+machine LinuxMemoryQueryer::mod_mark_at(&mut self, index: u64) -> u8 {
+    transition index < 512 {
+        true -> hit(index)
+        false -> miss()
+    }
+    state hit(&mut self, index: u64) -> u8 { self.mod_mark[index] }
+    state miss(&mut self) -> u8 { 1 }
+}
+
+machine LinuxMemoryQueryer::mod_mark_put(&mut self, index: u64) {
+    transition index < 512 {
+        true -> put(index)
+        false -> skip()
+    }
+    state put(&mut self, index: u64) { self.mod_mark[index] = 1; }
+    state skip(&mut self) {
+    }
+}
+
+machine LinuxMemoryQueryer::mod_lo_put(&mut self, index: u64, value: u64) {
+    transition index < 512 {
+        true -> put(index, value)
+        false -> skip()
+    }
+    state put(&mut self, index: u64, value: u64) { self.mod_lo[index] = value; }
+    state skip(&mut self) {
+    }
+}
+
+machine LinuxMemoryQueryer::mod_hi_put(&mut self, index: u64, value: u64) {
+    transition index < 512 {
+        true -> put(index, value)
+        false -> skip()
+    }
+    state put(&mut self, index: u64, value: u64) { self.mod_hi[index] = value; }
+    state skip(&mut self) {
+    }
+}
+
+machine LinuxMemoryQueryer::mod_path_at(&mut self, position: u64) -> u8 {
+    transition position < 32768 {
+        true -> hit(position)
+        false -> miss()
+    }
+    state hit(&mut self, position: u64) -> u8 { self.mod_paths[position] }
+    state miss(&mut self) -> u8 { 0 }
+}
+
+machine LinuxMemoryQueryer::mod_path_set(&mut self, position: u64, byte: u8) {
+    transition position < 32768 {
+        true -> put(position, byte)
+        false -> skip()
+    }
+    state put(&mut self, position: u64, byte: u8) { self.mod_paths[position] = byte; }
+    state skip(&mut self) {
+    }
+}
+
+machine LinuxMemoryQueryer::canon_at(&mut self, position: u64) -> u8 {
+    transition position < 4096 {
+        true -> hit(position)
+        false -> miss()
+    }
+    state hit(&mut self, position: u64) -> u8 { self.canon[position] }
+    state miss(&mut self) -> u8 { 0 }
+}
+
+machine LinuxMemoryQueryer::canon_set(&mut self, position: u64, byte: u8) {
+    transition position < 4096 {
+        true -> put(position, byte)
+        false -> skip()
+    }
+    state put(&mut self, position: u64, byte: u8) { self.canon[position] = byte; }
+    state skip(&mut self) {
+    }
+}
+
+machine LinuxMemoryQueryer::buf_put(&mut self, position: u64, byte: u8) {
+    transition position < 4096 {
+        true -> put(position, byte)
+        false -> skip()
+    }
+    state put(&mut self, position: u64, byte: u8) { self.buffer[position] = byte; }
+    state skip(&mut self) {
+    }
+}
+
+// Element read on a caller-bounded slice param — the requires clause
+// discharges the slice index; the caller proves position < s.len.
+machine LinuxMemoryQueryer::byte_at(&mut self, s: &[u8], position: u64) -> u8
+requires
+    position < s.len;
+{
+    s[position]
 }
