@@ -1,0 +1,334 @@
+module src::structures::tasks::trackable_task;
+
+use omega::language::core::option;
+use omega::language::core::wait_wake;
+use src::structures::tasks::trackable_task_handle;
+
+// Port of structures/tasks/trackable_task.rs @568aa758. Field-by-field:
+//
+//   name: String -> bounded byte buffer + live length (Omega has no
+//     growable String; 256 bytes covers every authored task name).
+//   progress: Arc<Mutex<f32>> -> `progress: f32`. The mutex exists only for
+//     cross-thread sharing; the lock-failure log branches have no single-
+//     owner analog, and `set_progress`'s interior mutation is the ordinary
+//     `&mut self` attachment.
+//   task_identifier: String -> bounded byte buffer + live length (a uuid
+//     text is 36 bytes). Upstream `Option<String>` defaults to
+//     `Uuid::new_v4()`; minting a v4 uuid awaits an entropy facility
+//     (recorded as a dependency, not simulated), so `create` takes the
+//     identifier bytes like upstream's `Some` leg.
+//   is_canceled / is_completed: Arc<AtomicBool> -> AtomicBool fields.
+//     The SeqCst stores/loads keep their GlobalOrder spellings; sharing the
+//     cell is a task borrow (`get_cancellation_token` returns the observed
+//     flag — a live shared cell awaits shared ownership).
+//   completed_cv: Condvar -> `completion_word` plus the WaitWake substrate
+//     admitted at `create` (provider admission stays a selection of the
+//     caller, matching the core wait/wake contract). `notify_all` is
+//     `wake_many` with an unbounded count; the wait keeps upstream's
+//     completion re-check loop so a wake edge that is not completion
+//     cannot end the wait early.
+//   progress_sender/progress_receiver: the unbounded crossbeam channel
+//     becomes a bounded 64-deep journal inside the task plus a wake word.
+//     Receivers are competing claims on the one shared head, exactly like
+//     crossbeam's cloned `Receiver`s; `subscribe_to_progress_updates`
+//     yields that claim. A full queue declines the send — upstream's
+//     `Err` send branch (whose handling is only an error log; the logging
+//     surface is deferred). `recv`'s disconnect failure has no analog
+//     while the task owns its queue.
+//   The Arc<Self> return of `create` is the owned value; upstream's shared
+//     clones are ordinary borrows at the call sites.
+
+// The `Receiver<f32>` clone upstream hands out: a competing-consumer claim
+// on the task's single shared progress queue. Stateless because every
+// receiver drains the same head — claims are interchangeable.
+pub data ProgressReceiver [copy] {
+}
+
+pub data TrackableTask<'a> {
+    name: [u8; 256];
+    name_len: u64;
+    progress: f32;
+    task_identifier: [u8; 256];
+    task_identifier_len: u64;
+    is_canceled: AtomicBool;
+    is_completed: AtomicBool;
+    completion_word: u64;
+    progress_queue: [f32; 64];
+    progress_queue_head: u64;
+    progress_queue_len: u64;
+    progress_queue_word: u64;
+    substrate: &'a WaitWake;
+}
+
+// The bounded-byte-buffer copy shared by the name and identifier fields
+// (the same shape ProcessInfo::set_name uses). Returns the stored count.
+machine copy_task_text(target: &mut [u8; 256], text: &[u8]) -> u64 {
+    transition { _ -> copy(target, text, 0) }
+    state copy(target: &mut [u8; 256], text: &[u8], position: u64) -> u64 {
+        transition position < text.len && position < 256 {
+            true -> store(target, text, position)
+            false -> (position)
+        }
+    }
+    state store(target: &mut [u8; 256], text: &[u8], position: u64) -> u64 {
+        target[position] = text[position];
+        transition { _ -> copy(target, text, position + 1) }
+    }
+}
+
+// Upstream `create(name, task_identifier) -> Arc<Self>`: progress at zero,
+// flags clear, channel empty. The identifier arrives caller-minted (see the
+// uuid note above) and the wait/wake substrate is admitted here for the
+// condvar and channel realizations.
+pub machine TrackableTask::create<'a>(
+    name: &[u8],
+    task_identifier: &[u8],
+    substrate: &'a WaitWake
+) -> TrackableTask<'a> {
+    let mut task: TrackableTask<'a> = TrackableTask {
+        progress: 0.0,
+        name_len: 0,
+        task_identifier_len: 0,
+        completion_word: 0,
+        progress_queue_head: 0,
+        progress_queue_len: 0,
+        progress_queue_word: 0,
+        substrate: substrate
+    };
+    task.set_name(name);
+    task.set_task_identifier(task_identifier);
+    task
+}
+
+// Upstream `get_task_handle`: an owned snapshot of name, progress and
+// identifier. The strings copy byte-for-byte into the handle's buffers.
+pub machine TrackableTask::get_task_handle<'a>(&self) -> trackable_task_handle::TrackableTaskHandle {
+    let mut handle: trackable_task_handle::TrackableTaskHandle = trackable_task_handle::TrackableTaskHandle {
+        progress: self.progress,
+        name_len: 0,
+        task_identifier_len: 0
+    };
+    let name_text: &[u8] = self.get_name();
+    let identifier_text: &[u8] = self.get_task_identifier();
+    handle.name_len = copy_task_text(&mut handle.name, name_text);
+    handle.task_identifier_len = copy_task_text(&mut handle.task_identifier, identifier_text);
+    handle
+}
+
+// Upstream `get_progress`: the guarded read. A lock failure cannot occur
+// on an owned field, so the `0.0` error leg is absent by construction.
+pub machine TrackableTask::get_progress<'a>(&self) -> f32 {
+    self.progress
+}
+
+// Upstream `set_progress`: store under the lock, then `send` on the
+// progress channel. The store is an ordinary field write; the send is a
+// journal append that wakes a pending receiver (crossbeam's send also
+// releases one blocked `recv`). A full journal declines the send — the
+// `Err` leg upstream only logs.
+pub machine TrackableTask::set_progress<'a>(&mut self, progress: f32)
+reaches WaitWake
+invokes WaitWake;
+{
+    self.progress = progress;
+    transition self.progress_queue_len < 64 {
+        true -> enqueue(progress)
+        _ -> sent()
+    }
+
+    state enqueue(&mut self, progress: f32) {
+        let tail: u64 [0..64] = (((self.progress_queue_head as u64 in Saturating) + (self.progress_queue_len as u64 in Saturating)) as u64) % 64;
+        self.progress_queue[tail] = progress;
+        self.progress_queue_len = ((self.progress_queue_len as u64 in Saturating) + 1) as u64;
+        self.progress_queue_word = self.progress_queue_len;
+        _ = self.substrate.wake_one(&self.progress_queue_word);
+    }
+
+    state sent(&mut self) {
+    }
+}
+
+// Upstream `subscribe_to_progress_updates`: clones the channel receiver.
+pub machine TrackableTask::subscribe_to_progress_updates<'a>(&self) -> ProgressReceiver {
+    ProgressReceiver {}
+}
+
+// Upstream `Receiver::try_recv`: a non-blocking pull on the shared queue —
+// `Optional::None` while empty, the oldest pending value otherwise.
+pub machine TrackableTask::next_progress_update<'a>(
+    &mut self,
+    receiver: &ProgressReceiver
+) -> Optional<f32> {
+    transition self.progress_queue_len > 0 {
+        true -> head_in_bounds(receiver)
+        _ -> (Optional::None)
+    }
+
+    state head_in_bounds(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
+        transition self.progress_queue_head < 64 {
+            true -> take(receiver, self.progress_queue_head)
+            _ -> (Optional::None)
+        }
+    }
+
+    state take(
+        &mut self,
+        receiver: &ProgressReceiver,
+        head: u64 [0..64]
+    ) -> Optional<f32> {
+        let value: f32 = self.progress_queue[head];
+        self.progress_queue_head = (((head as u64 in Saturating) + 1) as u64) % 64;
+        self.progress_queue_len = ((self.progress_queue_len as u64 in Saturating) - 1) as u64;
+        self.progress_queue_word = self.progress_queue_len;
+        Optional::Some { value: value }
+    }
+}
+
+// Upstream `Receiver::recv`: blocks on the empty queue until a send's wake
+// edge lands, then takes the oldest pending value. The re-check loop keeps
+// a losing competing receiver parked — upstream's own recv waits the same
+// way when another consumer claimed the message first.
+pub machine TrackableTask::wait_for_progress_update<'a>(
+    &mut self,
+    receiver: &ProgressReceiver
+) -> Optional<f32>
+reaches WaitWake
+invokes WaitWake;
+blocks;
+{
+    transition self.progress_queue_len > 0 {
+        true -> head_in_bounds(receiver)
+        _ -> await_message(receiver)
+    }
+
+    state await_message(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
+        let outcome: WaitOutcome =
+            block self.substrate.wait(&self.progress_queue_word, 0);
+        transition outcome {
+            WaitOutcome::Woken -> recheck(receiver)
+            _ -> recheck(receiver)
+        }
+    }
+
+    state recheck(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
+        transition self.progress_queue_len > 0 {
+            true -> head_in_bounds(receiver)
+            _ -> await_message(receiver)
+        }
+    }
+
+    state head_in_bounds(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
+        transition self.progress_queue_head < 64 {
+            true -> take(receiver, self.progress_queue_head)
+            _ -> (Optional::None)
+        }
+    }
+
+    state take(
+        &mut self,
+        receiver: &ProgressReceiver,
+        head: u64 [0..64]
+    ) -> Optional<f32> {
+        let value: f32 = self.progress_queue[head];
+        self.progress_queue_head = (((head as u64 in Saturating) + 1) as u64) % 64;
+        self.progress_queue_len = ((self.progress_queue_len as u64 in Saturating) - 1) as u64;
+        self.progress_queue_word = self.progress_queue_len;
+        Optional::Some { value: value }
+    }
+}
+
+// Upstream `get_name` returns an owned `String` clone; the owned-copy
+// shape is the buffer copy `get_task_handle` performs, so the getter
+// exposes the live text as a borrowed slice.
+pub machine TrackableTask::get_name<'a>(&self) -> &'a [u8] {
+    // The copy bound keeps name_len <= 256; `% 257` is the ranged witness
+    // the subslice's end bound needs (same modulo idiom as `tail`).
+    let end: u64 [0..=256] = self.name_len % 257;
+    self.name[0..end]
+}
+
+pub machine TrackableTask::set_name<'a>(&mut self, name: &[u8]) {
+    self.name_len = copy_task_text(&mut self.name, name);
+}
+
+// Identifier construction half of `create` (upstream has no setter).
+machine TrackableTask::set_task_identifier<'a>(&mut self, task_identifier: &[u8]) {
+    self.task_identifier_len = copy_task_text(&mut self.task_identifier, task_identifier);
+}
+
+// Upstream `get_task_identifier` returns an owned `String` clone; same
+// borrowed-view translation as `get_name`.
+pub machine TrackableTask::get_task_identifier<'a>(&self) -> &'a [u8] {
+    let end: u64 [0..=256] = self.task_identifier_len % 257;
+    self.task_identifier[0..end]
+}
+
+// Upstream `get_cancellation_token` hands out the shared `Arc<AtomicBool>`
+// for polling observation (`load(Acquire)`/`load(Relaxed)` at every
+// consumer site — never stored through). Without a cloneable shared cell
+// the token is the flag's current observation through a task borrow.
+pub machine TrackableTask::get_cancellation_token<'a>(&self) -> bool {
+    let observed: bool = self.is_canceled.load(Receive);
+    observed
+}
+
+pub machine TrackableTask::is_completed<'a>(&self) -> bool {
+    let observed: bool = self.is_completed.load(GlobalOrder);
+    observed
+}
+
+// Upstream `cancel`: flag, then complete. The SeqCst store keeps its
+// GlobalOrder spelling.
+pub machine TrackableTask::cancel<'a>(&mut self)
+reaches WaitWake
+invokes WaitWake;
+{
+    self.is_canceled.store(true, GlobalOrder);
+    self.complete()
+}
+
+// Upstream `complete`: flag, then `completed_cv.notify_all()`. The word
+// flips before the wake edge so a released wait observes completion.
+pub machine TrackableTask::complete<'a>(&mut self)
+reaches WaitWake
+invokes WaitWake;
+{
+    self.is_completed.store(true, GlobalOrder);
+    self.completion_word = 1;
+    let limit: u64 = 18446744073709551615;
+    _ = self.substrate.wake_many(&self.completion_word, limit);
+}
+
+// Upstream `wait_for_completion`: parks on the condvar until
+// `is_completed` reads true. The substrate wait releases only on a wake
+// edge or an already-differing word, and the re-check loop preserves
+// upstream's `while !is_completed` re-read after every wake.
+pub machine TrackableTask::wait_for_completion<'a>(&mut self)
+reaches WaitWake
+invokes WaitWake;
+blocks;
+{
+    transition self.is_completed.load(GlobalOrder) {
+        true -> finished()
+        _ -> await_completion()
+    }
+
+    state await_completion(&mut self) {
+        let outcome: WaitOutcome =
+            block self.substrate.wait(&self.completion_word, 0);
+        transition outcome {
+            WaitOutcome::Woken -> recheck()
+            _ -> recheck()
+        }
+    }
+
+    state recheck(&mut self) {
+        transition self.is_completed.load(GlobalOrder) {
+            true -> finished()
+            _ -> await_completion()
+        }
+    }
+
+    state finished(&mut self) {
+    }
+}
