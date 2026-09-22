@@ -1,0 +1,350 @@
+module src::conversions::storage_size_conversions;
+
+// Port of conversions/storage_size_conversions.rs @ upstream 568aa758:
+// StorageSizeConversions::{value_to_metric_size, value_to_binary_size}, the
+// byte-count text consumed by executor stats lines and the element_scanner
+// retained-bytes log.
+//
+// Named deviations:
+// - Input is u64, not u128. Omega's widest machine integer is u64 (wider
+//   naturals are proof-only Nat with no runtime layout). The u64 domain
+//   still reaches EB (10^18) metric and EiB (2^60) binary; upstream places
+//   needing >= 10^21 or >= 2^70 (ZB/YB/RB/QB, ZiB/YiB/RiB/QiB) are
+//   unreachable at u64 and are omitted from the ladders and suffix tables.
+// - `String` is a bounded byte carrier (Omega has no growable String):
+//   StorageSizeText{bytes:[u8;16], len:u64}. The longest possible output is
+//   "1000.0KiB" (9 bytes): scaled is < 10000 before the rounding promotion.
+// - The `value * 10` intermediate is decomposed to (value/scale)*10 +
+//   ((value%scale)*10)/scale so every product stays inside u64 through the
+//   EB/EiB range (upstream's u128 intermediate does not overflow at
+//   u64-domain inputs). The emitted text is identical for every u64 input.
+
+// Upstream returns `String`; the bounded carrier holds every output the
+// formatter can produce (<= 9 bytes), matching the package's other
+// text-carrying records.
+pub data StorageSizeText {
+    bytes: [u8; 16];
+    len: u64;
+}
+
+pub machine StorageSizeText::get_len(&self) -> u64 {
+    self.len
+}
+
+pub machine StorageSizeText::get_byte(&self, position: u64) -> u8 {
+    transition position < self.len && position < 16 {
+        true -> (self.bytes[position])
+        false -> (0)
+    }
+}
+
+// Emits `remaining` least-significant digit first starting at index 0; the
+// caller reverses the span. `remaining` is at most 1000 here.
+machine StorageSizeText::put_digits_reversed(&mut self, remaining: u64, digit_index: u64) {
+    transition digit_index < 4 {
+        true -> store_digit(remaining, digit_index)
+        false -> done()
+    }
+    state store_digit(&mut self, remaining: u64, digit_index: u64) {
+        self.bytes[digit_index] = (((48 as u64 in Wrapping) + ((remaining % 10) as u64 as u64 in Wrapping)) as u64) as u8;
+        self.len = ((digit_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition remaining >= 10 {
+            true -> self.put_digits_reversed(remaining / 10, ((digit_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> done()
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+machine StorageSizeText::reverse(&mut self, low: u64, high: u64) {
+    transition low < high && low < 16 && high < 16 {
+        true -> swap(low, high)
+        false -> done()
+    }
+    state swap(&mut self, low: u64, high: u64) {
+        let byte: u8 = self.bytes[low];
+        self.bytes[low] = self.bytes[high];
+        self.bytes[high] = byte;
+        transition { _ -> self.reverse(((low as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((high as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64) }
+    }
+    state done(&mut self) {
+    }
+}
+
+machine StorageSizeText::put_byte(&mut self, byte: u8) {
+    transition self.len < 16 {
+        true -> store(byte)
+        false -> done()
+    }
+    state store(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
+        self.len = ((self.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    }
+    state done(&mut self) {
+    }
+}
+
+machine StorageSizeText::put_suffix(&mut self, suffix: &[u8], position: u64) {
+    transition position < suffix.len && self.len < 16 {
+        true -> store(suffix, position, self.len)
+        false -> done()
+    }
+    state store(&mut self, suffix: &[u8], position: u64, at: u64 [0..=15]) {
+        self.bytes[at] = suffix[position];
+        self.len = ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> self.put_suffix(suffix, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done(&mut self) {
+    }
+}
+
+// The upstream unit struct: associated machines only, no instance state.
+pub data StorageSizeConversions {
+}
+
+// Upstream early-outs `0` to "0B" (not "0.0B"); kept verbatim.
+machine StorageSizeConversions::zero_b() -> StorageSizeText {
+    let mut text: StorageSizeText = StorageSizeText { len: 0 };
+    text.put_byte(48);
+    text.put_byte(66);
+    text
+}
+
+// Upstream `format!("{}.{}{}", rounded/10, rounded%10, suffix)`. The whole
+// part emits least-significant first and is reversed in place, then the
+// decimal point, tenth digit, and suffix bytes append.
+machine StorageSizeConversions::format_rounded(rounded: u64, suffix: &[u8]) -> StorageSizeText {
+    let mut text: StorageSizeText = StorageSizeText { len: 0 };
+    text.put_digits_reversed(rounded / 10, 0);
+    text.reverse(0, ((text.len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+    text.put_byte(46);
+    text.put_byte((((48 as u64 in Wrapping) + ((rounded % 10) as u64 as u64 in Wrapping)) as u64) as u8);
+    text.put_suffix(suffix, 0);
+    text
+}
+
+// Upstream: scaled = value*10/scale, remainder = value*10%scale, rounded =
+// scaled + (remainder*2 >= scale). With value = q*scale + r those are
+// q*10 + (r*10)/scale and (r*10)%scale — identical results, and every
+// intermediate stays in u64 for the whole u64 input domain. The Wrapping
+// locals only spell defined-overflow at the exact-arithmetic proof edge;
+// q < 1000 and r < scale <= 2^60 keep each product inside u64.
+machine StorageSizeConversions::rounded_tenths(value: u64, scale: u64 [1..=18446744073709551615]) -> u64 {
+    let vw: u64 in Wrapping = value as u64 in Wrapping;
+    let sw: u64 in Wrapping = scale as u64 in Wrapping;
+    let q: u64 in Wrapping = vw / sw;
+    let r: u64 in Wrapping = vw % sw;
+    let scaled: u64 in Wrapping = q * 10 + r * 10 / sw;
+    let rem10: u64 in Wrapping = r * 10 % sw;
+    transition rem10 * 2 >= sw {
+        true -> ((scaled + 1) as u64)
+        false -> (scaled as u64)
+    }
+}
+
+// Upstream base.pow(place): metric scale 1000^place, binary scale
+// 1024^place, tabulated to the largest u64-reachable power. The >= 1 guard
+// publishes the nonzero divisor certificate callers need for exact
+// division; every table entry satisfies it.
+machine StorageSizeConversions::metric_scale(place: u64 [0..=6]) -> u64 [1..=18446744073709551615] {
+    let scales: [u64; 7] = [1, 1000, 1000000, 1000000000, 1000000000000, 1000000000000000, 1000000000000000000];
+    transition scales[place] >= 1 {
+        true -> (scales[place])
+        false -> (1)
+    }
+}
+
+machine StorageSizeConversions::binary_scale(place: u64 [0..=6]) -> u64 [1..=18446744073709551615] {
+    let scales: [u64; 7] = [1, 1024, 1048576, 1073741824, 1099511627776, 1125899906842624, 1152921504606846976];
+    transition scales[place] >= 1 {
+        true -> (scales[place])
+        false -> (1)
+    }
+}
+
+// Upstream magnitude ladders, descending exactly as authored. The u64 top
+// rungs are EB (10^18) and EiB (2^60); higher upstream rungs need value
+// >= 10^21 or >= 2^70 and cannot be reached by a u64 input.
+machine StorageSizeConversions::metric_place(value: u64) -> u64 [0..=6] {
+    transition value >= 1000000000000000000 {
+        true -> (6)
+        false -> below_18(value)
+    }
+    state below_18(value: u64) -> u64 {
+        transition value >= 1000000000000000 {
+            true -> (5)
+            false -> below_15(value)
+        }
+    }
+    state below_15(value: u64) -> u64 {
+        transition value >= 1000000000000 {
+            true -> (4)
+            false -> below_12(value)
+        }
+    }
+    state below_12(value: u64) -> u64 {
+        transition value >= 1000000000 {
+            true -> (3)
+            false -> below_9(value)
+        }
+    }
+    state below_9(value: u64) -> u64 {
+        transition value >= 1000000 {
+            true -> (2)
+            false -> below_6(value)
+        }
+    }
+    state below_6(value: u64) -> u64 {
+        transition value >= 1000 {
+            true -> (1)
+            false -> (0)
+        }
+    }
+}
+
+machine StorageSizeConversions::binary_place(value: u64) -> u64 [0..=6] {
+    transition value >= 1152921504606846976 {
+        true -> (6)
+        false -> below_60(value)
+    }
+    state below_60(value: u64) -> u64 {
+        transition value >= 1125899906842624 {
+            true -> (5)
+            false -> below_50(value)
+        }
+    }
+    state below_50(value: u64) -> u64 {
+        transition value >= 1099511627776 {
+            true -> (4)
+            false -> below_40(value)
+        }
+    }
+    state below_40(value: u64) -> u64 {
+        transition value >= 1073741824 {
+            true -> (3)
+            false -> below_30(value)
+        }
+    }
+    state below_30(value: u64) -> u64 {
+        transition value >= 1048576 {
+            true -> (2)
+            false -> below_20(value)
+        }
+    }
+    state below_20(value: u64) -> u64 {
+        transition value >= 1024 {
+            true -> (1)
+            false -> (0)
+        }
+    }
+}
+
+// Upstream suffix tables, trimmed at the u64-reachable rungs named above.
+machine StorageSizeConversions::metric_suffix(place: u64) -> &[u8] {
+    transition place {
+        0 -> "B"
+        1 -> "KB"
+        2 -> "MB"
+        3 -> "GB"
+        4 -> "TB"
+        5 -> "PB"
+        _ -> "EB"
+    }
+}
+
+machine StorageSizeConversions::binary_suffix(place: u64) -> &[u8] {
+    transition place {
+        0 -> "B"
+        1 -> "KiB"
+        2 -> "MiB"
+        3 -> "GiB"
+        4 -> "TiB"
+        5 -> "PiB"
+        _ -> "EiB"
+    }
+}
+
+// Converts a value into a metric information storage size (KB, MB, GB, ...).
+pub machine StorageSizeConversions::value_to_metric_size(value: u64) -> StorageSizeText {
+    transition value == 0 {
+        true -> (StorageSizeConversions::zero_b())
+        false -> nonzero(value)
+    }
+    state nonzero(value: u64) -> StorageSizeText {
+        let place: u64 [0..=6] = StorageSizeConversions::metric_place(value);
+        let scale: u64 [1..=18446744073709551615] = StorageSizeConversions::metric_scale(place);
+        let rounded: u64 = StorageSizeConversions::rounded_tenths(value, scale);
+        StorageSizeConversions::format_rounded(rounded, StorageSizeConversions::metric_suffix(place))
+    }
+}
+
+// Converts a value into a binary information storage size (KiB, MiB, ...).
+pub machine StorageSizeConversions::value_to_binary_size(value: u64) -> StorageSizeText {
+    transition value == 0 {
+        true -> (StorageSizeConversions::zero_b())
+        false -> nonzero(value)
+    }
+    state nonzero(value: u64) -> StorageSizeText {
+        let place: u64 [0..=6] = StorageSizeConversions::binary_place(value);
+        let scale: u64 [1..=18446744073709551615] = StorageSizeConversions::binary_scale(place);
+        let rounded: u64 = StorageSizeConversions::rounded_tenths(value, scale);
+        StorageSizeConversions::format_rounded(rounded, StorageSizeConversions::binary_suffix(place))
+    }
+}
+
+// Byte-for-byte equality against a literal view: equal length and every
+// stored byte equal. Consumed by the in-package exercise below.
+machine StorageSizeConversions::matches(text: &StorageSizeText, expected: &[u8], position: u64) -> bool {
+    transition text.len == expected.len {
+        true -> walk(text, expected, position)
+        false -> (false)
+    }
+    state walk(text: &StorageSizeText, expected: &[u8], position: u64) -> bool {
+        transition position < text.len && position < 16 {
+            true -> bounded(text, expected, position)
+            false -> (true)
+        }
+    }
+    state bounded(text: &StorageSizeText, expected: &[u8], position: u64) -> bool {
+        transition position < expected.len {
+            true -> byte(text, expected, position)
+            false -> (false)
+        }
+    }
+    state byte(text: &StorageSizeText, expected: &[u8], position: u64) -> bool {
+        transition text.bytes[position] == expected[position] {
+            true -> walk(text, expected, position + 1)
+            false -> (false)
+        }
+    }
+}
+
+// In-package exercise: every ladder rung, both early-outs, the 999.9x -> 1000.0x
+// rounding promotion, and the u64::MAX reach. Checked here because
+// `&`-receiver calls on byte carriers do not cross the package boundary under
+// selected ProgramEntry establishment — same edge the other api modules name.
+pub machine StorageSizeConversions::value_to_text_consistent() -> bool {
+    let m_zero: StorageSizeText = StorageSizeConversions::value_to_metric_size(0);
+    let m_sub: StorageSizeText = StorageSizeConversions::value_to_metric_size(512);
+    let m_kb: StorageSizeText = StorageSizeConversions::value_to_metric_size(1500);
+    let m_roundup: StorageSizeText = StorageSizeConversions::value_to_metric_size(999950);
+    let m_tb: StorageSizeText = StorageSizeConversions::value_to_metric_size(2500000000000);
+    let m_max: StorageSizeText = StorageSizeConversions::value_to_metric_size(18446744073709551615);
+    let b_zero: StorageSizeText = StorageSizeConversions::value_to_binary_size(0);
+    let b_kib: StorageSizeText = StorageSizeConversions::value_to_binary_size(1536);
+    let b_exact: StorageSizeText = StorageSizeConversions::value_to_binary_size(2048);
+    let b_gib: StorageSizeText = StorageSizeConversions::value_to_binary_size(3000000000);
+    let b_max: StorageSizeText = StorageSizeConversions::value_to_binary_size(18446744073709551615);
+    StorageSizeConversions::matches(&m_zero, "0B", 0)
+        && StorageSizeConversions::matches(&m_sub, "512.0B", 0)
+        && StorageSizeConversions::matches(&m_kb, "1.5KB", 0)
+        && StorageSizeConversions::matches(&m_roundup, "1000.0KB", 0)
+        && StorageSizeConversions::matches(&m_tb, "2.5TB", 0)
+        && StorageSizeConversions::matches(&m_max, "18.4EB", 0)
+        && StorageSizeConversions::matches(&b_zero, "0B", 0)
+        && StorageSizeConversions::matches(&b_kib, "1.5KiB", 0)
+        && StorageSizeConversions::matches(&b_exact, "2.0KiB", 0)
+        && StorageSizeConversions::matches(&b_gib, "2.8GiB", 0)
+        && StorageSizeConversions::matches(&b_max, "16.0EiB", 0)
+}
