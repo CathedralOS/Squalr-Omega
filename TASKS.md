@@ -35,3 +35,13 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   process, partial-read handling, cancellations, SIMD and parallel execution.
   Reuse scalar fixtures to check optimized results; measure total allocation
   and throughput including result publication. GUI/TUI/installer are excluded.
+  Live-snapshot chain status: attach/enumerate/region/memory-io providers are
+  ported and check-green; `get_processes` reproduces the sysinfo sweep minus
+  the unported window-detect leg (`require_windowed` -> NotImplemented).
+  Session privileged-state, region merge, snapshot collect and the headless
+  probe entry are deferred on sibling snapshot structures
+  (`Snapshot`/`SnapshotRegion`, lane `path/scalar-scan-headless`), the
+  crash-route realization gap (`SnapshotRegionFilter::get_element_count` has
+  no admitted body for native), and toolchain-settled fused
+  `FilesystemHost`/`TimeHost` providers — residual evidence and resume steps
+  live in `tools/native_probe_resume.md`.
