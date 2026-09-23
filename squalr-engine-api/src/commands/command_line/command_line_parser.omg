@@ -1,0 +1,585 @@
+module src::commands::command_line::command_line_parser;
+
+use src::commands::command_line::command_line_command::CommandLineCommand;
+use src::commands::privileged_command::PrivilegedCommand;
+use src::commands::scan::collect_values::collect_values_request::CollectValuesRequest;
+use src::commands::scan::element_scan::element_scan_request::ElementScanRequest;
+use src::commands::scan::element_scan::element_scan_request::ScanConstraintSet;
+use src::commands::scan::new::scan_new_request::ScanNewRequest;
+use src::commands::scan::reset::scan_reset_request::ScanResetRequest;
+use src::commands::scan::scan_command::ScanCommand;
+use src::commands::scan_results::list::scan_results_list_request::ScanResultsListRequest;
+use src::commands::scan_results::scan_results_command::ScanResultsCommand;
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_types::data_type_ref::DataTypeRefParse;
+use src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraint;
+use src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraintParse;
+use src::structures::snapshots::snapshot_region::DataTypeRefSet;
+
+// Port of commands/command_line/clap.rs (the structopt grammar) reduced to
+// the token grammar this leg's commands declare:
+//   scan new | scan reset | scan collect-values (-d <type>)*
+//   scan element-scan (-c <constraint>)* (-d <type>)*
+//   scan-results list (-p <page>)? (--data-type-filter <type>)*
+// Upstream clap accepts long-flag `=value` attachments (`--constraints=5`);
+// those are honored here too. Unknown flags refuse the whole line, matching
+// clap's error posture.
+pub data CommandLineParse {
+    case Refused;
+    case Parsed(command: CommandLineCommand);
+}
+
+// One whitespace-delimited token's bounds, or end-of-line.
+pub data NextToken {
+    case End;
+    case Token(start: u64, end: u64);
+}
+
+machine is_space(byte: u8) -> bool {
+    transition byte == 32 || byte == 9 {
+        true -> (true)
+        false -> (false)
+    }
+}
+
+machine skip_space(line: &[u8], position: u64) -> u64 {
+    transition position < line.len {
+        true -> spaced_probe(line, position)
+        false -> (position)
+        _ -> (position)
+    }
+    state spaced_probe(line: &[u8], position: u64) -> u64 {
+        let spaced: bool = is_space(line[position]);
+        transition spaced {
+            true -> skip_space(line, position + 1)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+}
+
+machine token_end(line: &[u8], position: u64) -> u64 {
+    transition position < line.len {
+        true -> nonspace_probe(line, position)
+        false -> (position)
+        _ -> (position)
+    }
+    state nonspace_probe(line: &[u8], position: u64) -> u64 {
+        let spaced: bool = is_space(line[position]);
+        transition spaced {
+            true -> (position)
+            false -> token_end(line, position + 1)
+            _ -> (position)
+        }
+    }
+}
+
+machine next_token(line: &[u8], position: u64) -> NextToken {
+    let start: u64 = skip_space(line, position);
+    transition start < line.len {
+        true -> (NextToken::Token { start: start, end: token_end(line, start) })
+        false -> (NextToken::End)
+    }
+}
+
+machine token_is(line: &[u8], start: u64, end: u64, keyword: &[u8]) -> bool {
+    transition ((end as u64 in Saturating) - (start as u64 in Saturating)) as u64 == keyword.len {
+        true -> scan(line, start, keyword, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state scan(line: &[u8], position: u64, keyword: &[u8], offset: u64) -> bool {
+        transition offset < keyword.len {
+            true -> bounds(line, position, keyword, offset)
+            false -> (true)
+        }
+    }
+    state bounds(line: &[u8], position: u64, keyword: &[u8], offset: u64) -> bool {
+        transition position < line.len {
+            true -> compare(line, position, keyword, offset)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state compare(line: &[u8], position: u64, keyword: &[u8], offset: u64) -> bool {
+        transition line[position] == keyword[offset] {
+            true -> scan(line, position + 1, keyword, offset + 1)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Locate '=' (61) inside a token; returns `end` when absent.
+machine find_equals(line: &[u8], start: u64, end: u64) -> u64 {
+    transition { _ -> seek(line, start, end, start) }
+    state seek(line: &[u8], start: u64, end: u64, position: u64) -> u64 {
+        transition position < end {
+            true -> check(line, start, end, position)
+            false -> (end)
+        }
+    }
+    state check(line: &[u8], start: u64, end: u64, position: u64) -> u64 {
+        transition position < line.len && line[position] == 61 {
+            true -> (position)
+            false -> seek(line, start, end, position + 1)
+            _ -> seek(line, start, end, position + 1)
+        }
+    }
+}
+
+// Whether the token is flag `name`: `-x` or `--name`, with the flag-name
+// portion ending before any '='.
+machine flag_is(line: &[u8], start: u64, end: u64, name: &[u8]) -> bool {
+    let eq: u64 = find_equals(line, start, end);
+    transition start < eq && start < line.len && line[start] == 45 {
+        true -> strip(line, start, eq, name)
+        false -> (false)
+        _ -> (false)
+    }
+    state strip(line: &[u8], start: u64, eq: u64, name: &[u8]) -> bool {
+        let second: u64 = ((start as u64 in Wrapping) + 1) as u64;
+        transition second < eq && second < line.len && line[second] == 45 {
+            true -> long_name(line, second, eq, name)
+            false -> short_name(line, second, eq, name)
+            _ -> short_name(line, second, eq, name)
+        }
+    }
+    state short_name(line: &[u8], second: u64, eq: u64, name: &[u8]) -> bool {
+        let matched: bool = token_is(line, second, eq, name);
+        matched
+    }
+    state long_name(line: &[u8], second: u64, eq: u64, name: &[u8]) -> bool {
+        let skip: u64 = ((second as u64 in Wrapping) + 1) as u64;
+        let matched: bool = token_is(line, skip, eq, name);
+        matched
+    }
+}
+
+// The value a flag carries inline (`--flag=v`), or the following token
+// (`-f v`, `--flag v`).
+pub data FlagValue {
+    case Refused;
+    case Inline(start: u64, end: u64);
+    case Following(start: u64, end: u64);
+}
+
+machine flag_value(line: &[u8], start: u64, end: u64) -> FlagValue {
+    let eq: u64 = find_equals(line, start, end);
+    transition eq < end {
+        true -> (FlagValue::Inline { start: eq + 1, end: end })
+        false -> read_next(line, end)
+        _ -> read_next(line, end)
+    }
+    state read_next(line: &[u8], flag_end: u64) -> FlagValue {
+        let next: NextToken = next_token(line, flag_end);
+        transition next {
+            NextToken::Token { start, end } -> (
+                FlagValue::Following { start: start, end: end })
+            NextToken::End -> (FlagValue::Refused)
+            _ -> (FlagValue::Refused)
+        }
+    }
+}
+
+// Decimal u64 parse for `-p <page>` values.
+pub data U64Parse {
+    case Refused;
+    case Parsed(value: u64);
+}
+
+machine parse_u64(line: &[u8], start: u64, end: u64) -> U64Parse {
+    transition start < end {
+        true -> fold(line, start, end, start, 0)
+        false -> (U64Parse::Refused)
+    }
+    state fold(line: &[u8], start: u64, end: u64, position: u64, value: u64) -> U64Parse {
+        transition position < end {
+            true -> digit(line, start, end, position, value)
+            false -> (U64Parse::Parsed { value: value })
+        }
+    }
+    state digit(line: &[u8], start: u64, end: u64, position: u64, value: u64) -> U64Parse {
+        transition position < line.len && line[position] >= 48 && line[position] <= 57 {
+            true -> accumulate(line, start, end, position, value)
+            false -> (U64Parse::Refused)
+            _ -> (U64Parse::Refused)
+        }
+    }
+    state accumulate(line: &[u8], start: u64, end: u64, position: u64, value: u64) -> U64Parse {
+        transition position < line.len {
+            true -> read_digit(line, start, end, position, value)
+            false -> (U64Parse::Refused)
+            _ -> (U64Parse::Refused)
+        }
+    }
+    state read_digit(line: &[u8], start: u64, end: u64, position: u64, value: u64) -> U64Parse {
+        let digit_value: u64 = ((line[position] as u64 in Saturating) - 48) as u64;
+        transition { _ -> fold(line, start, end, position + 1,
+            (((value as u64 in Saturating) * 10) + (digit_value as u64 in Saturating)) as u64) }
+    }
+}
+
+// Value ranges are carried by position — `line[start..end]` materializes
+// the slice at the call site.
+
+// The entry point upstream calls `try_parse_from(["squalr-cli", ...])`.
+// Empty receiver type carrying the public `parse` entry — mirrors upstream's
+// `impl CommandLineParser` namespace.
+pub data CommandLineParser {}
+
+pub machine CommandLineParser::parse(line: &[u8]) -> CommandLineParse {
+    let root: NextToken = next_token(line, 0);
+    transition root {
+        NextToken::Token { start, end } -> root_token(line, start, end)
+        NextToken::End -> (CommandLineParse::Refused)
+        _ -> (CommandLineParse::Refused)
+    }
+    state root_token(line: &[u8], start: u64, end: u64) -> CommandLineParse {
+        let matched_scan: bool = token_is(line, start, end, "scan");
+        transition matched_scan {
+            true -> dispatch_scan(line, end)
+            false -> root_scan_results(line, start, end)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state dispatch_scan(line: &[u8], position: u64) -> CommandLineParse {
+        let parsed: CommandLineParse = parse_scan(line, position);
+        (parsed)
+    }
+    state root_scan_results(line: &[u8], start: u64, end: u64) -> CommandLineParse {
+        let matched_scan_results: bool = token_is(line, start, end, "scan-results");
+        transition matched_scan_results {
+            true -> dispatch_scan_results(line, end)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state dispatch_scan_results(line: &[u8], position: u64) -> CommandLineParse {
+        let parsed: CommandLineParse = parse_scan_results(line, position);
+        (parsed)
+    }
+}
+
+// `scan` subcommand dispatch — second token selects the request.
+machine parse_scan(line: &[u8], position: u64) -> CommandLineParse {
+    let next: NextToken = next_token(line, position);
+    transition next {
+        NextToken::Token { start, end } -> sub(line, start, end)
+        NextToken::End -> (CommandLineParse::Refused)
+        _ -> (CommandLineParse::Refused)
+    }
+    state sub(line: &[u8], start: u64, end: u64) -> CommandLineParse {
+        let matched_new: bool = token_is(line, start, end, "new");
+        transition matched_new {
+            true -> (CommandLineParse::Parsed { command:
+                CommandLineCommand::Privileged { command:
+                    PrivilegedCommand::Scan { command:
+                        ScanCommand::New { request: ScanNewRequest {} } } } })
+            false -> sub_reset(line, start, end)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state sub_reset(line: &[u8], start: u64, end: u64) -> CommandLineParse {
+        let matched_reset: bool = token_is(line, start, end, "reset");
+        transition matched_reset {
+            true -> (CommandLineParse::Parsed { command:
+                CommandLineCommand::Privileged { command:
+                    PrivilegedCommand::Scan { command:
+                        ScanCommand::Reset { request: ScanResetRequest {} } } } })
+            false -> sub_collect(line, start, end)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state sub_collect(line: &[u8], start: u64, end: u64) -> CommandLineParse {
+        let matched_collect_values: bool = token_is(line, start, end, "collect-values");
+        transition matched_collect_values {
+            true -> collect_args(line, end)
+            false -> sub_element(line, start, end)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state sub_element(line: &[u8], start: u64, end: u64) -> CommandLineParse {
+        let matched_element_scan: bool = token_is(line, start, end, "element-scan");
+        transition matched_element_scan {
+            true -> element_args(line, end)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+
+    // `-d <type>` accumulation for `collect-values`.
+    state collect_args(line: &[u8], position: u64) -> CommandLineParse {
+        transition { _ -> collect_loop(line, position, DataTypeRefSet::empty()) }
+    }
+    state collect_loop(line: &[u8], position: u64, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let next: NextToken = next_token(line, position);
+        transition next {
+            NextToken::Token { start, end } -> collect_flag(line, start, end, data_type_refs)
+            NextToken::End -> (CommandLineParse::Parsed { command:
+                CommandLineCommand::Privileged { command:
+                    PrivilegedCommand::Scan { command:
+                        ScanCommand::CollectValues { request: CollectValuesRequest {
+                            data_type_refs: data_type_refs } } } } })
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state collect_flag(line: &[u8], start: u64, end: u64, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let is_d: bool = flag_is(line, start, end, "d");
+        let is_long_d: bool = flag_is(line, start, end, "data-type-refs");
+        transition is_d || is_long_d {
+            true -> collect_value(line, start, end, data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state collect_value(line: &[u8], start: u64, end: u64, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let value: FlagValue = flag_value(line, start, end);
+        transition value {
+            FlagValue::Inline { start, end } -> collect_type(line, start, end, end, data_type_refs)
+            FlagValue::Following { start, end } -> collect_type(line, start, end, end, data_type_refs)
+            FlagValue::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    // Parse the type ref, push it, then continue after the value token —
+    // `continue_at` differs for inline (the flag token's end) vs following
+    // (the value token's end).
+    state collect_type(line: &[u8], start: u64, end: u64, continue_at: u64, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        transition start <= end && end <= line.len {
+            true -> collect_parse(line, &line[start..end], continue_at, data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state collect_parse(line: &[u8], value: &[u8], continue_at: u64, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let parsed: DataTypeRefParse = DataTypeRef::parse(value);
+        transition parsed {
+            DataTypeRefParse::Parsed { value } -> collect_pushed(line, value, continue_at, data_type_refs)
+            DataTypeRefParse::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state collect_pushed(line: &[u8], value: DataTypeRef, continue_at: u64, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let mut carried_data_type_refs: DataTypeRefSet = data_type_refs;
+        let pushed: bool = carried_data_type_refs.push(&value);
+        transition pushed {
+            true -> collect_loop(line, continue_at, carried_data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+
+    // `-c <constraint>`/`-d <type>` accumulation for `element-scan`.
+    state element_args(line: &[u8], position: u64) -> CommandLineParse {
+        transition { _ -> element_loop(line, position, ScanConstraintSet::empty(), DataTypeRefSet::empty()) }
+    }
+    state element_loop(line: &[u8], position: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let next: NextToken = next_token(line, position);
+        transition next {
+            NextToken::Token { start, end } -> element_flag(line, start, end, constraints, data_type_refs)
+            NextToken::End -> element_finish(constraints, data_type_refs)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state element_flag(line: &[u8], start: u64, end: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let is_c: bool = flag_is(line, start, end, "c");
+        let is_long_c: bool = flag_is(line, start, end, "constraints");
+        transition is_c || is_long_c {
+            true -> element_constraint(line, start, end, constraints, data_type_refs)
+            false -> element_type_flag(line, start, end, constraints, data_type_refs)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state element_type_flag(line: &[u8], start: u64, end: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let is_d_t: bool = flag_is(line, start, end, "d");
+        let is_long_d_t: bool = flag_is(line, start, end, "data-type-refs");
+        transition is_d_t || is_long_d_t {
+            true -> element_type(line, start, end, constraints, data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state element_constraint(line: &[u8], start: u64, end: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let value: FlagValue = flag_value(line, start, end);
+        transition value {
+            FlagValue::Inline { start, end } -> parse_constraint(line, start, end, end, constraints, data_type_refs)
+            FlagValue::Following { start, end } -> parse_constraint(line, start, end, end, constraints, data_type_refs)
+            FlagValue::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state element_type(line: &[u8], start: u64, end: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let value: FlagValue = flag_value(line, start, end);
+        transition value {
+            FlagValue::Inline { start, end } -> parse_type(line, start, end, end, constraints, data_type_refs)
+            FlagValue::Following { start, end } -> parse_type(line, start, end, end, constraints, data_type_refs)
+            FlagValue::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state parse_constraint(line: &[u8], start: u64, end: u64, continue_at: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        transition start <= end && end <= line.len {
+            true -> constraint_parse(line, &line[start..end], continue_at, constraints, data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state constraint_parse(line: &[u8], value: &[u8], continue_at: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let parsed: AnonymousScanConstraintParse = AnonymousScanConstraint::parse(value);
+        transition parsed {
+            AnonymousScanConstraintParse::Parsed { value } -> constraint_pushed(line, value, continue_at, constraints, data_type_refs)
+            AnonymousScanConstraintParse::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state constraint_pushed(line: &[u8], value: AnonymousScanConstraint, continue_at: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let mut carried_constraints: ScanConstraintSet = constraints;
+        let pushed: bool = carried_constraints.push(&value);
+        transition pushed {
+            true -> element_loop(line, continue_at, carried_constraints, data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state parse_type(line: &[u8], start: u64, end: u64, continue_at: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        transition start <= end && end <= line.len {
+            true -> type_parse(line, &line[start..end], continue_at, constraints, data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state type_parse(line: &[u8], value: &[u8], continue_at: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let parsed: DataTypeRefParse = DataTypeRef::parse(value);
+        transition parsed {
+            DataTypeRefParse::Parsed { value } -> type_pushed(line, value, continue_at, constraints, data_type_refs)
+            DataTypeRefParse::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state type_pushed(line: &[u8], value: DataTypeRef, continue_at: u64, constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        let mut carried_data_type_refs: DataTypeRefSet = data_type_refs;
+        let pushed: bool = carried_data_type_refs.push(&value);
+        transition pushed {
+            true -> element_loop(line, continue_at, constraints, carried_data_type_refs)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state element_finish(constraints: ScanConstraintSet, data_type_refs: DataTypeRefSet) -> CommandLineParse {
+        CommandLineParse::Parsed { command:
+            CommandLineCommand::Privileged { command:
+                PrivilegedCommand::Scan { command:
+                    ScanCommand::ElementScan { request: ElementScanRequest {
+                        scan_constraints: constraints,
+                        data_type_refs: data_type_refs } } } } }
+    }
+}
+
+// `scan-results` subcommand dispatch — only `list` lands.
+machine parse_scan_results(line: &[u8], position: u64) -> CommandLineParse {
+    let next: NextToken = next_token(line, position);
+    transition next {
+        NextToken::Token { start, end } -> sub(line, start, end)
+        NextToken::End -> (CommandLineParse::Refused)
+        _ -> (CommandLineParse::Refused)
+    }
+    state sub(line: &[u8], start: u64, end: u64) -> CommandLineParse {
+        let matched_list: bool = token_is(line, start, end, "list");
+        transition matched_list {
+            true -> list_args(line, end)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+
+    // `-p <page>` and `--data-type-filter <type>` accumulation.
+    state list_args(line: &[u8], position: u64) -> CommandLineParse {
+        transition { _ -> list_loop(line, position, 0, false, DataTypeRefSet::empty()) }
+    }
+    state list_loop(line: &[u8], position: u64, page_index: u64, has_page: bool, filters: DataTypeRefSet) -> CommandLineParse {
+        let next: NextToken = next_token(line, position);
+        transition next {
+            NextToken::Token { start, end } -> list_flag(line, start, end, page_index, has_page, filters)
+            NextToken::End -> list_finish(page_index, filters)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state list_flag(line: &[u8], start: u64, end: u64, page_index: u64, has_page: bool, filters: DataTypeRefSet) -> CommandLineParse {
+        let is_p: bool = flag_is(line, start, end, "p");
+        let is_long_p: bool = flag_is(line, start, end, "page-index");
+        transition is_p || is_long_p {
+            true -> list_page(line, start, end, has_page, filters)
+            false -> list_filter_flag(line, start, end, page_index, has_page, filters)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state list_filter_flag(line: &[u8], start: u64, end: u64, page_index: u64, has_page: bool, filters: DataTypeRefSet) -> CommandLineParse {
+        let is_filter: bool = flag_is(line, start, end, "data-type-filter");
+        transition is_filter {
+            true -> list_filter(line, start, end, page_index, filters)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state list_page(line: &[u8], start: u64, end: u64, has_page: bool, filters: DataTypeRefSet) -> CommandLineParse {
+        let value: FlagValue = flag_value(line, start, end);
+        transition value {
+            FlagValue::Inline { start, end } -> read_page(line, start, end, end, filters)
+            FlagValue::Following { start, end } -> read_page(line, start, end, end, filters)
+            FlagValue::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state read_page(line: &[u8], start: u64, end: u64, continue_at: u64, filters: DataTypeRefSet) -> CommandLineParse {
+        let parsed: U64Parse = parse_u64(line, start, end);
+        transition parsed {
+            U64Parse::Parsed { value } -> list_loop(line, continue_at, value, true, filters)
+            U64Parse::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state list_filter(line: &[u8], start: u64, end: u64, page_index: u64, filters: DataTypeRefSet) -> CommandLineParse {
+        let value: FlagValue = flag_value(line, start, end);
+        transition value {
+            FlagValue::Inline { start, end } -> read_filter(line, start, end, end, page_index, filters)
+            FlagValue::Following { start, end } -> read_filter(line, start, end, end, page_index, filters)
+            FlagValue::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state read_filter(line: &[u8], start: u64, end: u64, continue_at: u64, page_index: u64, filters: DataTypeRefSet) -> CommandLineParse {
+        transition start <= end && end <= line.len {
+            true -> filter_parse(line, &line[start..end], continue_at, page_index, filters)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state filter_parse(line: &[u8], value: &[u8], continue_at: u64, page_index: u64, filters: DataTypeRefSet) -> CommandLineParse {
+        let parsed: DataTypeRefParse = DataTypeRef::parse(value);
+        transition parsed {
+            DataTypeRefParse::Parsed { value } -> filter_pushed(line, value, continue_at, page_index, filters)
+            DataTypeRefParse::Refused -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state filter_pushed(line: &[u8], value: DataTypeRef, continue_at: u64, page_index: u64, filters: DataTypeRefSet) -> CommandLineParse {
+        let mut carried_filters: DataTypeRefSet = filters;
+        let pushed: bool = carried_filters.push(&value);
+        transition pushed {
+            true -> list_loop(line, continue_at, page_index, true, carried_filters)
+            false -> (CommandLineParse::Refused)
+            _ -> (CommandLineParse::Refused)
+        }
+    }
+    state list_finish(page_index: u64, filters: DataTypeRefSet) -> CommandLineParse {
+        let has_filters: bool = filters.get_count() > 0;
+        CommandLineParse::Parsed { command:
+            CommandLineCommand::Privileged { command:
+                PrivilegedCommand::ScanResults { command:
+                    ScanResultsCommand::List { request: ScanResultsListRequest {
+                        page_index: page_index,
+                        has_data_type_filters: has_filters,
+                        data_type_filters: filters } } } } }
+    }
+}
