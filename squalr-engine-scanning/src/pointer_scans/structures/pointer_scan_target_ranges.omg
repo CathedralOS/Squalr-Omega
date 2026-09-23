@@ -1,0 +1,1789 @@
+module src::pointer_scans::structures::pointer_scan_target_ranges;
+
+use squalr_engine_api::src::structures::memory::normalized_region;
+
+// Port of structures/pointer_scan_target_ranges.rs.
+//
+// TARGET_RANGE_BUCKET_SHIFT = 16 and the 8-range bucket linear-search
+// threshold are retained verbatim.
+//
+// Storage deviation: upstream owns `Vec` fields; the port takes caller-owned
+// extents plus live counts (the established Omega Vec analogue). The supplied
+// extents bound capacity — a target list larger than the extents is
+// truncated rather than grown; upstream has no capacity bound.
+// `Option<usize>` results port as found+index carriers.
+
+pub data RangeIndexLookup [copy] {
+    found: bool;
+    index: u64;
+}
+
+pub data BucketIndexLookup [copy] {
+    found: bool;
+    index: u64;
+}
+
+pub data PointerScanTargetRangeBucket [copy] {
+    bucket_key: u64;
+    start_range_index: u64;
+    end_range_index_exclusive: u64;
+}
+
+pub machine PointerScanTargetRangeBucket::new(
+    bucket_key: u64,
+    start_range_index: u64,
+    end_range_index_exclusive: u64
+) -> PointerScanTargetRangeBucket {
+    PointerScanTargetRangeBucket {
+        bucket_key: bucket_key,
+        start_range_index: start_range_index,
+        end_range_index_exclusive: end_range_index_exclusive
+    }
+}
+
+pub machine PointerScanTargetRangeBucket::get_bucket_key(&self) -> u64 {
+    self.bucket_key
+}
+
+pub machine PointerScanTargetRangeBucket::get_start_range_index(&self) -> u64 {
+    self.start_range_index
+}
+
+pub machine PointerScanTargetRangeBucket::get_end_range_index_exclusive(&self) -> u64 {
+    self.end_range_index_exclusive
+}
+
+pub machine PointerScanTargetRangeBucket::set_end_range_index_exclusive(
+    &mut self,
+    end_range_index_exclusive: u64
+) {
+    self.end_range_index_exclusive = end_range_index_exclusive;
+}
+
+pub data PointerScanTargetRangeSet<'ranges> {
+    source_target_count: u64;
+    target_ranges: &'ranges mut [normalized_region::NormalizedRegion];
+    range_count: u64;
+    lower_bounds: &'ranges mut [u64];
+    upper_bounds: &'ranges mut [u64];
+    target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket];
+    bucket_count: u64;
+}
+
+pub machine PointerScanTargetRangeSet::empty<'ranges>(
+    target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+    lower_bounds: &'ranges mut [u64],
+    upper_bounds: &'ranges mut [u64],
+    target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket]
+) -> PointerScanTargetRangeSet<'ranges> {
+    PointerScanTargetRangeSet {
+        source_target_count: 0,
+        target_ranges: target_ranges,
+        range_count: 0,
+        lower_bounds: lower_bounds,
+        upper_bounds: upper_bounds,
+        target_range_buckets: target_range_buckets,
+        bucket_count: 0
+    }
+}
+
+// Upstream `PointerScanTargetRangeSet::from_target_addresses`: copies the
+// addresses into caller scratch, insertion-sorts the copy in place (upstream
+// uses `sort_unstable` on the copy — same ascending result), then runs the
+// merge + bucket passes shared with `from_sorted_target_addresses_iter`.
+// `sorted_scratch` must be at least `target_addresses.len`; a shorter extent
+// truncates the input (capacity deviation).
+pub machine PointerScanTargetRangeSet::from_target_addresses<'ranges>(
+    target_addresses: &[u64],
+    offset_radius: u64,
+    sorted_scratch: &'ranges mut [u64],
+    target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+    lower_bounds: &'ranges mut [u64],
+    upper_bounds: &'ranges mut [u64],
+    target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket]
+) -> PointerScanTargetRangeSet<'ranges> {
+    transition (target_addresses.len <= sorted_scratch.len) {
+            true -> copy_loop(
+                target_addresses,
+                sorted_scratch,
+                target_ranges,
+                lower_bounds,
+                upper_bounds,
+                target_range_buckets,
+                offset_radius,
+                target_addresses.len,
+                0
+            )
+            false -> copy_loop(
+                target_addresses,
+                sorted_scratch,
+                target_ranges,
+                lower_bounds,
+                upper_bounds,
+                target_range_buckets,
+                offset_radius,
+                sorted_scratch.len,
+                0
+            )
+        }
+
+    state copy_loop(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        copy_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (copy_index < copy_count) {
+            true -> copy_gate(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, copy_index)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, 1)
+        }
+    }
+
+    state copy_gate(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        copy_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (copy_index < target_addresses.len) {
+            true -> copy_gate2(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, copy_index)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, 1)
+        }
+    }
+
+    state copy_gate2(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        copy_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (copy_index < sorted_scratch.len) {
+            true -> copy_one(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, copy_index)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, 1)
+        }
+    }
+
+    state copy_one(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        copy_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        sorted_scratch[copy_index] = target_addresses[copy_index];
+        copy_loop(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((copy_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+    }
+
+    state sort_outer(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        sort_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (sort_index < copy_count) {
+            true -> sort_gate(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, sort_index)
+            false -> merge_start(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count)
+        }
+    }
+
+    state sort_gate(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        sort_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (sort_index < sorted_scratch.len) {
+            true -> sort_insert(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, sort_index, sort_index)
+            false -> merge_start(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count)
+        }
+    }
+
+    state sort_insert(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        sort_index: u64,
+        insert_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (insert_index >= 1) {
+            true -> sort_cmp_gate(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, sort_index, insert_index)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((sort_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state sort_cmp_gate(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        sort_index: u64,
+        insert_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (insert_index < sorted_scratch.len) {
+            true -> sort_cmp_prev_gate(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, sort_index, insert_index)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((sort_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state sort_cmp_prev_gate(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        sort_index: u64,
+        insert_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let prev_index: u64 = ((insert_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (prev_index < sorted_scratch.len) {
+            true -> sort_cmp(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, sort_index, insert_index, prev_index)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((sort_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state sort_cmp(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        sort_index: u64,
+        insert_index: u64,
+        prev_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (sorted_scratch[prev_index] > sorted_scratch[insert_index]) {
+            true -> sort_swap(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, sort_index, insert_index, prev_index)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((sort_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state sort_swap(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        sort_index: u64,
+        insert_index: u64,
+        prev_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let held: u64 = sorted_scratch[prev_index];
+        sorted_scratch[prev_index] = sorted_scratch[insert_index];
+        sorted_scratch[insert_index] = held;
+        transition (insert_index >= 2) {
+            true -> sort_insert(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, sort_index, ((insert_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64)
+            false -> sort_outer(target_addresses, sorted_scratch, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((sort_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state merge_start(
+        target_addresses: &[u64],
+        sorted_scratch: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        merge_loop(
+            sorted_scratch,
+            target_ranges,
+            lower_bounds,
+            upper_bounds,
+            target_range_buckets,
+            offset_radius,
+            copy_count,
+            0,
+            0,
+            0,
+            false,
+            0
+        )
+    }
+
+    // Shared with `from_sorted_target_addresses_iter`'s build pass: dedupe
+    // via previous_target_address, saturate the radius bounds, merge an
+    // overlapping-or-adjacent next range into the last one, else append.
+    // `ranges_filled` is the parallel-extent live count.
+    state merge_loop(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        has_previous: bool,
+        previous_target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (scan_index < copy_count) {
+            true -> merge_scan_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, has_previous, previous_target_address)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_scan_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        has_previous: bool,
+        previous_target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (scan_index < sorted.len) {
+            true -> merge_read(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, has_previous, previous_target_address)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_read(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        has_previous: bool,
+        previous_target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let target_address: u64 = sorted[scan_index];
+        transition (has_previous) {
+            true -> merge_dup_check(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, has_previous, previous_target_address, target_address)
+            false -> merge_expand(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address)
+        }
+    }
+
+    state merge_dup_check(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        has_previous: bool,
+        previous_target_address: u64,
+        target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (target_address == previous_target_address) {
+            true -> merge_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ranges_filled, unique_target_count, has_previous, previous_target_address)
+            false -> merge_expand(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address)
+        }
+    }
+
+    state merge_expand(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let next_lower_bound: u64 = ((target_address as u64 in Saturating) - (offset_radius as u64 in Saturating)) as u64;
+        let next_upper_bound: u64 = ((target_address as u64 in Saturating) + (offset_radius as u64 in Saturating)) as u64;
+        transition (ranges_filled >= 1) {
+            true -> merge_last_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_append_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+        }
+    }
+
+    state merge_last_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_index: u64 = ((ranges_filled as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (last_index < upper_bounds.len) {
+            true -> merge_last(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound, last_index)
+            false -> merge_append_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+        }
+    }
+
+    state merge_last(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_upper_bound: u64 = upper_bounds[last_index];
+        transition (next_lower_bound <= ((last_upper_bound as u64 in Saturating) + (1 as u64 in Saturating)) as u64) {
+            true -> merge_write_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound)
+            false -> merge_append_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+        }
+    }
+
+    state merge_write_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_index: u64 = ((ranges_filled as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (last_index < lower_bounds.len) {
+            true -> merge_write_gate2(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound, last_index)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_write_gate2(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (last_index < target_ranges.len) {
+            true -> merge_write_gate3(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound, last_index)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_write_gate3(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (last_index < upper_bounds.len) {
+            true -> merge_write(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound, last_index)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+state merge_write(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_upper_bound: u64 = upper_bounds[last_index];
+        let merged_upper_bound: u64 = target_range_upper_max(last_upper_bound, next_upper_bound);
+        upper_bounds[last_index] = merged_upper_bound;
+        let last_lower_bound: u64 = lower_bounds[last_index];
+        target_ranges[last_index] = normalized_region::NormalizedRegion {
+            base_address: last_lower_bound,
+            region_size: ((merged_upper_bound as u64 in Saturating) - (last_lower_bound as u64 in Saturating)) as u64
+        };
+        merge_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ranges_filled, ((unique_target_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, target_address)
+    }
+
+    state merge_append_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled < target_ranges.len) {
+            true -> merge_append_gate2(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_append_gate2(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled < lower_bounds.len) {
+            true -> merge_append_gate3(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_append_gate3(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled < upper_bounds.len) {
+            true -> merge_append(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_done(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_append(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        copy_count: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        target_ranges[ranges_filled] = normalized_region::NormalizedRegion {
+            base_address: next_lower_bound,
+            region_size: ((next_upper_bound as u64 in Saturating) - (next_lower_bound as u64 in Saturating)) as u64
+        };
+        lower_bounds[ranges_filled] = next_lower_bound;
+        upper_bounds[ranges_filled] = next_upper_bound;
+        merge_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, copy_count, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((ranges_filled as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((unique_target_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, target_address)
+    }
+
+    state merge_done(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled >= 1) {
+            true -> bucket_start(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+            false -> finish_set(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, 0, 0, 0)
+        }
+    }
+
+    state bucket_start(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        bucket_range_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, 0, 0)
+    }
+
+    // Upstream `build_target_range_buckets`: every bucket key a range's
+    // lower..=upper covers maps to that range index, coalesced against the
+    // previous bucket.
+    state bucket_range_loop(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (range_index < ranges_filled) {
+            true -> bucket_low_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count)
+            false -> finish_set(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, bucket_count)
+        }
+    }
+
+    state bucket_low_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (range_index < lower_bounds.len) {
+            true -> bucket_high_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count)
+            false -> finish_set(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, bucket_count)
+        }
+    }
+
+    state bucket_high_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (range_index < upper_bounds.len) {
+            true -> bucket_keys(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count)
+            false -> finish_set(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, bucket_count)
+        }
+    }
+
+    state bucket_keys(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let lower_bound: u64 = lower_bounds[range_index];
+        let upper_bound: u64 = upper_bounds[range_index];
+        bucket_key_loop(
+            sorted,
+            target_ranges,
+            lower_bounds,
+            upper_bounds,
+            target_range_buckets,
+            ranges_filled,
+            unique_target_count,
+            range_index,
+            bucket_count,
+            lower_bound >> 16,
+            upper_bound >> 16
+        )
+    }
+
+    state bucket_key_loop(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (bucket_key <= upper_bucket_key) {
+            true -> bucket_last_check(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+            false -> bucket_range_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, bucket_count)
+        }
+    }
+
+    state bucket_last_check(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (bucket_count >= 1) {
+            true -> bucket_last_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+            false -> bucket_push_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+        }
+    }
+
+    state bucket_last_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let bucket_last_index: u64 = ((bucket_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (bucket_last_index < target_range_buckets.len) {
+            true -> bucket_last(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key, bucket_last_index)
+            false -> bucket_push_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+        }
+    }
+
+    state bucket_last(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        bucket_last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (target_range_buckets[bucket_last_index].bucket_key == bucket_key) {
+            true -> bucket_extend(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key, bucket_last_index)
+            false -> bucket_push_gate(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+        }
+    }
+
+    state bucket_extend(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        bucket_last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        target_range_buckets[bucket_last_index].end_range_index_exclusive = ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        bucket_key_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key)
+    }
+
+    state bucket_push_gate(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (bucket_count < target_range_buckets.len) {
+            true -> bucket_push(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+            false -> bucket_key_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key)
+        }
+    }
+
+    state bucket_push(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        target_range_buckets[bucket_count] = PointerScanTargetRangeBucket {
+            bucket_key: bucket_key,
+            start_range_index: range_index,
+            end_range_index_exclusive: ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        };
+        bucket_key_loop(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, ((bucket_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key)
+    }
+
+    state finish_set(
+        sorted: &'ranges mut [u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        PointerScanTargetRangeSet {
+            source_target_count: unique_target_count,
+            target_ranges: target_ranges,
+            range_count: ranges_filled,
+            lower_bounds: lower_bounds,
+            upper_bounds: upper_bounds,
+            target_range_buckets: target_range_buckets,
+            bucket_count: bucket_count
+        }
+    }
+}
+
+// Upstream `PointerScanTargetRangeSet::from_sorted_target_addresses_iter`:
+// same merge + bucket build over caller-sorted input — no copy, no sort.
+// `sorted_target_addresses` may be shorter than `sorted_scratch`-style
+// storage because the merge pass only reads it.
+pub machine PointerScanTargetRangeSet::from_sorted_target_addresses<'ranges>(
+    sorted_target_addresses: &[u64],
+    offset_radius: u64,
+    target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+    lower_bounds: &'ranges mut [u64],
+    upper_bounds: &'ranges mut [u64],
+    target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket]
+) -> PointerScanTargetRangeSet<'ranges> {
+    // The merge chain is shared with `from_target_addresses`; that chain
+    // threads a `&mut` scratch for its sort, so this entry re-exposes the
+    // sorted input as that same `&mut` view is not possible — instead the
+    // shared chain is duplicated at the merge entry via the read-only
+    // sorted slice: the merge states only read `sorted`.
+    transition {
+        _ -> merge_loop_i(
+            sorted_target_addresses,
+            target_ranges,
+            lower_bounds,
+            upper_bounds,
+            target_range_buckets,
+            offset_radius,
+            0,
+            0,
+            0,
+            false,
+            0
+        )
+    }
+
+    // Immutable-sorted twin of the from_target_addresses merge pass; states
+    // and transitions are identical except `sorted` is a `&[u64]` view.
+
+    state merge_loop_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        has_previous: bool,
+        previous_target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (scan_index < sorted.len) {
+            true -> merge_read_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, has_previous, previous_target_address)
+            false -> merge_done_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_read_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        has_previous: bool,
+        previous_target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let target_address: u64 = sorted[scan_index];
+        transition (has_previous) {
+            true -> merge_dup_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, has_previous, previous_target_address, target_address)
+            false -> merge_expand_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address)
+        }
+    }
+
+    state merge_dup_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        has_previous: bool,
+        previous_target_address: u64,
+        target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (target_address == previous_target_address) {
+            true -> merge_loop_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ranges_filled, unique_target_count, has_previous, previous_target_address)
+            false -> merge_expand_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address)
+        }
+    }
+
+    state merge_expand_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let next_lower_bound: u64 = ((target_address as u64 in Saturating) - (offset_radius as u64 in Saturating)) as u64;
+        let next_upper_bound: u64 = ((target_address as u64 in Saturating) + (offset_radius as u64 in Saturating)) as u64;
+        transition (ranges_filled >= 1) {
+            true -> merge_last_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_append_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+        }
+    }
+
+    state merge_last_gate_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_index: u64 = ((ranges_filled as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (last_index < upper_bounds.len) {
+            true -> merge_last_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound, last_index)
+            false -> merge_append_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+        }
+    }
+
+    state merge_last_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_upper_bound: u64 = upper_bounds[last_index];
+        transition (next_lower_bound <= ((last_upper_bound as u64 in Saturating) + (1 as u64 in Saturating)) as u64) {
+            true -> merge_write_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound)
+            false -> merge_append_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+        }
+    }
+
+    state merge_write_gate_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_index: u64 = ((ranges_filled as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (last_index < lower_bounds.len) {
+            true -> merge_write_gate2_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound, last_index)
+            false -> merge_done_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_write_gate2_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (last_index < target_ranges.len) {
+            true -> merge_write_gate3_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound, last_index)
+            false -> merge_done_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_write_gate3_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (last_index < upper_bounds.len) {
+            true -> merge_write_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_upper_bound, last_index)
+            false -> merge_done_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+state merge_write_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let last_upper_bound: u64 = upper_bounds[last_index];
+        let merged_upper_bound: u64 = target_range_upper_max(last_upper_bound, next_upper_bound);
+        upper_bounds[last_index] = merged_upper_bound;
+        let last_lower_bound: u64 = lower_bounds[last_index];
+        target_ranges[last_index] = normalized_region::NormalizedRegion {
+            base_address: last_lower_bound,
+            region_size: ((merged_upper_bound as u64 in Saturating) - (last_lower_bound as u64 in Saturating)) as u64
+        };
+        merge_loop_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ranges_filled, ((unique_target_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, target_address)
+    }
+
+    state merge_append_gate_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled < target_ranges.len) {
+            true -> merge_append_gate2_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_done_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_append_gate2_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled < lower_bounds.len) {
+            true -> merge_append_gate3_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_done_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_append_gate3_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled < upper_bounds.len) {
+            true -> merge_append_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, scan_index, ranges_filled, unique_target_count, target_address, next_lower_bound, next_upper_bound)
+            false -> merge_done_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count)
+        }
+    }
+
+    state merge_append_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        offset_radius: u64,
+        scan_index: u64,
+        ranges_filled: u64,
+        unique_target_count: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        target_ranges[ranges_filled] = normalized_region::NormalizedRegion {
+            base_address: next_lower_bound,
+            region_size: ((next_upper_bound as u64 in Saturating) - (next_lower_bound as u64 in Saturating)) as u64
+        };
+        lower_bounds[ranges_filled] = next_lower_bound;
+        upper_bounds[ranges_filled] = next_upper_bound;
+        merge_loop_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, offset_radius, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((ranges_filled as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((unique_target_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, target_address)
+    }
+
+    state merge_done_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (ranges_filled >= 1) {
+            true -> bucket_range_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, 0, 0)
+            false -> finish_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, 0, 0, 0)
+        }
+    }
+
+    state bucket_range_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (range_index < ranges_filled) {
+            true -> bucket_low_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count)
+            false -> finish_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, bucket_count)
+        }
+    }
+
+    state bucket_low_gate_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (range_index < lower_bounds.len) {
+            true -> bucket_high_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count)
+            false -> finish_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, bucket_count)
+        }
+    }
+
+    state bucket_high_gate_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (range_index < upper_bounds.len) {
+            true -> bucket_keys_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count)
+            false -> finish_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, bucket_count)
+        }
+    }
+
+    state bucket_keys_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let lower_bound: u64 = lower_bounds[range_index];
+        let upper_bound: u64 = upper_bounds[range_index];
+        bucket_key_i(
+            sorted,
+            target_ranges,
+            lower_bounds,
+            upper_bounds,
+            target_range_buckets,
+            ranges_filled,
+            unique_target_count,
+            range_index,
+            bucket_count,
+            lower_bound >> 16,
+            upper_bound >> 16
+        )
+    }
+
+    state bucket_key_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (bucket_key <= upper_bucket_key) {
+            true -> bucket_last_check_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+            false -> bucket_range_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, bucket_count)
+        }
+    }
+
+    state bucket_last_check_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (bucket_count >= 1) {
+            true -> bucket_last_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+            false -> bucket_push_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+        }
+    }
+
+    state bucket_last_gate_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        let bucket_last_index: u64 = ((bucket_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (bucket_last_index < target_range_buckets.len) {
+            true -> bucket_last_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key, bucket_last_index)
+            false -> bucket_push_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+        }
+    }
+
+    state bucket_last_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        bucket_last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (target_range_buckets[bucket_last_index].bucket_key == bucket_key) {
+            true -> bucket_extend_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key, bucket_last_index)
+            false -> bucket_push_gate_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+        }
+    }
+
+    state bucket_extend_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        bucket_last_index: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        target_range_buckets[bucket_last_index].end_range_index_exclusive = ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        bucket_key_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key)
+    }
+
+    state bucket_push_gate_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        transition (bucket_count < target_range_buckets.len) {
+            true -> bucket_push_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, bucket_key, upper_bucket_key)
+            false -> bucket_key_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, bucket_count, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key)
+        }
+    }
+
+    state bucket_push_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        range_index: u64,
+        bucket_count: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        target_range_buckets[bucket_count] = PointerScanTargetRangeBucket {
+            bucket_key: bucket_key,
+            start_range_index: range_index,
+            end_range_index_exclusive: ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        };
+        bucket_key_i(sorted, target_ranges, lower_bounds, upper_bounds, target_range_buckets, ranges_filled, unique_target_count, range_index, ((bucket_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key)
+    }
+
+    state finish_i(
+        sorted: &[u64],
+        target_ranges: &'ranges mut [normalized_region::NormalizedRegion],
+        lower_bounds: &'ranges mut [u64],
+        upper_bounds: &'ranges mut [u64],
+        target_range_buckets: &'ranges mut [PointerScanTargetRangeBucket],
+        ranges_filled: u64,
+        unique_target_count: u64,
+        bucket_count: u64
+    ) -> PointerScanTargetRangeSet<'ranges> {
+        PointerScanTargetRangeSet {
+            source_target_count: unique_target_count,
+            target_ranges: target_ranges,
+            range_count: ranges_filled,
+            lower_bounds: lower_bounds,
+            upper_bounds: upper_bounds,
+            target_range_buckets: target_range_buckets,
+            bucket_count: bucket_count
+        }
+    }
+}
+
+machine target_range_upper_max(
+    left: u64,
+    right: u64
+) -> u64 {
+    transition (left >= right) {
+        true -> (left)
+        false -> (right)
+    }
+}
+
+pub machine PointerScanTargetRangeSet::get_source_target_count(&self) -> u64 {
+    self.source_target_count
+}
+
+pub machine pointer_scan_target_range_set_get_range_count<'r>(
+    range_set: &'r PointerScanTargetRangeSet<'r>
+) -> u64 {
+    range_set.range_count
+}
+
+pub machine pointer_scan_target_range_set_is_empty<'r>(
+    range_set: &'r PointerScanTargetRangeSet<'r>
+) -> bool {
+    range_set.range_count == 0
+}
+
+pub machine pointer_scan_target_range_set_contains_value_linear<'r>(
+    range_set: &'r PointerScanTargetRangeSet<'r>,
+    pointer_value: u64
+) -> bool {
+    let lookup: RangeIndexLookup = find_linear(range_set, pointer_value, 0);
+    transition (lookup.found) {
+        true -> (true)
+        false -> (false)
+    }
+
+    state find_linear(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64) -> RangeIndexLookup {
+        transition (range_index < range_set.range_count) {
+            true -> bounds_gate(range_set, pointer_value, range_index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state bounds_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64) -> RangeIndexLookup {
+        transition (range_index < range_set.lower_bounds.len) {
+            true -> bounds_gate2(range_set, pointer_value, range_index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state bounds_gate2(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64) -> RangeIndexLookup {
+        transition (range_index < range_set.lower_bounds.len) {
+            true -> bounds_at(range_set, range_set.lower_bounds, pointer_value, range_index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state bounds_at(range_set: &'r PointerScanTargetRangeSet<'r>, lower_bounds: &[u64], pointer_value: u64, range_index: u64 [0..lower_bounds.len]) -> RangeIndexLookup {
+        let lower_bound: u64 = lower_bounds[range_index];
+        transition (pointer_value < lower_bound) {
+            true -> RangeIndexLookup { found: false, index: 0 }
+            false -> upper_bounds_gate(range_set, pointer_value, range_index)
+        }
+    }
+    state upper_bounds_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64) -> RangeIndexLookup {
+        transition (range_index < range_set.upper_bounds.len) {
+            true -> upper_check(range_set, range_set.upper_bounds, pointer_value, range_index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state upper_check(range_set: &'r PointerScanTargetRangeSet<'r>, upper_bounds: &[u64], pointer_value: u64, range_index: u64 [0..upper_bounds.len]) -> RangeIndexLookup {
+        let upper_bound: u64 = upper_bounds[range_index];
+        transition (pointer_value <= upper_bound) {
+            true -> RangeIndexLookup { found: true, index: range_index }
+            false -> find_linear(range_set, pointer_value, ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+}
+
+pub machine pointer_scan_target_range_set_contains_value_binary<'r>(
+    range_set: &'r PointerScanTargetRangeSet<'r>,
+    pointer_value: u64
+) -> bool {
+    let lookup: RangeIndexLookup = find_binary(range_set, pointer_value);
+    transition (lookup.found) {
+        true -> (true)
+        false -> (false)
+    }
+
+    // Upstream `find_matching_bucket_index`: partition_point over bucket
+    // keys `< bucket_key`, then an exact-key check on that index.
+    state find_binary(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64) -> RangeIndexLookup {
+        let bucket_key: u64 = pointer_value >> 16;
+        let bucket_lookup: BucketIndexLookup = bucket_partition(range_set, bucket_key, 0, range_set.bucket_count);
+        transition (bucket_lookup.found) {
+            true -> bucket_ranges(range_set, pointer_value, bucket_lookup.index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state bucket_partition(range_set: &'r PointerScanTargetRangeSet<'r>, bucket_key: u64, partition_lo: u64, partition_hi: u64) -> BucketIndexLookup {
+        transition (partition_lo < partition_hi) {
+            true -> partition_mid_gate(range_set, bucket_key, partition_lo, partition_hi)
+            false -> bucket_index_check(range_set, bucket_key, partition_lo)
+        }
+    }
+
+    state partition_mid_gate(range_set: &'r PointerScanTargetRangeSet<'r>, bucket_key: u64, partition_lo: u64, partition_hi: u64) -> BucketIndexLookup {
+        let partition_mid_index: u64 = (((partition_lo as u64 in Saturating) + (((partition_hi as u64 in Saturating) - (partition_lo as u64 in Saturating)) / (2 as u64 in Saturating))) as u64);
+        transition (partition_mid_index < range_set.target_range_buckets.len) {
+            true -> partition_mid_gate2(range_set, bucket_key, partition_lo, partition_hi, partition_mid_index)
+            false -> bucket_index_check(range_set, bucket_key, partition_lo)
+        }
+    }
+
+    state partition_mid_gate2(range_set: &'r PointerScanTargetRangeSet<'r>, bucket_key: u64, partition_lo: u64, partition_hi: u64, partition_mid_index: u64) -> BucketIndexLookup {
+        transition (partition_mid_index < range_set.target_range_buckets.len) {
+            true -> partition_at(range_set, range_set.target_range_buckets, bucket_key, partition_lo, partition_hi, partition_mid_index)
+            false -> bucket_index_check(range_set, bucket_key, partition_lo)
+        }
+    }
+
+    state partition_at(range_set: &'r PointerScanTargetRangeSet<'r>, target_range_buckets: &[PointerScanTargetRangeBucket], bucket_key: u64, partition_lo: u64, partition_hi: u64, partition_mid_index: u64 [0..target_range_buckets.len]) -> BucketIndexLookup {
+        transition (target_range_buckets[partition_mid_index].bucket_key < bucket_key) {
+            true -> bucket_partition(range_set, bucket_key, ((partition_mid_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, partition_hi)
+            false -> bucket_partition(range_set, bucket_key, partition_lo, partition_mid_index)
+        }
+    }
+    state bucket_index_check(range_set: &'r PointerScanTargetRangeSet<'r>, bucket_key: u64, bucket_index: u64) -> BucketIndexLookup {
+        transition (bucket_index < range_set.bucket_count) {
+            true -> bucket_len_check(range_set, bucket_key, bucket_index)
+            false -> BucketIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state bucket_len_check(range_set: &'r PointerScanTargetRangeSet<'r>, bucket_key: u64, bucket_index: u64) -> BucketIndexLookup {
+        transition (bucket_index < range_set.target_range_buckets.len) {
+            true -> bucket_key_check(range_set, range_set.target_range_buckets, bucket_key, bucket_index)
+            false -> BucketIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state bucket_key_check(range_set: &'r PointerScanTargetRangeSet<'r>, target_range_buckets: &[PointerScanTargetRangeBucket], bucket_key: u64, bucket_index: u64 [0..target_range_buckets.len]) -> BucketIndexLookup {
+        transition (target_range_buckets[bucket_index].bucket_key == bucket_key) {
+            true -> BucketIndexLookup { found: true, index: bucket_index }
+            false -> BucketIndexLookup { found: false, index: 0 }
+        }
+    }
+    state bucket_ranges(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, bucket_index: u64) -> RangeIndexLookup {
+        transition (bucket_index < range_set.target_range_buckets.len) {
+            true -> bucket_ranges_at(range_set, range_set.target_range_buckets, pointer_value, bucket_index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state bucket_ranges_at(range_set: &'r PointerScanTargetRangeSet<'r>, target_range_buckets: &[PointerScanTargetRangeBucket], pointer_value: u64, bucket_index: u64 [0..target_range_buckets.len]) -> RangeIndexLookup {
+        let bucket_range_count: u64 = ((target_range_buckets[bucket_index].end_range_index_exclusive as u64 in Saturating)
+            - (target_range_buckets[bucket_index].start_range_index as u64 in Saturating)) as u64;
+        transition (bucket_range_count <= 8) {
+            true -> linear_gate(range_set,
+                pointer_value,
+                target_range_buckets[bucket_index].start_range_index,
+                target_range_buckets[bucket_index].end_range_index_exclusive
+            )
+            false -> binary_bounds(range_set,
+                pointer_value,
+                target_range_buckets[bucket_index].start_range_index,
+                target_range_buckets[bucket_index].end_range_index_exclusive
+            )
+        }
+    }
+    state linear_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64, end_exclusive: u64) -> RangeIndexLookup {
+        transition (range_index < end_exclusive) {
+            true -> linear_low_gate(range_set, pointer_value, range_index, end_exclusive)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state linear_low_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64, end_exclusive: u64) -> RangeIndexLookup {
+        transition (range_index < range_set.lower_bounds.len) {
+            true -> linear_high_gate(range_set, pointer_value, range_index, end_exclusive)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state linear_high_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64, end_exclusive: u64) -> RangeIndexLookup {
+        transition (range_index < range_set.lower_bounds.len) {
+            true -> linear_at(range_set, range_set.lower_bounds, pointer_value, range_index, end_exclusive)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state linear_at(range_set: &'r PointerScanTargetRangeSet<'r>, lower_bounds: &[u64], pointer_value: u64, range_index: u64 [0..lower_bounds.len], end_exclusive: u64) -> RangeIndexLookup {
+        let lower_bound: u64 = lower_bounds[range_index];
+        transition (pointer_value < lower_bound) {
+            true -> RangeIndexLookup { found: false, index: 0 }
+            false -> linear_upper_gate(range_set, pointer_value, range_index, end_exclusive)
+        }
+    }
+    state linear_upper_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, range_index: u64, end_exclusive: u64) -> RangeIndexLookup {
+        transition (range_index < range_set.upper_bounds.len) {
+            true -> linear_upper(range_set, range_set.upper_bounds, pointer_value, range_index, end_exclusive)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state linear_upper(range_set: &'r PointerScanTargetRangeSet<'r>, upper_bounds: &[u64], pointer_value: u64, range_index: u64 [0..upper_bounds.len], end_exclusive: u64) -> RangeIndexLookup {
+        let upper_bound: u64 = upper_bounds[range_index];
+        transition (pointer_value <= upper_bound) {
+            true -> RangeIndexLookup { found: true, index: range_index }
+            false -> linear_gate(range_set, pointer_value, ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, end_exclusive)
+        }
+    }
+    state binary_bounds(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, search_start: u64, search_end_exclusive: u64) -> RangeIndexLookup {
+        let partition_index: u64 = range_partition(range_set, pointer_value, search_start, search_end_exclusive);
+        transition (partition_index == search_start) {
+            true -> RangeIndexLookup { found: false, index: 0 }
+            false -> binary_candidate(range_set, pointer_value, partition_index)
+        }
+    }
+
+    state range_partition(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, partition_lo: u64, partition_hi: u64) -> u64 {
+        transition (partition_lo < partition_hi) {
+            true -> range_mid_gate(range_set, pointer_value, partition_lo, partition_hi)
+            false -> (partition_lo)
+        }
+    }
+
+    state range_mid_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, partition_lo: u64, partition_hi: u64) -> u64 {
+        let partition_mid_index: u64 = (((partition_lo as u64 in Saturating) + (((partition_hi as u64 in Saturating) - (partition_lo as u64 in Saturating)) / (2 as u64 in Saturating))) as u64);
+        transition (partition_mid_index < range_set.lower_bounds.len) {
+            true -> range_partition_at(range_set, range_set.lower_bounds, pointer_value, partition_lo, partition_hi, partition_mid_index)
+            false -> (partition_lo)
+        }
+    }
+
+    state range_partition_at(range_set: &'r PointerScanTargetRangeSet<'r>, lower_bounds: &[u64], pointer_value: u64, partition_lo: u64, partition_hi: u64, partition_mid_index: u64 [0..lower_bounds.len]) -> u64 {
+        transition (lower_bounds[partition_mid_index] <= pointer_value) {
+            true -> range_partition(range_set, pointer_value, ((partition_mid_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, partition_hi)
+            false -> range_partition(range_set, pointer_value, partition_lo, partition_mid_index)
+        }
+    }
+    state binary_candidate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, partition_index: u64) -> RangeIndexLookup {
+        transition (partition_index >= 1) {
+            true -> binary_upper_gate(range_set, pointer_value, partition_index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state binary_upper_gate(range_set: &'r PointerScanTargetRangeSet<'r>, pointer_value: u64, partition_index: u64 ) -> RangeIndexLookup {
+        let target_range_index: u64 = ((partition_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (target_range_index < range_set.upper_bounds.len) {
+            true -> binary_upper(range_set, range_set.upper_bounds, pointer_value, target_range_index)
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+
+    state binary_upper(range_set: &'r PointerScanTargetRangeSet<'r>, upper_bounds: &[u64], pointer_value: u64, target_range_index: u64 [0..upper_bounds.len]) -> RangeIndexLookup {
+        transition (pointer_value <= upper_bounds[target_range_index]) {
+            true -> RangeIndexLookup { found: true, index: target_range_index }
+            false -> RangeIndexLookup { found: false, index: 0 }
+        }
+    }
+}

@@ -1,0 +1,370 @@
+module src::structures::pointer_scans::pointer_scan_level_candidates;
+
+use omega::language::core::option;
+use src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+
+// Port of PointerScanLevelCandidates. Upstream owns Vec<PointerScanCandidate>
+// per kind; Omega carries caller-supplied extents plus live counts. `new`'s
+// static-candidate sort and the lazy heap sort are ported as in-place
+// insertion sorts over the extents (upstream uses sort_unstable; equal keys
+// keep input order here, which callers do not observe).
+pub data PointerScanLevelCandidates<'static_ext, 'heap_ext> {
+    discovery_depth: u64;
+    static_candidates: &'static_ext mut [PointerScanCandidate];
+    static_count: u64;
+    heap_candidates: &'heap_ext mut [PointerScanCandidate];
+    heap_count: u64;
+    heap_candidates_sorted: bool;
+}
+
+// Slice range for find_heap_candidates_in_range: callers read
+// get_heap_candidates()[start_index .. start_index + candidate_count).
+pub data HeapCandidateRange [copy] {
+    start_index: u64;
+    candidate_count: u64;
+}
+
+// Result of find_heap_candidate_by_address: Optional's scalar payload cannot
+// be destructured cross-package, so the found slot index is returned.
+pub data HeapCandidateLookup [copy] {
+    case Found(index: u64);
+    case Absent;
+}
+
+// Insertion-shift for one element at `index`: walk it down while the previous
+// static key (module_index, module_offset) is greater.
+machine shift_static_insert(static_candidates: &mut [PointerScanCandidate], index: u64) {
+    transition (index >= 1) {
+        true -> gate(static_candidates, index)
+        false -> done(static_candidates, index)
+    }
+    state gate(static_candidates: &mut [PointerScanCandidate], index: u64) {
+        transition index < static_candidates.len {
+            true -> compare_previous(static_candidates, index)
+            false -> done(static_candidates, index)
+        }
+    }
+    state done(static_candidates: &mut [PointerScanCandidate], index: u64) {
+    }
+    state compare_previous(static_candidates: &mut [PointerScanCandidate], index: u64) {
+        let previous_index: u64 = ((index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition previous_index < static_candidates.len {
+            true -> access(static_candidates, index, previous_index)
+            false -> done(static_candidates, index)
+        }
+    }
+    state access(static_candidates: &mut [PointerScanCandidate], index: u64, previous_index: u64) {
+        let previous: PointerScanCandidate = static_candidates[previous_index];
+        let current: PointerScanCandidate = static_candidates[index];
+        let previous_less: bool = previous.module_index < current.module_index
+            || (previous.module_index == current.module_index && previous.module_offset <= current.module_offset);
+        transition previous_less {
+            true -> done(static_candidates, index)
+            false -> swap_step(static_candidates, index)
+        }
+    }
+    state swap_step(static_candidates: &mut [PointerScanCandidate], index: u64) {
+        let previous_index: u64 = ((index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition previous_index < static_candidates.len {
+            true -> swap_at(static_candidates, index, previous_index)
+            false -> done(static_candidates, index)
+        }
+    }
+    state swap_at(static_candidates: &mut [PointerScanCandidate], index: u64, previous_index: u64) {
+        let current: PointerScanCandidate = static_candidates[index];
+        static_candidates[index] = static_candidates[previous_index];
+        static_candidates[previous_index] = current;
+        transition {
+            _ -> shift_static_insert(static_candidates, previous_index)
+        }
+    }
+}
+
+// Same shape for heap candidates keyed on pointer_address.
+machine shift_heap_insert(heap_candidates: &mut [PointerScanCandidate], index: u64) {
+    transition (index >= 1) {
+        true -> gate(heap_candidates, index)
+        false -> done(heap_candidates, index)
+    }
+    state gate(heap_candidates: &mut [PointerScanCandidate], index: u64) {
+        transition index < heap_candidates.len {
+            true -> compare_previous(heap_candidates, index)
+            false -> done(heap_candidates, index)
+        }
+    }
+    state done(heap_candidates: &mut [PointerScanCandidate], index: u64) {
+    }
+    state compare_previous(heap_candidates: &mut [PointerScanCandidate], index: u64) {
+        let previous_index: u64 = ((index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition previous_index < heap_candidates.len {
+            true -> access(heap_candidates, index, previous_index)
+            false -> done(heap_candidates, index)
+        }
+    }
+    state access(heap_candidates: &mut [PointerScanCandidate], index: u64, previous_index: u64) {
+        let previous: PointerScanCandidate = heap_candidates[previous_index];
+        let current: PointerScanCandidate = heap_candidates[index];
+        transition (previous.pointer_address <= current.pointer_address) {
+            true -> done(heap_candidates, index)
+            false -> swap_step(heap_candidates, index)
+        }
+    }
+    state swap_step(heap_candidates: &mut [PointerScanCandidate], index: u64) {
+        let previous_index: u64 = ((index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition previous_index < heap_candidates.len {
+            true -> swap_at(heap_candidates, index, previous_index)
+            false -> done(heap_candidates, index)
+        }
+    }
+    state swap_at(heap_candidates: &mut [PointerScanCandidate], index: u64, previous_index: u64) {
+        let current: PointerScanCandidate = heap_candidates[index];
+        heap_candidates[index] = heap_candidates[previous_index];
+        heap_candidates[previous_index] = current;
+        transition {
+            _ -> shift_heap_insert(heap_candidates, previous_index)
+        }
+    }
+}
+
+pub machine PointerScanLevelCandidates::new<'static_ext, 'heap_ext>(
+    discovery_depth: u64,
+    static_candidates: &'static_ext mut [PointerScanCandidate],
+    static_count: u64,
+    heap_candidates: &'heap_ext mut [PointerScanCandidate],
+    heap_count: u64
+) -> PointerScanLevelCandidates<'static_ext, 'heap_ext> {
+    transition {
+        _ -> sort_static(static_candidates, 1, static_count, discovery_depth, heap_candidates, heap_count)
+    }
+    state sort_static(
+        static_candidates: &'static_ext mut [PointerScanCandidate],
+        index: u64,
+        static_count: u64,
+        discovery_depth: u64,
+        heap_candidates: &'heap_ext mut [PointerScanCandidate],
+        heap_count: u64
+    ) -> PointerScanLevelCandidates<'static_ext, 'heap_ext> {
+        transition (index < static_count && index < static_candidates.len) {
+            true -> insert_one(static_candidates, index, static_count, discovery_depth, heap_candidates, heap_count)
+            false -> (PointerScanLevelCandidates {
+                discovery_depth: discovery_depth,
+                static_candidates: static_candidates,
+                static_count: static_count,
+                heap_candidates: heap_candidates,
+                heap_count: heap_count,
+                heap_candidates_sorted: false,
+            })
+        }
+    }
+    state insert_one(
+        static_candidates: &'static_ext mut [PointerScanCandidate],
+        index: u64,
+        static_count: u64,
+        discovery_depth: u64,
+        heap_candidates: &'heap_ext mut [PointerScanCandidate],
+        heap_count: u64
+    ) -> PointerScanLevelCandidates<'static_ext, 'heap_ext> {
+        shift_static_insert(static_candidates, index);
+        transition {
+            _ -> sort_static(static_candidates, ((index as u64 in Wrapping) + 1) as u64, static_count, discovery_depth, heap_candidates, heap_count)
+        }
+    }
+}
+
+pub machine PointerScanLevelCandidates::new_presorted<'static_ext, 'heap_ext>(
+    discovery_depth: u64,
+    static_candidates: &'static_ext mut [PointerScanCandidate],
+    static_count: u64,
+    heap_candidates: &'heap_ext mut [PointerScanCandidate],
+    heap_count: u64
+) -> PointerScanLevelCandidates<'static_ext, 'heap_ext> {
+    (PointerScanLevelCandidates {
+        discovery_depth: discovery_depth,
+        static_candidates: static_candidates,
+        static_count: static_count,
+        heap_candidates: heap_candidates,
+        heap_count: heap_count,
+        heap_candidates_sorted: true,
+    })
+}
+
+pub machine PointerScanLevelCandidates::get_discovery_depth<'static_ext, 'heap_ext>(&self) -> u64 {
+    self.discovery_depth
+}
+
+pub machine PointerScanLevelCandidates::get_static_candidates<'static_ext, 'heap_ext>(&self) -> &[PointerScanCandidate] {
+    transition (self.static_count <= self.static_candidates.len) {
+        true -> (self.static_candidates[0..self.static_count])
+        false -> (self.static_candidates[0..self.static_candidates.len])
+    }
+}
+
+// Upstream binary_search_by_key over (module_index, module_offset).
+pub machine PointerScanLevelCandidates::contains_static_candidate<'static_ext, 'heap_ext>(
+    &self,
+    module_index: u64,
+    module_offset: u64
+) -> bool {
+    transition {
+        _ -> scan(0, self.static_count, module_index, module_offset)
+    }
+    state scan(&self, low: u64, high: u64, module_index: u64, module_offset: u64) -> bool {
+        transition (low < high) {
+            true -> probe(low, high, module_index, module_offset)
+            false -> (false)
+        }
+    }
+    state probe(&self, low: u64, high: u64, module_index: u64, module_offset: u64) -> bool {
+        let mid: u64 = (((low as u64 in Wrapping) + (high as u64 in Wrapping)) as u64) / 2;
+        transition mid < self.static_candidates.len {
+            true -> access(self.static_candidates, low, high, mid, module_index, module_offset)
+            false -> (false)
+        }
+    }
+    state access(&self, candidates: &[PointerScanCandidate], low: u64, high: u64, mid: u64 [0..candidates.len], module_index: u64, module_offset: u64) -> bool {
+        let candidate: PointerScanCandidate = candidates[mid];
+        transition (candidate.module_index == module_index && candidate.module_offset == module_offset) {
+            true -> (true)
+            false -> recurse(low, high, mid, candidate, module_index, module_offset)
+        }
+    }
+    state recurse(&self, low: u64, high: u64, mid: u64, candidate: PointerScanCandidate, module_index: u64, module_offset: u64) -> bool {
+        let key_less: bool = candidate.module_index < module_index
+            || (candidate.module_index == module_index && candidate.module_offset < module_offset);
+        transition key_less {
+            true -> scan(((mid as u64 in Wrapping) + 1) as u64, high, module_index, module_offset)
+            false -> scan(low, mid, module_index, module_offset)
+        }
+    }
+}
+
+pub machine PointerScanLevelCandidates::get_heap_candidates<'static_ext, 'heap_ext>(&self) -> &[PointerScanCandidate] {
+    transition (self.heap_count <= self.heap_candidates.len) {
+        true -> (self.heap_candidates[0..self.heap_count])
+        false -> (self.heap_candidates[0..self.heap_candidates.len])
+    }
+}
+
+pub machine PointerScanLevelCandidates::get_node_count<'static_ext, 'heap_ext>(&self) -> u64 {
+    ((self.static_count as u64 in Wrapping) + (self.heap_count as u64 in Wrapping)) as u64
+}
+
+pub machine PointerScanLevelCandidates::get_static_node_count<'static_ext, 'heap_ext>(&self) -> u64 {
+    self.static_count
+}
+
+pub machine PointerScanLevelCandidates::get_heap_node_count<'static_ext, 'heap_ext>(&self) -> u64 {
+    self.heap_count
+}
+
+// Upstream ensure_heap_candidates_sorted.
+machine PointerScanLevelCandidates::ensure_heap_candidates_sorted<'static_ext, 'heap_ext>(&mut self) {
+    transition self.heap_candidates_sorted {
+        true -> done()
+        false -> sort_heap(1)
+    }
+    state done(&mut self) {
+    }
+    state sort_heap(&mut self, index: u64) {
+        transition (index < self.heap_count && index < self.heap_candidates.len) {
+            true -> insert_one(index)
+            false -> mark_sorted()
+        }
+    }
+    state insert_one(&mut self, index: u64) {
+        shift_heap_insert(&mut self.heap_candidates, index);
+        transition {
+            _ -> sort_heap(((index as u64 in Wrapping) + 1) as u64)
+        }
+    }
+    state mark_sorted(&mut self) {
+        self.heap_candidates_sorted = true;
+    }
+}
+
+// Upstream find_heap_candidate_by_address: lazily sort then binary search.
+pub machine PointerScanLevelCandidates::find_heap_candidate_by_address<'static_ext, 'heap_ext>(
+    &mut self,
+    pointer_address: u64
+) -> HeapCandidateLookup {
+    self.ensure_heap_candidates_sorted();
+    transition {
+        _ -> scan(0, self.heap_count, pointer_address)
+    }
+    state scan(&mut self, low: u64, high: u64, pointer_address: u64) -> HeapCandidateLookup {
+        transition (low < high) {
+            true -> probe(low, high, pointer_address)
+            false -> (HeapCandidateLookup::Absent)
+        }
+    }
+    state probe(&mut self, low: u64, high: u64, pointer_address: u64) -> HeapCandidateLookup {
+        let mid: u64 = (((low as u64 in Wrapping) + (high as u64 in Wrapping)) as u64) / 2;
+        transition mid < self.heap_candidates.len {
+            true -> access(self.heap_candidates, low, high, mid, pointer_address)
+            false -> (HeapCandidateLookup::Absent)
+        }
+    }
+    state access(&mut self, candidates: &[PointerScanCandidate], low: u64, high: u64, mid: u64 [0..candidates.len], pointer_address: u64) -> HeapCandidateLookup {
+        let candidate: PointerScanCandidate = candidates[mid];
+        transition (candidate.pointer_address == pointer_address) {
+            true -> (HeapCandidateLookup::Found { index: mid })
+            false -> recurse(low, high, mid, candidate.pointer_address, pointer_address)
+        }
+    }
+    state recurse(&mut self, low: u64, high: u64, mid: u64, mid_address: u64, pointer_address: u64) -> HeapCandidateLookup {
+        transition (mid_address < pointer_address) {
+            true -> scan(((mid as u64 in Wrapping) + 1) as u64, high, pointer_address)
+            false -> scan(low, mid, pointer_address)
+        }
+    }
+}
+
+// Upstream find_heap_candidates_in_range: partition_point lower/upper.
+pub machine PointerScanLevelCandidates::find_heap_candidates_in_range<'static_ext, 'heap_ext>(
+    &mut self,
+    lower_bound: u64,
+    upper_bound: u64
+) -> HeapCandidateRange {
+    self.ensure_heap_candidates_sorted();
+    transition {
+        _ -> lower(0, self.heap_count, lower_bound, upper_bound)
+    }
+    state lower(&mut self, low: u64, high: u64, lower_bound: u64, upper_bound: u64) -> HeapCandidateRange {
+        transition (low < high) {
+            true -> lower_probe(low, high, lower_bound, upper_bound)
+            false -> upper(low, low, self.heap_count, upper_bound)
+        }
+    }
+    state lower_probe(&mut self, low: u64, high: u64, lower_bound: u64, upper_bound: u64) -> HeapCandidateRange {
+        let mid: u64 = (((low as u64 in Wrapping) + (high as u64 in Wrapping)) as u64) / 2;
+        transition mid < self.heap_candidates.len {
+            true -> lower_at(self.heap_candidates, low, high, mid, lower_bound, upper_bound)
+            false -> upper(low, low, self.heap_count, upper_bound)
+        }
+    }
+    state lower_at(&mut self, candidates: &[PointerScanCandidate], low: u64, high: u64, mid: u64 [0..candidates.len], lower_bound: u64, upper_bound: u64) -> HeapCandidateRange {
+        transition (candidates[mid].pointer_address < lower_bound) {
+            true -> lower(((mid as u64 in Wrapping) + 1) as u64, high, lower_bound, upper_bound)
+            false -> lower(low, mid, lower_bound, upper_bound)
+        }
+    }
+    state upper(&mut self, start: u64, low: u64, high: u64, upper_bound: u64) -> HeapCandidateRange {
+        transition (low < high) {
+            true -> upper_probe(start, low, high, upper_bound)
+            false -> (HeapCandidateRange { start_index: start, candidate_count: ((low as u64 in Wrapping) - (start as u64 in Wrapping)) as u64 })
+        }
+    }
+    state upper_probe(&mut self, start: u64, low: u64, high: u64, upper_bound: u64) -> HeapCandidateRange {
+        let mid: u64 = (((low as u64 in Wrapping) + (high as u64 in Wrapping)) as u64) / 2;
+        transition mid < self.heap_candidates.len {
+            true -> upper_at(self.heap_candidates, start, low, high, mid, upper_bound)
+            false -> (HeapCandidateRange { start_index: start, candidate_count: ((low as u64 in Wrapping) - (start as u64 in Wrapping)) as u64 })
+        }
+    }
+    state upper_at(&mut self, candidates: &[PointerScanCandidate], start: u64, low: u64, high: u64, mid: u64 [0..candidates.len], upper_bound: u64) -> HeapCandidateRange {
+        transition (candidates[mid].pointer_address <= upper_bound) {
+            true -> upper(start, ((mid as u64 in Wrapping) + 1) as u64, high, upper_bound)
+            false -> upper(start, low, mid, upper_bound)
+        }
+    }
+}
