@@ -1,0 +1,716 @@
+module src::pointer_scans::pointer_scan_results_builder;
+
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node::PointerScanNode;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node_type::PointerScanNodeType;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::MaterializedPageKeyEntry;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanModuleName;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+use src::pointer_scans::pointer_scan_level_collector::EmittedDiscoveredLevel;
+use src::pointer_scans::pointer_scan_level_collector::PointerScanCollectedLevelSource;
+use src::pointer_scans::structures::pointer_scan_collected_candidate::PointerScanCollectedCandidate;
+use src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+
+// Port of pointer_scan_results_builder.rs.
+//
+// Upstream `build_results` maps a `Vec<PointerScanCollectedLevel>` onto fresh
+// Vecs and returns owned `PointerScanResults`; the omega results record and
+// the collected level both borrow caller-owned extents, so the build is a
+// two-phase drain:
+//
+//   Phase A (drain): `fill_module_names` then `drain_levels` pull the
+//   `PointerScanCollectedLevelSource` once per level. Per level the
+//   collected candidates are copied, in collected order, into flat
+//   `static_candidate_arena` / `heap_candidate_arena` at running fills
+//   (upstream `build_level_candidates` — candidates arrive presorted by the
+//   collector, matching upstream's `new_presorted` constructor), and the
+//   per-level arena span lands in `level_spans_out` next to the
+//   `PointerScanLevel` row in `levels_out`.
+//
+//   Phase B (seal): `seal_level` stores each
+//   `PointerScanLevelCandidates::new_presorted` element with SHARED
+//   `&arena[offset..end]` windows of the now-frozen arenas — N disjoint
+//   shared windows of one arena coexist, disjoint `&mut` windows of one
+//   arena cannot.
+//
+// Honest-capacity semantics: every fill is bounded by both the source count
+// and the lent extent's length, and `level_spans_out` records what was
+// actually stored (callers size arenas to cover the collected extents they
+// themselves lent). `levels_out`, `level_candidates_out`, and
+// `level_spans_out` are expected at equal capacity; a short extent stops
+// the drain and the stored span/level rows keep the result self-consistent
+// (upstream's growable Vecs cannot overflow). Upstream iterates a pre-built
+// Vec where `is_empty` decides the empty path up front; the pull driver
+// reports `Done` on the first pull instead, and an empty drain passes
+// `module_name_count` 0 to `PointerScanResults::new` exactly as upstream's
+// `create_empty_results` constructs `module_names: vec![]`. `with_logging`
+// is threaded for the future log legs (upstream uses `log::debug!`).
+//
+// The `Value` candidate variant is not part of this build — the missing
+// symbol is `structures::data_types::data_type_ref::DataTypeRef` (z2
+// scalar-scan lane), matching the results-materializer deviation.
+pub data BuiltLevelSpan [copy] {
+    static_offset: u64;
+    static_count: u64;
+    heap_offset: u64;
+    heap_count: u64;
+}
+
+pub data PointerScanResultsBuilder {}
+
+// Upstream PointerScanResultsBuilder::build_results (the
+// build_results_with_module_names split is folded — under caller-owned
+// extents the empty/non-empty paths share one entry point, diverging only
+// in the module-name count stored at finish).
+pub machine PointerScanResultsBuilder::build_results<'ext, 'sh, 's, 'h, 'candidates>(
+    &self,
+    pointer_scan_session_id: u64,
+    pointer_scan_parameters: &PointerScanParameters,
+    target_descriptor: PointerScanTargetDescriptor,
+    target_addresses: &'ext mut [u64],
+    target_address_count: u64,
+    address_space: PointerScanAddressSpace,
+    modules: &[NormalizedModule],
+    source: &mut dyn PointerScanCollectedLevelSource,
+    level_out: &mut PointerScanCollectedLevel<'candidates>,
+    heap_address_scratch: &mut [u64],
+    module_names_out: &'ext mut [PointerScanModuleName],
+    levels_out: &'sh mut [PointerScanLevel],
+    level_spans_out: &mut [BuiltLevelSpan],
+    level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+    static_candidate_arena: &'s mut [PointerScanCandidate],
+    heap_candidate_arena: &'h mut [PointerScanCandidate],
+    materialized_nodes: &'ext mut [PointerScanNode],
+    materialized_node_id_slab: &'ext mut [u64],
+    page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+    with_logging: bool
+) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+    transition {
+        _ -> fill_module_names(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, 0)
+    }
+
+    // module_name_count accumulates the filled prefix (bounded by both
+    // extents); the drain carries it forward for `PointerScanResults::new`.
+    state fill_module_names(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        module_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        transition (module_index < modules.len && module_index < module_names_out.len) {
+            true -> fill_module_at(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, module_index)
+            false -> drain_levels(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, 0, 0, 0, 1, module_index, 0, 0)
+        }
+    }
+
+    state fill_module_at(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        module_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let module_name: &[u8] = modules[module_index].get_module_name();
+        module_names_out[module_index] = PointerScanModuleName::new(module_name);
+        transition {
+            _ -> fill_module_names(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, ((module_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    // Upstream `for (index, level) in collected_pointer_levels.iter().enumerate()`
+    // — one `next` per iteration.
+    state drain_levels(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_index: u64,
+        static_fill: u64,
+        heap_fill: u64,
+        next_candidate_id: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let emission: EmittedDiscoveredLevel =
+            source.next(level_out, heap_address_scratch);
+        transition emission {
+            EmittedDiscoveredLevel::Level -> fill_statics(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, next_candidate_id, module_name_count, total_static_node_count, total_heap_node_count, 0)
+            EmittedDiscoveredLevel::Done -> seal_level(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, module_name_count, total_static_node_count, total_heap_node_count, 0)
+            _ -> seal_level(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, module_name_count, total_static_node_count, total_heap_node_count, 0)
+        }
+    }
+
+    // Upstream `build_level_candidates` static arm: map collected statics to
+    // `PointerScanCandidate::new(next_candidate_id, depth, Static, ...)`,
+    // `next_candidate_id = next_candidate_id.saturating_add(1)`.
+    state fill_statics(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_index: u64,
+        static_fill: u64,
+        heap_fill: u64,
+        next_candidate_id: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        candidate_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let write_index: u64 =
+            ((static_fill as u64 in Saturating) + (candidate_index as u64 in Saturating)) as u64;
+        transition (candidate_index < level_out.get_static_candidate_count() && write_index < static_candidate_arena.len) {
+            true -> fill_static_at(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, next_candidate_id, module_name_count, total_static_node_count, total_heap_node_count, candidate_index, write_index)
+            false -> fill_heaps(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, next_candidate_id, module_name_count, total_static_node_count, total_heap_node_count, candidate_index, 0)
+        }
+    }
+
+    state fill_static_at(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_index: u64,
+        static_fill: u64,
+        heap_fill: u64,
+        next_candidate_id: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        candidate_index: u64,
+        write_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let candidate: PointerScanCollectedCandidate =
+            level_out.get_static_candidate(candidate_index);
+        static_candidate_arena[write_index] = PointerScanCandidate::new(
+            next_candidate_id,
+            ((level_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            PointerScanNodeType::Static,
+            candidate.pointer_address,
+            candidate.pointer_value,
+            candidate.module_index,
+            candidate.module_offset
+        );
+        transition {
+            _ -> fill_statics(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, ((next_candidate_id as u64 in Saturating) + (1 as u64 in Saturating)) as u64, module_name_count, total_static_node_count, total_heap_node_count, ((candidate_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    // Upstream heap arm: `PointerScanNodeType::Heap`, module_index 0,
+    // module_offset 0.
+    state fill_heaps(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_index: u64,
+        static_fill: u64,
+        heap_fill: u64,
+        next_candidate_id: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        static_written: u64,
+        candidate_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let write_index: u64 =
+            ((heap_fill as u64 in Saturating) + (candidate_index as u64 in Saturating)) as u64;
+        transition (candidate_index < level_out.get_heap_candidate_count() && write_index < heap_candidate_arena.len) {
+            true -> fill_heap_at(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, next_candidate_id, module_name_count, total_static_node_count, total_heap_node_count, static_written, candidate_index, write_index)
+            false -> record_level(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, next_candidate_id, module_name_count, total_static_node_count, total_heap_node_count, static_written, candidate_index)
+        }
+    }
+
+    state fill_heap_at(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_index: u64,
+        static_fill: u64,
+        heap_fill: u64,
+        next_candidate_id: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        static_written: u64,
+        candidate_index: u64,
+        write_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let candidate: PointerScanCollectedCandidate =
+            level_out.get_heap_candidate(candidate_index);
+        heap_candidate_arena[write_index] = PointerScanCandidate::new(
+            next_candidate_id,
+            ((level_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            PointerScanNodeType::Heap,
+            candidate.pointer_address,
+            candidate.pointer_value,
+            0,
+            0
+        );
+        transition {
+            _ -> fill_heaps(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, ((next_candidate_id as u64 in Saturating) + (1 as u64 in Saturating)) as u64, module_name_count, total_static_node_count, total_heap_node_count, static_written, ((candidate_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    // Upstream `pointer_scan_levels.push(PointerScanLevel::new(index+1, ...))`
+    // plus the span row tracking the arena window for the seal phase.
+    state record_level(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_index: u64,
+        static_fill: u64,
+        heap_fill: u64,
+        next_candidate_id: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        static_written: u64,
+        heap_written: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        transition (level_index < levels_out.len && level_index < level_spans_out.len) {
+            true -> record_level_apply(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, static_fill, heap_fill, next_candidate_id, module_name_count, total_static_node_count, total_heap_node_count, static_written, heap_written)
+            false -> seal_level(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_index, module_name_count, total_static_node_count, total_heap_node_count, 0)
+        }
+    }
+
+    state record_level_apply(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_index: u64,
+        static_fill: u64,
+        heap_fill: u64,
+        next_candidate_id: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        static_written: u64,
+        heap_written: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        levels_out[level_index] = PointerScanLevel::new(
+            ((level_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            ((static_written as u64 in Saturating) + (heap_written as u64 in Saturating)) as u64,
+            static_written,
+            heap_written
+        );
+        level_spans_out[level_index] = BuiltLevelSpan {
+            static_offset: static_fill,
+            static_count: static_written,
+            heap_offset: heap_fill,
+            heap_count: heap_written
+        };
+        transition {
+            _ -> drain_levels(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, ((level_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((static_fill as u64 in Saturating) + (static_written as u64 in Saturating)) as u64, ((heap_fill as u64 in Saturating) + (heap_written as u64 in Saturating)) as u64, next_candidate_id, module_name_count, ((total_static_node_count as u64 in Saturating) + (static_written as u64 in Saturating)) as u64, ((total_heap_node_count as u64 in Saturating) + (heap_written as u64 in Saturating)) as u64)
+        }
+    }
+
+    // Phase B — freeze the arenas into shared per-level windows.
+    state seal_level(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_count: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        seal_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        transition (seal_index < level_count && seal_index < level_spans_out.len) {
+            true -> seal_load(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_count, module_name_count, total_static_node_count, total_heap_node_count, seal_index)
+            false -> finish(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, module_names_out, levels_out, level_candidates_out, materialized_nodes, materialized_node_id_slab, page_key_cache, level_count, module_name_count, total_static_node_count, total_heap_node_count)
+        }
+    }
+
+    state seal_load(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_count: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        seal_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let span: BuiltLevelSpan = level_spans_out[seal_index];
+        let static_end: u64 =
+            ((span.static_offset as u64 in Saturating) + (span.static_count as u64 in Saturating)) as u64;
+        let heap_end: u64 =
+            ((span.heap_offset as u64 in Saturating) + (span.heap_count as u64 in Saturating)) as u64;
+        transition (seal_index < level_candidates_out.len && span.static_offset <= static_end && static_end <= static_candidate_arena.len && span.heap_offset <= heap_end && heap_end <= heap_candidate_arena.len) {
+            true -> seal_store(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_count, module_name_count, total_static_node_count, total_heap_node_count, seal_index, &static_candidate_arena[span.static_offset..static_end], span.static_count, &heap_candidate_arena[span.heap_offset..heap_end], span.heap_count)
+            false -> finish(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, module_names_out, levels_out, level_candidates_out, materialized_nodes, materialized_node_id_slab, page_key_cache, seal_index, module_name_count, total_static_node_count, total_heap_node_count)
+        }
+    }
+
+    state seal_store(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        modules: &[NormalizedModule],
+        source: &mut dyn PointerScanCollectedLevelSource,
+        level_out: &mut PointerScanCollectedLevel<'candidates>,
+        heap_address_scratch: &mut [u64],
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_spans_out: &mut [BuiltLevelSpan],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        static_candidate_arena: &'s mut [PointerScanCandidate],
+        heap_candidate_arena: &'h mut [PointerScanCandidate],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        with_logging: bool,
+        level_count: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        seal_index: u64,
+        static_window: &'s [PointerScanCandidate],
+        static_count: u64,
+        heap_window: &'h [PointerScanCandidate],
+        heap_count: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        level_candidates_out[seal_index] = PointerScanLevelCandidates::new_presorted(
+            ((seal_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            static_window,
+            static_count,
+            heap_window,
+            heap_count
+        );
+        transition {
+            _ -> seal_level(pointer_scan_session_id, pointer_scan_parameters, target_descriptor, target_addresses, target_address_count, address_space, modules, source, level_out, heap_address_scratch, module_names_out, levels_out, level_spans_out, level_candidates_out, static_candidate_arena, heap_candidate_arena, materialized_nodes, materialized_node_id_slab, page_key_cache, with_logging, level_count, module_name_count, total_static_node_count, total_heap_node_count, ((seal_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    // Upstream's empty path (`create_empty_results`) is `level_count == 0` —
+    // `module_names` is `vec![]` there, so the stored count drops to 0.
+    state finish(
+        &mut self,
+        pointer_scan_session_id: u64,
+        pointer_scan_parameters: &PointerScanParameters,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        module_names_out: &'ext mut [PointerScanModuleName],
+        levels_out: &'sh mut [PointerScanLevel],
+        level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        level_count: u64,
+        module_name_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        transition (level_count == 0) {
+            true -> (PointerScanResults::new(
+                pointer_scan_session_id,
+                target_descriptor,
+                target_addresses,
+                target_address_count,
+                address_space,
+                pointer_scan_parameters.get_pointer_size(),
+                pointer_scan_parameters.get_max_depth(),
+                pointer_scan_parameters.get_offset_radius(),
+                module_names_out,
+                0,
+                &levels_out[..],
+                level_count,
+                level_candidates_out,
+                level_count,
+                total_static_node_count,
+                total_heap_node_count,
+                materialized_nodes,
+                materialized_node_id_slab,
+                page_key_cache
+            ))
+            false -> (PointerScanResults::new(
+                pointer_scan_session_id,
+                target_descriptor,
+                target_addresses,
+                target_address_count,
+                address_space,
+                pointer_scan_parameters.get_pointer_size(),
+                pointer_scan_parameters.get_max_depth(),
+                pointer_scan_parameters.get_offset_radius(),
+                module_names_out,
+                module_name_count,
+                &levels_out[..],
+                level_count,
+                level_candidates_out,
+                level_count,
+                total_static_node_count,
+                total_heap_node_count,
+                materialized_nodes,
+                materialized_node_id_slab,
+                page_key_cache
+            ))
+            _ -> (PointerScanResults::new(
+                pointer_scan_session_id,
+                target_descriptor,
+                target_addresses,
+                target_address_count,
+                address_space,
+                pointer_scan_parameters.get_pointer_size(),
+                pointer_scan_parameters.get_max_depth(),
+                pointer_scan_parameters.get_offset_radius(),
+                module_names_out,
+                module_name_count,
+                &levels_out[..],
+                level_count,
+                level_candidates_out,
+                level_count,
+                total_static_node_count,
+                total_heap_node_count,
+                materialized_nodes,
+                materialized_node_id_slab,
+                page_key_cache
+            ))
+        }
+    }
+}
+
+// Upstream PointerScanResultsBuilder::create_empty_results.
+pub machine PointerScanResultsBuilder::create_empty_results<'ext, 'sh, 's, 'h>(
+    &self,
+    pointer_scan_session_id: u64,
+    pointer_scan_parameters: &PointerScanParameters,
+    target_descriptor: PointerScanTargetDescriptor,
+    target_addresses: &'ext mut [u64],
+    target_address_count: u64,
+    address_space: PointerScanAddressSpace,
+    module_names_out: &'ext mut [PointerScanModuleName],
+    levels_out: &'sh mut [PointerScanLevel],
+    level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+    materialized_nodes: &'ext mut [PointerScanNode],
+    materialized_node_id_slab: &'ext mut [u64],
+    page_key_cache: &'ext mut [MaterializedPageKeyEntry]
+) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+    (PointerScanResults::new(
+        pointer_scan_session_id,
+        target_descriptor,
+        target_addresses,
+        target_address_count,
+        address_space,
+        pointer_scan_parameters.get_pointer_size(),
+        pointer_scan_parameters.get_max_depth(),
+        pointer_scan_parameters.get_offset_radius(),
+        module_names_out,
+        0,
+        &levels_out[..],
+        0,
+        level_candidates_out,
+        0,
+        0,
+        0,
+        materialized_nodes,
+        materialized_node_id_slab,
+        page_key_cache
+    ))
+}
