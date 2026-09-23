@@ -1,0 +1,950 @@
+module src::pointer_scans::pointer_scan_task_builder;
+
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use src::pointer_scans::structures::snapshot_region_scan_task::SnapshotRegionScanTask;
+use src::pointer_scans::structures::snapshot_region_scan_task_kind::SnapshotRegionScanTaskKind;
+
+// Port of pointer_scan_task_builder.rs.
+//
+// Upstream slices each task's `current_values` directly out of the snapshot
+// region's owned `Vec<u8>`. Omega regions store `ElementWindow` (u64
+// elements), so the builder materializes each region's bytes — little-endian
+// decoded from the current elements, matching the kernel's byte reads — into
+// the caller-owned `byte_arena`; tasks record their view as arena offsets
+// (see SnapshotRegionScanTask). Region byte count is
+// `current_element_count * 8`, exactly upstream's `current_values.len()`.
+//
+// Caller-owned extents replace Vec: `tasks_out` bounds the produced task
+// count, `byte_arena` bounds decoded bytes, `module_order_scratch` bounds the
+// sorted module order (at least `modules.len`). A region whose decoded byte
+// extent exceeds the remaining arena is skipped whole rather than partially
+// decoded (upstream has no capacity bound; a correctly sized caller scratch
+// covers every region — partition-owned output, not a fixed-capacity demo).
+// The original `module_index` on static tasks survives the sort: the scratch
+// carries each module's input position, as upstream's enumerate+sort does.
+//
+// `build_heap_scan_tasks` folds into this entry: upstream differs only in
+// `include_static_ranges = false` and taking an explicit region slice; pass
+// `include_static_ranges = false` here for the same heap-only output.
+pub data PointerScanTaskBuilder {}
+
+// Per-build counters threaded through the task build states — upstream's
+// accumulating locals (the task vec, `total_snapshot_region_count`, the
+// arena write cursor, the sorted module count).
+pub data PointerScanTaskBuildState [copy] {
+    task_count: u64;
+    arena_byte_count: u64;
+    total_snapshot_region_count: u64;
+}
+
+// Upstream `build_snapshot_region_scan_tasks`: total region count across all
+// snapshots + tasks for every snapshot region.
+pub machine PointerScanTaskBuilder::build_snapshot_region_scan_tasks(
+    snapshots: &[&Snapshot],
+    modules: &[NormalizedModule],
+    pointer_size: PointerScanPointerSize,
+    include_static_ranges: bool,
+    module_order_scratch: &mut [u64],
+    tasks_out: &mut [SnapshotRegionScanTask],
+    byte_arena: &mut [u8]
+) -> PointerScanTaskBuildState {
+    let pointer_size_in_bytes: u64 = pointer_size.get_size_in_bytes();
+    transition modules.len <= module_order_scratch.len {
+        true -> fill_order(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order_scratch, tasks_out, byte_arena, modules.len, 0)
+        false -> fill_order(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order_scratch, tasks_out, byte_arena, module_order_scratch.len, 0)
+    }
+
+    state fill_order(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        position: u64
+    ) -> PointerScanTaskBuildState {
+        transition position < module_count {
+            true -> write_order(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, position)
+            false -> sort_modules(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, 1)
+        }
+    }
+
+    state write_order(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        position: u64
+    ) -> PointerScanTaskBuildState {
+        module_order[position] = position;
+        fill_order(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, ((position as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+    }
+
+    // Upstream `sort_unstable_by_key(base_address)` — insertion sort over the
+    // index scratch; ascending base addresses, same resulting order.
+    state sort_modules(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64
+    ) -> PointerScanTaskBuildState {
+        transition index < module_count {
+            true -> sort_key(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index)
+            false -> region_loop(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, 0, 0, PointerScanTaskBuildState {
+                task_count: 0,
+                arena_byte_count: 0,
+                total_snapshot_region_count: 0
+            })
+        }
+    }
+
+    state sort_key(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64
+    ) -> PointerScanTaskBuildState {
+        transition index < module_order.len {
+            true -> sort_key_read(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index)
+            false -> sort_modules(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state sort_key_read(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64
+    ) -> PointerScanTaskBuildState {
+        let key_index: u64 = module_order[index];
+        transition key_index < modules.len {
+            true -> sort_key_base(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, key_index)
+            false -> sort_modules(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state sort_key_base(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        key_index: u64
+    ) -> PointerScanTaskBuildState {
+        let key_base: u64 = modules[key_index].get_base_address();
+        sort_insert(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, index, key_index, key_base)
+    }
+
+    state sort_insert(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64,
+        key_base: u64
+    ) -> PointerScanTaskBuildState {
+        transition position > 0 {
+            true -> sort_prev_gate(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index, key_base)
+            false -> sort_place(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index)
+        }
+    }
+
+    state sort_prev_gate(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64,
+        key_base: u64
+    ) -> PointerScanTaskBuildState {
+        let previous_position: u64 = ((position as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition previous_position < module_order.len {
+            true -> sort_prev_read(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index, key_base, previous_position)
+            false -> sort_place(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index)
+        }
+    }
+
+    state sort_prev_read(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64,
+        key_base: u64,
+        previous_position: u64
+    ) -> PointerScanTaskBuildState {
+        let previous_index: u64 = module_order[previous_position];
+        transition previous_index < modules.len {
+            true -> sort_prev_base(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index, key_base, previous_index)
+            false -> sort_place(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index)
+        }
+    }
+
+    state sort_prev_base(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64,
+        key_base: u64,
+        previous_index: u64
+    ) -> PointerScanTaskBuildState {
+        let previous_base: u64 = modules[previous_index].get_base_address();
+        transition previous_base > key_base {
+            true -> sort_shift(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index, key_base, previous_index)
+            false -> sort_place(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index)
+        }
+    }
+
+    state sort_shift(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64,
+        key_base: u64,
+        previous_index: u64
+    ) -> PointerScanTaskBuildState {
+        transition position < module_order.len {
+            true -> sort_shift_write(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index, key_base, previous_index)
+            false -> sort_place(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index)
+        }
+    }
+
+    state sort_shift_write(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64,
+        key_base: u64,
+        previous_index: u64
+    ) -> PointerScanTaskBuildState {
+        module_order[position] = previous_index;
+        sort_insert(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, ((position as u64 in Saturating) - (1 as u64 in Saturating)) as u64, key_index, key_base)
+    }
+
+    state sort_place(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64
+    ) -> PointerScanTaskBuildState {
+        transition position < module_order.len {
+            true -> sort_place_write(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, index, position, key_index)
+            false -> sort_modules(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state sort_place_write(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &mut [u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        index: u64,
+        position: u64,
+        key_index: u64
+    ) -> PointerScanTaskBuildState {
+        module_order[position] = key_index;
+        sort_modules(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+    }
+
+    // Upstream iterates `snapshots.iter().flat_map(|s| s.get_snapshot_regions())`
+    // — one region stream across all snapshots.
+    state region_loop(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState
+    ) -> PointerScanTaskBuildState {
+        transition snapshot_index < snapshots.len {
+            true -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state)
+            false -> (state)
+        }
+    }
+
+    state region_load(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState
+    ) -> PointerScanTaskBuildState {
+        transition region_index < snapshots[snapshot_index].get_region_count() {
+            true -> region_visit(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state)
+            false -> region_loop(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, ((snapshot_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, 0, state)
+        }
+    }
+
+    state region_visit(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState
+    ) -> PointerScanTaskBuildState {
+        let snapshot_region: SnapshotRegion = snapshots[snapshot_index].get_region(region_index);
+        let visited: PointerScanTaskBuildState = PointerScanTaskBuildState {
+            task_count: state.task_count,
+            arena_byte_count: state.arena_byte_count,
+            total_snapshot_region_count: ((state.total_snapshot_region_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        };
+        // Upstream `if get_current_values().is_empty() { continue; }` —
+        // empty regions count toward the total but build no tasks.
+        transition snapshot_region.has_current_values() {
+            true -> region_decode_gate(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, visited, &snapshot_region)
+            false -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, visited)
+            _ -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, visited)
+        }
+    }
+
+    // Arena capacity check: decode this region only when its whole decoded
+    // extent fits (see header — unsplittable byte view).
+    state region_decode_gate(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion
+    ) -> PointerScanTaskBuildState {
+        let region_byte_count: u64 =
+            ((snapshot_region.get_current_element_count() as u64 in Saturating) * (8 as u64 in Saturating)) as u64;
+        transition ((state.arena_byte_count as u64 in Saturating) + (region_byte_count as u64 in Saturating)) as u64 <= byte_arena.len {
+            true -> decode_bytes(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, 0)
+            false -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, state)
+        }
+    }
+
+    // Element → little-endian bytes: element e covers region bytes
+    // [e*8, e*8+8); LE byte j = `(element >> (8*j)) as u8`.
+    state decode_bytes(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        write_offset: u64
+    ) -> PointerScanTaskBuildState {
+        transition write_offset < region_byte_count {
+            true -> decode_write_gate(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, write_offset)
+            false -> module_walk(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, PointerScanTaskBuildState {
+                task_count: state.task_count,
+                arena_byte_count: ((state.arena_byte_count as u64 in Saturating) + (region_byte_count as u64 in Saturating)) as u64,
+                total_snapshot_region_count: state.total_snapshot_region_count
+            }, snapshot_region, region_byte_count, snapshot_region.get_base_address(), 0)
+        }
+    }
+
+    state decode_write_gate(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        write_offset: u64
+    ) -> PointerScanTaskBuildState {
+        let write_index: u64 = ((state.arena_byte_count as u64 in Saturating) + (write_offset as u64 in Saturating)) as u64;
+        transition write_index < byte_arena.len {
+            true -> decode_write(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, write_offset, write_index)
+            false -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, state)
+        }
+    }
+
+    state decode_write(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        write_offset: u64,
+        write_index: u64
+    ) -> PointerScanTaskBuildState {
+        let element: u64 = snapshot_region.get_current_element(write_offset / 8);
+        let byte_in_element: u64 = write_offset % 8;
+        byte_arena[write_index] = ((element >> ((byte_in_element as u64 in Wrapping) * (8 as u64 in Wrapping)) as u64) & 255) as u8;
+        decode_bytes(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, ((write_offset as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+    }
+
+    // Upstream's per-region inner walk: `uncovered_range_base_address`
+    // tracks the heap-gap cursor while the sorted modules are overlaid.
+    state module_walk(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64
+    ) -> PointerScanTaskBuildState {
+        transition module_position < module_count {
+            true -> module_gate(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position)
+            false -> trailing_heap(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address)
+        }
+    }
+
+    state module_gate(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64
+    ) -> PointerScanTaskBuildState {
+        transition module_position < module_order.len {
+            true -> module_index_read(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position)
+            false -> trailing_heap(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address)
+        }
+    }
+
+    state module_index_read(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64
+    ) -> PointerScanTaskBuildState {
+        let module_index: u64 = module_order[module_position];
+        transition module_index < modules.len {
+            true -> module_bounds(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+            false -> module_walk(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, ((module_position as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state module_bounds(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64,
+        module_index: u64
+    ) -> PointerScanTaskBuildState {
+        let module_base_address: u64 = modules[module_index].get_base_address();
+        let module_end_address: u64 =
+            ((module_base_address as u64 in Saturating) + (modules[module_index].get_region_size() as u64 in Saturating)) as u64;
+        let snapshot_region_end_address: u64 = snapshot_region.get_end_address();
+        // Upstream: module entirely below the uncovered cursor → `continue`;
+        // module base at/past region end → `break`.
+        transition module_end_address <= uncovered_range_base_address {
+            true -> module_walk(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, ((module_position as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            false -> module_break(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+            _ -> module_break(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+        }
+    }
+
+    state module_break(
+        module_base_address: u64,
+        module_end_address: u64,
+        snapshot_region_end_address: u64,
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64,
+        module_index: u64
+    ) -> PointerScanTaskBuildState {
+        transition module_base_address >= snapshot_region_end_address {
+            true -> trailing_heap(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address)
+            false -> heap_gap(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+            _ -> heap_gap(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+        }
+    }
+
+    // Upstream `if uncovered_range_base_address < module_base_address` —
+    // the heap range preceding this module.
+    state heap_gap(
+        module_base_address: u64,
+        module_end_address: u64,
+        snapshot_region_end_address: u64,
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64,
+        module_index: u64
+    ) -> PointerScanTaskBuildState {
+        let heap_range_end_address: u64 = min_u64(module_base_address, snapshot_region_end_address);
+        transition uncovered_range_base_address < module_base_address {
+            true -> heap_append(heap_range_end_address, module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+            false -> static_range(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+            _ -> static_range(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+        }
+    }
+
+    state heap_append(
+        heap_range_end_address: u64,
+        module_base_address: u64,
+        module_end_address: u64,
+        snapshot_region_end_address: u64,
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64,
+        module_index: u64
+    ) -> PointerScanTaskBuildState {
+        let next_state: PointerScanTaskBuildState = pointer_scan_append_task(
+            snapshot_region,
+            uncovered_range_base_address,
+            heap_range_end_address,
+            pointer_size_in_bytes,
+            region_byte_count,
+            state,
+            tasks_out,
+            SnapshotRegionScanTaskKind::Heap
+        );
+        static_range(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, next_state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+    }
+
+    // Upstream `if include_static_ranges`: the module-covered portion of the
+    // region becomes a Static task carrying the ORIGINAL module index.
+    state static_range(
+        module_base_address: u64,
+        module_end_address: u64,
+        snapshot_region_end_address: u64,
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64,
+        module_index: u64
+    ) -> PointerScanTaskBuildState {
+        let static_range_base_address: u64 = max_u64(uncovered_range_base_address, module_base_address);
+        let static_range_end_address: u64 = min_u64(snapshot_region_end_address, module_end_address);
+        transition include_static_ranges && static_range_base_address < static_range_end_address {
+            true -> static_append(static_range_base_address, static_range_end_address, module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+            false -> advance_uncovered(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+            _ -> advance_uncovered(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+        }
+    }
+
+    state static_append(
+        static_range_base_address: u64,
+        static_range_end_address: u64,
+        module_base_address: u64,
+        module_end_address: u64,
+        snapshot_region_end_address: u64,
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64,
+        module_index: u64
+    ) -> PointerScanTaskBuildState {
+        let next_state: PointerScanTaskBuildState = pointer_scan_append_task(
+            snapshot_region,
+            static_range_base_address,
+            static_range_end_address,
+            pointer_size_in_bytes,
+            region_byte_count,
+            state,
+            tasks_out,
+            SnapshotRegionScanTaskKind::Static {
+                module_index: module_index,
+                module_base_address: module_base_address
+            }
+        );
+        advance_uncovered(module_base_address, module_end_address, snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, next_state, snapshot_region, region_byte_count, uncovered_range_base_address, module_position, module_index)
+    }
+
+    // Upstream `uncovered_range_base_address = max(..., module_end_address)`
+    // followed by the `>= snapshot_region_end_address` break.
+    state advance_uncovered(
+        module_base_address: u64,
+        module_end_address: u64,
+        snapshot_region_end_address: u64,
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64,
+        module_position: u64,
+        module_index: u64
+    ) -> PointerScanTaskBuildState {
+        let next_uncovered: u64 = max_u64(uncovered_range_base_address, module_end_address);
+        transition next_uncovered >= snapshot_region_end_address {
+            true -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, state)
+            false -> module_walk(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, next_uncovered, ((module_position as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            _ -> module_walk(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, next_uncovered, ((module_position as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    // Upstream trailing `if uncovered_range_base_address <
+    // snapshot_region_end_address` — heap task covering the region tail.
+    state trailing_heap(
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64
+    ) -> PointerScanTaskBuildState {
+        let snapshot_region_end_address: u64 = snapshot_region.get_end_address();
+        transition uncovered_range_base_address < snapshot_region_end_address {
+            true -> trailing_append(snapshot_region_end_address, snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, region_index, state, snapshot_region, region_byte_count, uncovered_range_base_address)
+            false -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, state)
+            _ -> region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, state)
+        }
+    }
+
+    state trailing_append(
+        snapshot_region_end_address: u64,
+        snapshots: &[&Snapshot],
+        modules: &[NormalizedModule],
+        pointer_size_in_bytes: u64,
+        include_static_ranges: bool,
+        module_order: &[u64],
+        tasks_out: &mut [SnapshotRegionScanTask],
+        byte_arena: &mut [u8],
+        module_count: u64,
+        snapshot_index: u64,
+        region_index: u64,
+        state: PointerScanTaskBuildState,
+        snapshot_region: &SnapshotRegion,
+        region_byte_count: u64,
+        uncovered_range_base_address: u64
+    ) -> PointerScanTaskBuildState {
+        let next_state: PointerScanTaskBuildState = pointer_scan_append_task(
+            snapshot_region,
+            uncovered_range_base_address,
+            snapshot_region_end_address,
+            pointer_size_in_bytes,
+            region_byte_count,
+            state,
+            tasks_out,
+            SnapshotRegionScanTaskKind::Heap
+        );
+        region_load(snapshots, modules, pointer_size_in_bytes, include_static_ranges, module_order, tasks_out, byte_arena, module_count, snapshot_index, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, next_state)
+    }
+}
+
+machine min_u64(a: u64, b: u64) -> u64 {
+    transition a <= b {
+        true -> (a)
+        false -> (b)
+        _ -> (b)
+    }
+}
+
+machine max_u64(a: u64, b: u64) -> u64 {
+    transition a >= b {
+        true -> (a)
+        false -> (b)
+        _ -> (b)
+    }
+}
+
+// Upstream `append_snapshot_region_scan_task_for_range`: `read_end` clamps to
+// `range_end + pointer_size - 1` capped at the region's byte length so a
+// boundary pointer read never runs past the region's materialized bytes.
+machine pointer_scan_append_task(
+    snapshot_region: &SnapshotRegion,
+    range_base_address: u64,
+    range_end_address: u64,
+    pointer_size_in_bytes: u64,
+    region_byte_count: u64,
+    state: PointerScanTaskBuildState,
+    tasks_out: &mut [SnapshotRegionScanTask],
+    task_kind: SnapshotRegionScanTaskKind
+) -> PointerScanTaskBuildState {
+    transition range_end_address <= range_base_address {
+        true -> (state)
+        false -> bounds(
+            snapshot_region,
+            range_base_address,
+            range_end_address,
+            pointer_size_in_bytes,
+            region_byte_count,
+            state,
+            tasks_out,
+            task_kind,
+            ((range_base_address as u64 in Saturating) - (snapshot_region.get_base_address() as u64 in Saturating)) as u64,
+            ((range_end_address as u64 in Saturating) - (snapshot_region.get_base_address() as u64 in Saturating)) as u64
+        )
+        _ -> bounds(
+            snapshot_region,
+            range_base_address,
+            range_end_address,
+            pointer_size_in_bytes,
+            region_byte_count,
+            state,
+            tasks_out,
+            task_kind,
+            ((range_base_address as u64 in Saturating) - (snapshot_region.get_base_address() as u64 in Saturating)) as u64,
+            ((range_end_address as u64 in Saturating) - (snapshot_region.get_base_address() as u64 in Saturating)) as u64
+        )
+    }
+
+    state bounds(
+        snapshot_region: &SnapshotRegion,
+        range_base_address: u64,
+        range_end_address: u64,
+        pointer_size_in_bytes: u64,
+        region_byte_count: u64,
+        state: PointerScanTaskBuildState,
+        tasks_out: &mut [SnapshotRegionScanTask],
+        task_kind: SnapshotRegionScanTaskKind,
+        range_start_offset: u64,
+        range_end_offset: u64
+    ) -> PointerScanTaskBuildState {
+        let task_read_end_offset: u64 = min_u64(
+            ((range_end_offset as u64 in Saturating) + (((pointer_size_in_bytes as u64 in Saturating) - (1 as u64 in Saturating)) as u64 in Saturating)) as u64,
+            region_byte_count
+        );
+        transition state.task_count < tasks_out.len {
+            true -> store(
+                state,
+                tasks_out,
+                SnapshotRegionScanTask {
+                    scan_base_address: range_base_address,
+                    scan_end_address: range_end_address,
+                    arena_start_offset: ((((state.arena_byte_count as u64 in Saturating) - (region_byte_count as u64 in Saturating)) as u64 in Saturating) + (range_start_offset as u64 in Saturating)) as u64,
+                    arena_end_offset: ((((state.arena_byte_count as u64 in Saturating) - (region_byte_count as u64 in Saturating)) as u64 in Saturating) + (task_read_end_offset as u64 in Saturating)) as u64,
+                    task_kind: task_kind
+                }
+            )
+            false -> (state)
+        }
+    }
+
+    state store(
+        state: PointerScanTaskBuildState,
+        tasks_out: &mut [SnapshotRegionScanTask],
+        task: SnapshotRegionScanTask
+    ) -> PointerScanTaskBuildState {
+        tasks_out[state.task_count] = task;
+        (PointerScanTaskBuildState {
+            task_count: ((state.task_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            arena_byte_count: state.arena_byte_count,
+            total_snapshot_region_count: state.total_snapshot_region_count
+        })
+    }
+}

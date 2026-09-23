@@ -1,0 +1,241 @@
+module src::pointer_scans::pointer_scan_candidate_collector;
+
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_execution_plan::PointerScanExecutionPlan;
+use src::pointer_scans::pointer_scan_dispatcher::PointerScanDispatcher;
+use src::pointer_scans::pointer_scan_dispatcher::PointerScanRangeSearchKernel;
+use src::pointer_scans::search_kernels::pointer_scan_search_kernel_context::PointerScanSearchKernelContext;
+use src::pointer_scans::search_kernels::pointer_scan_simd_linear_search_kernel::PointerScanMatchVisitor;
+use src::pointer_scans::structures::pointer_scan_collected_candidate::PointerScanCollectedCandidate;
+use src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+use src::pointer_scans::structures::pointer_scan_region_match::PointerScanRegionMatch;
+use src::pointer_scans::structures::pointer_scan_target_ranges::PointerScanTargetRangeSet;
+use src::pointer_scans::structures::snapshot_region_scan_task::SnapshotRegionScanTask;
+use src::pointer_scans::structures::snapshot_region_scan_task::SnapshotRegionScanTasks;
+use src::pointer_scans::structures::snapshot_region_scan_task_kind::SnapshotRegionScanTaskKind;
+
+// Port of pointer_scan_candidate_collector.rs.
+//
+// Upstream's per-task `&mut |pointer_match| {...}` closure captures
+// (scan_end_address, task_kind, retain flags, `&mut collected_level`). The
+// closure becomes a visitor data type whose `visit` satisfies
+// PointerScanMatchVisitor — the closure body is preserved verbatim, with the
+// captured mutable level as a borrowed field.
+pub data PointerScanCandidateCollectingVisitor<'level, 'candidates> {
+    scan_end_address: u64;
+    task_kind: SnapshotRegionScanTaskKind;
+    retain_static_candidates: bool;
+    retain_heap_candidates: bool;
+    collected_level: &'level mut PointerScanCollectedLevel<'candidates>;
+}
+
+pub machine PointerScanCandidateCollectingVisitor::visit<'level, 'candidates>(
+    &mut self,
+    pointer_match: PointerScanRegionMatch
+)
+satisfies PointerScanMatchVisitor::visit
+{
+    let pointer_address: u64 = pointer_match.get_pointer_address();
+    transition pointer_address >= self.scan_end_address {
+        true -> finished()
+        false -> by_kind(pointer_address, pointer_match.get_pointer_value())
+        _ -> by_kind(pointer_address, pointer_match.get_pointer_value())
+    }
+
+    state by_kind(
+        &mut self,
+        pointer_address: u64,
+        pointer_value: u64
+    ) {
+        transition self.task_kind {
+            SnapshotRegionScanTaskKind::Static {
+                module_index,
+                module_base_address
+            } -> static_case(
+                pointer_address,
+                pointer_value,
+                module_index,
+                module_base_address
+            )
+            SnapshotRegionScanTaskKind::Heap -> heap_case(
+                pointer_address,
+                pointer_value
+            )
+            _ -> finished()
+        }
+    }
+
+    state static_case(
+        &mut self,
+        pointer_address: u64,
+        pointer_value: u64,
+        module_index: u64,
+        module_base_address: u64
+    ) {
+        transition self.retain_static_candidates {
+            true -> push_static(
+                PointerScanCollectedCandidate {
+                    pointer_address: pointer_address,
+                    pointer_value: pointer_value,
+                    module_index: module_index,
+                    module_offset: ((pointer_address as u64 in Saturating) - (module_base_address as u64 in Saturating)) as u64
+                }
+            )
+            false -> finished()
+            _ -> finished()
+        }
+    }
+
+    state push_static(
+        &mut self,
+        candidate: PointerScanCollectedCandidate
+    ) {
+        self.collected_level.push_static(candidate);
+    }
+
+    state heap_case(
+        &mut self,
+        pointer_address: u64,
+        pointer_value: u64
+    ) {
+        transition self.retain_heap_candidates {
+            true -> push_heap(
+                PointerScanCollectedCandidate {
+                    pointer_address: pointer_address,
+                    pointer_value: pointer_value,
+                    module_index: 0,
+                    module_offset: 0
+                }
+            )
+            false -> finished()
+            _ -> finished()
+        }
+    }
+
+    state push_heap(
+        &mut self,
+        candidate: PointerScanCollectedCandidate
+    ) {
+        self.collected_level.push_heap(candidate);
+    }
+
+    state finished() {}
+}
+
+// Upstream's `PointerScanCandidateCollector` unit struct.
+pub data PointerScanCandidateCollector {}
+
+// Upstream `build_execution_plan`: largest task byte view becomes the plan's
+// scan_region_byte_count before the dispatcher maps planning rules.
+pub machine PointerScanCandidateCollector::build_execution_plan<'ranges, 'tasks, 'values>(
+    &self,
+    frontier_target_ranges: &'ranges PointerScanTargetRangeSet<'ranges>,
+    pointer_size: PointerScanPointerSize,
+    snapshot_region_scan_tasks: &'tasks SnapshotRegionScanTasks<'tasks, 'values>
+) -> PointerScanExecutionPlan {
+    let dispatcher: PointerScanDispatcher = PointerScanDispatcher {};
+    dispatcher.build_execution_plan(
+        frontier_target_ranges,
+        pointer_size,
+        snapshot_region_scan_tasks.get_largest_region_byte_count()
+    )
+}
+
+// Upstream `collect_candidates`. Its per-task `par_iter().map(collect one
+// level) -> append into merged` is a sequential task walk here: the merged
+// level accumulates task outputs in the same task order, so the produced
+// candidate order is identical — partition-owned output into the
+// caller's `level_out` extents.
+pub machine PointerScanCandidateCollector::collect_candidates_into<'ranges, 'tasks, 'values, 'candidates>(
+    &self,
+    snapshot_region_scan_tasks: &'tasks SnapshotRegionScanTasks<'tasks, 'values>,
+    frontier_target_ranges: &'ranges PointerScanTargetRangeSet<'ranges>,
+    pointer_scan_execution_plan: &PointerScanExecutionPlan,
+    retain_static_candidates: bool,
+    retain_heap_candidates: bool,
+    level_out: &'candidates mut PointerScanCollectedLevel<'candidates>
+) {
+    let dispatcher: PointerScanDispatcher = PointerScanDispatcher {};
+    let range_search_kernel: PointerScanRangeSearchKernel =
+        dispatcher.acquire_range_search_kernel(
+            frontier_target_ranges,
+            pointer_scan_execution_plan
+        );
+    let pointer_size: PointerScanPointerSize =
+        pointer_scan_execution_plan.get_pointer_size();
+    let pointer_scan_search_kernel_context: PointerScanSearchKernelContext =
+        PointerScanSearchKernelContext::new(frontier_target_ranges, pointer_size);
+    begin(
+        &range_search_kernel,
+        &pointer_scan_search_kernel_context,
+        snapshot_region_scan_tasks,
+        retain_static_candidates,
+        retain_heap_candidates,
+        level_out,
+        0
+    );
+
+    // Upstream `if range_search_kernel.is_empty(context) { return default }`.
+    state begin(
+        range_search_kernel: &PointerScanRangeSearchKernel,
+        pointer_scan_search_kernel_context: &PointerScanSearchKernelContext,
+        snapshot_region_scan_tasks: &'tasks SnapshotRegionScanTasks<'tasks, 'values>,
+        retain_static_candidates: bool,
+        retain_heap_candidates: bool,
+        level_out: &'candidates mut PointerScanCollectedLevel<'candidates>,
+        task_index: u64
+    ) {
+        transition range_search_kernel.is_empty(pointer_scan_search_kernel_context) {
+            true -> finished()
+            false -> per_task(range_search_kernel, pointer_scan_search_kernel_context, snapshot_region_scan_tasks, retain_static_candidates, retain_heap_candidates, level_out, task_index)
+            _ -> per_task(range_search_kernel, pointer_scan_search_kernel_context, snapshot_region_scan_tasks, retain_static_candidates, retain_heap_candidates, level_out, task_index)
+        }
+    }
+
+    state per_task(
+        range_search_kernel: &PointerScanRangeSearchKernel,
+        pointer_scan_search_kernel_context: &PointerScanSearchKernelContext,
+        snapshot_region_scan_tasks: &'tasks SnapshotRegionScanTasks<'tasks, 'values>,
+        retain_static_candidates: bool,
+        retain_heap_candidates: bool,
+        level_out: &'candidates mut PointerScanCollectedLevel<'candidates>,
+        task_index: u64
+    ) {
+        transition task_index < snapshot_region_scan_tasks.get_task_count() {
+            true -> scan_task(range_search_kernel, pointer_scan_search_kernel_context, snapshot_region_scan_tasks, retain_static_candidates, retain_heap_candidates, level_out, task_index)
+            false -> finished()
+        }
+    }
+
+    // Upstream `collect_task_matches`: the visitor carries the task's
+    // end address + kind so each match routes static/heap like the closure.
+    state scan_task(
+        range_search_kernel: &PointerScanRangeSearchKernel,
+        pointer_scan_search_kernel_context: &PointerScanSearchKernelContext,
+        snapshot_region_scan_tasks: &'tasks SnapshotRegionScanTasks<'tasks, 'values>,
+        retain_static_candidates: bool,
+        retain_heap_candidates: bool,
+        level_out: &'candidates mut PointerScanCollectedLevel<'candidates>,
+        task_index: u64
+    ) {
+        let snapshot_region_scan_task: SnapshotRegionScanTask =
+            snapshot_region_scan_tasks.get_task(task_index);
+        let mut collecting_visitor: PointerScanCandidateCollectingVisitor =
+            PointerScanCandidateCollectingVisitor {
+                scan_end_address: snapshot_region_scan_task.scan_end_address,
+                task_kind: snapshot_region_scan_task.task_kind,
+                retain_static_candidates: retain_static_candidates,
+                retain_heap_candidates: retain_heap_candidates,
+                collected_level: &mut level_out
+            };
+        range_search_kernel.scan_region_with_visitor(
+            pointer_scan_search_kernel_context,
+            snapshot_region_scan_task.scan_base_address,
+            snapshot_region_scan_tasks.get_task_values(&snapshot_region_scan_task),
+            &mut collecting_visitor
+        );
+        per_task(range_search_kernel, pointer_scan_search_kernel_context, snapshot_region_scan_tasks, retain_static_candidates, retain_heap_candidates, level_out, ((task_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+    }
+
+    state finished() {}
+}
