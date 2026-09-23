@@ -4,10 +4,11 @@ use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
 use squalr_engine_api::src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
-use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
 use src::element_scans::element_scan_report::ElementScanReport;
@@ -1006,17 +1007,20 @@ crashes Abort
         collection_count: u64,
         seed_end: u64
     ) -> ElementScanReport {
-        let seed_view: &'r [SnapshotRegionFilterCollection] =
-            ElementScanDispatcher::view_collection_range(
-                collection_seeds,
-                collection_cursor,
-                seed_end
-            );
-        let seeded: SnapshotRegionScanResults =
-            SnapshotRegionScanResults::new(seed_view);
-        let region_mut: &mut SnapshotRegion =
-            Snapshot::get_region(regions, region_index);
-        SnapshotRegion::initialize_scan_results(region_mut, seeded);
+        // Upstream installs the freshly seeded collections through
+        // `snapshot_region.initialize_scan_results`; the `&mut`-receiver /
+        // borrowed-argument composition does not cross the package boundary,
+        // so the snapshot-level entry performs it inside the api package.
+        // The pre-written seed slab (collection_seeds[cursor..seed_end]) is
+        // the external mirror of the same seeds this entry builds — kept for
+        // the signature, unused by the in-package path.
+        let data_type_refs: DataTypeRefSet = element_scan_plan.clone_data_type_refs();
+        let memory_alignment: MemoryAlignment = element_scan_plan.get_memory_alignment();
+        snapshot.initialize_region_scan_results(
+            region_index,
+            data_type_refs,
+            memory_alignment
+        );
         transition { _ -> dispatch_guard(
             snapshot,
             element_scan_plan,
@@ -1508,16 +1512,78 @@ crashes Abort
                 round_b,
                 out_cursor
             );
-        // The result borrows `filter_out` ('r) and must be consumed here —
-        // forwarding it onward while `filter_out` is passed mut conflicts.
-        // `number_of_results` is a stored scalar — a machine call on the
-        // 'r-bound `result` drops the outstanding 'r index facts in this pin.
-        let written_count: u64 = result.number_of_results;
-        collection_results[slot_index] = result;
+        // The result is an owned collection — it can cross the store guard
+        // that bounds `slot_index` for the `collection_results` write.
+        let written_count: u64 = result.get_number_of_results();
         let next_out_cursor: u64 = ((out_cursor as u64 in Saturating)
             + (written_count as u64 in Saturating)) as u64;
         let next_collection_index: u64 = ((collection_index as u64 in Saturating)
             + (1 as u64 in Saturating)) as u64;
+        transition slot_index < collection_results.len {
+            true -> dispatch_store(
+                snapshot,
+                element_scan_plan,
+                scan_control,
+                seed_filters,
+                collection_seeds,
+                collection_results,
+                filter_out,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                round_a,
+                round_b,
+                region_index,
+                next_collection_index,
+                collection_cursor,
+                next_out_cursor,
+                processed_region_count,
+                region_count,
+                data_type_count,
+                committed_deleted_result_count,
+                seed_base,
+                seed_size,
+                collection_count,
+                region,
+                scan_results,
+                slot_index,
+                result
+            )
+            false -> abort_scan()
+            _ -> abort_scan()
+        }
+    }
+
+    state dispatch_store(
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
+        seed_filters: &'r mut [SnapshotRegionFilter],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        region_index: u64,
+        collection_index: u64,
+        collection_cursor: u64,
+        out_cursor: u64,
+        processed_region_count: u64,
+        region_count: u64,
+        data_type_count: u64,
+        committed_deleted_result_count: u64,
+        seed_base: u64,
+        seed_size: u64,
+        collection_count: u64,
+        region: SnapshotRegion,
+        scan_results: SnapshotRegionScanResults,
+        slot_index: u64,
+        result: SnapshotRegionFilterCollection
+    ) -> ElementScanReport {
+        collection_results[slot_index] = result;
         transition { _ -> dispatch_each(
             snapshot,
             element_scan_plan,
@@ -1532,9 +1598,9 @@ crashes Abort
             round_a,
             round_b,
             region_index,
-            next_collection_index,
+            collection_index,
             collection_cursor,
-            next_out_cursor,
+            out_cursor,
             processed_region_count,
             region_count,
             data_type_count,
@@ -1747,20 +1813,15 @@ crashes Abort
         collection_count: u64,
         result_end: u64
     ) -> ElementScanReport {
-        let result_view: &'r [SnapshotRegionFilterCollection] =
-            ElementScanDispatcher::view_collection_range(
-                collection_results,
-                collection_cursor,
-                result_end
-            );
-        let scan_results: SnapshotRegionScanResults =
-            SnapshotRegionScanResults::new(result_view);
-        let region_mut: &mut SnapshotRegion =
-            snapshot.get_region(region_index);
-        SnapshotRegion::set_scan_results(region_mut, scan_results);
+        // Upstream installs `set_scan_results(collections)` then
+        // `resize_to_filters`; the `&mut`-receiver / borrowed-argument
+        // composition does not cross the package boundary, so the snapshot
+        // performs the staged install inside the api package — reset, push
+        // each dispatched collection, resize.
+        snapshot.reset_region_scan_results(region_index);
         let next_processed: u64 = ((processed_region_count as u64 in Saturating)
             + (1 as u64 in Saturating)) as u64;
-        transition { _ -> progress_head(
+        transition { _ -> install_each(
             snapshot,
             element_scan_plan,
             scan_control,
@@ -1778,6 +1839,211 @@ crashes Abort
             collection_cursor,
             out_cursor,
             next_processed,
+            region_count,
+            data_type_count,
+            committed_deleted_result_count,
+            seed_base,
+            seed_size,
+            collection_count,
+            collection_cursor,
+            result_end
+        ) }
+    }
+
+    state install_each(
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
+        seed_filters: &'r mut [SnapshotRegionFilter],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        region_index: u64,
+        collection_index: u64,
+        collection_cursor: u64,
+        out_cursor: u64,
+        processed_region_count: u64,
+        region_count: u64,
+        data_type_count: u64,
+        committed_deleted_result_count: u64,
+        seed_base: u64,
+        seed_size: u64,
+        collection_count: u64,
+        push_cursor: u64,
+        result_end: u64
+    ) -> ElementScanReport {
+        transition push_cursor < result_end && push_cursor < collection_results.len {
+            true -> install_push(
+                snapshot,
+                element_scan_plan,
+                scan_control,
+                seed_filters,
+                collection_seeds,
+                collection_results,
+                filter_out,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                round_a,
+                round_b,
+                region_index,
+                collection_index,
+                collection_cursor,
+                out_cursor,
+                processed_region_count,
+                region_count,
+                data_type_count,
+                committed_deleted_result_count,
+                seed_base,
+                seed_size,
+                collection_count,
+                push_cursor,
+                result_end
+            )
+            false -> install_resize(
+                snapshot,
+                element_scan_plan,
+                scan_control,
+                seed_filters,
+                collection_seeds,
+                collection_results,
+                filter_out,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                round_a,
+                round_b,
+                region_index,
+                collection_index,
+                collection_cursor,
+                out_cursor,
+                processed_region_count,
+                region_count,
+                data_type_count,
+                committed_deleted_result_count,
+                seed_base,
+                seed_size,
+                collection_count
+            )
+            _ -> abort_scan()
+        }
+    }
+
+    state install_push(
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
+        seed_filters: &'r mut [SnapshotRegionFilter],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        region_index: u64,
+        collection_index: u64,
+        collection_cursor: u64,
+        out_cursor: u64,
+        processed_region_count: u64,
+        region_count: u64,
+        data_type_count: u64,
+        committed_deleted_result_count: u64,
+        seed_base: u64,
+        seed_size: u64,
+        collection_count: u64,
+        push_cursor: u64,
+        result_end: u64
+    ) -> ElementScanReport {
+        let collection: SnapshotRegionFilterCollection =
+            SnapshotRegionFilterCollection::clone(&collection_results[push_cursor]);
+        let pushed: bool = snapshot.push_region_scan_result_collection(
+            region_index,
+            collection
+        );
+        transition pushed {
+            true -> install_each(
+                snapshot,
+                element_scan_plan,
+                scan_control,
+                seed_filters,
+                collection_seeds,
+                collection_results,
+                filter_out,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                round_a,
+                round_b,
+                region_index,
+                collection_index,
+                collection_cursor,
+                out_cursor,
+                processed_region_count,
+                region_count,
+                data_type_count,
+                committed_deleted_result_count,
+                seed_base,
+                seed_size,
+                collection_count,
+                ((push_cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                result_end
+            )
+            false -> abort_scan()
+            _ -> abort_scan()
+        }
+    }
+
+    state install_resize(
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
+        seed_filters: &'r mut [SnapshotRegionFilter],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
+        filter_out: &'r mut [SnapshotRegionFilter],
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        round_a: &mut [SnapshotRegionFilter],
+        round_b: &mut [SnapshotRegionFilter],
+        region_index: u64,
+        collection_index: u64,
+        collection_cursor: u64,
+        out_cursor: u64,
+        processed_region_count: u64,
+        region_count: u64,
+        data_type_count: u64,
+        committed_deleted_result_count: u64,
+        seed_base: u64,
+        seed_size: u64,
+        collection_count: u64
+    ) -> ElementScanReport {
+        snapshot.resize_region_to_filters(region_index);
+        transition { _ -> progress_head(
+            snapshot,
+            element_scan_plan,
+            scan_control,
+            seed_filters,
+            collection_seeds,
+            collection_results,
+            filter_out,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            round_a,
+            round_b,
+            region_index,
+            collection_index,
+            collection_cursor,
+            out_cursor,
+            processed_region_count,
             region_count,
             data_type_count,
             committed_deleted_result_count,
@@ -2009,8 +2275,8 @@ crashes Abort
         processed_region_count: u64,
         committed_deleted_result_count: u64
     ) -> ElementScanReport {
-        Snapshot::discard_empty_regions(snapshot);
-        let scanned_byte_count: u64 = snapshot.get_byte_count();
+        snapshot.discard_empty_regions();
+        let scanned_byte_count: u64 = snapshot.get_collected_byte_count();
         let result_count: u64 = snapshot.get_number_of_results();
         ElementScanReport::new(
             scanned_byte_count,
@@ -2027,11 +2293,11 @@ crashes Abort
 }
 
 // Seed unit size: upstream resolves `symbol_registry.get_unit_size_in_bytes`
-// (the data type's element width); each finalized constraint already carries
-// it, so the first matching constraint supplies it here. A data type with no
-// constraints yields an inert seed collection — dispatch drops unconstrained
-// input filters upstream — and the alignment is the fallback (deviation:
-// registry-less equivalent of "unit size unknown").
+// (the data type's element width); the finalized unit rides the plan entry,
+// so the first plan supplies it here. A data type with no plans yields an
+// inert seed collection — dispatch drops unconstrained input filters
+// upstream — and the alignment is the fallback (deviation: registry-less
+// equivalent of "unit size unknown").
 pub machine ElementScanner::unit_size_for<'t, 'c>(
     element_scan_plan: &ElementScanPlan,
     data_type_id: &[u8],
@@ -2039,8 +2305,9 @@ pub machine ElementScanner::unit_size_for<'t, 'c>(
 ) -> u64
 crashes Abort
 {
-    let constraint_count: u64 =
-        element_scan_plan.count_constraints_for(data_type_id);
+    let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
+    let plan_list: TypePlanList = element_scan_plan.get_plan_list_for(&data_type_ref);
+    let constraint_count: u64 = plan_list.get_plan_count();
     transition constraint_count > 0 {
         true -> first_match(element_scan_plan, data_type_id)
         false -> (fallback_size)
@@ -2051,10 +2318,9 @@ crashes Abort
         element_scan_plan: &ElementScanPlan,
         data_type_id: &[u8]
     ) -> u64 {
-        let constraint_index: u64 =
-            element_scan_plan.constraint_index_for(data_type_id, 0);
-        let constraint: ScanConstraintFinalized<'c> =
-            element_scan_plan.get_constraint(constraint_index);
-        constraint.get_unit_size_in_bytes()
+        let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
+        let plan_list: TypePlanList = element_scan_plan.get_plan_list_for(&data_type_ref);
+        let plan: SnapshotFilterElementScanPlan = plan_list.get_plan(0);
+        plan.get_unit_size_in_bytes()
     }
 }

@@ -12,10 +12,9 @@ use squalr_engine_api::src::registries::scan_rules::element_scan_rule_registry::
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
-use squalr_engine_api::src::structures::scanning::constraints::scan_constraint::ScanConstraint;
-use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
 use src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
 use src::scanners::scalar::scanner_scalar_single_element::ScannerScalarSingleElement;
@@ -255,6 +254,7 @@ machine apply_constraint<'a, 'p, 'r, 't, 'd, 'c>(
     snapshot_region: &SnapshotRegion,
     result_value_size_in_bytes: u64,
     element_scan_plan: &ElementScanPlan,
+    data_type_id: &'t [u8],
     constraint_index: u64,
     snapshot_region_filter: &SnapshotRegionFilter,
     current_elements: &mut [u64],
@@ -265,29 +265,30 @@ machine apply_constraint<'a, 'p, 'r, 't, 'd, 'c>(
 ) -> u64
 crashes Abort
 {
-    let constraint: ScanConstraintFinalized<'c> =
-        element_scan_plan.get_constraint(constraint_index);
-    let compare_type: ScanCompareType = constraint.get_scan_compare_type();
-    let operand_value: u64 = constraint.get_operand_value();
-    let unit_size: u64 = constraint.get_unit_size_in_bytes();
-    let has_sfn: bool = constraint.has_scan_function_scalar();
-    let sfn: ScanFunctionScalar = constraint.get_scan_function_scalar();
-    let periodicity: u64 = constraint.get_periodicity();
-    let scan_constraint: ScanConstraint<'c> = constraint.get_scan_constraint();
-    let is_floating_point: bool = scan_constraint.is_floating_point();
-    let prefer_type_scanner: bool = scan_constraint.prefers_type_scanner();
-    let has_mask: bool = scan_constraint.has_mask();
+    // Upstream looks the `ScanConstraintFinalized` up out of
+    // `ElementScanPlan::get_scan_constraints_by_data_type` — a borrowed view
+    // over the stored constraints. The owned plan cannot store that borrowed
+    // view, so `SnapshotFilterElementScanPlan` carries the finalized and
+    // constraint-derived scalars itself; the dispatcher reads them off the
+    // plan entry at the constraint ordinal (the plan builder pushes plans in
+    // constraint order, so the ordinal is the plan index — the constraint
+    // navigation upstream's flattened index answered is this same slot).
+    let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
+    let plan_list: TypePlanList = element_scan_plan.get_plan_list_for(&data_type_ref);
+    let plan: SnapshotFilterElementScanPlan = plan_list.get_plan(constraint_index);
+    let compare_type: ScanCompareType = plan.get_scan_compare_type();
+    let operand_value: u64 = plan.get_operand_value();
+    let unit_size: u64 = plan.get_unit_size_in_bytes();
+    let periodicity: u64 = plan.get_periodicity();
+    let is_floating_point: bool = plan.get_is_floating_point();
+    let prefer_type_scanner: bool = plan.get_prefer_type_scanner();
+    let has_mask: bool = plan.get_has_mask();
     let memory_alignment: MemoryAlignment =
         element_scan_plan.get_memory_alignment();
+    // The rule pass mutates a scratch copy; the stored plan keeps its
+    // planned scan type from build time.
     let mut scan_plan: SnapshotFilterElementScanPlan =
-        SnapshotFilterElementScanPlan::new(
-            compare_type,
-            operand_value,
-            unit_size,
-            has_sfn,
-            sfn,
-            memory_alignment
-        );
+        SnapshotFilterElementScanPlan::clone(&plan);
     ElementScanRuleRegistry::apply_filter_rules(
         compare_type,
         snapshot_region.has_current_values(),
@@ -970,15 +971,14 @@ crashes Abort
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter]
     ) -> u64 {
-        let constraint_index: u64 = element_scan_plan.constraint_index_for(
-            data_type_id,
-            constraint_ordinal
-        );
+        // The owned plan list is constraint-ordinal-indexed (the plan
+        // builder pushes one plan per constraint, in order).
         let next_b_count: u64 = apply_constraint(
             snapshot_region,
             result_value_size_in_bytes,
             element_scan_plan,
-            constraint_index,
+            data_type_id,
+            constraint_ordinal,
             &round_a[source_index],
             current_elements,
             previous_elements,
@@ -1059,15 +1059,12 @@ crashes Abort
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter]
     ) -> u64 {
-        let constraint_index: u64 = element_scan_plan.constraint_index_for(
-            data_type_id,
-            constraint_ordinal
-        );
         let next_dst_len: u64 = apply_constraint(
             snapshot_region,
             result_value_size_in_bytes,
             element_scan_plan,
-            constraint_index,
+            data_type_id,
+            constraint_ordinal,
             &round_a[source_index],
             current_elements,
             previous_elements,
@@ -1273,15 +1270,12 @@ crashes Abort
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter]
     ) -> u64 {
-        let constraint_index: u64 = element_scan_plan.constraint_index_for(
-            data_type_id,
-            constraint_ordinal
-        );
         let next_a_count: u64 = apply_constraint(
             snapshot_region,
             result_value_size_in_bytes,
             element_scan_plan,
-            constraint_index,
+            data_type_id,
+            constraint_ordinal,
             &round_b[source_index],
             current_elements,
             previous_elements,
@@ -1362,15 +1356,12 @@ crashes Abort
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter]
     ) -> u64 {
-        let constraint_index: u64 = element_scan_plan.constraint_index_for(
-            data_type_id,
-            constraint_ordinal
-        );
         let next_dst_len: u64 = apply_constraint(
             snapshot_region,
             result_value_size_in_bytes,
             element_scan_plan,
-            constraint_index,
+            data_type_id,
+            constraint_ordinal,
             &round_b[source_index],
             current_elements,
             previous_elements,
@@ -1445,13 +1436,13 @@ machine resolve_result_value_size<'d, 'c>(
         best: u64,
         constraint_ordinal: u64
     ) -> u64 {
-        let constraint_index: u64 = element_scan_plan.constraint_index_for(
-            data_type_id,
-            constraint_ordinal
-        );
-        let constraint: ScanConstraintFinalized<'c> =
-            element_scan_plan.get_constraint(constraint_index);
-        let operand_size: u64 = constraint.get_operand_size_in_bytes();
+        let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
+        let plan_list: TypePlanList = element_scan_plan.get_plan_list_for(&data_type_ref);
+        let plan: SnapshotFilterElementScanPlan = plan_list.get_plan(constraint_ordinal);
+        // Upstream's operand width is the parsed data value's width; the
+        // owned plan carries the operand at unit width, so the unit stands
+        // in for it.
+        let operand_size: u64 = plan.get_unit_size_in_bytes();
         transition operand_size > best {
             true -> walk(
                 element_scan_plan,
@@ -1511,15 +1502,10 @@ machine resolve_result_container_type<'d, 'c>(
         constraint_count: u64,
         constraint_ordinal: u64
     ) -> ContainerType {
-        let constraint_index: u64 = element_scan_plan.constraint_index_for(
-            data_type_id,
-            constraint_ordinal
-        );
-        let constraint: ScanConstraintFinalized<'c> =
-            element_scan_plan.get_constraint(constraint_index);
-        let scan_constraint: ScanConstraint<'c> = constraint.get_scan_constraint();
-        let container_type: ContainerType =
-            scan_constraint.get_result_container_type();
+        let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
+        let plan_list: TypePlanList = element_scan_plan.get_plan_list_for(&data_type_ref);
+        let plan: SnapshotFilterElementScanPlan = plan_list.get_plan(constraint_ordinal);
+        let container_type: ContainerType = plan.get_result_container_type();
         transition container_type {
             ContainerType::Array -> (container_type)
             ContainerType::ArrayFixed { length } -> (container_type)
@@ -1576,8 +1562,9 @@ pub machine ElementScanDispatcher::dispatch_scan<'a, 'p, 'r, 't, 'd, 'c, 'f>(
 ) -> SnapshotRegionFilterCollection
 crashes Abort
 {
+    let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
     let constraint_count: u64 =
-        element_scan_plan.count_constraints_for(data_type_id);
+        element_scan_plan.get_plan_list_for(&data_type_ref).get_plan_count();
     let memory_alignment: MemoryAlignment =
         snapshot_region_filter_collection.get_memory_alignment();
     let default_size: u64 =
@@ -1666,17 +1653,10 @@ crashes Abort
         filter_out: &'r mut [SnapshotRegionFilter],
         out_cursor: u64
     ) -> SnapshotRegionFilterCollection {
-        let empty_view: &'r [SnapshotRegionFilter] = ElementScanDispatcher::view_filter_range(
-            filter_out,
-            out_cursor,
-            out_cursor
-        );
-        SnapshotRegionFilterCollection::new_with_result_size(
-            empty_view,
+        SnapshotRegionFilterCollection::empty(
             DataTypeRef::new(data_type_id),
             memory_alignment,
-            result_value_size_in_bytes,
-            0
+            result_value_size_in_bytes
         )
     }
 
@@ -1698,9 +1678,9 @@ crashes Abort
         out_cursor: u64,
         out_len: u64
     ) -> SnapshotRegionFilterCollection {
-        let filters: &'r [SnapshotRegionFilter] =
-            snapshot_region_filter_collection.get_filters();
-        transition filter_index < filters.len {
+        let input_filter_count: u64 =
+            snapshot_region_filter_collection.get_filter_count();
+        transition filter_index < input_filter_count {
             true -> copy_in(
                 snapshot_region,
                 snapshot_region_filter_collection,
@@ -1766,9 +1746,9 @@ crashes Abort
         out_cursor: u64,
         out_len: u64
     ) -> SnapshotRegionFilterCollection {
-        let filters: &'r [SnapshotRegionFilter] =
-            snapshot_region_filter_collection.get_filters();
-        transition filter_index < filters.len {
+        let input_filter_count: u64 =
+            snapshot_region_filter_collection.get_filter_count();
+        transition filter_index < input_filter_count {
             true -> clone_input(
                 snapshot_region,
                 snapshot_region_filter_collection,
@@ -1778,7 +1758,6 @@ crashes Abort
                 memory_alignment,
                 result_value_size_in_bytes,
                 filter_index,
-                filters,
                 current_elements,
                 previous_elements,
                 driver_cell,
@@ -1822,7 +1801,6 @@ crashes Abort
         memory_alignment: MemoryAlignment,
         result_value_size_in_bytes: u64,
         filter_index: u64,
-        filters: &'f [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
@@ -1833,7 +1811,7 @@ crashes Abort
         out_len: u64
     ) -> SnapshotRegionFilterCollection {
         let input_filter: SnapshotRegionFilter =
-            SnapshotRegionFilter::clone(&filters[filter_index]);
+            snapshot_region_filter_collection.get_filter(filter_index);
         transition { _ -> chain(
             snapshot_region,
             snapshot_region_filter_collection,
@@ -1948,35 +1926,75 @@ crashes Abort
         out_cursor: u64,
         out_len: u64
     ) -> SnapshotRegionFilterCollection {
-        let view: &'r [SnapshotRegionFilter] = ElementScanDispatcher::view_filter_range(
-            filter_out,
-            out_cursor,
-            out_len
-        );
-        let number_of_results: u64 =
-            SnapshotRegionFilterCollection::count_results(
-                view,
-                result_value_size_in_bytes,
-                memory_alignment,
-                0,
-                0
-            );
         let data_type_ref: DataTypeRef =
             snapshot_region_filter_collection.get_data_type_ref();
+        let collection: SnapshotRegionFilterCollection =
+            SnapshotRegionFilterCollection::empty(
+                data_type_ref,
+                memory_alignment,
+                result_value_size_in_bytes
+            );
         let container_type: ContainerType = resolve_result_container_type(
             element_scan_plan,
             data_type_id,
             constraint_count
         );
-        let collection: SnapshotRegionFilterCollection =
-            SnapshotRegionFilterCollection::new_with_result_size(
-                view,
-                data_type_ref,
-                memory_alignment,
-                result_value_size_in_bytes,
-                number_of_results
-            );
-        collection.with_result_container_type(container_type)
+        transition { _ -> make_fill(
+            collection,
+            container_type,
+            filter_out,
+            data_type_id,
+            out_cursor,
+            out_len
+        ) }
+    }
+
+    state make_fill(
+        collection: SnapshotRegionFilterCollection,
+        container_type: ContainerType,
+        filter_out: &'r mut [SnapshotRegionFilter],
+        data_type_id: &'t [u8],
+        cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection {
+        transition cursor < out_len && cursor < filter_out.len {
+            true -> make_push(collection, container_type, filter_out, data_type_id, cursor, out_len)
+            false -> make_finish(collection, container_type)
+        }
+    }
+
+    // Upstream drains each emitted filter into the result collection; the
+    // api's by-value push keeps the slab read-only here.
+    state make_push(
+        collection: SnapshotRegionFilterCollection,
+        container_type: ContainerType,
+        filter_out: &'r mut [SnapshotRegionFilter],
+        data_type_id: &'t [u8],
+        cursor: u64,
+        out_len: u64
+    ) -> SnapshotRegionFilterCollection {
+        let mut staged: SnapshotRegionFilterCollection = collection;
+        let filter: SnapshotRegionFilter = SnapshotRegionFilter::clone(&filter_out[cursor]);
+        let pushed: bool = staged.push_filter_value(filter);
+        transition pushed {
+            true -> make_fill(staged, container_type, filter_out, data_type_id,
+                ((cursor as u64 in Saturating) + (1 as u64 in Saturating)) as u64, out_len)
+            false -> abort_scan(filter_out, data_type_id)
+            _ -> abort_scan(filter_out, data_type_id)
+        }
+    }
+
+    // `new_with_result_size`'s finish order, staged: retain result-sized
+    // filters, sort by base, then tag the resolved container type.
+    state make_finish(
+        collection: SnapshotRegionFilterCollection,
+        container_type: ContainerType
+    ) -> SnapshotRegionFilterCollection {
+        let mut staged: SnapshotRegionFilterCollection = collection;
+        staged.finalize_result_sized();
+        staged.sort_filters();
+        staged.set_result_container_type(container_type);
+        staged
     }
 
     state abort_scan(
