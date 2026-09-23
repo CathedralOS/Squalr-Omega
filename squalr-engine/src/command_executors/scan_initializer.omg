@@ -1,0 +1,110 @@
+module src::command_executors::scan_initializer;
+
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use src::command_executors::snapshot_region_builder::SnapshotRegionBuilder;
+
+// Port of commands/scan/scan_initializer.rs — the shared scan-start glue the
+// collect-values and struct-scan executors call before reading values.
+//
+// `ensure_snapshot_regions_for_scan`: upstream reads live page bounds through
+// the target's memory queryer and merges them into snapshot regions; the
+// sanctioned supplied source yields the same bound sequence for the captured
+// target — the same substitution the scan-new executor names.
+//
+// `initialize_snapshot_scan_results_if_empty`: seeds a whole-region filter
+// collection per requested data type into every region that has none and
+// reports whether any region was seeded. Upstream then clears the pending
+// delete tombstones; the tombstone set ships with the delete command leg
+// (Snapshot header deviation), so the clear has no carrier here yet.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ScanInitializer {}
+
+pub machine ScanInitializer::ensure_snapshot_regions(
+    engine_privileged_state: &mut EnginePrivilegedState
+) {
+    let region_count: u64 = engine_privileged_state.borrow_snapshot().get_region_count();
+    transition region_count == 0 {
+        true -> fill(engine_privileged_state)
+        false -> done()
+    }
+
+    state fill(engine_privileged_state: &mut EnginePrivilegedState) {
+        let mut builder: SnapshotRegionBuilder = SnapshotRegionBuilder::new();
+        let mut snapshot: Snapshot = Snapshot::new();
+        SnapshotRegionBuilder::fill_from_supplied_source(
+            &mut builder,
+            engine_privileged_state.get_supplied_memory_source());
+        SnapshotRegionBuilder::fill_snapshot(&builder, &mut snapshot);
+        engine_privileged_state.set_snapshot(snapshot);
+        transition { _ -> done() }
+    }
+
+    state done() {
+    }
+}
+
+// Upstream returns true when at least one region gained collections — the
+// caller uses it to clear the freeze list and to tag the update event as a
+// new scan.
+pub machine ScanInitializer::initialize_snapshot_scan_results_if_empty(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    data_type_refs: &DataTypeRefSet,
+    memory_alignment: MemoryAlignment
+) -> bool {
+    transition data_type_refs.get_count() == 0 {
+        true -> (false)
+        false -> probe(engine_privileged_state, data_type_refs, memory_alignment, 0, false)
+    }
+
+    state probe(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        data_type_refs: &DataTypeRefSet,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        did_initialize: bool
+    ) -> bool {
+        let region_count: u64 = engine_privileged_state.borrow_snapshot().get_region_count();
+        transition position < region_count {
+            true -> measure(engine_privileged_state, data_type_refs, memory_alignment, position, did_initialize)
+            false -> (did_initialize)
+        }
+    }
+
+    // Upstream checks each region's had/has around the seed loop; since the
+    // seed only fills regions that had no collections, a region that starts
+    // empty and ends populated is exactly `did_initialize`. The port checks
+    // the same condition one region at a time.
+    state measure(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        data_type_refs: &DataTypeRefSet,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        did_initialize: bool
+    ) -> bool {
+        let had_scan_results: bool = engine_privileged_state
+            .borrow_snapshot()
+            .get_region(position)
+            .get_scan_results()
+            .get_collection_count() > 0;
+        let set: DataTypeRefSet = DataTypeRefSet::clone(data_type_refs);
+        engine_privileged_state.borrow_snapshot_mut().initialize_region_scan_results(
+            position, set, memory_alignment);
+        let has_scan_results: bool = engine_privileged_state
+            .borrow_snapshot()
+            .get_region(position)
+            .get_scan_results()
+            .get_collection_count() > 0;
+        transition { _ -> probe(
+            engine_privileged_state,
+            data_type_refs,
+            memory_alignment,
+            ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+            did_initialize || (!had_scan_results && has_scan_results)) }
+    }
+
+}
