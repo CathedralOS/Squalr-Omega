@@ -1,3 +1,9 @@
+> SUPERSEDED (2026-09-23): the fs fused-provider deadlock below was cleared on
+> Omega main (z4's fused FsHost binding + `ad39f401ed` ambient borrowed-self
+> receivers + `122222e07e` crash-declaring callee custody, all ≤ `5d5e5f371c`).
+> The lane is now blocked by a NEW toolchain regression — see
+> `tools/native_probe_toolchain_float_regression.md`.
+
 # LEAF native-probe-child-reads — blocked at toolchain rev 24d256130eba1eef860cbed64b6f9e109715aeb7
 
 Branch `leaf/native-probe-child-reads`, zergling z6 (2026-09-22). Omega built
