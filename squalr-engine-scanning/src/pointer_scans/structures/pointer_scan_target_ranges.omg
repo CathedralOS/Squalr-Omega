@@ -1787,3 +1787,458 @@ pub machine pointer_scan_target_range_set_contains_value_binary<'r>(
         }
     }
 }
+
+
+
+// Upstream `PointerScanTargetRangeSet::from_sorted_target_addresses_iter`
+// reused per discovered level — the frontier set is rebuilt in place over
+// the same caller-owned extents (a level's heap candidates cannot exceed
+// the initial frontier extents the caller sized for the scan).
+// `source_target_count`/`range_count`/`bucket_count` reset, then the shared
+// merge and bucket passes replay against the stored extents, which the
+// states thread as parameters the way the `from_sorted` chain does.
+pub machine PointerScanTargetRangeSet::rebuild_from_sorted_target_addresses(
+    &mut self,
+    sorted_target_addresses: &[u64],
+    offset_radius: u64
+) {
+    self.source_target_count = 0;
+    self.range_count = 0;
+    self.bucket_count = 0;
+    transition {
+        _ -> rebuild_merge(
+            sorted_target_addresses,
+            offset_radius,
+            0,
+            false,
+            0,
+            &mut self.target_ranges[..],
+            &mut self.lower_bounds[..],
+            &mut self.upper_bounds[..],
+            &mut self.target_range_buckets[..]
+        )
+    }
+
+    state rebuild_merge(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        has_previous: bool,
+        previous_target_address: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition scan_index < sorted.len {
+            true -> rebuild_read(sorted, offset_radius, scan_index, has_previous, previous_target_address, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_buckets(0, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_read(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        has_previous: bool,
+        previous_target_address: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        let target_address: u64 = sorted[scan_index];
+        transition has_previous && target_address == previous_target_address {
+            true -> rebuild_merge(sorted, offset_radius, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, has_previous, previous_target_address, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_expand(sorted, offset_radius, scan_index, target_address, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            _ -> rebuild_expand(sorted, offset_radius, scan_index, target_address, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_expand(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        let next_lower_bound: u64 = ((target_address as u64 in Saturating) - (offset_radius as u64 in Saturating)) as u64;
+        let next_upper_bound: u64 = ((target_address as u64 in Saturating) + (offset_radius as u64 in Saturating)) as u64;
+        transition self.range_count >= 1 {
+            true -> rebuild_last_gate(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_append_gate(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            _ -> rebuild_append_gate(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_last_gate(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        let last_index: u64 = ((self.range_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition last_index < upper_bounds.len {
+            true -> rebuild_last(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, last_index, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_append_gate(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_last(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        last_index: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        let last_upper_bound: u64 = upper_bounds[last_index];
+        transition next_lower_bound <= ((last_upper_bound as u64 in Saturating) + (1 as u64 in Saturating)) as u64 {
+            true -> rebuild_write_gate(sorted, offset_radius, scan_index, target_address, next_upper_bound, last_index, last_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_append_gate(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_write_gate(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64,
+        last_upper_bound: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition last_index < lower_bounds.len {
+            true -> rebuild_write_gate2(sorted, offset_radius, scan_index, target_address, next_upper_bound, last_index, last_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_buckets(0, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_write_gate2(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64,
+        last_upper_bound: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition last_index < target_ranges.len {
+            true -> rebuild_write(sorted, offset_radius, scan_index, target_address, next_upper_bound, last_index, last_upper_bound, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_buckets(0, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_write(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_upper_bound: u64,
+        last_index: u64,
+        last_upper_bound: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        let merged_upper_bound: u64 = target_range_upper_max(last_upper_bound, next_upper_bound);
+        upper_bounds[last_index] = merged_upper_bound;
+        let last_lower_bound: u64 = lower_bounds[last_index];
+        target_ranges[last_index] = normalized_region::NormalizedRegion {
+            base_address: last_lower_bound,
+            region_size: ((merged_upper_bound as u64 in Saturating) - (last_lower_bound as u64 in Saturating)) as u64
+        };
+        rebuild_merge(sorted, offset_radius, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, target_address, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+    }
+
+    state rebuild_append_gate(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition self.range_count < target_ranges.len {
+            true -> rebuild_append_gate2(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, self.range_count, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_buckets(0, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_append_gate2(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        range_count: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition range_count < lower_bounds.len {
+            true -> rebuild_append_gate3(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, range_count, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_buckets(0, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_append_gate3(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        range_count: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition range_count < upper_bounds.len {
+            true -> rebuild_append(sorted, offset_radius, scan_index, target_address, next_lower_bound, next_upper_bound, range_count, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_buckets(0, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state rebuild_append(
+        &mut self,
+        sorted: &[u64],
+        offset_radius: u64,
+        scan_index: u64,
+        target_address: u64,
+        next_lower_bound: u64,
+        next_upper_bound: u64,
+        range_count: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        target_ranges[range_count] = normalized_region::NormalizedRegion {
+            base_address: next_lower_bound,
+            region_size: ((next_upper_bound as u64 in Saturating) - (next_lower_bound as u64 in Saturating)) as u64
+        };
+        lower_bounds[range_count] = next_lower_bound;
+        upper_bounds[range_count] = next_upper_bound;
+        self.range_count = ((range_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        self.source_target_count = ((self.source_target_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        rebuild_merge(sorted, offset_radius, ((scan_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, true, target_address, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+    }
+
+    state rebuild_buckets(
+        &mut self,
+        range_index: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition range_index < self.range_count {
+            true -> bucket_low_gate(range_index, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> finished()
+        }
+    }
+
+    state bucket_low_gate(
+        &mut self,
+        range_index: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition range_index < lower_bounds.len {
+            true -> bucket_high_gate(range_index, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> finished()
+        }
+    }
+
+    state bucket_high_gate(
+        &mut self,
+        range_index: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition range_index < upper_bounds.len {
+            true -> bucket_keys(range_index, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> finished()
+        }
+    }
+
+    state bucket_keys(
+        &mut self,
+        range_index: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        let lower_bound: u64 = lower_bounds[range_index];
+        let upper_bound: u64 = upper_bounds[range_index];
+        bucket_key_loop(range_index, lower_bound >> 16, upper_bound >> 16, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+    }
+
+    state bucket_key_loop(
+        &mut self,
+        range_index: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition bucket_key <= upper_bucket_key {
+            true -> bucket_last_gate(range_index, bucket_key, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> rebuild_buckets(((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state bucket_last_gate(
+        &mut self,
+        range_index: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition self.bucket_count >= 1 {
+            true -> bucket_last_check(range_index, bucket_key, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> bucket_push_gate(range_index, bucket_key, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            _ -> bucket_push_gate(range_index, bucket_key, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state bucket_last_check(
+        &mut self,
+        range_index: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        let bucket_last_index: u64 = ((self.bucket_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition bucket_last_index < target_range_buckets.len {
+            true -> bucket_last(range_index, bucket_key, upper_bucket_key, bucket_last_index, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> bucket_push_gate(range_index, bucket_key, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state bucket_last(
+        &mut self,
+        range_index: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        bucket_last_index: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition target_range_buckets[bucket_last_index].bucket_key == bucket_key {
+            true -> bucket_extend(range_index, bucket_key, upper_bucket_key, bucket_last_index, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> bucket_push_gate(range_index, bucket_key, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state bucket_extend(
+        &mut self,
+        range_index: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        bucket_last_index: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        target_range_buckets[bucket_last_index].end_range_index_exclusive =
+            ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        bucket_key_loop(range_index, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+    }
+
+    state bucket_push_gate(
+        &mut self,
+        range_index: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        transition self.bucket_count < target_range_buckets.len {
+            true -> bucket_push(range_index, bucket_key, upper_bucket_key, self.bucket_count, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+            false -> bucket_key_loop(range_index, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+        }
+    }
+
+    state bucket_push(
+        &mut self,
+        range_index: u64,
+        bucket_key: u64,
+        upper_bucket_key: u64,
+        bucket_count: u64,
+        target_ranges: &mut [normalized_region::NormalizedRegion],
+        lower_bounds: &mut [u64],
+        upper_bounds: &mut [u64],
+        target_range_buckets: &mut [PointerScanTargetRangeBucket]
+    ) {
+        target_range_buckets[bucket_count] = PointerScanTargetRangeBucket {
+            bucket_key: bucket_key,
+            start_range_index: range_index,
+            end_range_index_exclusive: ((range_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        };
+        self.bucket_count = ((bucket_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        bucket_key_loop(range_index, ((bucket_key as u64 in Saturating) + (1 as u64 in Saturating)) as u64, upper_bucket_key, target_ranges, lower_bounds, upper_bounds, target_range_buckets)
+    }
+
+    state finished() {}
+}
