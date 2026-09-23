@@ -1,14 +1,19 @@
 module src::structures::pointer_scans::pointer_scan_node;
 
-use src::structures::memory::address_display::format_module_address;
 use src::structures::pointer_scans::pointer_scan_node_type::PointerScanNodeType;
+use src::structures::memory::address_display::format_module_address;
 
-// Port of PointerScanNode. Upstream fields that have no Omega spelling map
-// as follows: `parent_node_id: Option<u64>` -> has_parent_node_id flag +
-// payload; `module_name: String` -> inline [u8; 256] buffer + length
-// (ProcessInfo name capacity); `child_node_ids: Vec<u64>` -> caller-supplied
-// extent + live count. `new` copies the name text into the node.
-pub data PointerScanNode<'children> {
+// Port of structures/pointer_scans/pointer_scan_node.rs.
+//
+// Named deviation: upstream `child_node_ids: Vec<u64>` is unbounded; the port
+// carries a bounded inline list of 64 ids. The results materializer only ever
+// constructs nodes with empty child lists (has_children is passed
+// explicitly), and GUI expansion writes through `set_child_node_ids`; calls
+// attaching more than 64 ids retain the first 64 — beyond that the stored id
+// list truncates while `child_node_count`/`has_children` still reflect the
+// requested count.
+
+pub data PointerScanNode [copy] {
     node_id: u64;
     graph_node_id: u64;
     discovery_depth: u64;
@@ -24,12 +29,12 @@ pub data PointerScanNode<'children> {
     module_name: [u8; 256];
     module_name_len: u64;
     module_offset: u64;
-    child_node_ids: &'children mut [u64];
+    child_node_ids: [u64; 64];
     child_node_count: u64;
     has_children: bool;
 }
 
-pub machine PointerScanNode::new<'children>(
+pub machine PointerScanNode::new(
     node_id: u64,
     has_parent_node_id: bool,
     parent_node_id: u64,
@@ -41,12 +46,12 @@ pub machine PointerScanNode::new<'children>(
     pointer_offset: i64,
     module_name: &[u8],
     module_offset: u64,
-    child_node_ids: &'children mut [u64],
+    child_node_ids: &[u64],
     child_node_count: u64
-) -> PointerScanNode<'children> {
+) -> PointerScanNode {
     // Upstream sets has_children = !child_node_ids.is_empty() and mirrors
     // graph/discovery/branch fields off depth/node_id.
-    let mut node: PointerScanNode<'children> = PointerScanNode {
+    let mut node: PointerScanNode = PointerScanNode {
         node_id: node_id,
         graph_node_id: node_id,
         discovery_depth: depth,
@@ -61,16 +66,17 @@ pub machine PointerScanNode::new<'children>(
         pointer_offset: pointer_offset,
         module_name_len: 0,
         module_offset: module_offset,
-        child_node_ids: child_node_ids,
+
         child_node_count: child_node_count,
         has_children: child_node_count > 0,
     };
     node.set_module_name(module_name);
+    node.set_child_node_ids(child_node_ids);
     (node)
 }
 
 // Upstream module_name: String copies into the node's buffer.
-pub machine PointerScanNode::set_module_name<'children>(&mut self, module_name: &[u8]) {
+pub machine PointerScanNode::set_module_name(&mut self, module_name: &[u8]) {
     transition {
         _ -> copy(module_name, 0)
     }
@@ -80,7 +86,7 @@ pub machine PointerScanNode::set_module_name<'children>(&mut self, module_name: 
             false -> finish(position)
         }
     }
-    state store(&mut self, module_name: &[u8], position: u64) {
+    state store(&mut self, module_name: &[u8], position: u64 [0..module_name.len]) {
         self.module_name[position] = module_name[position];
         transition {
             _ -> copy(module_name, ((position as u64 in Wrapping) + 1) as u64)
@@ -91,7 +97,37 @@ pub machine PointerScanNode::set_module_name<'children>(&mut self, module_name: 
     }
 }
 
-pub machine PointerScanNode::new_materialized<'children>(
+// Upstream set_child_node_ids: replaces the id list and refreshes
+// has_children. Bounded inline storage keeps the first 64 ids (see header).
+pub machine PointerScanNode::set_child_node_ids(&mut self, child_node_ids: &[u64]) {
+    transition {
+        _ -> count_ids(child_node_ids)
+    }
+    state count_ids(&mut self, child_node_ids: &[u64]) {
+        transition (child_node_ids.len <= 64) {
+            true -> copy(child_node_ids, 0, child_node_ids.len)
+            false -> copy(child_node_ids, 0, 64)
+        }
+    }
+    state copy(&mut self, child_node_ids: &[u64], position: u64, count: u64) {
+        transition (position < count && position < child_node_ids.len && position < 64) {
+            true -> store(child_node_ids, position, count)
+            false -> finish(count)
+        }
+    }
+    state store(&mut self, child_node_ids: &[u64], position: u64 [0..child_node_ids.len], count: u64) {
+        self.child_node_ids[position] = child_node_ids[position];
+        transition {
+            _ -> copy(child_node_ids, ((position as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+    state finish(&mut self, count: u64) {
+        self.child_node_count = count;
+        self.has_children = count > 0;
+    }
+}
+
+pub machine PointerScanNode::new_materialized(
     node_id: u64,
     graph_node_id: u64,
     discovery_depth: u64,
@@ -106,10 +142,11 @@ pub machine PointerScanNode::new_materialized<'children>(
     pointer_offset: i64,
     module_name: &[u8],
     module_offset: u64,
-    child_node_ids: &'children mut [u64],
     has_children: bool
-) -> PointerScanNode<'children> {
-    let mut node: PointerScanNode<'children> = PointerScanNode {
+) -> PointerScanNode {
+    // Upstream new_materialized: child_node_ids starts empty and
+    // has_children is supplied by the caller.
+    let mut node: PointerScanNode = PointerScanNode {
         node_id: node_id,
         graph_node_id: graph_node_id,
         discovery_depth: discovery_depth,
@@ -124,7 +161,7 @@ pub machine PointerScanNode::new_materialized<'children>(
         pointer_offset: pointer_offset,
         module_name_len: 0,
         module_offset: module_offset,
-        child_node_ids: child_node_ids,
+
         child_node_count: 0,
         has_children: has_children,
     };
@@ -132,36 +169,35 @@ pub machine PointerScanNode::new_materialized<'children>(
     (node)
 }
 
-pub machine PointerScanNode::get_node_id<'children>(&self) -> u64 { self.node_id }
-pub machine PointerScanNode::get_graph_node_id<'children>(&self) -> u64 { self.graph_node_id }
-pub machine PointerScanNode::get_discovery_depth<'children>(&self) -> u64 { self.discovery_depth }
-pub machine PointerScanNode::get_branch_total_depth<'children>(&self) -> u64 { self.branch_total_depth }
+pub machine PointerScanNode::get_node_id(&self) -> u64 { self.node_id }
+pub machine PointerScanNode::get_graph_node_id(&self) -> u64 { self.graph_node_id }
+pub machine PointerScanNode::get_discovery_depth(&self) -> u64 { self.discovery_depth }
+pub machine PointerScanNode::get_branch_total_depth(&self) -> u64 { self.branch_total_depth }
+// Upstream Option<u64>: the port exposes has_parent_node_id/get_parent_node_id.
+pub machine PointerScanNode::has_parent_node_id(&self) -> bool { self.has_parent_node_id }
+pub machine PointerScanNode::get_parent_node_id(&self) -> u64 { self.parent_node_id }
 
-// Upstream returns Option<u64>; presence is inspected through the flag
-// accessors so callers never need to destructure an Optional payload.
-pub machine PointerScanNode::has_parent_node_id<'children>(&self) -> bool { self.has_parent_node_id }
-pub machine PointerScanNode::get_parent_node_id<'children>(&self) -> u64 { self.parent_node_id }
-
-pub machine PointerScanNode::get_pointer_scan_node_type<'children>(&self) -> PointerScanNodeType { self.pointer_scan_node_type }
-pub machine PointerScanNode::get_depth<'children>(&self) -> u64 { self.depth }
-pub machine PointerScanNode::set_depth<'children>(&mut self, depth: u64) { self.depth = depth; }
-pub machine PointerScanNode::set_discovery_depth<'children>(&mut self, discovery_depth: u64) { self.discovery_depth = discovery_depth; }
-pub machine PointerScanNode::set_branch_total_depth<'children>(&mut self, branch_total_depth: u64) { self.branch_total_depth = branch_total_depth; }
-pub machine PointerScanNode::get_pointer_address<'children>(&self) -> u64 { self.pointer_address }
-pub machine PointerScanNode::get_pointer_value<'children>(&self) -> u64 { self.pointer_value }
-pub machine PointerScanNode::get_resolved_target_address<'children>(&self) -> u64 { self.resolved_target_address }
-pub machine PointerScanNode::get_pointer_offset<'children>(&self) -> i64 { self.pointer_offset }
-pub machine PointerScanNode::get_module_name<'children>(&self) -> &[u8] {
+pub machine PointerScanNode::get_pointer_scan_node_type(&self) -> PointerScanNodeType { self.pointer_scan_node_type }
+pub machine PointerScanNode::get_depth(&self) -> u64 { self.depth }
+pub machine PointerScanNode::set_depth(&mut self, depth: u64) { self.depth = depth; }
+pub machine PointerScanNode::set_discovery_depth(&mut self, discovery_depth: u64) { self.discovery_depth = discovery_depth; }
+pub machine PointerScanNode::set_branch_total_depth(&mut self, branch_total_depth: u64) { self.branch_total_depth = branch_total_depth; }
+pub machine PointerScanNode::get_pointer_address(&self) -> u64 { self.pointer_address }
+pub machine PointerScanNode::get_pointer_value(&self) -> u64 { self.pointer_value }
+pub machine PointerScanNode::get_resolved_target_address(&self) -> u64 { self.resolved_target_address }
+pub machine PointerScanNode::get_pointer_offset(&self) -> i64 { self.pointer_offset }
+pub machine PointerScanNode::get_module_name(&self) -> &[u8] {
     transition (self.module_name_len <= 256) {
         true -> (self.module_name[0..self.module_name_len])
         false -> (self.module_name[0..256])
     }
 }
-pub machine PointerScanNode::get_module_offset<'children>(&self) -> u64 { self.module_offset }
+
+pub machine PointerScanNode::get_module_offset(&self) -> u64 { self.module_offset }
 
 // Upstream get_module_display_text: "<module_name>+0x<offset>" into `out`;
 // returns the produced length.
-pub machine PointerScanNode::get_module_display_text<'children>(&self, out: &mut [u8; 512]) -> u64 {
+pub machine PointerScanNode::get_module_display_text(&self, out: &mut [u8; 512]) -> u64 {
     transition (self.module_name_len <= 256) {
         true -> slice_text(out)
         false -> full_text(out)
@@ -174,12 +210,12 @@ pub machine PointerScanNode::get_module_display_text<'children>(&self, out: &mut
     }
 }
 
-pub machine PointerScanNode::get_child_node_ids<'children>(&self) -> &[u64] {
-    transition (self.child_node_count <= self.child_node_ids.len) {
+pub machine PointerScanNode::get_child_node_ids(&self) -> &[u64] {
+    transition (self.child_node_count <= 64) {
         true -> (self.child_node_ids[0..self.child_node_count])
-        false -> (self.child_node_ids[0..self.child_node_ids.len])
+        false -> (self.child_node_ids[0..64])
     }
 }
 
 
-pub machine PointerScanNode::has_children<'children>(&self) -> bool { self.has_children }
+pub machine PointerScanNode::has_children(&self) -> bool { self.has_children }
