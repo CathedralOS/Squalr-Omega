@@ -2,7 +2,7 @@ module src::element_scans::element_scanner;
 
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
-use squalr_engine_api::src::structures::results::snapshot_region_scan_results::CollectionRef;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
 use squalr_engine_api::src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
 use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
@@ -37,19 +37,19 @@ use src::scanners::scan_control::ScanControl;
 // (borrows derived from a `&mut` receiver's field cannot co-travel with that
 // receiver across states in this pin); inside the dispatch loop the owned
 // region clone and the scan-results view travel without `regions`, and the
-// region index is re-proven against `snapshot.snapshot_regions.len` when the
+// region index is re-proven against `snapshot.regions.len` when the
 // stored results are installed back.
 
 pub data ElementScanner {
 }
 
 pub machine ElementScanner::scan_snapshot<'a, 'p, 'r, 't, 'd, 'c>(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -59,10 +59,11 @@ pub machine ElementScanner::scan_snapshot<'a, 'p, 'r, 't, 'd, 'c>(
     ) -> ElementScanReport
 crashes Abort
 {
-    let committed_deleted: u64 =
-        snapshot.commit_deleted_scan_result_indices();
+    // The deleted-index set ships with the delete command leg; until then
+    // results stay append-only and the committed-deleted count is zero.
+    let committed_deleted: u64 = 0;
     let total_regions: u64 = snapshot.get_region_count();
-    let total_data_types: u64 = element_scan_plan.get_data_type_refs().len;
+    let total_data_types: u64 = element_scan_plan.get_data_type_ref_count();
     transition { _ -> guard_region(
             snapshot,
             element_scan_plan,
@@ -91,12 +92,12 @@ crashes Abort
 
     // Upstream checks `scan_control.should_cancel()` once per region.
     state guard_region(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -130,7 +131,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -156,7 +156,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -173,19 +172,18 @@ crashes Abort
     }
 
     state bound_region(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -198,7 +196,7 @@ crashes Abort
         seed_size: u64,
         collection_count: u64
     ) -> ElementScanReport {
-        transition region_index < region_count && region_index < regions.len {
+        transition region_index < region_count && region_index < snapshot.region_count {
             true -> read_region(
                 snapshot,
                 element_scan_plan,
@@ -212,7 +210,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -233,19 +230,18 @@ crashes Abort
     // Shared element read for the seed bounds; the borrow is released
     // in-state so `snapshot` and `regions` keep flowing.
     state read_region(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -258,14 +254,14 @@ crashes Abort
         seed_size: u64,
         collection_count: u64
     ) -> ElementScanReport {
-        let region_ref: &SnapshotRegion<'a, 'p, 'r, 't> =
-            Snapshot::get_regions(regions, region_index);
-        let base: u64 = region_ref.get_base_address();
-        let size: u64 = region_ref.get_region_size();
+        let region: SnapshotRegion =
+            snapshot.get_region(region_index);
+        let base: u64 = region.get_base_address();
+        let size: u64 = region.get_region_size();
         let cursor: u64 = ((region_index as u64 in Saturating)
             * (data_type_count as u64 in Saturating)) as u64;
-        let refs: &'t [DataTypeRef<'t>] =
-            element_scan_plan.get_data_type_refs();
+        let refs: DataTypeRefSet =
+            element_scan_plan.clone_data_type_refs();
         transition { _ -> seed_each(
             snapshot,
             element_scan_plan,
@@ -279,7 +275,6 @@ crashes Abort
             driver_cell,
             round_a,
             round_b,
-            regions,
             region_index,
             0,
             cursor,
@@ -299,19 +294,18 @@ crashes Abort
     // `initialize_scan_results` builds one single-filter collection per
     // data type; here the backing is caller-lent at slot i*D+j).
     state seed_each(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -323,7 +317,7 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        data_type_refs: &'t [DataTypeRef<'t>]
+        data_type_refs: DataTypeRefSet
     ) -> ElementScanReport {
         transition collection_index < data_type_count {
             true -> seed_bound(
@@ -339,7 +333,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -366,7 +359,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -392,7 +384,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -409,19 +400,18 @@ crashes Abort
     }
 
     state seed_bound(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -433,7 +423,7 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        data_type_refs: &'t [DataTypeRef<'t>]
+        data_type_refs: DataTypeRefSet
     ) -> ElementScanReport {
         let slot_index: u64 = ((collection_cursor as u64 in Saturating)
             + (collection_index as u64 in Saturating)) as u64;
@@ -454,7 +444,6 @@ crashes Abort
             driver_cell,
             round_a,
             round_b,
-            regions,
             region_index,
             collection_index,
             collection_cursor,
@@ -476,19 +465,18 @@ crashes Abort
     // Atomic index facts decompose and propagate further than the state
     // edge — the element write and the collection-slot write both read them.
     state seed_idx_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -500,12 +488,12 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        data_type_refs: &'t [DataTypeRef<'t>],
+        data_type_refs: DataTypeRefSet,
         slot_index: u64,
         slot_end: u64,
         seed_filter: SnapshotRegionFilter
     ) -> ElementScanReport {
-        transition collection_index < data_type_refs.len
+        transition collection_index < data_type_refs.get_count()
             && slot_index < seed_filters.len {
             true -> seed_elem_write(
                 snapshot,
@@ -520,7 +508,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -543,19 +530,18 @@ crashes Abort
     }
 
     state seed_elem_write(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -567,15 +553,15 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        data_type_refs: &'t [DataTypeRef<'t>],
+        data_type_refs: DataTypeRefSet,
         slot_index: u64,
         slot_end: u64,
         seed_filter: SnapshotRegionFilter
     ) -> ElementScanReport {
-        let data_type_ref: &'t DataTypeRef<'t> =
-            &data_type_refs[collection_index];
+        let data_type_ref: DataTypeRef =
+            data_type_refs.get(collection_index);
         seed_filters[slot_index] = seed_filter;
-        let data_type_id: &'t [u8] = data_type_ref.get_data_type_id();
+        let data_type_id: &[u8] = data_type_ref.get_data_type_id();
         let memory_alignment: MemoryAlignment =
             element_scan_plan.get_memory_alignment();
         let fallback_unit_size: u64 = memory_alignment.get_size_in_bytes();
@@ -597,7 +583,6 @@ crashes Abort
             driver_cell,
             round_a,
             round_b,
-            regions,
             region_index,
             collection_index,
             collection_cursor,
@@ -622,19 +607,18 @@ crashes Abort
     // the element write — mutations drop the guarded slice's facts, so the
     // exact-shape scrutinee sits immediately before its consumer.
     state seed_view_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -646,7 +630,7 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        data_type_refs: &'t [DataTypeRef<'t>],
+        data_type_refs: DataTypeRefSet,
         slot_index: u64,
         slot_end: u64,
         data_type_id: &'t [u8],
@@ -667,7 +651,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -692,19 +675,18 @@ crashes Abort
     }
 
     state seed_coll_idx_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -716,7 +698,7 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        data_type_refs: &'t [DataTypeRef<'t>],
+        data_type_refs: DataTypeRefSet,
         slot_index: u64,
         slot_end: u64,
         data_type_id: &'t [u8],
@@ -737,7 +719,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -762,19 +743,18 @@ crashes Abort
     }
 
     state seed_coll_write(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -786,26 +766,21 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        data_type_refs: &'t [DataTypeRef<'t>],
+        data_type_refs: DataTypeRefSet,
         slot_index: u64,
         slot_end: u64,
         data_type_id: &'t [u8],
         memory_alignment: MemoryAlignment,
         unit_size: u64
     ) -> ElementScanReport {
-        let seed_filter_view: &'r [SnapshotRegionFilter] =
-            ElementScanDispatcher::view_filter_range(
-                seed_filters,
-                slot_index,
-                slot_end
+        let seed_data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
+        collection_seeds[slot_index] =
+            SnapshotRegionFilterCollection::from_single_filter(
+                &seed_filters[slot_index],
+                &seed_data_type_ref,
+                memory_alignment,
+                unit_size
             );
-        let seed_data_type_ref: DataTypeRef<'t> = DataTypeRef::new(data_type_id);
-        collection_seeds[slot_index] = SnapshotRegionFilterCollection::new(
-            seed_filter_view,
-            seed_data_type_ref,
-            memory_alignment,
-            unit_size
-        );
         transition { _ -> seed_each(
             snapshot,
             element_scan_plan,
@@ -819,7 +794,6 @@ crashes Abort
             driver_cell,
             round_a,
             round_b,
-            regions,
             region_index,
             ((collection_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
             collection_cursor,
@@ -836,19 +810,18 @@ crashes Abort
     }
 
     state initialize_head(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -876,7 +849,6 @@ crashes Abort
             driver_cell,
             round_a,
             round_b,
-            regions,
             region_index,
             collection_index,
             collection_cursor,
@@ -893,19 +865,18 @@ crashes Abort
     }
 
     state init_idx_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -919,7 +890,7 @@ crashes Abort
         collection_count: u64,
         seed_end: u64
     ) -> ElementScanReport {
-        transition region_index < regions.len {
+        transition region_index < snapshot.region_count {
             true -> init_view_guard(
                 snapshot,
                 element_scan_plan,
@@ -933,7 +904,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -953,19 +923,18 @@ crashes Abort
     }
 
     state init_view_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -993,7 +962,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -1013,19 +981,18 @@ crashes Abort
     }
 
     state do_initialize(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -1039,15 +1006,15 @@ crashes Abort
         collection_count: u64,
         seed_end: u64
     ) -> ElementScanReport {
-        let seed_view: &'r [SnapshotRegionFilterCollection<'r, 't>] =
+        let seed_view: &'r [SnapshotRegionFilterCollection] =
             ElementScanDispatcher::view_collection_range(
                 collection_seeds,
                 collection_cursor,
                 seed_end
             );
-        let seeded: SnapshotRegionScanResults<'r, 't> =
+        let seeded: SnapshotRegionScanResults =
             SnapshotRegionScanResults::new(seed_view);
-        let region_mut: &mut SnapshotRegion<'a, 'p, 'r, 't> =
+        let region_mut: &mut SnapshotRegion =
             Snapshot::get_region(regions, region_index);
         SnapshotRegion::initialize_scan_results(region_mut, seeded);
         transition { _ -> dispatch_guard(
@@ -1063,7 +1030,6 @@ crashes Abort
             driver_cell,
             round_a,
             round_b,
-            regions,
             region_index,
             0,
             collection_cursor,
@@ -1080,19 +1046,18 @@ crashes Abort
 
     // One-hop guard so the `regions` index fact reaches the load.
     state dispatch_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -1105,7 +1070,7 @@ crashes Abort
         seed_size: u64,
         collection_count: u64
     ) -> ElementScanReport {
-        transition region_index < regions.len {
+        transition region_index < snapshot.region_count {
             true -> dispatch_load(
                 snapshot,
                 element_scan_plan,
@@ -1119,7 +1084,6 @@ crashes Abort
                 driver_cell,
                 round_a,
                 round_b,
-                snapshot.snapshot_regions,
                 region_index,
                 collection_index,
                 collection_cursor,
@@ -1142,19 +1106,18 @@ crashes Abort
     // clone — which reads the same 'a/'p/'r/'t-backed bytes as upstream's
     // &mut region — is the value that travels.
     state dispatch_load(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
         driver_cell: &mut [ScalarRegionScan],
         round_a: &mut [SnapshotRegionFilter],
         round_b: &mut [SnapshotRegionFilter],
-        regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
         region_index: u64,
         collection_index: u64,
         collection_cursor: u64,
@@ -1167,10 +1130,9 @@ crashes Abort
         seed_size: u64,
         collection_count: u64
     ) -> ElementScanReport {
-        let region_ref: &SnapshotRegion<'a, 'p, 'r, 't> =
-            Snapshot::get_regions(regions, region_index);
-        let region: SnapshotRegion<'a, 'p, 'r, 't> = region_ref.clone_region();
-        let scan_results: SnapshotRegionScanResults<'r, 't> =
+        let region: SnapshotRegion =
+            snapshot.get_region(region_index);
+        let scan_results: SnapshotRegionScanResults =
             region.get_scan_results();
         let total_collections: u64 = scan_results.get_collection_count();
         transition { _ -> dispatch_each(
@@ -1203,12 +1165,12 @@ crashes Abort
     }
 
     state dispatch_each(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1226,8 +1188,8 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        region: SnapshotRegion<'a, 'p, 'r, 't>,
-        scan_results: SnapshotRegionScanResults<'r, 't>
+        region: SnapshotRegion,
+        scan_results: SnapshotRegionScanResults
     ) -> ElementScanReport {
         transition collection_index < collection_count {
             true -> collection_bound(
@@ -1311,12 +1273,12 @@ crashes Abort
     }
 
     state collection_bound(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1334,8 +1296,8 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        region: SnapshotRegion<'a, 'p, 'r, 't>,
-        scan_results: SnapshotRegionScanResults<'r, 't>
+        region: SnapshotRegion,
+        scan_results: SnapshotRegionScanResults
     ) -> ElementScanReport {
         let slot_index: u64 = ((collection_cursor as u64 in Saturating)
             + (collection_index as u64 in Saturating)) as u64;
@@ -1370,12 +1332,12 @@ crashes Abort
     }
 
     state fetch_collection(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1393,12 +1355,14 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        region: SnapshotRegion<'a, 'p, 'r, 't>,
-        scan_results: SnapshotRegionScanResults<'r, 't>,
+        region: SnapshotRegion,
+        scan_results: SnapshotRegionScanResults,
         slot_index: u64
     ) -> ElementScanReport {
-        transition scan_results.get_collection(collection_index) {
-            CollectionRef::Found { collection } -> collection_idx_guard(
+        let collection: SnapshotRegionFilterCollection =
+            scan_results.get_filter_collection(collection_index);
+        transition collection_index < scan_results.get_collection_count() {
+            true -> collection_idx_guard(
                 snapshot,
                 element_scan_plan,
                 scan_control,
@@ -1423,11 +1387,11 @@ crashes Abort
                 seed_size,
                 collection_count,
                 region,
-                collection,
+                &collection,
                 slot_index,
                 scan_results
             )
-            CollectionRef::Missing -> abort_scan()
+            false -> abort_scan()
             _ -> abort_scan()
         }
     }
@@ -1435,12 +1399,12 @@ crashes Abort
     // The result-slot index fact is established after the collection match —
     // guard facts must sit one state before the write that reads them.
     state collection_idx_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1458,10 +1422,10 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        region: SnapshotRegion<'a, 'p, 'r, 't>,
-        collection: &SnapshotRegionFilterCollection<'r, 't>,
+        region: SnapshotRegion,
+        collection: &SnapshotRegionFilterCollection,
         slot_index: u64,
-        scan_results: SnapshotRegionScanResults<'r, 't>
+        scan_results: SnapshotRegionScanResults
     ) -> ElementScanReport {
         transition slot_index < collection_results.len
             && out_cursor <= filter_out.len {
@@ -1500,12 +1464,12 @@ crashes Abort
     }
 
     state run_dispatch(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1523,14 +1487,14 @@ crashes Abort
         seed_base: u64,
         seed_size: u64,
         collection_count: u64,
-        region: SnapshotRegion<'a, 'p, 'r, 't>,
-        collection: &SnapshotRegionFilterCollection<'r, 't>,
+        region: SnapshotRegion,
+        collection: &SnapshotRegionFilterCollection,
         slot_index: u64,
-        scan_results: SnapshotRegionScanResults<'r, 't>
+        scan_results: SnapshotRegionScanResults
     ) -> ElementScanReport {
-        let data_type_ref: DataTypeRef<'t> = collection.get_data_type_ref();
-        let data_type_id: &'t [u8] = data_type_ref.get_data_type_id();
-        let result: SnapshotRegionFilterCollection<'r, 't> =
+        let data_type_ref: DataTypeRef = collection.get_data_type_ref();
+        let data_type_id: &[u8] = data_type_ref.get_data_type_id();
+        let result: SnapshotRegionFilterCollection =
             ElementScanDispatcher::dispatch_scan(
                 &region,
                 collection,
@@ -1584,12 +1548,12 @@ crashes Abort
     }
 
     state install_head(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1639,12 +1603,12 @@ crashes Abort
     }
 
     state install_idx_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1664,7 +1628,7 @@ crashes Abort
         collection_count: u64,
         result_end: u64
     ) -> ElementScanReport {
-        transition region_index < snapshot.snapshot_regions.len {
+        transition region_index < snapshot.region_count {
             true -> install_view_guard(
                 snapshot,
                 element_scan_plan,
@@ -1697,12 +1661,12 @@ crashes Abort
     }
 
     state install_view_guard(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1758,12 +1722,12 @@ crashes Abort
     // `set_scan_results` rewrites the region's stored results to the just-
     // scanned collections and collapses the value windows (resize_to_filters).
     state install_results(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1783,16 +1747,16 @@ crashes Abort
         collection_count: u64,
         result_end: u64
     ) -> ElementScanReport {
-        let result_view: &'r [SnapshotRegionFilterCollection<'r, 't>] =
+        let result_view: &'r [SnapshotRegionFilterCollection] =
             ElementScanDispatcher::view_collection_range(
                 collection_results,
                 collection_cursor,
                 result_end
             );
-        let scan_results: SnapshotRegionScanResults<'r, 't> =
+        let scan_results: SnapshotRegionScanResults =
             SnapshotRegionScanResults::new(result_view);
-        let region_mut: &mut SnapshotRegion<'a, 'p, 'r, 't> =
-            Snapshot::get_region(snapshot.snapshot_regions, region_index);
+        let region_mut: &mut SnapshotRegion =
+            snapshot.get_region(region_index);
         SnapshotRegion::set_scan_results(region_mut, scan_results);
         let next_processed: u64 = ((processed_region_count as u64 in Saturating)
             + (1 as u64 in Saturating)) as u64;
@@ -1827,12 +1791,12 @@ crashes Abort
     // total > 0`, percent = processed*100/total — the u64 percent replaces
     // the f32 progress callback (the ScanControl comment records it).
     state progress_head(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1931,12 +1895,12 @@ crashes Abort
     }
 
     state report_progress(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -1987,12 +1951,12 @@ crashes Abort
     }
 
     state next_region(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
         scan_control: &mut ScanControl,
         seed_filters: &'r mut [SnapshotRegionFilter],
-        collection_seeds: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
-        collection_results: &'r mut [SnapshotRegionFilterCollection<'r, 't>],
+        collection_seeds: &'r mut [SnapshotRegionFilterCollection],
+        collection_results: &'r mut [SnapshotRegionFilterCollection],
         filter_out: &'r mut [SnapshotRegionFilter],
         current_elements: &mut [u64],
         previous_elements: &mut [u64],
@@ -2041,7 +2005,7 @@ crashes Abort
     // Upstream order: `discard_empty_regions` runs before the report
     // fields are read, so byte/result counts see the compacted snapshot.
     state finish(
-        snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
+        snapshot: &mut Snapshot,
         processed_region_count: u64,
         committed_deleted_result_count: u64
     ) -> ElementScanReport {
@@ -2069,7 +2033,7 @@ crashes Abort
 // input filters upstream — and the alignment is the fallback (deviation:
 // registry-less equivalent of "unit size unknown").
 pub machine ElementScanner::unit_size_for<'t, 'c>(
-    element_scan_plan: &ElementScanPlan<'t, 'c>,
+    element_scan_plan: &ElementScanPlan,
     data_type_id: &[u8],
     fallback_size: u64
 ) -> u64
@@ -2084,7 +2048,7 @@ crashes Abort
     }
 
     state first_match(
-        element_scan_plan: &ElementScanPlan<'t, 'c>,
+        element_scan_plan: &ElementScanPlan,
         data_type_id: &[u8]
     ) -> u64 {
         let constraint_index: u64 =
