@@ -1,0 +1,660 @@
+module src::structures::memory::symbolic_pointer_chain;
+
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::structures::memory::address_display;
+
+// Port of structures/memory/symbolic_pointer_chain.rs: a root module (or
+// absolute anchor) plus the ordered link list that walks a pointer chain.
+//
+// Shape translations (named deviations):
+// - `module_name: String` -> bounded `[u8; 256]` + live length (the package's
+//   authored-text translation).
+// - `links: Vec<SymbolicPointerChainLink>` -> caller-lent extent `links:
+//   &'links mut [SymbolicPointerChainLink]` + `link_count`.
+// - `Option` returns on internal helpers become flag+payload carriers
+//   (`Optional` payloads are not matchable in this pin).
+// - `set_links` is omitted: replacing a persistent extent field is not
+//   expressible under the persistent-loan rules (same call as
+//   PointerScanNode::set_child_node_ids).
+// - `parse_text_list` ports only the comma-separated `from_str` fallback; the
+//   serde_json array spellings have no JSON machinery in this pin and are
+//   deferred to the dispatch leaf's caller side.
+// - `get_root_offset`, `with_resolved_symbols` and `resolve_final_address`
+//   take Rust closure resolvers (`FnMut`) — they land with the dispatch leaf
+//   where the resolver/reader trait shapes are decided; the pure helpers
+//   (`get_numeric_root_offset`, `get_numeric_tail_offsets`, `apply_pointer_offset`,
+//   `has_symbolic_links`, `resolve_link_offset_numeric`) are ported here.
+
+pub data PointerChainSymbol [copy] {
+    symbol_name: [u8; 256];
+    symbol_name_len: u64;
+}
+
+// Upstream `SymbolicPointerChainLink` (untagged serde enum).
+pub data SymbolicPointerChainLink [copy] {
+    case Offset(offset: i64);
+    case Symbol(symbol: PointerChainSymbol);
+}
+
+// Flag carrier for `as_offset` — `Option<i64>` is unmatchable in this pin.
+pub data SymbolicLinkOffset [copy] {
+    found: bool;
+    offset: i64;
+}
+
+pub machine SymbolicPointerChainLink::new_offset(offset: i64) -> SymbolicPointerChainLink {
+    SymbolicPointerChainLink::Offset { offset: offset }
+}
+
+// Upstream `new_symbol` — `None` maps to `found: false`; `found: true`
+// carries the built `Symbolic` link.
+pub machine SymbolicPointerChainLink::new_symbol(symbol_name: &[u8]) -> SymbolicLinkBuild {
+    transition (symbol_name.len > 0 && symbol_name.len <= 256) {
+        true -> within_bound(symbol_name)
+        false -> refuse()
+    }
+    state within_bound(symbol_name: &[u8]) -> SymbolicLinkBuild {
+        let valid: bool = symbolic_pointer_chain_is_valid_symbol_name(symbol_name);
+        transition valid {
+            true -> build(symbol_name)
+            false -> refuse()
+        }
+    }
+    state build(symbol_name: &[u8]) -> SymbolicLinkBuild {
+        let mut symbol: PointerChainSymbol = PointerChainSymbol { symbol_name_len: 0 };
+        let written: u64 = copy_symbol_text(symbol.symbol_name, symbol_name);
+        symbol.symbol_name_len = written;
+        (SymbolicLinkBuild { found: true, link: SymbolicPointerChainLink::Symbol { symbol: symbol } })
+    }
+    state refuse() -> SymbolicLinkBuild {
+        (SymbolicLinkBuild { found: false, link: SymbolicPointerChainLink::Offset { offset: 0 } })
+    }
+}
+
+// Flag carrier for `new_symbol` — refusal reports `found: false` and a dummy
+// Offset(0) link the caller must ignore.
+pub data SymbolicLinkBuild {
+    found: bool;
+    link: SymbolicPointerChainLink;
+}
+
+machine copy_symbol_text(out: &mut [u8; 256], text: &[u8]) -> u64 {
+    transition {
+        _ -> copy(out, text, 0)
+    }
+    state copy(out: &mut [u8; 256], text: &[u8], position: u64) -> u64 {
+        transition (position < text.len && position < 256) {
+            true -> store(out, text, position)
+            false -> (position)
+        }
+    }
+    state store(out: &mut [u8; 256], text: &[u8], position: u64) -> u64 {
+        out[position] = text[position];
+        transition {
+            _ -> copy(out, text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `as_offset` — offset links report their value, symbols report false.
+pub machine SymbolicPointerChainLink::as_offset(&self) -> SymbolicLinkOffset {
+    transition self {
+        SymbolicPointerChainLink::Offset { offset } -> (SymbolicLinkOffset { found: true, offset: offset })
+        SymbolicPointerChainLink::Symbol { symbol } -> (SymbolicLinkOffset { found: false, offset: 0 })
+    }
+}
+
+// Upstream `symbol_name().is_some()`.
+pub machine SymbolicPointerChainLink::is_symbol(&self) -> bool {
+    transition self {
+        SymbolicPointerChainLink::Offset { offset } -> (false)
+        SymbolicPointerChainLink::Symbol { symbol } -> (true)
+    }
+}
+
+// Upstream `symbol_name` — the stored symbol text (empty for offsets).
+pub machine SymbolicPointerChainLink::get_symbol_name(&self) -> u64 {
+    transition self {
+        SymbolicPointerChainLink::Offset { offset } -> (0)
+        SymbolicPointerChainLink::Symbol { symbol } -> (symbol.symbol_name_len)
+    }
+}
+
+// Upstream `display_text` — offset renders as "0x.."/"-0x..", symbol as its
+// text. Writes into `out` and reports the width written.
+pub machine SymbolicPointerChainLink::display_text(&self, out: &mut [u8; 512]) -> u64 {
+    transition self {
+        SymbolicPointerChainLink::Offset { offset } -> fmt_offset(offset, out)
+        SymbolicPointerChainLink::Symbol { symbol } -> copy_symbol_display(symbol, out)
+    }
+    state fmt_offset(&self, offset: i64, out: &mut [u8; 512]) -> u64 {
+        symbolic_pointer_chain_format_offset(offset, out)
+    }
+    state copy_symbol_display(&self, symbol: PointerChainSymbol, out: &mut [u8; 512]) -> u64 {
+        transition {
+            _ -> copy_text(out, symbol, 0)
+        }
+    }
+    state copy_text(&self, out: &mut [u8; 512], symbol: PointerChainSymbol, position: u64) -> u64 {
+        transition (position < symbol.symbol_name_len && position < 256 && position < 512) {
+            true -> store_text(out, symbol, position)
+            false -> (position)
+        }
+    }
+    state store_text(&self, out: &mut [u8; 512], symbol: PointerChainSymbol, position: u64) -> u64 {
+        out[position] = symbol.symbol_name[position];
+        transition {
+            _ -> copy_text(out, symbol, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `format_offset` — `0x{:X}` for non-negative, `-0x{:X}` for negative.
+pub machine symbolic_pointer_chain_format_offset(offset: i64, out: &mut [u8; 512]) -> u64 {
+    transition (offset < 0) {
+        true -> negative(out, offset)
+        false -> positive(out, offset)
+    }
+    state positive(out: &mut [u8; 512], offset: i64) -> u64 {
+        let unsigned: u64 = (offset as u64 in Wrapping) as u64;
+        write_prefixed_hex(out, unsigned, false)
+    }
+    state negative(out: &mut [u8; 512], offset: i64) -> u64 {
+        let magnitude: u64 = ((((0 as i64 in Wrapping) - (offset as i64 in Wrapping)) as i64) as u64 in Wrapping) as u64;
+        write_prefixed_hex(out, magnitude, true)
+    }
+}
+
+machine write_prefixed_hex(out: &mut [u8; 512], magnitude: u64, negative: bool) -> u64 {
+    out[0] = 48;
+    out[1] = 120;
+    let digit_width: u64 = hex_width(magnitude);
+    transition negative {
+        true -> sign_write(out, magnitude, digit_width)
+        false -> (address_display::write_hex_upper_at(out, magnitude, 2, digit_width))
+    }
+    state sign_write(out: &mut [u8; 512], magnitude: u64, digit_width: u64) -> u64 {
+        out[0] = 45;
+        out[1] = 48;
+        out[2] = 120;
+        address_display::write_hex_upper_at(out, magnitude, 3, digit_width)
+    }
+}
+
+machine hex_width(value: u64) -> u64 {
+    transition {
+        _ -> measure(value, 0)
+    }
+    state measure(remaining: u64, width: u64) -> u64 {
+        let next: u64 = remaining / 16;
+        transition (next > 0) {
+            true -> measure(next, ((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `is_valid_symbol_name` — first char `_` or ascii alphabetic, rest
+// `_` or ascii alphanumeric; offset-looking text refuses.
+pub machine symbolic_pointer_chain_is_valid_symbol_name(symbol_name: &[u8]) -> bool {
+    transition (symbol_name.len > 0) {
+        true -> not_offset(symbol_name)
+        false -> (false)
+    }
+    state not_offset(symbol_name: &[u8]) -> bool {
+        let offset: SymbolicLinkOffset = symbolic_pointer_chain_parse_offset(symbol_name);
+        transition offset.found {
+            true -> (false)
+            false -> first_char(symbol_name)
+        }
+    }
+    state first_char(symbol_name: &[u8]) -> bool {
+        let first: u8 = symbol_name[0];
+        transition (first == 95 || (first >= 65 && first <= 90) || (first >= 97 && first <= 122)) {
+            true -> rest_chars(symbol_name, 1)
+            false -> (false)
+        }
+    }
+    state rest_chars(symbol_name: &[u8], position: u64) -> bool {
+        transition (position < symbol_name.len) {
+            true -> check_char(symbol_name, position)
+            false -> (true)
+        }
+    }
+    state check_char(symbol_name: &[u8], position: u64) -> bool {
+        let c: u8 = symbol_name[position];
+        let ok: bool = c == 95 || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
+        transition ok {
+            true -> rest_chars(symbol_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+        }
+    }
+}
+
+// Upstream `parse_offset` — optional '-', optional 0x/0X hex, else decimal.
+pub machine symbolic_pointer_chain_parse_offset(text: &[u8]) -> SymbolicLinkOffset {
+    transition (text.len > 0) {
+        true -> sign_or_unsigned(text)
+        false -> (SymbolicLinkOffset { found: false, offset: 0 })
+    }
+    state sign_or_unsigned(text: &[u8]) -> SymbolicLinkOffset {
+        transition (text[0] == 45) {
+            true -> neg_body(text)
+            false -> unsigned_body(text, 0)
+        }
+    }
+    state neg_body(text: &[u8]) -> SymbolicLinkOffset {
+        transition (text.len > 1) {
+            true -> unsigned_body(text, 1)
+            false -> (SymbolicLinkOffset { found: false, offset: 0 })
+        }
+    }
+    state unsigned_body(text: &[u8], sign_index: u64) -> SymbolicLinkOffset {
+        transition (text.len > sign_index && text.len >= ((sign_index as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64) {
+            true -> hex_check(text, sign_index)
+            false -> dec_body(text, sign_index)
+        }
+    }
+    state hex_check(text: &[u8], sign_index: u64) -> SymbolicLinkOffset {
+        let i1: u64 = ((sign_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition i1 < text.len {
+            true -> hex_check2(text, sign_index, i1)
+            false -> dec_body(text, sign_index)
+        }
+    }
+    state hex_check2(text: &[u8], sign_index: u64, i1: u64) -> SymbolicLinkOffset {
+        let c0: u8 = text[sign_index];
+        let c1: u8 = text[i1];
+        transition (c0 == 48 && (c1 == 120 || c1 == 88)) {
+            true -> hex_body(text, ((sign_index as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64, sign_index)
+            false -> dec_body(text, sign_index)
+        }
+    }
+    state hex_body(text: &[u8], start: u64, sign_index: u64) -> SymbolicLinkOffset {
+        transition (start < text.len) {
+            true -> hex_digits(text, start, 0, sign_index)
+            false -> (SymbolicLinkOffset { found: false, offset: 0 })
+        }
+    }
+    state hex_digits(text: &[u8], position: u64, value: u64, sign_index: u64) -> SymbolicLinkOffset {
+        transition (position < text.len) {
+            true -> hex_digit(text, position, value, sign_index)
+            false -> apply_sign(value, sign_index)
+        }
+    }
+    state hex_digit(text: &[u8], position: u64, value: u64, sign_index: u64) -> SymbolicLinkOffset {
+        let c: u8 = text[position];
+        transition ((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)) {
+            true -> hex_accum(text, position, value, c, sign_index)
+            false -> (SymbolicLinkOffset { found: false, offset: 0 })
+        }
+    }
+    state hex_accum(text: &[u8], position: u64, value: u64, c: u8, sign_index: u64) -> SymbolicLinkOffset {
+        let digit: u64 = hex_value(c);
+        let next: u64 = (((value as u64 in Wrapping) * (16 as u64 in Wrapping)) as u64 in Wrapping) + (digit as u64 in Wrapping);
+        transition {
+            _ -> hex_digits(text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next as u64, sign_index)
+        }
+    }
+    state dec_body(text: &[u8], sign_index: u64) -> SymbolicLinkOffset {
+        transition (sign_index < text.len) {
+            true -> dec_digits(text, sign_index, 0, sign_index)
+            false -> (SymbolicLinkOffset { found: false, offset: 0 })
+        }
+    }
+    state dec_digits(text: &[u8], position: u64, value: u64, sign_index: u64) -> SymbolicLinkOffset {
+        transition (position < text.len) {
+            true -> dec_digit(text, position, value, sign_index)
+            false -> apply_sign(value, sign_index)
+        }
+    }
+    state dec_digit(text: &[u8], position: u64, value: u64, sign_index: u64) -> SymbolicLinkOffset {
+        let c: u8 = text[position];
+        transition (c >= 48 && c <= 57) {
+            true -> dec_accum(text, position, value, c, sign_index)
+            false -> (SymbolicLinkOffset { found: false, offset: 0 })
+        }
+    }
+    state dec_accum(text: &[u8], position: u64, value: u64, c: u8, sign_index: u64) -> SymbolicLinkOffset {
+        let digit: u64 = (((c as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64);
+        let next: u64 = (((value as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64 in Wrapping) + (digit as u64 in Wrapping);
+        transition {
+            _ -> dec_digits(text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next as u64, sign_index)
+        }
+    }
+    state apply_sign(value: u64, sign_index: u64) -> SymbolicLinkOffset {
+        transition (sign_index == 1) {
+            true -> negate(value)
+            false -> positive(value)
+        }
+    }
+    state negate(value: u64) -> SymbolicLinkOffset {
+        let signed: i64 = ((0 as i64 in Wrapping) - (value as i64 in Wrapping)) as i64;
+        (SymbolicLinkOffset { found: true, offset: signed })
+    }
+    state positive(value: u64) -> SymbolicLinkOffset {
+        (SymbolicLinkOffset { found: true, offset: (value as i64 in Wrapping) as i64 })
+    }
+}
+
+machine hex_value(c: u8) -> u64 {
+    transition (c >= 48 && c <= 57) {
+        true -> (((c as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64)
+        false -> letter(c)
+    }
+    state letter(c: u8) -> u64 {
+        transition (c >= 65 && c <= 70) {
+            true -> upper_value(c)
+            false -> lower(c)
+        }
+    }
+    state upper_value(c: u8) -> u64 {
+        let base: u64 = ((c as u64 in Wrapping) - (65 as u64 in Wrapping)) as u64;
+        (((base as u64 in Wrapping) + (10 as u64 in Wrapping)) as u64)
+    }
+    state lower(c: u8) -> u64 {
+        let base: u64 = ((c as u64 in Wrapping) - (97 as u64 in Wrapping)) as u64;
+        (((base as u64 in Wrapping) + (10 as u64 in Wrapping)) as u64)
+    }
+}
+
+// Upstream `FromStr` — offset parses first, then a valid symbol name.
+pub machine SymbolicPointerChainLink::from_str(text: &[u8]) -> SymbolicLinkParse {
+    let offset: SymbolicLinkOffset = symbolic_pointer_chain_parse_offset(text);
+    transition offset.found {
+        true -> (SymbolicLinkParse { is_symbol: false, found: true, offset: offset.offset, symbol_name_len: 0 })
+        false -> symbol_route(text)
+    }
+    state symbol_route(text: &[u8]) -> SymbolicLinkParse {
+        let valid: bool = symbolic_pointer_chain_is_valid_symbol_name(text);
+        transition valid {
+            true -> (SymbolicLinkParse { is_symbol: true, found: true, offset: 0, symbol_name_len: text.len })
+            false -> (SymbolicLinkParse { is_symbol: false, found: false, offset: 0, symbol_name_len: 0 })
+        }
+    }
+}
+
+// Flag carrier for `from_str` — refusal carries `found: false`; symbol text
+// stays on the caller side (the caller already holds the token slice).
+pub data SymbolicLinkParse [copy] {
+    is_symbol: bool;
+    found: bool;
+    offset: i64;
+    symbol_name_len: u64;
+}
+
+// Upstream `SymbolicPointerChain`.
+pub data SymbolicPointerChain<'links> {
+    module_name: [u8; 256];
+    module_name_len: u64;
+    links: &'links mut [SymbolicPointerChainLink];
+    link_count: u64;
+    pointer_size: PointerScanPointerSize;
+}
+
+// Upstream `new` — ensures at least one link (an empty input gains Offset(0)).
+pub machine SymbolicPointerChain::new<'links>(
+    module_name: &[u8],
+    links: &'links mut [SymbolicPointerChainLink],
+    link_count: u64,
+    pointer_size: PointerScanPointerSize
+) -> SymbolicPointerChain<'links> {
+    let mut chain: SymbolicPointerChain<'links> = SymbolicPointerChain {
+        module_name_len: 0,
+        links: links,
+        link_count: link_count,
+        pointer_size: pointer_size,
+    };
+    chain.set_module_name(module_name);
+    chain.ensure_minimum_links();
+    (chain)
+}
+
+// Upstream `new_absolute` — empty module name.
+pub machine SymbolicPointerChain::new_absolute<'links>(
+    links: &'links mut [SymbolicPointerChainLink],
+    link_count: u64,
+    pointer_size: PointerScanPointerSize
+) -> SymbolicPointerChain<'links> {
+    SymbolicPointerChain::new((""), links, link_count, pointer_size)
+}
+
+// Upstream `new_allow_empty`.
+pub machine SymbolicPointerChain::new_allow_empty<'links>(
+    module_name: &[u8],
+    links: &'links mut [SymbolicPointerChainLink],
+    link_count: u64,
+    pointer_size: PointerScanPointerSize
+) -> SymbolicPointerChain<'links> {
+    let mut chain: SymbolicPointerChain<'links> = SymbolicPointerChain {
+        module_name_len: 0,
+        links: links,
+        link_count: link_count,
+        pointer_size: pointer_size,
+    };
+    chain.set_module_name(module_name);
+    (chain)
+}
+
+// Upstream `ensure_minimum_links` — an empty chain gains Offset(0) when the
+// caller's extent can hold it; an empty extent stays empty (named deviation —
+// upstream's growable Vec always satisfies the minimum).
+pub machine SymbolicPointerChain::ensure_minimum_links<'links>(&mut self) {
+    transition (self.link_count == 0 && self.links.len >= 1) {
+        true -> seed()
+        false -> done()
+    }
+    state seed(&mut self) {
+        transition self.links.len >= 1 {
+            true -> write_seed()
+            false -> done()
+        }
+    }
+    state write_seed(&mut self) {
+        self.links[0] = SymbolicPointerChainLink::Offset { offset: 0 };
+        self.link_count = 1;
+        transition {
+            _ -> done()
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `get_module_name`.
+pub machine SymbolicPointerChain::get_module_name<'links>(&self) -> &[u8] {
+    transition self.module_name_len <= 256 {
+        true -> (self.module_name[0..self.module_name_len])
+        false -> (self.module_name[0..256])
+    }
+}
+
+// Upstream `set_module_name`.
+pub machine SymbolicPointerChain::set_module_name<'links>(&mut self, module_name: &[u8]) {
+    self.module_name_len = 0;
+    transition {
+        _ -> copy_name(module_name, 0)
+    }
+    state copy_name(&mut self, module_name: &[u8], position: u64) {
+        transition (position < module_name.len && position < 256) {
+            true -> store_name(module_name, position)
+            false -> finish(position)
+        }
+    }
+    state store_name(&mut self, module_name: &[u8], position: u64) {
+        self.module_name[position] = module_name[position];
+        transition {
+            _ -> copy_name(module_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(&mut self, count: u64) {
+        self.module_name_len = count;
+    }
+}
+
+// Upstream `get_links` — whole extent plus live-count accessor.
+pub machine SymbolicPointerChain::get_links<'links>(&self) -> &[SymbolicPointerChainLink] {
+    transition (self.link_count <= self.links.len) {
+        true -> (self.links[0..self.link_count])
+        false -> (self.links[0..self.links.len])
+    }
+}
+
+pub machine SymbolicPointerChain::get_link_count<'links>(&self) -> u64 {
+    self.link_count
+}
+
+// Upstream `is_empty`.
+pub machine SymbolicPointerChain::is_empty<'links>(&self) -> bool {
+    self.link_count == 0
+}
+
+// Upstream `get_pointer_size`.
+pub machine SymbolicPointerChain::get_pointer_size<'links>(&self) -> PointerScanPointerSize {
+    self.pointer_size
+}
+
+// Upstream `set_pointer_size`.
+pub machine SymbolicPointerChain::set_pointer_size<'links>(&mut self, pointer_size: PointerScanPointerSize) {
+    self.pointer_size = pointer_size;
+}
+
+// Upstream `get_numeric_root_offset` — the first link's offset or refusal.
+pub machine SymbolicPointerChain::get_numeric_root_offset<'links>(&self) -> SymbolicLinkOffset {
+    transition (self.link_count > 0 && self.links.len > 0) {
+        true -> first()
+        false -> (SymbolicLinkOffset { found: false, offset: 0 })
+    }
+    state first(&self) -> SymbolicLinkOffset {
+        let link: &SymbolicPointerChainLink = self.links[0];
+        link.as_offset()
+    }
+}
+
+// Upstream `get_tail_links` — links[1..]; empty when link_count <= 1.
+pub machine SymbolicPointerChain::get_tail_links<'links>(&self) -> &[SymbolicPointerChainLink] {
+    transition (self.link_count > 1) {
+        true -> gate()
+        false -> empty_tail()
+    }
+    state gate(&self) -> &[SymbolicPointerChainLink] {
+        transition (self.link_count <= self.links.len) {
+            true -> gate_start()
+            false -> empty_tail()
+        }
+    }
+    state gate_start(&self) -> &[SymbolicPointerChainLink] {
+        transition (1 <= self.link_count) {
+            true -> sub()
+            false -> empty_tail()
+        }
+    }
+    state sub(&self) -> &[SymbolicPointerChainLink] {
+        transition (1 <= self.links.len) {
+            true -> (self.links[1..self.link_count])
+            false -> empty_tail()
+        }
+    }
+    state empty_tail(&self) -> &[SymbolicPointerChainLink] {
+        transition (self.links.len >= 1) {
+            true -> (self.links[1..1])
+            false -> (self.links)
+        }
+    }
+}
+
+// Upstream `get_numeric_tail_offsets` — every tail link resolved numerically
+// or the whole request refuses (`found: false`). Writes into `out`.
+pub machine SymbolicPointerChain::get_numeric_tail_offsets<'links>(&self, out: &mut [i64]) -> SymbolicTailOffsets {
+    transition (self.link_count > 1 && self.link_count <= self.links.len) {
+        true -> scan(out, 1, 0)
+        false -> (SymbolicTailOffsets { found: true, count: 0 })
+    }
+    state scan(&self, out: &mut [i64], index: u64, written: u64) -> SymbolicTailOffsets {
+        transition (index < self.link_count) {
+            true -> gate(out, index, written)
+            false -> (SymbolicTailOffsets { found: true, count: written })
+        }
+    }
+    state gate(&self, out: &mut [i64], index: u64, written: u64) -> SymbolicTailOffsets {
+        transition (index < self.links.len) {
+            true -> at(self.links, out, index, written)
+            false -> (SymbolicTailOffsets { found: true, count: written })
+        }
+    }
+    state at(&self, links: &[SymbolicPointerChainLink], out: &mut [i64], index: u64 [0..links.len], written: u64) -> SymbolicTailOffsets {
+        let link: SymbolicPointerChainLink = links[index];
+        let resolved: SymbolicLinkOffset = link.as_offset();
+        transition resolved.found {
+            true -> store(out, resolved.offset, index, written)
+            false -> (SymbolicTailOffsets { found: false, count: 0 })
+        }
+    }
+    state store(&self, out: &mut [i64], offset: i64, index: u64, written: u64) -> SymbolicTailOffsets {
+        transition written < out.len {
+            true -> write(out, offset, index, written)
+            false -> (SymbolicTailOffsets { found: false, count: 0 })
+        }
+    }
+    state write(&self, out: &mut [i64], offset: i64, index: u64, written: u64) -> SymbolicTailOffsets {
+        out[written] = offset;
+        transition {
+            _ -> scan(out, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+pub data SymbolicTailOffsets [copy] {
+    found: bool;
+    count: u64;
+}
+
+// Upstream `has_symbolic_links`.
+pub machine SymbolicPointerChain::has_symbolic_links<'links>(&self) -> bool {
+    transition {
+        _ -> scan(0)
+    }
+    state scan(&self, index: u64) -> bool {
+        transition (index < self.link_count) {
+            true -> gate(index)
+            false -> (false)
+        }
+    }
+    state gate(&self, index: u64) -> bool {
+        transition (index < self.links.len) {
+            true -> at(self.links, index)
+            false -> (false)
+        }
+    }
+    state at(&self, links: &[SymbolicPointerChainLink], index: u64 [0..links.len]) -> bool {
+        let link: SymbolicPointerChainLink = links[index];
+        transition link.is_symbol() {
+            true -> (true)
+            false -> scan(((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `apply_pointer_offset` — checked add/sub by sign. `Optional<u64>`
+// construction only (upstream's Option; matching is the caller's problem).
+pub machine symbolic_pointer_chain_apply_pointer_offset(address: u64, pointer_offset: i64) -> Optional<u64> {
+    transition (pointer_offset >= 0) {
+        true -> add(address, pointer_offset)
+        false -> sub(address, pointer_offset)
+    }
+    state add(address: u64, pointer_offset: i64) -> Optional<u64> {
+        let delta: u64 = (pointer_offset as u64 in Wrapping) as u64;
+        let limit: u64 = ((18446744073709551615 as u64 in Wrapping) - (delta as u64 in Wrapping)) as u64;
+        transition (address <= limit) {
+            true -> (Optional::Some { value: ((address as u64 in Wrapping) + (delta as u64 in Wrapping)) as u64 })
+            false -> (Optional::None)
+        }
+    }
+    state sub(address: u64, pointer_offset: i64) -> Optional<u64> {
+        let delta: u64 = ((((0 as i64 in Wrapping) - (pointer_offset as i64 in Wrapping)) as i64) as u64 in Wrapping) as u64;
+        transition (address >= delta) {
+            true -> (Optional::Some { value: ((address as u64 in Wrapping) - (delta as u64 in Wrapping)) as u64 })
+            false -> (Optional::None)
+        }
+    }
+}
