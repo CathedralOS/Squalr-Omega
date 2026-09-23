@@ -1,0 +1,2196 @@
+module src::structures::pointer_scans::pointer_scan_results;
+
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use src::structures::pointer_scans::pointer_scan_level_candidates::HeapCandidateLookup;
+use src::structures::pointer_scans::pointer_scan_level_candidates::HeapCandidateRange;
+use src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use src::structures::pointer_scans::pointer_scan_level_summary::PointerScanLevelSummary;
+use src::structures::pointer_scans::pointer_scan_node::PointerScanNode;
+use src::structures::pointer_scans::pointer_scan_node_type::PointerScanNodeType;
+use src::structures::pointer_scans::pointer_scan_summary::PointerScanSummary;
+use src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+
+// Port of structures/pointer_scans/pointer_scan_results.rs: lazy
+// materialization of expanded pointer-scan node pages plus the owning result
+// record.
+//
+// Named deviations (all caller-lent storage, same convention as
+// PointerScanTargetRangeSet):
+//   * `target_addresses: Vec<u64>` -> `&'ext mut [u64]` + count; `new` still
+//     sorts and dedups in place. `module_names: Vec<String>` ->
+//     `&'ext mut [PointerScanModuleName]` bounded-name extents (each name
+//     holds up to 256 bytes; longer names truncate on construction).
+//   * `pointer_scan_level_candidates: Vec<PointerScanLevelCandidates>` ->
+//     `&'ext mut [PointerScanLevelCandidates<'s, 'h>]` element extents.
+//   * `materialized_pointer_scan_nodes: HashMap<u64, PointerScanNode>` ->
+//     dense `&'ext mut [PointerScanNode]` arena; materialized ids allocate
+//     1.. and address the arena directly (`id - 1`). Upstream never
+//     overflows; when the arena is exhausted the port keeps minting ids,
+//     sets `materialized_nodes_overflowed`, and those ids resolve as absent.
+//   * `materialized_node_ids_by_page_key: HashMap<PageKey, Vec<u64>>` ->
+//     bounded `&'ext mut [MaterializedPageKeyEntry]` row table plus a shared
+//     `&'ext mut [u64]` id slab (append-only). A full row table or slab
+//     skips the cache insert: the page still materializes on each request
+//     but re-materialization may mint fresh node ids, matching upstream
+//     only when caller storage is adequate.
+//   * `Option<u64>` parent/target lookups become explicit has_* + value
+//     carriers; `get_expanded_node_page`'s `Vec<PointerScanNode>` return
+//     becomes caller `out_*` extents (bounded by their length).
+//   * The `Value` target-descriptor variant is absent (blocked on
+//     `structures::data_types::data_type_ref::DataTypeRef`, currently only on
+//     z2's `leaf/supplied-bytes-scan`), so
+//     `uses_multi_target_terminal_materialization` is always false today.
+//     The multi-target paths are still ported through the
+//     `is_value_descriptor` seam and activate when the variant lands.
+//   * Node module names are resolved inside `create_materialized_pointer_scan_node`
+//     through a name-source discriminator (`module_name_kind`): 0 -> empty
+//     name (non-root children), 1 -> `module_names[module_name_index]`
+//     (roots and level candidates), 2 -> the stored name of the parent node
+//     at `module_name_index` (root children inherit it). This replaces
+//     upstream's Option<String> lookups that cannot cross `&mut self` here.
+//   * `materialize_root_child_node_page` serves both child-page routes: the
+//     dispatcher `materialize_child_node_page` passes kind 2 + parent index
+//     for root children (parents with `has_parent_node_id` unset) and kind 0
+//     for non-root children, matching upstream's module-name split. Heap
+//     children carry `resolved_target_address = child.pointer_value` so
+//     deeper expansion re-queries the pointed-to region, `has_children =
+//     child_discovery_depth > 1`, and `parent_node_id = parent.node_id`.
+//     Parents at leaf depth (discovery_depth <= 1) emit no children;
+//     upstream's leaf-terminal path is not modeled.
+
+// Upstream module name `String`; bounded inline name buffer per convention.
+pub data PointerScanModuleName {
+    module_name: [u8; 256];
+    module_name_len: u64;
+}
+
+pub machine PointerScanModuleName::new(module_name: &[u8]) -> PointerScanModuleName {
+    let mut name: PointerScanModuleName = PointerScanModuleName {
+        module_name_len: 0
+    };
+    name.fill_module_name(module_name);
+    (name)
+}
+
+pub machine PointerScanModuleName::fill_module_name(&mut self, module_name: &[u8]) {
+    transition {
+        _ -> copy(module_name, 0)
+    }
+    state copy(&mut self, module_name: &[u8], position: u64) {
+        transition (position < module_name.len && position < 256) {
+            true -> store(module_name, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, module_name: &[u8], position: u64 [0..module_name.len]) {
+        self.module_name[position] = module_name[position];
+        transition {
+            _ -> copy(module_name, ((position as u64 in Wrapping) + 1) as u64)
+        }
+    }
+    state finish(&mut self, count: u64) {
+        self.module_name_len = count;
+    }
+}
+
+pub machine PointerScanModuleName::get_module_name(&self) -> &[u8] {
+    transition (self.module_name_len <= 256) {
+        true -> (self.module_name[0..self.module_name_len])
+        false -> (self.module_name[0..256])
+    }
+}
+
+pub machine PointerScanModuleName::get_module_name_len(&self) -> u64 { self.module_name_len }
+
+// Bounded byte probe for cross-slice copies (returns 0 out of range).
+pub machine PointerScanModuleName::get_module_name_byte(&self, position: u64) -> u8 {
+    transition (position < 256) {
+        true -> gate_len(position)
+        false -> (0)
+    }
+    state gate_len(&self, position: u64 [0..256]) -> u8 {
+        transition (position < self.module_name_len) {
+            true -> (self.module_name[position])
+            false -> (0)
+        }
+    }
+}
+
+// Upstream MaterializedPointerScanPageKey + the cached Vec<u64>: one row in
+// the bounded cache table; `ids_start..ids_start+ids_len` addresses the
+// shared id slab.
+pub data MaterializedPageKeyEntry [copy] {
+    has_parent_node_id: bool;
+    parent_node_id: u64;
+    page_index: u64;
+    page_size: u64;
+    ids_start: u64;
+    ids_len: u64;
+}
+
+// Cache-row lookup result (Option<row index>).
+pub data MaterializedPageKeyLookup [copy] {
+    case Found(index: u64);
+    case Absent;
+}
+
+// Materialized-node lookup result (Option<arena index>).
+pub data MaterializedNodeLookup [copy] {
+    case Found(index: u64);
+    case Absent;
+}
+
+// Upstream Option<i64> pointer offset.
+pub data PointerOffsetLookup [copy] {
+    case Fits(offset: i64);
+    case Overflow;
+}
+
+// Upstream Option<usize> module-name index.
+pub data ModuleIndexLookup [copy] {
+    case Found(index: u64);
+    case Absent;
+}
+
+// Slice range over the sorted target-address extent.
+pub data TargetAddressRange [copy] {
+    start_index: u64;
+    candidate_count: u64;
+}
+
+// Upstream MaterializedPointerScanNodePage minus the id Vec (ids land in the
+// caller's `out_node_ids` extent, `node_id_count` of them).
+pub data MaterializedPointerScanNodePage [copy] {
+    page_index: u64;
+    last_page_index: u64;
+    total_node_count: u64;
+    node_id_count: u64;
+}
+
+// Upstream get_expanded_node_page's (nodes, page, last, total) tuple; nodes
+// land in the caller's `out_nodes` extent, `node_count` of them.
+pub data ExpandedNodePage [copy] {
+    node_count: u64;
+    page_index: u64;
+    last_page_index: u64;
+    total_node_count: u64;
+}
+
+pub data PointerScanResults<'ext, 'sh, 's, 'h> {
+    session_id: u64;
+    target_descriptor: PointerScanTargetDescriptor;
+    target_addresses: &'ext mut [u64];
+    target_address_count: u64;
+    address_space: PointerScanAddressSpace;
+    pointer_size: PointerScanPointerSize;
+    max_depth: u64;
+    offset_radius: u64;
+    root_node_count: u64;
+    module_names: &'ext mut [PointerScanModuleName];
+    module_name_count: u64;
+    pointer_scan_levels: &'sh [PointerScanLevel];
+    pointer_scan_level_count: u64;
+    pointer_scan_level_candidates: &'ext mut [PointerScanLevelCandidates<'s, 'h>];
+    pointer_scan_level_candidate_count: u64;
+    total_node_count: u64;
+    total_static_node_count: u64;
+    total_heap_node_count: u64;
+    materialized_nodes: &'ext mut [PointerScanNode];
+    materialized_node_count: u64;
+    materialized_node_id_slab: &'ext mut [u64];
+    materialized_node_id_slab_count: u64;
+    page_key_cache: &'ext mut [MaterializedPageKeyEntry];
+    page_key_cache_count: u64;
+    next_materialized_node_id: u64;
+    materialized_nodes_overflowed: bool;
+}
+
+machine pointer_scan_results_min_u64(a: u64, b: u64) -> u64 {
+    transition (a <= b) {
+        true -> (a)
+        false -> (b)
+    }
+}
+
+machine pointer_scan_results_max_u64(a: u64, b: u64) -> u64 {
+    transition (a >= b) {
+        true -> (a)
+        false -> (b)
+    }
+}
+
+machine pointer_scan_results_bytes_equal(a: &[u8], b: &[u8]) -> bool {
+    transition (a.len == b.len) {
+        true -> scan(a, b, 0)
+        false -> (false)
+    }
+    state scan(a: &[u8], b: &[u8], position: u64) -> bool {
+        transition (position < a.len) {
+            true -> read_left(a, b, position)
+            false -> (true)
+        }
+    }
+    state read_left(a: &[u8], b: &[u8], position: u64 [0..a.len]) -> bool {
+        let left: u8 = a[position];
+        transition (position < b.len) {
+            true -> read_right(a, b, position, left)
+            false -> (false)
+        }
+    }
+    state read_right(a: &[u8], b: &[u8], position: u64 [0..b.len], left: u8) -> bool {
+        let right: u8 = b[position];
+        transition (left == right) {
+            true -> (scan(a, b, ((position as u64 in Wrapping) + 1) as u64))
+            false -> (false)
+        }
+    }
+}
+
+// Upstream target_addresses.sort_unstable: in-place insertion sort over the
+// first `count` addresses (stable; equal elements keep input order, which
+// dedup and the range scans do not observe).
+machine pointer_scan_results_sort_u64(target_addresses: &mut [u64], count: u64) {
+    transition {
+        _ -> sort(target_addresses, 1, count)
+    }
+    state sort(target_addresses: &mut [u64], index: u64, count: u64) {
+        transition (index < count) {
+            true -> gate_len(target_addresses, index, count)
+            false -> finished()
+        }
+    }
+    state gate_len(target_addresses: &mut [u64], index: u64, count: u64) {
+        transition (index < target_addresses.len) {
+            true -> insert(target_addresses, index, count)
+            false -> finished()
+        }
+    }
+    state insert(target_addresses: &mut [u64], index: u64 [0..target_addresses.len], count: u64) {
+        let previous_index: u64 = ((index as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (previous_index < target_addresses.len) {
+            true -> read_previous(target_addresses, index, previous_index, count)
+            false -> sort(target_addresses, ((index as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+    state read_previous(target_addresses: &mut [u64], index: u64, previous_index: u64 [0..target_addresses.len], count: u64) {
+        let previous_value: u64 = target_addresses[previous_index];
+        transition (index < target_addresses.len) {
+            true -> compare_values(target_addresses, index, previous_index, previous_value, count)
+            false -> sort(target_addresses, ((index as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+    state compare_values(target_addresses: &mut [u64], index: u64 [0..target_addresses.len], previous_index: u64, previous_value: u64, count: u64) {
+        let current_value: u64 = target_addresses[index];
+        transition (previous_value > current_value) {
+            true -> gate_shift(target_addresses, index, previous_index, previous_value, count)
+            false -> sort(target_addresses, ((index as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+    state gate_shift(target_addresses: &mut [u64], index: u64, previous_index: u64, previous_value: u64, count: u64) {
+        transition (index < target_addresses.len) {
+            true -> shift_down(target_addresses, index, previous_index, previous_value, count)
+            false -> sort(target_addresses, ((index as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+    state shift_down(target_addresses: &mut [u64], index: u64 [0..target_addresses.len], previous_index: u64, previous_value: u64, count: u64) {
+        target_addresses[index] = previous_value;
+        transition (previous_index < target_addresses.len) {
+            true -> insert(target_addresses, previous_index, count)
+            false -> sort(target_addresses, ((index as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+    state finished() {}
+}
+
+// Upstream target_addresses.dedup: compaction pass, returns the kept count.
+machine pointer_scan_results_dedup_u64(target_addresses: &mut [u64], count: u64) -> u64 {
+    transition (count <= 1) {
+        true -> (pointer_scan_results_min_u64(count, target_addresses.len))
+        false -> compact(target_addresses, 1, 1, count)
+    }
+    state compact(target_addresses: &mut [u64], read_index: u64, write_index: u64, count: u64) -> u64 {
+        transition (read_index < count) {
+            true -> gate_read_len(target_addresses, read_index, write_index, count)
+            false -> (pointer_scan_results_min_u64(write_index, target_addresses.len))
+        }
+    }
+    state gate_read_len(target_addresses: &mut [u64], read_index: u64, write_index: u64, count: u64) -> u64 {
+        transition (read_index < target_addresses.len) {
+            true -> read_value(target_addresses, read_index, write_index, count)
+            false -> (pointer_scan_results_min_u64(write_index, target_addresses.len))
+        }
+    }
+    state read_value(target_addresses: &mut [u64], read_index: u64 [0..target_addresses.len], write_index: u64, count: u64) -> u64 {
+        let read_value: u64 = target_addresses[read_index];
+        let write_previous_index: u64 = ((write_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (write_previous_index < target_addresses.len) {
+            true -> read_previous_value(target_addresses, read_index, read_value, write_previous_index, write_index, count)
+            false -> compact(target_addresses, ((read_index as u64 in Wrapping) + 1) as u64, write_index, count)
+        }
+    }
+    state read_previous_value(target_addresses: &mut [u64], read_index: u64, read_value: u64, write_previous_index: u64 [0..target_addresses.len], write_index: u64, count: u64) -> u64 {
+        let previous_value: u64 = target_addresses[write_previous_index];
+        transition (read_value != previous_value) {
+            true -> gate_write_len(target_addresses, read_index, read_value, write_index, count)
+            false -> compact(target_addresses, ((read_index as u64 in Wrapping) + 1) as u64, write_index, count)
+        }
+    }
+    state gate_write_len(target_addresses: &mut [u64], read_index: u64, read_value: u64, write_index: u64, count: u64) -> u64 {
+        transition (write_index < target_addresses.len) {
+            true -> store_kept(target_addresses, read_index, read_value, write_index, count)
+            false -> compact(target_addresses, ((read_index as u64 in Wrapping) + 1) as u64, ((write_index as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+    state store_kept(target_addresses: &mut [u64], read_index: u64, read_value: u64, write_index: u64 [0..target_addresses.len], count: u64) -> u64 {
+        target_addresses[write_index] = read_value;
+        transition {
+            _ -> compact(target_addresses, ((read_index as u64 in Wrapping) + 1) as u64, ((write_index as u64 in Wrapping) + 1) as u64, count)
+        }
+    }
+}
+
+// Upstream PointerScanResults::new. Extra extent/count params carry the
+// caller-lent storage described in the header; `target_address_count`
+// returns the post-dedup count, so callers pass the raw fill and the record
+// stores the deduplicated live range.
+pub machine PointerScanResults::new<'ext, 'sh, 's, 'h>(
+    session_id: u64,
+    target_descriptor: PointerScanTargetDescriptor,
+    target_addresses: &'ext mut [u64],
+    target_address_count: u64,
+    address_space: PointerScanAddressSpace,
+    pointer_size: PointerScanPointerSize,
+    max_depth: u64,
+    offset_radius: u64,
+    module_names: &'ext mut [PointerScanModuleName],
+    module_name_count: u64,
+    pointer_scan_levels: &'sh [PointerScanLevel],
+    pointer_scan_level_count: u64,
+    pointer_scan_level_candidates: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+    pointer_scan_level_candidate_count: u64,
+    total_static_node_count: u64,
+    total_heap_node_count: u64,
+    materialized_nodes: &'ext mut [PointerScanNode],
+    materialized_node_id_slab: &'ext mut [u64],
+    page_key_cache: &'ext mut [MaterializedPageKeyEntry]
+) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+    pointer_scan_results_sort_u64(target_addresses, target_address_count);
+    let deduped_target_address_count: u64 = pointer_scan_results_dedup_u64(target_addresses, target_address_count);
+    let is_value_descriptor: bool = target_descriptor.is_value_descriptor();
+    let computed_root_node_count: u64 = pointer_scan_results_root_node_count(
+        is_value_descriptor,
+        pointer_scan_level_candidates,
+        pointer_scan_level_candidate_count,
+        target_addresses,
+        deduped_target_address_count,
+        offset_radius);
+    let computed_total_node_count: u64 = pointer_scan_results_total_node_count(pointer_scan_levels, pointer_scan_level_count);
+    transition {
+        _ -> assemble(
+            session_id,
+            target_descriptor,
+            target_addresses,
+            deduped_target_address_count,
+            address_space,
+            pointer_size,
+            max_depth,
+            offset_radius,
+            module_names,
+            module_name_count,
+            pointer_scan_levels,
+            pointer_scan_level_count,
+            pointer_scan_level_candidates,
+            pointer_scan_level_candidate_count,
+            total_static_node_count,
+            total_heap_node_count,
+            materialized_nodes,
+            materialized_node_id_slab,
+            page_key_cache,
+            computed_root_node_count,
+            computed_total_node_count)
+    }
+    state assemble(
+        session_id: &[u8],
+        target_descriptor: PointerScanTargetDescriptor,
+        target_addresses: &'ext mut [u64],
+        deduped_target_address_count: u64,
+        address_space: PointerScanAddressSpace,
+        pointer_size: PointerScanPointerSize,
+        max_depth: u64,
+        offset_radius: u64,
+        module_names: &'ext mut [PointerScanModuleName],
+        module_name_count: u64,
+        pointer_scan_levels: &'sh [PointerScanLevel],
+        pointer_scan_level_count: u64,
+        pointer_scan_level_candidates: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+        pointer_scan_level_candidate_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        materialized_nodes: &'ext mut [PointerScanNode],
+        materialized_node_id_slab: &'ext mut [u64],
+        page_key_cache: &'ext mut [MaterializedPageKeyEntry],
+        computed_root_node_count: u64,
+        computed_total_node_count: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        transition {
+            _ -> (PointerScanResults {
+                session_id: session_id,
+                target_descriptor: target_descriptor,
+                target_addresses: target_addresses,
+                target_address_count: deduped_target_address_count,
+                address_space: address_space,
+                pointer_size: pointer_size,
+                max_depth: max_depth,
+                offset_radius: offset_radius,
+                root_node_count: computed_root_node_count,
+                module_names: module_names,
+                module_name_count: module_name_count,
+                pointer_scan_levels: pointer_scan_levels,
+                pointer_scan_level_count: pointer_scan_level_count,
+                pointer_scan_level_candidates: pointer_scan_level_candidates,
+                pointer_scan_level_candidate_count: pointer_scan_level_candidate_count,
+                total_node_count: computed_total_node_count,
+                total_static_node_count: total_static_node_count,
+                total_heap_node_count: total_heap_node_count,
+                materialized_nodes: materialized_nodes,
+                materialized_node_count: 0,
+                materialized_node_id_slab: materialized_node_id_slab,
+                materialized_node_id_slab_count: 0,
+                page_key_cache: page_key_cache,
+                page_key_cache_count: 0,
+                next_materialized_node_id: 1,
+                materialized_nodes_overflowed: false,
+            })
+        }
+    }
+}
+
+// Upstream `pointer_scan_levels.iter().map(get_node_count).sum()`.
+machine pointer_scan_results_total_node_count(
+    pointer_scan_levels: &[PointerScanLevel],
+    pointer_scan_level_count: u64
+) -> u64 {
+    transition {
+        _ -> sum(pointer_scan_levels, 0, 0, pointer_scan_level_count)
+    }
+    state sum(pointer_scan_levels: &[PointerScanLevel], index: u64, running_total: u64, pointer_scan_level_count: u64) -> u64 {
+        transition (index < pointer_scan_level_count && index < pointer_scan_levels.len) {
+            true -> at(pointer_scan_levels, index, running_total, pointer_scan_level_count)
+            false -> (running_total)
+        }
+    }
+    state at(pointer_scan_levels: &[PointerScanLevel], index: u64 [0..pointer_scan_levels.len], running_total: u64, pointer_scan_level_count: u64) -> u64 {
+        let level_node_count: u64 = pointer_scan_levels[index].node_count;
+        transition {
+            _ -> sum(pointer_scan_levels, ((index as u64 in Wrapping) + 1) as u64, ((running_total as u64 in Saturating) + (level_node_count as u64 in Saturating)) as u64, pointer_scan_level_count)
+        }
+    }
+}
+
+// Upstream calculate_root_node_count: Address path sums each level's
+// static_node_count; the Value path expands each static candidate to its
+// matching target-address count (dead while the Value variant is absent).
+machine pointer_scan_results_root_node_count<'s, 'h>(
+    is_value: bool,
+    pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>],
+    pointer_scan_level_candidate_count: u64,
+    target_addresses: &mut [u64],
+    target_address_count: u64,
+    offset_radius: u64
+) -> u64 {
+    transition (is_value) {
+        true -> value_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, 0, 0, 0)
+        false -> static_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, 0, 0)
+    }
+    state static_sum(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, level_index: u64, running_total: u64) -> u64 {
+        transition (level_index < pointer_scan_level_candidate_count) {
+            true -> static_len_gate(pointer_scan_level_candidates, pointer_scan_level_candidate_count, level_index, running_total)
+            false -> (running_total)
+        }
+    }
+    state static_len_gate(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, level_index: u64, running_total: u64) -> u64 {
+        transition (level_index < pointer_scan_level_candidates.len) {
+            true -> level_at(pointer_scan_level_candidates, pointer_scan_level_candidate_count, level_index, running_total)
+            false -> (running_total)
+        }
+    }
+    state level_at(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, level_index: u64 [0..pointer_scan_level_candidates.len], running_total: u64) -> u64 {
+        let level_static_count: u64 = pointer_scan_level_candidates[level_index].static_count;
+        transition {
+            _ -> static_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, ((level_index as u64 in Wrapping) + 1) as u64, ((running_total as u64 in Saturating) + (level_static_count as u64 in Saturating)) as u64)
+        }
+    }
+    state value_sum(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, target_addresses: &mut [u64], target_address_count: u64, offset_radius: u64, level_index: u64, static_index: u64, running_total: u64) -> u64 {
+        transition (level_index < pointer_scan_level_candidate_count) {
+            true -> value_len_gate(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, static_index, running_total)
+            false -> (running_total)
+        }
+    }
+    state value_len_gate(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, target_addresses: &mut [u64], target_address_count: u64, offset_radius: u64, level_index: u64, static_index: u64, running_total: u64) -> u64 {
+        transition (level_index < pointer_scan_level_candidates.len) {
+            true -> value_level(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, static_index, running_total)
+            false -> (running_total)
+        }
+    }
+    state value_level(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, target_addresses: &mut [u64], target_address_count: u64, offset_radius: u64, level_index: u64 [0..pointer_scan_level_candidates.len], static_index: u64, running_total: u64) -> u64 {
+        let static_count: u64 = pointer_scan_level_candidates[level_index].static_count;
+        transition (static_index < static_count) {
+            true -> value_level_gate(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, static_index, running_total)
+            false -> value_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, ((level_index as u64 in Wrapping) + 1) as u64, 0, running_total)
+        }
+    }
+    state value_level_gate(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, target_addresses: &mut [u64], target_address_count: u64, offset_radius: u64, level_index: u64, static_index: u64, running_total: u64) -> u64 {
+        transition (level_index < pointer_scan_level_candidates.len) {
+            true -> static_slice_gate(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, static_index, running_total)
+            false -> value_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, ((level_index as u64 in Wrapping) + 1) as u64, 0, running_total)
+        }
+    }
+    state static_slice_gate(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, target_addresses: &mut [u64], target_address_count: u64, offset_radius: u64, level_index: u64 [0..pointer_scan_level_candidates.len], static_index: u64, running_total: u64) -> u64 {
+        let static_candidates: &[PointerScanCandidate] = pointer_scan_level_candidates[level_index].get_static_candidates();
+        transition (static_index < static_candidates.len) {
+            true -> candidate_at(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, static_candidates, static_index, running_total)
+            false -> value_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, ((level_index as u64 in Wrapping) + 1) as u64, 0, running_total)
+        }
+    }
+    state candidate_at(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, target_addresses: &mut [u64], target_address_count: u64, offset_radius: u64, level_index: u64, static_candidates: &[PointerScanCandidate], static_index: u64 [0..static_candidates.len], running_total: u64) -> u64 {
+        let static_candidate: PointerScanCandidate = static_candidates[static_index];
+        transition (static_candidate.discovery_depth > 1) {
+            true -> value_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, ((static_index as u64 in Wrapping) + 1) as u64, ((running_total as u64 in Saturating) + 1) as u64)
+            false -> target_counted(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, static_index, running_total, static_candidate.pointer_value)
+        }
+    }
+    state target_counted(pointer_scan_level_candidates: &[PointerScanLevelCandidates<'s, 'h>], pointer_scan_level_candidate_count: u64, target_addresses: &mut [u64], target_address_count: u64, offset_radius: u64, level_index: u64, static_index: u64, running_total: u64, pointer_value: u64) -> u64 {
+        let lower_bound: u64 = ((pointer_value as u64 in Saturating) - (offset_radius as u64 in Saturating)) as u64;
+        let upper_bound: u64 = ((pointer_value as u64 in Saturating) + (offset_radius as u64 in Saturating)) as u64;
+        let target_range: TargetAddressRange = pointer_scan_results_find_target_addresses_in_range(target_addresses, target_address_count, lower_bound, upper_bound);
+        transition {
+            _ -> value_sum(pointer_scan_level_candidates, pointer_scan_level_candidate_count, target_addresses, target_address_count, offset_radius, level_index, ((static_index as u64 in Wrapping) + 1) as u64, ((running_total as u64 in Saturating) + (target_range.candidate_count as u64 in Saturating)) as u64)
+        }
+    }
+}
+
+// Upstream partition_point(|a| *a < lower_bound) then |a| *a <= upper_bound.
+machine pointer_scan_results_find_target_addresses_in_range(
+    target_addresses: &[u64],
+    target_address_count: u64,
+    lower_bound: u64,
+    upper_bound: u64
+) -> TargetAddressRange {
+    transition {
+        _ -> lower(target_addresses, 0, target_address_count, lower_bound, upper_bound)
+    }
+    state lower(target_addresses: &[u64], low: u64, high: u64, lower_bound: u64, upper_bound: u64) -> TargetAddressRange {
+        transition (low < high) {
+            true -> lower_probe(target_addresses, low, high, lower_bound, upper_bound)
+            false -> upper(target_addresses, low, low, high, upper_bound)
+        }
+    }
+    state lower_probe(target_addresses: &[u64], low: u64, high: u64, lower_bound: u64, upper_bound: u64) -> TargetAddressRange {
+        let mid: u64 = (((low as u64 in Wrapping) + (high as u64 in Wrapping)) as u64) / 2;
+        transition (mid < target_addresses.len) {
+            true -> lower_at(target_addresses, low, high, mid, lower_bound, upper_bound)
+            false -> upper(target_addresses, low, low, high, upper_bound)
+        }
+    }
+    state lower_at(target_addresses: &[u64], low: u64, high: u64, mid: u64 [0..target_addresses.len], lower_bound: u64, upper_bound: u64) -> TargetAddressRange {
+        transition (target_addresses[mid] < lower_bound) {
+            true -> lower(target_addresses, ((mid as u64 in Wrapping) + 1) as u64, high, lower_bound, upper_bound)
+            false -> lower(target_addresses, low, mid, lower_bound, upper_bound)
+        }
+    }
+    state upper(target_addresses: &[u64], start: u64, low: u64, high: u64, upper_bound: u64) -> TargetAddressRange {
+        transition (low < high) {
+            true -> upper_probe(target_addresses, start, low, high, upper_bound)
+            false -> (TargetAddressRange { start_index: start, candidate_count: ((low as u64 in Wrapping) - (start as u64 in Wrapping)) as u64 })
+        }
+    }
+    state upper_probe(target_addresses: &[u64], start: u64, low: u64, high: u64, upper_bound: u64) -> TargetAddressRange {
+        let mid: u64 = (((low as u64 in Wrapping) + (high as u64 in Wrapping)) as u64) / 2;
+        transition (mid < target_addresses.len) {
+            true -> upper_at(target_addresses, start, low, high, mid, upper_bound)
+            false -> (TargetAddressRange { start_index: start, candidate_count: ((low as u64 in Wrapping) - (start as u64 in Wrapping)) as u64 })
+        }
+    }
+    state upper_at(target_addresses: &[u64], start: u64, low: u64, high: u64, mid: u64 [0..target_addresses.len], upper_bound: u64) -> TargetAddressRange {
+        transition (target_addresses[mid] <= upper_bound) {
+            true -> upper(target_addresses, start, ((mid as u64 in Wrapping) + 1) as u64, high, upper_bound)
+            false -> upper(target_addresses, start, low, mid, upper_bound)
+        }
+    }
+}
+
+// Upstream calculate_last_page_index.
+machine pointer_scan_results_last_page_index(total_node_count: u64, page_size: u64) -> u64 {
+    transition (total_node_count == 0 || page_size == 0) {
+        true -> (0)
+        false -> ((((total_node_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64) / page_size)
+    }
+}
+
+// Upstream calculate_pointer_offset (i128 midpoint -> Option<i64>): the
+// checked-subtract pair keeps the sign without a wider type.
+machine pointer_scan_results_pointer_offset(target_address: u64, pointer_value: u64) -> PointerOffsetLookup {
+    transition (target_address >= pointer_value) {
+        true -> positive(target_address, pointer_value)
+        false -> negative(target_address, pointer_value)
+    }
+    state positive(target_address: u64, pointer_value: u64) -> PointerOffsetLookup {
+        let difference: u64 = ((target_address as u64 in Wrapping) - (pointer_value as u64 in Wrapping)) as u64;
+        transition (difference <= 9223372036854775807) {
+            true -> (PointerOffsetLookup::Fits { offset: (difference as i64 in Wrapping) as i64 })
+            false -> (PointerOffsetLookup::Overflow)
+        }
+    }
+    state negative(target_address: u64, pointer_value: u64) -> PointerOffsetLookup {
+        let difference: u64 = ((pointer_value as u64 in Wrapping) - (target_address as u64 in Wrapping)) as u64;
+        transition (difference <= 9223372036854775808) {
+            true -> negate(difference)
+            false -> (PointerOffsetLookup::Overflow)
+        }
+    }
+    state negate(difference: u64) -> PointerOffsetLookup {
+        let signed_difference: i64 = (difference as i64 in Wrapping) as i64;
+        (PointerOffsetLookup::Fits { offset: ((0 as i64 in Wrapping) - (signed_difference as i64 in Wrapping)) as i64 })
+    }
+}
+
+// ==== Accessors ====
+pub machine PointerScanResults::get_session_id(&self) -> u64 { self.session_id }
+pub machine PointerScanResults::get_target_descriptor(&self) -> PointerScanTargetDescriptor { self.target_descriptor }
+pub machine PointerScanResults::get_target_address_count(&self) -> u64 { self.target_address_count }
+pub machine PointerScanResults::get_address_space(&self) -> PointerScanAddressSpace { self.address_space }
+pub machine PointerScanResults::get_pointer_size(&self) -> PointerScanPointerSize { self.pointer_size }
+pub machine PointerScanResults::get_max_depth(&self) -> u64 { self.max_depth }
+pub machine PointerScanResults::get_offset_radius(&self) -> u64 { self.offset_radius }
+pub machine PointerScanResults::get_root_node_count(&self) -> u64 { self.root_node_count }
+pub machine PointerScanResults::get_total_node_count(&self) -> u64 { self.total_node_count }
+pub machine PointerScanResults::get_total_static_node_count(&self) -> u64 { self.total_static_node_count }
+pub machine PointerScanResults::get_total_heap_node_count(&self) -> u64 { self.total_heap_node_count }
+pub machine PointerScanResults::get_pointer_scan_level_count(&self) -> u64 { self.pointer_scan_level_count }
+pub machine PointerScanResults::get_pointer_scan_level_candidate_count(&self) -> u64 { self.pointer_scan_level_candidate_count }
+pub machine PointerScanResults::get_module_name_count(&self) -> u64 { self.module_name_count }
+pub machine PointerScanResults::get_materialized_nodes_overflowed(&self) -> bool { self.materialized_nodes_overflowed }
+
+pub machine PointerScanResults::has_pointer_scan_level(&self, level_index: u64) -> bool {
+    transition (level_index < self.pointer_scan_level_count && level_index < self.pointer_scan_levels.len) {
+        true -> (true)
+        false -> (false)
+    }
+}
+
+// Upstream get_pointer_scan_levels()[index]; [copy] level returned by value.
+pub machine PointerScanResults::get_pointer_scan_level_copy(&self, level_index: u64) -> PointerScanLevel {
+    transition (level_index < self.pointer_scan_levels.len) {
+        true -> at(&self.pointer_scan_levels, level_index)
+        false -> (PointerScanLevel::new(0, 0, 0, 0))
+    }
+    state at(&self, levels: &[PointerScanLevel], level_index: u64 [0..levels.len]) -> PointerScanLevel {
+        transition {
+            _ -> (levels[level_index])
+        }
+    }
+}
+
+pub machine PointerScanResults::has_module_name(&self, module_index: u64) -> bool {
+    transition (module_index < self.module_name_count && module_index < self.module_names.len) {
+        true -> (true)
+        false -> (false)
+    }
+}
+
+// Upstream get_module_name -> Option<&str>: port copies the name bytes into
+// the caller's `out_name` extent and returns the copied length (0 when the
+// index is absent); the copy truncates at `out_name.len` (bounded extent).
+pub machine PointerScanResults::get_module_name_copy(&self, module_index: u64, out_name: &mut [u8]) -> u64 {
+    transition (module_index < self.module_name_count) {
+        true -> gate(module_index, out_name)
+        false -> (0)
+    }
+    state gate(&self, module_index: u64, out_name: &mut [u8]) -> u64 {
+        transition (module_index < self.module_names.len) {
+            true -> at(&self.module_names, module_index, out_name)
+            false -> (0)
+        }
+    }
+    state at(&self, module_names: &[PointerScanModuleName], module_index: u64 [0..module_names.len], out_name: &mut [u8]) -> u64 {
+        let name_len: u64 = module_names[module_index].get_module_name_len();
+        let copy_len: u64 = pointer_scan_results_min_u64(name_len, out_name.len);
+        transition {
+            _ -> copy_bytes(module_names, module_index, out_name, 0, copy_len)
+        }
+    }
+    state copy_bytes(&self, module_names: &[PointerScanModuleName], module_index: u64, out_name: &mut [u8], position: u64, copy_len: u64) -> u64 {
+        transition (position < copy_len) {
+            true -> gate_module(module_names, module_index, out_name, position, copy_len)
+            false -> (copy_len)
+        }
+    }
+    state gate_module(&self, module_names: &[PointerScanModuleName], module_index: u64, out_name: &mut [u8], position: u64, copy_len: u64) -> u64 {
+        transition (module_index < module_names.len) {
+            true -> read_byte(module_names, module_index, out_name, position, copy_len)
+            false -> (copy_len)
+        }
+    }
+    state read_byte(&self, module_names: &[PointerScanModuleName], module_index: u64 [0..module_names.len], out_name: &mut [u8], position: u64, copy_len: u64) -> u64 {
+        let name_byte: u8 = module_names[module_index].get_module_name_byte(position);
+        transition (position < out_name.len) {
+            true -> write_byte(module_names, module_index, out_name, position, name_byte, copy_len)
+            false -> (copy_len)
+        }
+    }
+    state write_byte(&self, module_names: &[PointerScanModuleName], module_index: u64, out_name: &mut [u8], position: u64 [0..out_name.len], name_byte: u8, copy_len: u64) -> u64 {
+        out_name[position] = name_byte;
+        transition {
+            _ -> copy_bytes(module_names, module_index, out_name, ((position as u64 in Wrapping) + 1) as u64, copy_len)
+        }
+    }
+}
+
+// Upstream get_module_index_by_name -> Option<usize>.
+pub machine PointerScanResults::get_module_index_by_name(&self, module_name: &[u8]) -> ModuleIndexLookup {
+    transition {
+        _ -> scan(0, module_name)
+    }
+    state scan(&self, index: u64, module_name: &[u8]) -> ModuleIndexLookup {
+        transition (index < self.module_name_count) {
+            true -> gate(index, module_name)
+            false -> (ModuleIndexLookup::Absent)
+        }
+    }
+    state gate(&self, index: u64, module_name: &[u8]) -> ModuleIndexLookup {
+        transition (index < self.module_names.len) {
+            true -> at(&self.module_names, index, module_name)
+            false -> (ModuleIndexLookup::Absent)
+        }
+    }
+    state at(&self, module_names: &[PointerScanModuleName], index: u64 [0..module_names.len], module_name: &[u8]) -> ModuleIndexLookup {
+        let candidate_name: &[u8] = module_names[index].get_module_name();
+        let names_equal: bool = pointer_scan_results_bytes_equal(candidate_name, module_name);
+        transition (names_equal) {
+            true -> (ModuleIndexLookup::Found { index: index })
+            false -> scan(((index as u64 in Wrapping) + 1) as u64, module_name)
+        }
+    }
+}
+
+// Upstream summarize: maps each level to a PointerScanLevelSummary into a
+// fresh Vec. Port fills the caller's `out_summaries` extent (bounded by its
+// length) and returns the written count.
+pub machine PointerScanResults::fill_level_summaries(&self, out_summaries: &mut [PointerScanLevelSummary]) -> u64 {
+    transition {
+        _ -> walk(0, out_summaries)
+    }
+    state walk(&self, level_index: u64, out_summaries: &mut [PointerScanLevelSummary]) -> u64 {
+        transition (level_index < self.pointer_scan_level_count) {
+            true -> gate_level(level_index, out_summaries)
+            false -> (level_index)
+        }
+    }
+    state gate_level(&self, level_index: u64, out_summaries: &mut [PointerScanLevelSummary]) -> u64 {
+        transition (level_index < self.pointer_scan_levels.len) {
+            true -> read_level(&self.pointer_scan_levels, level_index, out_summaries)
+            false -> (level_index)
+        }
+    }
+    state read_level(&self, levels: &[PointerScanLevel], level_index: u64 [0..levels.len], out_summaries: &mut [PointerScanLevelSummary]) -> u64 {
+        let pointer_scan_level: PointerScanLevel = levels[level_index];
+        transition (level_index < out_summaries.len) {
+            true -> store_summary(level_index, out_summaries, pointer_scan_level)
+            false -> (level_index)
+        }
+    }
+    state store_summary(&self, level_index: u64 [0..out_summaries.len], out_summaries: &mut [PointerScanLevelSummary], pointer_scan_level: PointerScanLevel) -> u64 {
+        let depth: u64 = pointer_scan_level.get_depth();
+        let node_count: u64 = pointer_scan_level.get_node_count();
+        let static_node_count: u64 = pointer_scan_level.get_static_node_count();
+        let heap_node_count: u64 = pointer_scan_level.get_heap_node_count();
+        let level_summary: PointerScanLevelSummary = PointerScanLevelSummary::new(
+            depth,
+            node_count,
+            static_node_count,
+            heap_node_count);
+        out_summaries[level_index] = level_summary;
+        transition {
+            _ -> walk(((level_index as u64 in Wrapping) + 1) as u64, out_summaries)
+        }
+    }
+}
+
+// Upstream summarize's return record; the level summaries extent is lent by
+// the caller (fill it with fill_level_summaries first).
+pub machine PointerScanResults::summarize<'o>(&self, pointer_scan_level_summaries: &'o [PointerScanLevelSummary]) -> PointerScanSummary<'o> {
+    transition {
+        _ -> (PointerScanSummary::new(
+            self.session_id,
+            self.target_descriptor,
+            self.address_space,
+            self.pointer_size,
+            self.max_depth,
+            self.offset_radius,
+            self.root_node_count,
+            self.total_node_count,
+            self.total_static_node_count,
+            self.total_heap_node_count,
+            pointer_scan_level_summaries))
+    }
+}
+
+// Upstream find_target_addresses_for_pointer_value.
+pub machine PointerScanResults::find_target_addresses_for_pointer_value(&self, pointer_value: u64) -> TargetAddressRange {
+    let lower_bound: u64 = ((pointer_value as u64 in Saturating) - (self.offset_radius as u64 in Saturating)) as u64;
+    let upper_bound: u64 = ((pointer_value as u64 in Saturating) + (self.offset_radius as u64 in Saturating)) as u64;
+    transition {
+        _ -> (pointer_scan_results_find_target_addresses_in_range(&self.target_addresses, self.target_address_count, lower_bound, upper_bound))
+    }
+}
+
+// Upstream count_matching_target_addresses.
+pub machine PointerScanResults::count_matching_target_addresses(&self, pointer_value: u64) -> u64 {
+    let matching_range: TargetAddressRange = self.find_target_addresses_for_pointer_value(pointer_value);
+    transition {
+        _ -> (matching_range.candidate_count)
+    }
+}
+
+// Upstream uses_multi_target_terminal_materialization (Value-descriptor
+// match). Inert while the Value variant is absent (DataTypeRef dependency).
+pub machine PointerScanResults::uses_multi_target_terminal_materialization(&self) -> bool {
+    let value_descriptor: bool = self.target_descriptor.is_value_descriptor();
+    transition {
+        _ -> (value_descriptor)
+    }
+}
+
+pub machine PointerScanResults::uses_single_display_root_materialization(&self) -> bool {
+    let value_descriptor: bool = self.target_descriptor.is_value_descriptor();
+    transition (value_descriptor) {
+        true -> (false)
+        false -> (true)
+    }
+}
+
+// Upstream count_root_display_nodes.
+pub machine PointerScanResults::count_root_display_nodes(&self, discovery_depth: u64, pointer_value: u64) -> u64 {
+    let multi_target: bool = self.uses_multi_target_terminal_materialization();
+    transition (multi_target && discovery_depth <= 1) {
+        true -> (self.count_matching_target_addresses(pointer_value))
+        false -> (1)
+    }
+}
+
+// Upstream find_materialized_node (HashMap get): dense-arena probe.
+pub machine PointerScanResults::find_materialized_node(&self, node_id: u64) -> MaterializedNodeLookup {
+    transition (node_id >= 1) {
+        true -> gate(node_id)
+        false -> (MaterializedNodeLookup::Absent)
+    }
+    state gate(&self, node_id: u64) -> MaterializedNodeLookup {
+        let arena_index: u64 = ((node_id as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (arena_index < self.materialized_node_count) {
+            true -> gate_len(arena_index)
+            false -> (MaterializedNodeLookup::Absent)
+        }
+    }
+    state gate_len(&self, arena_index: u64) -> MaterializedNodeLookup {
+        transition (arena_index < self.materialized_nodes.len) {
+            true -> (MaterializedNodeLookup::Found { index: arena_index })
+            false -> (MaterializedNodeLookup::Absent)
+        }
+    }
+}
+
+// Upstream materialized_node_ids_by_page_key HashMap get -> bounded row scan.
+pub machine PointerScanResults::page_cache_find(&self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64) -> MaterializedPageKeyLookup {
+    transition {
+        _ -> scan(0, has_parent_node_id, parent_node_id, page_index, page_size)
+    }
+    state scan(&self, index: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64) -> MaterializedPageKeyLookup {
+        transition (index < self.page_key_cache_count) {
+            true -> gate(index, has_parent_node_id, parent_node_id, page_index, page_size)
+            false -> (MaterializedPageKeyLookup::Absent)
+        }
+    }
+    state gate(&self, index: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64) -> MaterializedPageKeyLookup {
+        transition (index < self.page_key_cache.len) {
+            true -> at(&self.page_key_cache, index, has_parent_node_id, parent_node_id, page_index, page_size)
+            false -> (MaterializedPageKeyLookup::Absent)
+        }
+    }
+    state at(&self, page_key_cache: &[MaterializedPageKeyEntry], index: u64 [0..page_key_cache.len], has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64) -> MaterializedPageKeyLookup {
+        let entry: MaterializedPageKeyEntry = page_key_cache[index];
+        let keys_match: bool = entry.has_parent_node_id == has_parent_node_id && entry.parent_node_id == parent_node_id && entry.page_index == page_index && entry.page_size == page_size;
+        transition (keys_match) {
+            true -> (MaterializedPageKeyLookup::Found { index: index })
+            false -> scan(((index as u64 in Wrapping) + 1) as u64, has_parent_node_id, parent_node_id, page_index, page_size)
+        }
+    }
+}
+
+// Upstream materialized_node_ids_by_page_key insert: appends the id list to
+// the slab and a row to the table; a full row table or slab skips caching
+// (the page still materializes; the next request re-materializes).
+pub machine PointerScanResults::page_cache_insert(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_ids: &[u64], node_id_count: u64) -> bool {
+    transition (self.page_key_cache_count < self.page_key_cache.len) {
+        true -> gate_slab(has_parent_node_id, parent_node_id, page_index, page_size, node_ids, node_id_count)
+        false -> (false)
+    }
+    state gate_slab(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_ids: &[u64], node_id_count: u64) -> bool {
+        let slab_remaining: u64 = ((self.materialized_node_id_slab.len as u64 in Saturating) - (self.materialized_node_id_slab_count as u64 in Saturating)) as u64;
+        transition (node_id_count <= slab_remaining) {
+            true -> copy_ids(0, has_parent_node_id, parent_node_id, page_index, page_size, node_ids, node_id_count)
+            false -> (false)
+        }
+    }
+    state copy_ids(&mut self, position: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_ids: &[u64], node_id_count: u64) -> bool {
+        transition (position < node_id_count) {
+            true -> gate_id(position, has_parent_node_id, parent_node_id, page_index, page_size, node_ids, node_id_count)
+            false -> write_row(has_parent_node_id, parent_node_id, page_index, page_size, node_id_count)
+        }
+    }
+    state gate_id(&mut self, position: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_ids: &[u64], node_id_count: u64) -> bool {
+        transition (position < node_ids.len) {
+            true -> read_id(position, has_parent_node_id, parent_node_id, page_index, page_size, node_ids, node_id_count)
+            false -> write_row(has_parent_node_id, parent_node_id, page_index, page_size, node_id_count)
+        }
+    }
+    state read_id(&mut self, position: u64 [0..node_ids.len], has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_ids: &[u64], node_id_count: u64) -> bool {
+        let node_id: u64 = node_ids[position];
+        let slab_position: u64 = ((self.materialized_node_id_slab_count as u64 in Saturating) + (position as u64 in Saturating)) as u64;
+        transition (slab_position < self.materialized_node_id_slab.len) {
+            true -> write_id(position, &mut self.materialized_node_id_slab, slab_position, node_id, has_parent_node_id, parent_node_id, page_index, page_size, node_ids, node_id_count)
+            false -> (false)
+        }
+    }
+    state write_id(&mut self, position: u64, id_slab: &mut [u64], slab_position: u64 [0..id_slab.len], node_id: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_ids: &[u64], node_id_count: u64) -> bool {
+        id_slab[slab_position] = node_id;
+        transition {
+            _ -> copy_ids(((position as u64 in Wrapping) + 1) as u64, has_parent_node_id, parent_node_id, page_index, page_size, node_ids, node_id_count)
+        }
+    }
+    state write_row(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_id_count: u64) -> bool {
+        transition (self.page_key_cache_count < self.page_key_cache.len) {
+            true -> store_row(&mut self.page_key_cache, self.page_key_cache_count, has_parent_node_id, parent_node_id, page_index, page_size, node_id_count)
+            false -> (false)
+        }
+    }
+    state store_row(&mut self, page_key_cache: &mut [MaterializedPageKeyEntry], row_index: u64 [0..page_key_cache.len], has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_id_count: u64) -> bool {
+        let new_row: MaterializedPageKeyEntry = MaterializedPageKeyEntry {
+            has_parent_node_id: has_parent_node_id,
+            parent_node_id: parent_node_id,
+            page_index: page_index,
+            page_size: page_size,
+            ids_start: self.materialized_node_id_slab_count,
+            ids_len: node_id_count
+        };
+        page_key_cache[row_index] = new_row;
+        self.page_key_cache_count = ((row_index as u64 in Wrapping) + 1) as u64;
+        self.materialized_node_id_slab_count = ((self.materialized_node_id_slab_count as u64 in Saturating) + (node_id_count as u64 in Saturating)) as u64;
+        transition {
+            _ -> (true)
+        }
+    }
+}
+
+// Upstream create_materialized_pointer_scan_node: mints the next dense id,
+// stores the node in the arena when capacity remains (overflow flag +
+// unstored id otherwise), and returns the minted id.
+// Upstream takes a resolved `&str` module name; views cannot cross an
+// `&mut self` boundary in Omega, so callers pass a name source instead:
+// kind 0 = empty name, 1 = `module_names[module_name_index]` (pre-checked by
+// the caller via has_module_name), 2 = the materialized parent node's name
+// at arena index `module_name_index`.
+pub machine PointerScanResults::create_materialized_pointer_scan_node(
+    &mut self,
+    candidate_id: u64,
+    discovery_depth: u64,
+    branch_total_depth: u64,
+    pointer_scan_node_type: PointerScanNodeType,
+    pointer_address: u64,
+    pointer_value: u64,
+    module_name_kind: u64,
+    module_name_index: u64,
+    module_offset: u64,
+    resolved_target_address: u64,
+    pointer_offset: i64,
+    has_children: bool,
+    display_depth: u64,
+    has_parent_node_id: bool,
+    parent_node_id: u64
+) -> u64 {
+    transition (module_name_kind == 1) {
+        true -> gate_module_index(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_index, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+        false -> non_module(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+    }
+    state gate_module_index(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_index: u64, module_offset: u64, resolved_target_address: u64, pointer_offset: i64, has_children: bool, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64) -> u64 {
+        transition (module_name_index < self.module_names.len) {
+            true -> name_at(&self.module_names, module_name_index, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+            false -> with_name("", candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+        }
+    }
+    state name_at(&mut self, module_names: &[PointerScanModuleName], module_name_index: u64 [0..module_names.len], candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_offset: u64, resolved_target_address: u64, pointer_offset: i64, has_children: bool, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64) -> u64 {
+        let module_name: &[u8] = module_names[module_name_index].get_module_name();
+        transition {
+            _ -> with_name(module_name, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+        }
+    }
+    state non_module(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, resolved_target_address: u64, pointer_offset: i64, has_children: bool, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64) -> u64 {
+        transition (module_name_kind == 2) {
+            true -> gate_parent_count(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_index, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+            false -> with_name("", candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+        }
+    }
+    state gate_parent_count(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_index: u64, module_offset: u64, resolved_target_address: u64, pointer_offset: i64, has_children: bool, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64) -> u64 {
+        transition (module_name_index < self.materialized_node_count) {
+            true -> gate_parent_len(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_index, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+            false -> with_name("", candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+        }
+    }
+    state gate_parent_len(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_index: u64, module_offset: u64, resolved_target_address: u64, pointer_offset: i64, has_children: bool, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64) -> u64 {
+        transition (module_name_index < self.materialized_nodes.len) {
+            true -> parent_at(&self.materialized_nodes, module_name_index, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+            false -> with_name("", candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+        }
+    }
+    state parent_at(&mut self, nodes: &[PointerScanNode], module_name_index: u64 [0..nodes.len], candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_offset: u64, resolved_target_address: u64, pointer_offset: i64, has_children: bool, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64) -> u64 {
+        let module_name: &[u8] = nodes[module_name_index].get_module_name();
+        transition {
+            _ -> with_name(module_name, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_offset, resolved_target_address, pointer_offset, has_children, display_depth, has_parent_node_id, parent_node_id)
+        }
+    }
+    state with_name(&mut self, module_name: &[u8], candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_offset: u64, resolved_target_address: u64, pointer_offset: i64, has_children: bool, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64) -> u64 {
+        let materialized_node_id: u64 = self.next_materialized_node_id;
+        self.next_materialized_node_id = ((materialized_node_id as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let new_node: PointerScanNode = PointerScanNode::new_materialized(
+            materialized_node_id,
+            candidate_id,
+            discovery_depth,
+            branch_total_depth,
+            display_depth,
+            has_parent_node_id,
+            parent_node_id,
+            pointer_scan_node_type,
+            pointer_address,
+            pointer_value,
+            resolved_target_address,
+            pointer_offset,
+            module_name,
+            module_offset,
+            has_children);
+        transition (self.materialized_node_count < self.materialized_nodes.len) {
+            true -> store_node(&mut self.materialized_nodes, self.materialized_node_count, new_node, materialized_node_id)
+            false -> record_overflow(materialized_node_id)
+        }
+    }
+    state store_node(&mut self, nodes: &mut [PointerScanNode], arena_index: u64 [0..nodes.len], new_node: PointerScanNode, materialized_node_id: u64) -> u64 {
+        nodes[arena_index] = new_node;
+        self.materialized_node_count = ((arena_index as u64 in Wrapping) + 1) as u64;
+        transition {
+            _ -> (materialized_node_id)
+        }
+    }
+    state record_overflow(&mut self, materialized_node_id: u64) -> u64 {
+        self.materialized_nodes_overflowed = true;
+        transition {
+            _ -> (materialized_node_id)
+        }
+    }
+}
+
+// ===== live extent views (upstream get_* slice getters) =====
+
+pub machine PointerScanResults::get_target_addresses(&self) -> &[u64] {
+    transition (self.target_address_count <= self.target_addresses.len) {
+        true -> (self.target_addresses[0..self.target_address_count])
+        false -> (self.target_addresses[0..self.target_addresses.len])
+    }
+}
+
+pub machine PointerScanResults::get_pointer_scan_levels(&self) -> &[PointerScanLevel] {
+    transition (self.pointer_scan_level_count <= self.pointer_scan_levels.len) {
+        true -> (self.pointer_scan_levels[0..self.pointer_scan_level_count])
+        false -> (self.pointer_scan_levels[0..self.pointer_scan_levels.len])
+    }
+}
+
+// Upstream returns &Vec<PointerScanLevelCandidates>; a mut-element slice
+// cannot re-slice into a shared `&[PLC]` view, so the whole extent is lent.
+pub machine PointerScanResults::get_pointer_scan_level_candidates<'s2, 'h2>(&self) -> &[PointerScanLevelCandidates<'s2, 'h2>] {
+    (self.pointer_scan_level_candidates)
+}
+
+// ===== materialized-node element copy =====
+
+pub machine PointerScanResults::copy_materialized_node(&self, arena_index: u64) -> PointerScanNode {
+    transition (arena_index < self.materialized_node_count) {
+        true -> gate(arena_index)
+        false -> absent()
+    }
+    state gate(&self, arena_index: u64) -> PointerScanNode {
+        transition (arena_index < self.materialized_nodes.len) {
+            true -> at(&self.materialized_nodes, arena_index)
+            false -> absent()
+        }
+    }
+    state at(&self, nodes: &[PointerScanNode], arena_index: u64 [0..nodes.len]) -> PointerScanNode {
+        transition {
+            _ -> (nodes[arena_index])
+        }
+    }
+    state absent(&self) -> PointerScanNode {
+        transition {
+            _ -> (PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Static, 0, 0, 0, 0, "", 0, false))
+        }
+    }
+}
+
+// ===== upstream count_display_nodes_for_pointer_value =====
+
+pub machine PointerScanResults::count_display_nodes_for_pointer_value(&mut self, discovery_depth: u64, pointer_value: u64) -> u64 {
+    transition (discovery_depth <= 1) {
+        true -> terminal(pointer_value)
+        false -> level_gate(discovery_depth, pointer_value)
+    }
+    state terminal(&mut self, pointer_value: u64) -> u64 {
+        let multi: bool = self.uses_multi_target_terminal_materialization();
+        let matched: u64 = self.count_matching_target_addresses(pointer_value);
+        transition multi {
+            true -> (matched)
+            false -> (1)
+        }
+    }
+    state level_gate(&mut self, discovery_depth: u64, pointer_value: u64) -> u64 {
+        let level_index: u64 = ((discovery_depth as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (level_index < self.pointer_scan_level_candidate_count) {
+            true -> len_gate(level_index, pointer_value)
+            false -> (0)
+        }
+    }
+    state len_gate(&mut self, level_index: u64, pointer_value: u64) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> in_range(&mut self.pointer_scan_level_candidates, level_index, pointer_value)
+            false -> (0)
+        }
+    }
+    state in_range(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], pointer_value: u64) -> u64 {
+        let lower_bound: u64 = ((pointer_value as u64 in Saturating) - (self.offset_radius as u64 in Saturating)) as u64;
+        let upper_bound: u64 = ((pointer_value as u64 in Saturating) + (self.offset_radius as u64 in Saturating)) as u64;
+        let range: HeapCandidateRange = pointer_scan_level_candidates[level_index].find_heap_candidates_in_range(lower_bound, upper_bound);
+        transition {
+            _ -> (range.candidate_count)
+        }
+    }
+}
+
+// ===== upstream materialize_terminal_target_node_page (multi-target) =====
+
+pub machine PointerScanResults::materialize_terminal_target_node_page(
+    &mut self,
+    candidate_id: u64,
+    discovery_depth: u64,
+    branch_total_depth: u64,
+    pointer_scan_node_type: PointerScanNodeType,
+    pointer_address: u64,
+    pointer_value: u64,
+    module_name_kind: u64,
+    module_name_index: u64,
+    module_offset: u64,
+    display_depth: u64,
+    has_parent_node_id: bool,
+    parent_node_id: u64,
+    page_start_index: u64,
+    page_node_count: u64,
+    out_node_ids: &mut [u64],
+    write_start: u64
+) -> u64 {
+    transition (page_node_count == 0) {
+        true -> (0)
+        false -> find_range(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+    }
+    state find_range(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let range: TargetAddressRange = self.find_target_addresses_for_pointer_value(pointer_value);
+        let page_end_index: u64 = pointer_scan_results_min_u64(((page_start_index as u64 in Saturating) + (page_node_count as u64 in Saturating)) as u64, range.candidate_count);
+        let emit_count: u64 = ((page_end_index as u64 in Saturating) - (page_start_index as u64 in Saturating)) as u64;
+        transition {
+            _ -> emit(&self.target_addresses, range.start_index, 0, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, 0)
+        }
+    }
+    state emit(&mut self, target_addresses: &[u64], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        transition (emit_index < emit_count) {
+            true -> gate_target(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+            false -> (ids_written)
+        }
+    }
+    state gate_target(&mut self, target_addresses: &[u64], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let page_offset: u64 = ((page_start_index as u64 in Saturating) + (emit_index as u64 in Saturating)) as u64;
+        let target_index: u64 = ((range_start_index as u64 in Saturating) + (page_offset as u64 in Saturating)) as u64;
+        transition (target_index < target_addresses.len) {
+            true -> read_target(target_addresses, target_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+            false -> emit_next(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state read_target(&mut self, target_addresses: &[u64], target_index: u64 [0..target_addresses.len], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let resolved_target_address: u64 = target_addresses[target_index];
+        let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(resolved_target_address, pointer_value);
+        transition offset_lookup {
+            PointerOffsetLookup::Fits { offset } -> gate_out(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, offset, out_node_ids, write_start, ids_written)
+            _ -> emit_next(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state gate_out(&mut self, target_addresses: &[u64], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, resolved_target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let write_position: u64 = ((write_start as u64 in Saturating) + (ids_written as u64 in Saturating)) as u64;
+        transition (write_position < out_node_ids.len) {
+            true -> emit_node(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, pointer_offset, out_node_ids, write_start, ids_written)
+            false -> emit_next(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state emit_node(&mut self, target_addresses: &[u64], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, resolved_target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let node_id: u64 = self.create_materialized_pointer_scan_node(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, resolved_target_address, pointer_offset, false, display_depth, has_parent_node_id, parent_node_id);
+        let write_position: u64 = ((write_start as u64 in Saturating) + (ids_written as u64 in Saturating)) as u64;
+        transition (write_position < out_node_ids.len) {
+            true -> store_id(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, write_position, node_id, ids_written)
+            false -> emit_next(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state store_id(&mut self, target_addresses: &[u64], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, write_position: u64 [0..out_node_ids.len], node_id: u64, ids_written: u64) -> u64 {
+        out_node_ids[write_position] = node_id;
+        transition {
+            _ -> emit_next(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ((ids_written as u64 in Wrapping) + 1) as u64)
+        }
+    }
+    state emit_next(&mut self, target_addresses: &[u64], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        transition {
+            _ -> emit(target_addresses, range_start_index, ((emit_index as u64 in Wrapping) + 1) as u64, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+}
+
+// ===== upstream materialize_display_node_page =====
+// `module_name` arrives as the create_materialized_pointer_scan_node
+// name-source pair (kind/index), resolved inside the node mint.
+pub machine PointerScanResults::materialize_display_node_page(
+    &mut self,
+    candidate_id: u64,
+    discovery_depth: u64,
+    branch_total_depth: u64,
+    pointer_scan_node_type: PointerScanNodeType,
+    pointer_address: u64,
+    pointer_value: u64,
+    module_name_kind: u64,
+    module_name_index: u64,
+    module_offset: u64,
+    display_depth: u64,
+    has_parent_node_id: bool,
+    parent_node_id: u64,
+    page_start_index: u64,
+    page_node_count: u64,
+    out_node_ids: &mut [u64],
+    write_start: u64
+) -> u64 {
+    transition (page_node_count == 0) {
+        true -> (0)
+        false -> depth_gate(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+    }
+    state depth_gate(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (discovery_depth <= 1) {
+            true -> terminal(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> level_gate(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+        }
+    }
+    state terminal(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let multi: bool = self.uses_multi_target_terminal_materialization();
+        transition multi {
+            true -> terminal_page(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> target_gate(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+        }
+    }
+    state terminal_page(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let ids_written: u64 = self.materialize_terminal_target_node_page(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start);
+        transition {
+            _ -> (ids_written)
+        }
+    }
+    state target_gate(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let has_target: bool = self.target_descriptor.has_target_address();
+        transition has_target {
+            true -> start_gate(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state start_gate(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (page_start_index == 0) {
+            true -> resolve_target(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state resolve_target(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let target_address: u64 = self.target_descriptor.get_target_address();
+        let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(target_address, pointer_value);
+        transition offset_lookup {
+            PointerOffsetLookup::Fits { offset } -> gate_out(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, target_address, offset, out_node_ids, write_start)
+            _ -> (0)
+        }
+    }
+    state gate_out(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, resolved_target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (write_start < out_node_ids.len) {
+            true -> emit_node(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, resolved_target_address, pointer_offset, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state emit_node(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, resolved_target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let node_id: u64 = self.create_materialized_pointer_scan_node(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, resolved_target_address, pointer_offset, false, display_depth, has_parent_node_id, parent_node_id);
+        transition (write_start < out_node_ids.len) {
+            true -> store_id(out_node_ids, write_start, node_id)
+            false -> (0)
+        }
+    }
+    state store_id(&mut self, out_node_ids: &mut [u64], write_start: u64 [0..out_node_ids.len], node_id: u64) -> u64 {
+        out_node_ids[write_start] = node_id;
+        transition {
+            _ -> (1)
+        }
+    }
+    state level_gate(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let level_index: u64 = ((discovery_depth as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition (level_index < self.pointer_scan_level_candidate_count) {
+            true -> len_gate(level_index, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state len_gate(&mut self, level_index: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> in_range(&mut self.pointer_scan_level_candidates, level_index, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state in_range(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let lower_bound: u64 = ((pointer_value as u64 in Saturating) - (self.offset_radius as u64 in Saturating)) as u64;
+        let upper_bound: u64 = ((pointer_value as u64 in Saturating) + (self.offset_radius as u64 in Saturating)) as u64;
+        let range: HeapCandidateRange = pointer_scan_level_candidates[level_index].find_heap_candidates_in_range(lower_bound, upper_bound);
+        let page_end_index: u64 = pointer_scan_results_min_u64(((page_start_index as u64 in Saturating) + (page_node_count as u64 in Saturating)) as u64, range.candidate_count);
+        let emit_count: u64 = ((page_end_index as u64 in Saturating) - (page_start_index as u64 in Saturating)) as u64;
+        transition (level_index < pointer_scan_level_candidates.len) {
+            true -> emit_heap(pointer_scan_level_candidates, level_index, range.start_index, 0, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, 0)
+            false -> (0)
+        }
+    }
+    state emit_heap(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        transition (emit_index < emit_count) {
+            true -> gate_plc(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+            false -> (ids_written)
+        }
+    }
+    state gate_plc(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        transition (level_index < pointer_scan_level_candidates.len) {
+            true -> gate_candidate(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+            false -> (ids_written)
+        }
+    }
+    state gate_candidate(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let heap_candidates: &[PointerScanCandidate] = pointer_scan_level_candidates[level_index].get_heap_candidates();
+        let page_offset: u64 = ((page_start_index as u64 in Saturating) + (emit_index as u64 in Saturating)) as u64;
+        let candidate_index: u64 = ((range_start_index as u64 in Saturating) + (page_offset as u64 in Saturating)) as u64;
+        transition (candidate_index < heap_candidates.len) {
+            true -> gate_plc_two(pointer_scan_level_candidates, level_index, candidate_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+            false -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state gate_plc_two(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64, candidate_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        transition (level_index < pointer_scan_level_candidates.len) {
+            true -> emit_one(pointer_scan_level_candidates, level_index, candidate_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+            false -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state emit_one(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], candidate_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let heap_candidate: PointerScanCandidate = pointer_scan_level_candidates[level_index].copy_heap_candidate(candidate_index);
+        let child_pointer_address: u64 = heap_candidate.get_pointer_address();
+        let resolved_target_address: u64 = heap_candidate.get_pointer_value();
+        let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(child_pointer_address, pointer_value);
+        transition offset_lookup {
+            PointerOffsetLookup::Fits { offset } -> gate_out_heap(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, heap_candidate, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, offset, out_node_ids, write_start, ids_written)
+            _ -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state gate_out_heap(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, heap_candidate: PointerScanCandidate, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, resolved_target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let write_position: u64 = ((write_start as u64 in Saturating) + (ids_written as u64 in Saturating)) as u64;
+        transition (write_position < out_node_ids.len) {
+            true -> emit_node_heap(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, heap_candidate, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, pointer_offset, out_node_ids, write_start, ids_written)
+            false -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state emit_node_heap(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, heap_candidate: PointerScanCandidate, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, resolved_target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        let child_id: u64 = heap_candidate.get_candidate_id();
+        let child_discovery_depth: u64 = heap_candidate.get_discovery_depth();
+        let child_has_children: bool = child_discovery_depth > 1;
+        let child_pointer_address: u64 = heap_candidate.get_pointer_address();
+        let child_pointer_value: u64 = heap_candidate.get_pointer_value();
+        let node_id: u64 = self.create_materialized_pointer_scan_node(child_id, child_discovery_depth, branch_total_depth, PointerScanNodeType::Heap, child_pointer_address, child_pointer_value, module_name_kind, module_name_index, module_offset, resolved_target_address, pointer_offset, child_has_children, display_depth, has_parent_node_id, parent_node_id);
+        let write_position: u64 = ((write_start as u64 in Saturating) + (ids_written as u64 in Saturating)) as u64;
+        transition (write_position < out_node_ids.len) {
+            true -> store_id_heap(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, write_position, node_id, ids_written)
+            false -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+    state store_id_heap(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, write_position: u64 [0..out_node_ids.len], node_id: u64, ids_written: u64) -> u64 {
+        out_node_ids[write_position] = node_id;
+        transition {
+            _ -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ((ids_written as u64 in Wrapping) + 1) as u64)
+        }
+    }
+    state emit_next(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64, range_start_index: u64, emit_index: u64, emit_count: u64, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, out_node_ids: &mut [u64], write_start: u64, ids_written: u64) -> u64 {
+        transition {
+            _ -> emit_heap(pointer_scan_level_candidates, level_index, range_start_index, ((emit_index as u64 in Wrapping) + 1) as u64, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
+        }
+    }
+}
+
+// ===== cached-page copy: slab -> caller out extent =====
+
+machine pointer_scan_results_copy_cached_ids(
+    id_slab: &[u64],
+    ids_start: u64,
+    ids_len: u64,
+    out_node_ids: &mut [u64]
+) -> u64 {
+    transition {
+        _ -> copy(id_slab, ids_start, ids_len, 0, out_node_ids)
+    }
+    state copy(id_slab: &[u64], ids_start: u64, ids_len: u64, position: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (position < ids_len) {
+            true -> gate_slab(id_slab, ids_start, ids_len, position, out_node_ids)
+            false -> (position)
+        }
+    }
+    state gate_slab(id_slab: &[u64], ids_start: u64, ids_len: u64, position: u64, out_node_ids: &mut [u64]) -> u64 {
+        let slab_position: u64 = ((ids_start as u64 in Saturating) + (position as u64 in Saturating)) as u64;
+        transition (slab_position < id_slab.len) {
+            true -> read_slab(id_slab, slab_position, ids_start, ids_len, position, out_node_ids)
+            false -> (position)
+        }
+    }
+    state read_slab(id_slab: &[u64], slab_position: u64 [0..id_slab.len], ids_start: u64, ids_len: u64, position: u64, out_node_ids: &mut [u64]) -> u64 {
+        let node_id: u64 = id_slab[slab_position];
+        transition (position < out_node_ids.len) {
+            true -> write_out(node_id, id_slab, ids_start, ids_len, position, out_node_ids)
+            false -> (position)
+        }
+    }
+    state write_out(node_id: u64, id_slab: &[u64], ids_start: u64, ids_len: u64, position: u64 [0..out_node_ids.len], out_node_ids: &mut [u64]) -> u64 {
+        out_node_ids[position] = node_id;
+        transition {
+            _ -> copy(id_slab, ids_start, ids_len, ((position as u64 in Wrapping) + 1) as u64, out_node_ids)
+        }
+    }
+}
+
+// ===== upstream materialize_root_pointer_scan_nodes =====
+// module name resolves by index -> name-source kind 1 for create_.
+pub machine PointerScanResults::materialize_root_pointer_scan_nodes(
+    &mut self,
+    candidate_id: u64,
+    discovery_depth: u64,
+    pointer_scan_node_type: PointerScanNodeType,
+    pointer_address: u64,
+    pointer_value: u64,
+    module_index: u64,
+    module_offset: u64,
+    page_start_index: u64,
+    page_node_count: u64,
+    out_node_ids: &mut [u64],
+    write_start: u64
+) -> u64 {
+    transition (page_node_count == 0) {
+        true -> (0)
+        false -> module_gate(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, page_start_index, page_node_count, out_node_ids, write_start)
+    }
+    state module_gate(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let has_module: bool = self.has_module_name(module_index);
+        transition has_module {
+            true -> depth_gate(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state depth_gate(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (discovery_depth > 1) {
+            true -> parent_start_gate(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> terminal(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, page_start_index, page_node_count, out_node_ids, write_start)
+        }
+    }
+    state parent_start_gate(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (page_start_index > 0) {
+            true -> (0)
+            false -> gate_out_parent(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, out_node_ids, write_start)
+        }
+    }
+    state gate_out_parent(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (write_start < out_node_ids.len) {
+            true -> emit_parent(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state emit_parent(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let node_id: u64 = self.create_materialized_pointer_scan_node(candidate_id, discovery_depth, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, 1, module_index, module_offset, pointer_value, 0, true, 1, false, 0);
+        transition (write_start < out_node_ids.len) {
+            true -> store_parent(out_node_ids, write_start, node_id)
+            false -> (0)
+        }
+    }
+    state store_parent(&mut self, out_node_ids: &mut [u64], write_start: u64 [0..out_node_ids.len], node_id: u64) -> u64 {
+        out_node_ids[write_start] = node_id;
+        transition {
+            _ -> (1)
+        }
+    }
+    state terminal(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let multi: bool = self.uses_multi_target_terminal_materialization();
+        transition multi {
+            true -> terminal_page(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, page_start_index, page_node_count, out_node_ids, write_start)
+            false -> target_gate(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, page_start_index, page_node_count, out_node_ids, write_start)
+        }
+    }
+    state terminal_page(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let ids_written: u64 = self.materialize_terminal_target_node_page(candidate_id, discovery_depth, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, 1, module_index, module_offset, 1, false, 0, page_start_index, page_node_count, out_node_ids, write_start);
+        transition {
+            _ -> (ids_written)
+        }
+    }
+    state target_gate(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let has_target: bool = self.target_descriptor.has_target_address();
+        transition has_target {
+            true -> resolve_target(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state resolve_target(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let target_address: u64 = self.target_descriptor.get_target_address();
+        let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(target_address, pointer_value);
+        transition offset_lookup {
+            PointerOffsetLookup::Fits { offset } -> gate_out_leaf(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, target_address, offset, out_node_ids, write_start)
+            _ -> (0)
+        }
+    }
+    state gate_out_leaf(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        transition (write_start < out_node_ids.len) {
+            true -> emit_leaf(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, target_address, pointer_offset, out_node_ids, write_start)
+            false -> (0)
+        }
+    }
+    state emit_leaf(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, target_address: u64, pointer_offset: i64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
+        let node_id: u64 = self.create_materialized_pointer_scan_node(candidate_id, discovery_depth, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, 1, module_index, module_offset, target_address, pointer_offset, false, 1, false, 0);
+        transition (write_start < out_node_ids.len) {
+            true -> store_parent(out_node_ids, write_start, node_id)
+            false -> (0)
+        }
+    }
+}
+
+// ===== upstream materialize_root_node_page_single_display =====
+// One display node per static candidate (single-target descriptor); the walk
+// skips whole levels before paging across a level's static candidates. Only
+// states that index `pointer_scan_level_candidates` carry the slice param and
+// the sibling-length bound; intermediates re-gate it in their calling arm.
+pub machine PointerScanResults::materialize_root_node_page_single_display(
+    &mut self,
+    page_start_index: u64,
+    page_node_count: u64,
+    out_node_ids: &mut [u64]
+) -> u64 {
+    transition {
+        _ -> level_loop(0, page_start_index, page_node_count, 0, out_node_ids)
+    }
+    state level_loop(&mut self, level_index: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidate_count && remaining_capacity > 0) {
+            true -> gate_plc(level_index, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+            false -> (ids_written)
+        }
+    }
+    state gate_plc(&mut self, level_index: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> level_at(&mut self.pointer_scan_level_candidates, level_index, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+            false -> (ids_written)
+        }
+    }
+    state level_at(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        let static_candidates: &[PointerScanCandidate] = pointer_scan_level_candidates[level_index].get_static_candidates();
+        let static_candidate_count: u64 = static_candidates.len;
+        transition (remaining_skip >= static_candidate_count) {
+            true -> skip_level(level_index, remaining_skip, remaining_capacity, ids_written, static_candidate_count, out_node_ids)
+            false -> enter_candidates(level_index, remaining_skip, remaining_capacity, ids_written, static_candidate_count, out_node_ids)
+        }
+    }
+    state skip_level(&mut self, level_index: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, static_candidate_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition {
+            _ -> level_loop(((level_index as u64 in Wrapping) + 1) as u64, ((remaining_skip as u64 in Saturating) - (static_candidate_count as u64 in Saturating)) as u64, remaining_capacity, ids_written, out_node_ids)
+        }
+    }
+    state enter_candidates(&mut self, level_index: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, static_candidate_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let level_page_count: u64 = pointer_scan_results_min_u64(((static_candidate_count as u64 in Saturating) - (remaining_skip as u64 in Saturating)) as u64, remaining_capacity);
+        transition {
+            _ -> candidate_loop(level_index, remaining_skip, level_page_count, 0, remaining_capacity, ids_written, out_node_ids)
+        }
+    }
+    state candidate_loop(&mut self, level_index: u64, first_candidate_index: u64, level_page_count: u64, position: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (position < level_page_count) {
+            true -> gate_plc_two(level_index, first_candidate_index, level_page_count, position, remaining_capacity, ids_written, out_node_ids)
+            false -> level_done(level_index, remaining_capacity, ids_written, level_page_count, out_node_ids)
+        }
+    }
+    state gate_plc_two(&mut self, level_index: u64, first_candidate_index: u64, level_page_count: u64, position: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> emit_static(&mut self.pointer_scan_level_candidates, level_index, first_candidate_index, level_page_count, position, remaining_capacity, ids_written, out_node_ids)
+            false -> level_done(level_index, remaining_capacity, ids_written, level_page_count, out_node_ids)
+        }
+    }
+    state emit_static(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], first_candidate_index: u64, level_page_count: u64, position: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        let static_candidate_index: u64 = ((first_candidate_index as u64 in Saturating) + (position as u64 in Saturating)) as u64;
+        let candidate: PointerScanCandidate = pointer_scan_level_candidates[level_index].copy_static_candidate(static_candidate_index);
+        let candidate_id: u64 = candidate.get_candidate_id();
+        let candidate_depth: u64 = candidate.get_discovery_depth();
+        let candidate_node_type: PointerScanNodeType = candidate.get_pointer_scan_node_type();
+        let candidate_pointer_address: u64 = candidate.get_pointer_address();
+        let candidate_pointer_value: u64 = candidate.get_pointer_value();
+        let candidate_module_index: u64 = candidate.get_module_index();
+        let candidate_module_offset: u64 = candidate.get_module_offset();
+        let emitted: u64 = self.materialize_root_pointer_scan_nodes(candidate_id, candidate_depth, candidate_node_type, candidate_pointer_address, candidate_pointer_value, candidate_module_index, candidate_module_offset, 0, 1, out_node_ids, ids_written);
+        transition {
+            _ -> candidate_loop(level_index, first_candidate_index, level_page_count, ((position as u64 in Wrapping) + 1) as u64, remaining_capacity, ((ids_written as u64 in Saturating) + (emitted as u64 in Saturating)) as u64, out_node_ids)
+        }
+    }
+    state level_done(&mut self, level_index: u64, remaining_capacity: u64, ids_written: u64, level_page_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition {
+            _ -> level_loop(((level_index as u64 in Wrapping) + 1) as u64, 0, ((remaining_capacity as u64 in Saturating) - (level_page_count as u64 in Saturating)) as u64, ids_written, out_node_ids)
+        }
+    }
+}
+
+// ===== upstream materialize_root_node_page_multi_display =====
+// Per-candidate display count buckets the page (multi-target descriptor).
+pub machine PointerScanResults::materialize_root_node_page_multi_display(
+    &mut self,
+    page_start_index: u64,
+    page_node_count: u64,
+    out_node_ids: &mut [u64]
+) -> u64 {
+    transition {
+        _ -> level_loop(0, page_start_index, page_node_count, 0, out_node_ids)
+    }
+    state level_loop(&mut self, level_index: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidate_count) {
+            true -> gate_plc(level_index, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+            false -> (ids_written)
+        }
+    }
+    state gate_plc(&mut self, level_index: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> level_at(&mut self.pointer_scan_level_candidates, level_index, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+            false -> (ids_written)
+        }
+    }
+    state level_at(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        let static_candidates: &[PointerScanCandidate] = pointer_scan_level_candidates[level_index].get_static_candidates();
+        let static_candidate_count: u64 = static_candidates.len;
+        transition {
+            _ -> candidate_loop(level_index, 0, static_candidate_count, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+        }
+    }
+    state candidate_loop(&mut self, level_index: u64, position: u64, static_candidate_count: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (position < static_candidate_count) {
+            true -> gate_capacity(level_index, position, static_candidate_count, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+            false -> level_done(level_index, remaining_capacity, ids_written, remaining_skip, out_node_ids)
+        }
+    }
+    state gate_capacity(&mut self, level_index: u64, position: u64, static_candidate_count: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (remaining_capacity > 0) {
+            true -> gate_plc_two(level_index, position, static_candidate_count, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+            false -> level_done(level_index, remaining_capacity, ids_written, remaining_skip, out_node_ids)
+        }
+    }
+    state gate_plc_two(&mut self, level_index: u64, position: u64, static_candidate_count: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> candidate_at(&mut self.pointer_scan_level_candidates, level_index, position, static_candidate_count, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+            false -> level_done(level_index, remaining_capacity, ids_written, remaining_skip, out_node_ids)
+        }
+    }
+    state candidate_at(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], position: u64, static_candidate_count: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, out_node_ids: &mut [u64]) -> u64 {
+        let candidate: PointerScanCandidate = pointer_scan_level_candidates[level_index].copy_static_candidate(position);
+        let candidate_depth: u64 = candidate.get_discovery_depth();
+        let candidate_pointer_value: u64 = candidate.get_pointer_value();
+        let root_display_node_count: u64 = self.count_root_display_nodes(candidate_depth, candidate_pointer_value);
+        transition (remaining_skip >= root_display_node_count) {
+            true -> candidate_loop(level_index, ((position as u64 in Wrapping) + 1) as u64, static_candidate_count, ((remaining_skip as u64 in Saturating) - (root_display_node_count as u64 in Saturating)) as u64, remaining_capacity, ids_written, out_node_ids)
+            false -> emit_bucket(level_index, position, static_candidate_count, remaining_skip, remaining_capacity, ids_written, candidate, root_display_node_count, out_node_ids)
+        }
+    }
+    state emit_bucket(&mut self, level_index: u64, position: u64, static_candidate_count: u64, remaining_skip: u64, remaining_capacity: u64, ids_written: u64, candidate: PointerScanCandidate, root_display_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let candidate_page_count: u64 = pointer_scan_results_min_u64(((root_display_node_count as u64 in Saturating) - (remaining_skip as u64 in Saturating)) as u64, remaining_capacity);
+        let candidate_id: u64 = candidate.get_candidate_id();
+        let candidate_depth: u64 = candidate.get_discovery_depth();
+        let candidate_node_type: PointerScanNodeType = candidate.get_pointer_scan_node_type();
+        let candidate_pointer_address: u64 = candidate.get_pointer_address();
+        let candidate_pointer_value: u64 = candidate.get_pointer_value();
+        let candidate_module_index: u64 = candidate.get_module_index();
+        let candidate_module_offset: u64 = candidate.get_module_offset();
+        let emitted: u64 = self.materialize_root_pointer_scan_nodes(candidate_id, candidate_depth, candidate_node_type, candidate_pointer_address, candidate_pointer_value, candidate_module_index, candidate_module_offset, remaining_skip, candidate_page_count, out_node_ids, ids_written);
+        transition {
+            _ -> candidate_loop(level_index, ((position as u64 in Wrapping) + 1) as u64, static_candidate_count, 0, ((remaining_capacity as u64 in Saturating) - (candidate_page_count as u64 in Saturating)) as u64, ((ids_written as u64 in Saturating) + (emitted as u64 in Saturating)) as u64, out_node_ids)
+        }
+    }
+    state level_done(&mut self, level_index: u64, remaining_capacity: u64, ids_written: u64, remaining_skip: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition {
+            _ -> level_loop(((level_index as u64 in Wrapping) + 1) as u64, remaining_skip, remaining_capacity, ids_written, out_node_ids)
+        }
+    }
+}
+
+// ===== upstream materialize_root_child_node_page =====
+// Children of a root node: candidate_id is the parent's graph_node_id and each
+// child inherits the parent's stored module name (name-source kind 2, parent
+// arena index = node_id - 1) and links parent_node_id = parent's node_id.
+// Heap candidates under the parent level in range of the parent's resolved
+// target become child nodes; each child's own resolved target is its
+// pointer_value so deeper expansion can re-query ranges.
+pub machine PointerScanResults::materialize_root_child_node_page(
+    &mut self,
+    parent_node_index: u64,
+    discovery_depth: u64,
+    module_name_kind: u64,
+    module_name_index: u64,
+    page_start_index: u64,
+    page_node_count: u64,
+    out_node_ids: &mut [u64]
+) -> u64 {
+    transition (discovery_depth > 1) {
+        true -> gate_parent(parent_node_index, discovery_depth, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+        false -> (0)
+    }
+    state gate_parent(&mut self, parent_node_index: u64, discovery_depth: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (parent_node_index < self.materialized_node_count) {
+            true -> parent_bound_gate(parent_node_index, discovery_depth, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+            false -> (0)
+        }
+    }
+    state parent_bound_gate(&mut self, parent_node_index: u64, discovery_depth: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (parent_node_index < self.materialized_nodes.len) {
+            true -> parent_at(&mut self.materialized_nodes, parent_node_index, discovery_depth, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+            false -> (0)
+        }
+    }
+    state parent_at(&mut self, materialized_nodes: &mut [PointerScanNode], parent_node_index: u64 [0..materialized_nodes.len], discovery_depth: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let parent: PointerScanNode = materialized_nodes[parent_node_index];
+        transition parent.has_children() {
+            true -> emit_children(parent, parent_node_index, discovery_depth, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+            false -> (0)
+        }
+    }
+    state emit_children(&mut self, parent: PointerScanNode, parent_node_index: u64, discovery_depth: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let level_index: u64 = ((discovery_depth as u64 in Saturating) - 2) as u64;
+        let candidate_id: u64 = parent.get_graph_node_id();
+        let resolved_target_address: u64 = parent.get_resolved_target_address();
+        let parent_node_id: u64 = parent.get_node_id();
+        transition {
+            _ -> level_gate(level_index, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+        }
+    }
+    state level_gate(&mut self, level_index: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidate_count) {
+            true -> len_gate(level_index, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+            false -> (0)
+        }
+    }
+    state len_gate(&mut self, level_index: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> in_range(&mut self.pointer_scan_level_candidates, level_index, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+            false -> (0)
+        }
+    }
+    state in_range(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let lower_bound: u64 = ((resolved_target_address as u64 in Saturating) - (self.offset_radius as u64 in Saturating)) as u64;
+        let upper_bound: u64 = ((resolved_target_address as u64 in Saturating) + (self.offset_radius as u64 in Saturating)) as u64;
+        let range: HeapCandidateRange = pointer_scan_level_candidates[level_index].find_heap_candidates_in_range(lower_bound, upper_bound);
+        let display_count: u64 = range.candidate_count;
+        transition (display_count == 0) {
+            true -> (0)
+            false -> emit_page(level_index, range.start_index, display_count, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, page_start_index, page_node_count, out_node_ids)
+        }
+    }
+    state emit_page(&mut self, level_index: u64, range_start: u64, display_count: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let emit_count: u64 = pointer_scan_results_min_u64(((display_count as u64 in Saturating) - (page_start_index as u64 in Saturating)) as u64, page_node_count);
+        transition (page_start_index < display_count) {
+            true -> emit_loop(level_index, range_start, page_start_index, emit_count, 0, 0, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+            false -> (0)
+        }
+    }
+    state emit_loop(&mut self, level_index: u64, range_start: u64, page_start_index: u64, emit_count: u64, position: u64, ids_written: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (position < emit_count) {
+            true -> gate_plc(level_index, range_start, page_start_index, emit_count, position, ids_written, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+            false -> (ids_written)
+        }
+    }
+    state gate_plc(&mut self, level_index: u64, range_start: u64, page_start_index: u64, emit_count: u64, position: u64, ids_written: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> emit_one(&mut self.pointer_scan_level_candidates, level_index, range_start, page_start_index, emit_count, position, ids_written, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+            false -> (ids_written)
+        }
+    }
+    state emit_one(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], range_start: u64, page_start_index: u64, emit_count: u64, position: u64, ids_written: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, out_node_ids: &mut [u64]) -> u64 {
+        let page_offset: u64 = ((page_start_index as u64 in Saturating) + (position as u64 in Saturating)) as u64;
+        let candidate_index: u64 = ((range_start as u64 in Saturating) + (page_offset as u64 in Saturating)) as u64;
+        let child: PointerScanCandidate = pointer_scan_level_candidates[level_index].copy_heap_candidate(candidate_index);
+        let child_pointer_address: u64 = child.get_pointer_address();
+        let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(resolved_target_address, child_pointer_address);
+        transition offset_lookup {
+            PointerOffsetLookup::Fits { offset } -> emit_node(level_index, range_start, page_start_index, emit_count, position, ids_written, child, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, offset, out_node_ids)
+            _ -> emit_loop(level_index, range_start, page_start_index, emit_count, ((position as u64 in Wrapping) + 1) as u64, ids_written, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+        }
+    }
+    state emit_node(&mut self, level_index: u64, range_start: u64, page_start_index: u64, emit_count: u64, position: u64, ids_written: u64, child: PointerScanCandidate, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, pointer_offset: i64, out_node_ids: &mut [u64]) -> u64 {
+        let child_id: u64 = child.get_candidate_id();
+        let child_discovery_depth: u64 = child.get_discovery_depth();
+        let child_has_children: bool = child_discovery_depth > 1;
+        let child_pointer_address: u64 = child.get_pointer_address();
+        let child_pointer_value: u64 = child.get_pointer_value();
+        let branch_total_depth: u64 = self.max_depth;
+        let node_id: u64 = self.create_materialized_pointer_scan_node(child_id, child_discovery_depth, branch_total_depth, PointerScanNodeType::Heap, child_pointer_address, child_pointer_value, module_name_kind, module_name_index, 0, child_pointer_value, pointer_offset, child_has_children, 1, true, parent_node_id);
+        transition {
+            _ -> store_id(level_index, range_start, page_start_index, emit_count, position, ids_written, node_id, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+        }
+    }
+    state store_id(&mut self, level_index: u64, range_start: u64, page_start_index: u64, emit_count: u64, position: u64, ids_written: u64, node_id: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (ids_written < out_node_ids.len) {
+            true -> write_id(level_index, range_start, page_start_index, emit_count, position, ids_written, node_id, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+            false -> emit_loop(level_index, range_start, page_start_index, emit_count, ((position as u64 in Wrapping) + 1) as u64, ids_written, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+        }
+    }
+    state write_id(&mut self, level_index: u64, range_start: u64, page_start_index: u64, emit_count: u64, position: u64, ids_written: u64 [0..out_node_ids.len], node_id: u64, candidate_id: u64, resolved_target_address: u64, parent_node_index: u64, parent_node_id: u64, module_name_kind: u64, module_name_index: u64, out_node_ids: &mut [u64]) -> u64 {
+        out_node_ids[ids_written] = node_id;
+        transition {
+            _ -> emit_loop(level_index, range_start, page_start_index, emit_count, ((position as u64 in Wrapping) + 1) as u64, ((ids_written as u64 in Wrapping) + 1) as u64, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, out_node_ids)
+        }
+    }
+}
+
+// ===== upstream materialize_child_node_page =====
+// Routes a child page by parent kind: root children keep the parent's stored
+// module name (kind 2, parent arena index); non-root children take the empty
+// name (kind 0). Both share the heap-candidate emit walk; parents without
+// children or at leaf depth emit nothing.
+pub machine PointerScanResults::materialize_child_node_page(
+    &mut self,
+    parent_node_index: u64,
+    page_start_index: u64,
+    page_node_count: u64,
+    out_node_ids: &mut [u64]
+) -> u64 {
+    transition (parent_node_index < self.materialized_node_count) {
+        true -> len_gate(parent_node_index, page_start_index, page_node_count, out_node_ids)
+        false -> (0)
+    }
+    state len_gate(&mut self, parent_node_index: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        transition (parent_node_index < self.materialized_nodes.len) {
+            true -> parent_at(&mut self.materialized_nodes, parent_node_index, page_start_index, page_node_count, out_node_ids)
+            false -> (0)
+        }
+    }
+    state parent_at(&mut self, materialized_nodes: &mut [PointerScanNode], parent_node_index: u64 [0..materialized_nodes.len], page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let parent: PointerScanNode = materialized_nodes[parent_node_index];
+        let parent_discovery_depth: u64 = parent.get_discovery_depth();
+        transition parent.has_parent_node_id() {
+            true -> non_root(parent_node_index, parent_discovery_depth, page_start_index, page_node_count, out_node_ids)
+            false -> root(parent_node_index, parent_discovery_depth, page_start_index, page_node_count, out_node_ids)
+        }
+    }
+    state root(&mut self, parent_node_index: u64, parent_discovery_depth: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let ids_written: u64 = self.materialize_root_child_node_page(parent_node_index, parent_discovery_depth, 2, parent_node_index, page_start_index, page_node_count, out_node_ids);
+        transition {
+            _ -> (ids_written)
+        }
+    }
+    state non_root(&mut self, parent_node_index: u64, parent_discovery_depth: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64]) -> u64 {
+        let ids_written: u64 = self.materialize_root_child_node_page(parent_node_index, parent_discovery_depth, 0, 0, page_start_index, page_node_count, out_node_ids);
+        transition {
+            _ -> (ids_written)
+        }
+    }
+}
+
+// ===== heap-candidate display count for a parent's resolved region =====
+// Counts children the emit walk produces: heap candidates at `level_index`
+// (= parent discovery_depth - 2) whose addresses land within the resolved
+// target +/- offset_radius.
+pub machine PointerScanResults::count_heap_children_in_range(
+    &mut self,
+    level_index: u64,
+    resolved_target_address: u64
+) -> u64 {
+    transition (level_index < self.pointer_scan_level_candidate_count) {
+        true -> len_gate(level_index, resolved_target_address)
+        false -> (0)
+    }
+    state len_gate(&mut self, level_index: u64, resolved_target_address: u64) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> in_range(&mut self.pointer_scan_level_candidates, level_index, resolved_target_address)
+            false -> (0)
+        }
+    }
+    state in_range(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], resolved_target_address: u64) -> u64 {
+        let lower_bound: u64 = ((resolved_target_address as u64 in Saturating) - (self.offset_radius as u64 in Saturating)) as u64;
+        let upper_bound: u64 = ((resolved_target_address as u64 in Saturating) + (self.offset_radius as u64 in Saturating)) as u64;
+        let range: HeapCandidateRange = pointer_scan_level_candidates[level_index].find_heap_candidates_in_range(lower_bound, upper_bound);
+        transition {
+            _ -> (range.candidate_count)
+        }
+    }
+}
+
+// ===== display-node total for one materialized parent =====
+pub machine PointerScanResults::count_child_display_nodes(
+    &mut self,
+    parent_node_index: u64
+) -> u64 {
+    transition (parent_node_index < self.materialized_node_count) {
+        true -> len_gate(parent_node_index)
+        false -> (0)
+    }
+    state len_gate(&mut self, parent_node_index: u64) -> u64 {
+        transition (parent_node_index < self.materialized_nodes.len) {
+            true -> parent_at(&mut self.materialized_nodes, parent_node_index)
+            false -> (0)
+        }
+    }
+    state parent_at(&mut self, materialized_nodes: &mut [PointerScanNode], parent_node_index: u64 [0..materialized_nodes.len]) -> u64 {
+        let parent: PointerScanNode = materialized_nodes[parent_node_index];
+        let parent_discovery_depth: u64 = parent.get_discovery_depth();
+        let resolved_target_address: u64 = parent.get_resolved_target_address();
+        transition (parent_discovery_depth > 1) {
+            true -> count_children(parent_discovery_depth, resolved_target_address)
+            false -> (0)
+        }
+    }
+    state count_children(&mut self, parent_discovery_depth: u64, resolved_target_address: u64) -> u64 {
+        let level_index: u64 = ((parent_discovery_depth as u64 in Saturating) - 2) as u64;
+        let child_count: u64 = self.count_heap_children_in_range(level_index, resolved_target_address);
+        transition {
+            _ -> (child_count)
+        }
+    }
+}
+
+// ===== root display-node total for the multi (multi-target) descriptor =====
+// Sums count_root_display_nodes over every static candidate in every level.
+pub machine PointerScanResults::count_total_root_display_nodes(
+    &mut self
+) -> u64 {
+    transition {
+        _ -> level_loop(0, 0)
+    }
+    state level_loop(&mut self, level_index: u64, running_total: u64) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidate_count) {
+            true -> gate_plc(level_index, running_total)
+            false -> (running_total)
+        }
+    }
+    state gate_plc(&mut self, level_index: u64, running_total: u64) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> level_at(&mut self.pointer_scan_level_candidates, level_index, running_total)
+            false -> (running_total)
+        }
+    }
+    state level_at(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], running_total: u64) -> u64 {
+        let static_candidates: &[PointerScanCandidate] = pointer_scan_level_candidates[level_index].get_static_candidates();
+        let static_candidate_count: u64 = static_candidates.len;
+        transition {
+            _ -> candidate_loop(level_index, 0, static_candidate_count, running_total)
+        }
+    }
+    state candidate_loop(&mut self, level_index: u64, position: u64, static_candidate_count: u64, running_total: u64) -> u64 {
+        transition (position < static_candidate_count) {
+            true -> gate_plc_two(level_index, position, static_candidate_count, running_total)
+            false -> level_done(level_index, running_total)
+        }
+    }
+    state gate_plc_two(&mut self, level_index: u64, position: u64, static_candidate_count: u64, running_total: u64) -> u64 {
+        transition (level_index < self.pointer_scan_level_candidates.len) {
+            true -> candidate_at(&mut self.pointer_scan_level_candidates, level_index, position, static_candidate_count, running_total)
+            false -> level_done(level_index, running_total)
+        }
+    }
+    state candidate_at(&mut self, pointer_scan_level_candidates: &mut [PointerScanLevelCandidates<'s, 'h>], level_index: u64 [0..pointer_scan_level_candidates.len], position: u64, static_candidate_count: u64, running_total: u64) -> u64 {
+        let candidate: PointerScanCandidate = pointer_scan_level_candidates[level_index].copy_static_candidate(position);
+        let candidate_depth: u64 = candidate.get_discovery_depth();
+        let candidate_pointer_value: u64 = candidate.get_pointer_value();
+        let candidate_display_count: u64 = self.count_root_display_nodes(candidate_depth, candidate_pointer_value);
+        transition {
+            _ -> candidate_loop(level_index, ((position as u64 in Wrapping) + 1) as u64, static_candidate_count, ((running_total as u64 in Saturating) + (candidate_display_count as u64 in Saturating)) as u64)
+        }
+    }
+    state level_done(&mut self, level_index: u64, running_total: u64) -> u64 {
+        transition {
+            _ -> level_loop(((level_index as u64 in Wrapping) + 1) as u64, running_total)
+        }
+    }
+}
+
+// ===== page total resolver =====
+// Root pages: single display -> root_node_count; multi display -> the summed
+// per-candidate display counts. Child pages: the parent's heap-children count.
+pub machine PointerScanResults::compute_page_total(
+    &mut self,
+    has_parent_node_id: bool,
+    parent_node_id: u64
+) -> u64 {
+    transition has_parent_node_id {
+        true -> find_parent(parent_node_id)
+        false -> root_total()
+    }
+    state root_total(&mut self) -> u64 {
+        let single: bool = self.uses_single_display_root_materialization();
+        transition single {
+            true -> single_total()
+            false -> multi_total()
+        }
+    }
+    state single_total(&mut self) -> u64 {
+        transition {
+            _ -> (self.root_node_count)
+        }
+    }
+    state multi_total(&mut self) -> u64 {
+        let total: u64 = self.count_total_root_display_nodes();
+        transition {
+            _ -> (total)
+        }
+    }
+    state find_parent(&mut self, parent_node_id: u64) -> u64 {
+        let lookup: MaterializedNodeLookup = self.find_materialized_node(parent_node_id);
+        transition lookup {
+            MaterializedNodeLookup::Found { index } -> parent_total(index)
+            _ -> (0)
+        }
+    }
+    state parent_total(&mut self, parent_node_index: u64) -> u64 {
+        let child_count: u64 = self.count_child_display_nodes(parent_node_index);
+        transition {
+            _ -> (child_count)
+        }
+    }
+}
+
+// ===== upstream get_expanded_node_page =====
+// Bounded page key (parent, page_index, page_size) -> cached id page, else
+// materialize into the arena + slab and remember the key -> id range row.
+pub machine PointerScanResults::get_expanded_node_page(
+    &mut self,
+    has_parent_node_id: bool,
+    parent_node_id: u64,
+    page_index: u64,
+    page_size: u64,
+    out_node_ids: &mut [u64]
+) -> ExpandedNodePage {
+    transition (page_size == 0) {
+        true -> with_size(has_parent_node_id, parent_node_id, page_index, 1, out_node_ids)
+        false -> with_size(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
+    }
+    state with_size(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let lookup: MaterializedPageKeyLookup = self.page_cache_find(has_parent_node_id, parent_node_id, page_index, page_size);
+        transition lookup {
+            MaterializedPageKeyLookup::Found { index } -> cache_hit(has_parent_node_id, parent_node_id, page_index, page_size, index, out_node_ids)
+            _ -> route_page(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
+        }
+    }
+    state cache_hit(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, entry_index: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        transition (entry_index < self.page_key_cache_count) {
+            true -> entry_len_gate(has_parent_node_id, parent_node_id, page_index, page_size, entry_index, out_node_ids)
+            false -> route_page(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
+        }
+    }
+    state entry_len_gate(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, entry_index: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        transition (entry_index < self.page_key_cache.len) {
+            true -> entry_at(&self.page_key_cache, has_parent_node_id, parent_node_id, page_index, page_size, entry_index, out_node_ids)
+            false -> route_page(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
+        }
+    }
+    state entry_at(&mut self, page_key_cache: &[MaterializedPageKeyEntry], has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, entry_index: u64 [0..page_key_cache.len], out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let entry: MaterializedPageKeyEntry = page_key_cache[entry_index];
+        let node_count: u64 = pointer_scan_results_copy_cached_ids(&self.materialized_node_id_slab, entry.ids_start, entry.ids_len, out_node_ids);
+        transition {
+            _ -> total_for_hit(has_parent_node_id, parent_node_id, page_index, page_size, node_count)
+        }
+    }
+    state total_for_hit(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_count: u64) -> ExpandedNodePage {
+        let page_total: u64 = self.compute_page_total(has_parent_node_id, parent_node_id);
+        let last_page: u64 = pointer_scan_results_last_page_index(page_total, page_size);
+        transition {
+            _ -> (ExpandedNodePage { node_count: node_count, page_index: page_index, last_page_index: last_page, total_node_count: page_total })
+        }
+    }
+    state route_page(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        transition has_parent_node_id {
+            true -> child_page(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
+            false -> root_page(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
+        }
+    }
+    state root_page(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let page_total: u64 = self.compute_page_total(has_parent_node_id, parent_node_id);
+        let page_start_index: u64 = ((page_index as u64 in Saturating) * (page_size as u64 in Saturating)) as u64;
+        transition (page_start_index < page_total) {
+            true -> root_emit(has_parent_node_id, parent_node_id, page_index, page_size, page_start_index, page_total, out_node_ids)
+            false -> page_done(has_parent_node_id, parent_node_id, page_index, page_size, 0, page_total)
+        }
+    }
+    state root_emit(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, page_start_index: u64, total_node_count: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let page_node_count: u64 = pointer_scan_results_min_u64(((total_node_count as u64 in Saturating) - (page_start_index as u64 in Saturating)) as u64, page_size);
+        let single: bool = self.uses_single_display_root_materialization();
+        transition single {
+            true -> emit_single(has_parent_node_id, parent_node_id, page_index, page_size, page_start_index, page_node_count, total_node_count, out_node_ids)
+            false -> emit_multi(has_parent_node_id, parent_node_id, page_index, page_size, page_start_index, page_node_count, total_node_count, out_node_ids)
+        }
+    }
+    state emit_single(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, page_start_index: u64, page_node_count: u64, total_node_count: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let ids_written: u64 = self.materialize_root_node_page_single_display(page_start_index, page_node_count, out_node_ids);
+        transition {
+            _ -> cache_insert(has_parent_node_id, parent_node_id, page_index, page_size, ids_written, total_node_count, out_node_ids)
+        }
+    }
+    state emit_multi(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, page_start_index: u64, page_node_count: u64, total_node_count: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let ids_written: u64 = self.materialize_root_node_page_multi_display(page_start_index, page_node_count, out_node_ids);
+        transition {
+            _ -> cache_insert(has_parent_node_id, parent_node_id, page_index, page_size, ids_written, total_node_count, out_node_ids)
+        }
+    }
+    state child_page(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let lookup: MaterializedNodeLookup = self.find_materialized_node(parent_node_id);
+        transition lookup {
+            MaterializedNodeLookup::Found { index } -> child_total(has_parent_node_id, parent_node_id, page_index, page_size, index, out_node_ids)
+            _ -> page_done(has_parent_node_id, parent_node_id, page_index, page_size, 0, 0)
+        }
+    }
+    state child_total(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, parent_node_index: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let page_total: u64 = self.count_child_display_nodes(parent_node_index);
+        let page_start_index: u64 = ((page_index as u64 in Saturating) * (page_size as u64 in Saturating)) as u64;
+        transition (page_start_index < page_total) {
+            true -> child_emit(has_parent_node_id, parent_node_id, page_index, page_size, page_start_index, page_total, parent_node_index, out_node_ids)
+            false -> page_done(has_parent_node_id, parent_node_id, page_index, page_size, 0, page_total)
+        }
+    }
+    state child_emit(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, page_start_index: u64, total_node_count: u64, parent_node_index: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
+        let page_node_count: u64 = pointer_scan_results_min_u64(((total_node_count as u64 in Saturating) - (page_start_index as u64 in Saturating)) as u64, page_size);
+        let ids_written: u64 = self.materialize_child_node_page(parent_node_index, page_start_index, page_node_count, out_node_ids);
+        transition {
+            _ -> cache_insert(has_parent_node_id, parent_node_id, page_index, page_size, ids_written, total_node_count, out_node_ids)
+        }
+    }
+    state cache_insert(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, ids_written: u64, total_node_count: u64, out_node_ids: &[u64]) -> ExpandedNodePage {
+        let cached: bool = self.page_cache_insert(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids, ids_written);
+        transition {
+            _ -> page_done(has_parent_node_id, parent_node_id, page_index, page_size, ids_written, total_node_count)
+        }
+    }
+    state page_done(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, node_count: u64, total_node_count: u64) -> ExpandedNodePage {
+        let last_page_index: u64 = pointer_scan_results_last_page_index(total_node_count, page_size);
+        transition {
+            _ -> (ExpandedNodePage { node_count: node_count, page_index: page_index, last_page_index: last_page_index, total_node_count: total_node_count })
+        }
+    }
+}
