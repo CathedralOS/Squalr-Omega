@@ -92,9 +92,17 @@ is_process_alive) is therefore fully ported at source level;
 
 ### Two blockers now stand before the probe can run, in order
 
-1. **Crash-route realization gap (new, earlier stage).**
-   `tools/verify.py native --project squalr-tests` reaches native realization
-   but rejects the geometry canary's callee:
+1. ~~**Crash-route realization gap (new, earlier stage).**~~ **CLEARED**
+   (2026-09-23, swarm): crash states are admitted through composed control
+   (`93489c3a05`), `&self` reads joined the scalar graph (`d28d773700`) and
+   multi-state mixed graphs carry structural formals (`906f03f41b`), so
+   `SnapshotRegionFilter::get_element_count` lowers and verifies at
+   `a951e7882a`. What remains of this step is *verification*: the
+   `squalr-tests` lock in this checkout still pins the old toolchain and the
+   re-review currently stops at blocker 2's regression, so the probe has not
+   yet been re-run natively. Original evidence:
+   `tools/verify.py native --project squalr-tests` reached native realization
+   but rejected the geometry canary's callee:
    `InvalidUnitMachinePlan { machine: "...SnapshotRegionFilter::get_element_count",
    reason: "scalar callee has no checked executable body", omission:
    "no admitted body (local construction stopped at state graph: result
@@ -118,7 +126,16 @@ is_process_alive) is therefore fully ported at source level;
    Still toolchain-owned (`omega-rust/omega/build/provider-planning`,
    `native-realization/.../terminal_authority_policy/filesystem.rs`, plus a
    `TimeHost` provider that does not exist anywhere), fenced by the same
-   Omega wave items.
+   Omega wave items. Update (2026-09-23, swarm): between `b5ac760ff4` and
+   `a951e7882a` this package stopped *checking* at all —
+   `data LinuxMemoryQueryer { host: Service<FilesystemHost> }` now reports
+   "field `host` references unknown generic type `Service`" and every
+   `host.open/open_at/close/seek/read` call "does not resolve" (57
+   diagnostics across targets-native); `omega update`/lock re-review cannot
+   pass it, which parks the `pin/a951e7882a` lane and the probe retry alike.
+   Under investigation as a toolchain regression alongside the check-mode
+   post-Stage-05 cost jump on FsHost-bound packages (same surface, same
+   window).
 
 ### Resume steps (unchanged, with the new precondition)
 
