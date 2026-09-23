@@ -1,0 +1,152 @@
+module src::pointer_scans::pointer_scan_executor_task;
+
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::memory::normalized_region;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node::PointerScanNode;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::MaterializedPageKeyEntry;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanModuleName;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use src::pointer_scans::pointer_scan_level_collector::PointerScanDiscoveredLevels;
+use src::pointer_scans::pointer_scan_level_collector::PointerScanLevelCollector;
+use src::pointer_scans::pointer_scan_results_builder::BuiltLevelSpan;
+use src::pointer_scans::pointer_scan_results_builder::PointerScanResultsBuilder;
+use src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+use src::pointer_scans::structures::pointer_scan_target_ranges::PointerScanTargetRangeBucket;
+use src::pointer_scans::structures::snapshot_region_scan_task::SnapshotRegionScanTask;
+
+// Port of pointer_scan_executor_task.rs.
+//
+// Upstream `execute_scan` takes `Arc<RwLock<Snapshot>>` pair and acquires
+// read locks inside `with_pointer_scan_snapshots`, turning lock failures
+// into `create_empty_results`. Arc/RwLock do not exist under the
+// caller-owned-extents model: the caller holds the snapshot guard and lends
+// `snapshots: &[&Snapshot]` (one element covering the shared statics+heaps
+// snapshot — the `Arc::ptr_eq` branch — two for split). The upstream
+// lock-failure empty-results branch collapses onto the collector's
+// `Done`-at-first-pull path, which yields the same zero-count results. This
+// is the exact surface the L7 headless leg drives: one call does
+// `discover_pointer_levels` + `build_results` end to end.
+//
+// The source is a local `PointerScanDiscoveredLevels` — a pull driver whose
+// `next` satisfies `PointerScanCollectedLevelSource` — drained by the
+// builder into the caller's results extents.
+pub data PointerScanExecutor {}
+
+// Upstream PointerScanExecutor::execute_scan (the Arc/RwLock layer folded;
+// see the header).
+pub machine PointerScanExecutor::execute_scan<'frontier, 'tasks, 'values, 'params, 'ext, 'sh, 's, 'h, 'candidates>(
+    &self,
+    snapshots: &[&Snapshot],
+    pointer_scan_session_id: u64,
+    pointer_scan_parameters: &'params PointerScanParameters,
+    target_descriptor: PointerScanTargetDescriptor,
+    target_addresses: &'ext mut [u64],
+    target_address_count: u64,
+    address_space: PointerScanAddressSpace,
+    modules: &[NormalizedModule],
+    with_logging: bool,
+    sorted_scratch: &'frontier mut [u64],
+    target_ranges: &'frontier mut [normalized_region::NormalizedRegion],
+    lower_bounds: &'frontier mut [u64],
+    upper_bounds: &'frontier mut [u64],
+    target_range_buckets: &'frontier mut [PointerScanTargetRangeBucket],
+    tasks_scratch: &'tasks mut [SnapshotRegionScanTask],
+    byte_arena: &'values mut [u8],
+    module_order_scratch: &mut [u64],
+    level_out: &mut PointerScanCollectedLevel<'candidates>,
+    heap_address_scratch: &mut [u64],
+    module_names_out: &'ext mut [PointerScanModuleName],
+    levels_out: &'sh mut [PointerScanLevel],
+    level_spans_out: &mut [BuiltLevelSpan],
+    level_candidates_out: &'ext mut [PointerScanLevelCandidates<'s, 'h>],
+    static_candidate_arena: &'s mut [PointerScanCandidate],
+    heap_candidate_arena: &'h mut [PointerScanCandidate],
+    materialized_nodes: &'ext mut [PointerScanNode],
+    materialized_node_id_slab: &'ext mut [u64],
+    page_key_cache: &'ext mut [MaterializedPageKeyEntry]
+) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+    let level_collector: PointerScanLevelCollector = PointerScanLevelCollector {};
+    let mut discovered_pointer_levels: PointerScanDiscoveredLevels<'frontier, 'tasks, 'values, 'params> =
+        level_collector.discover_pointer_levels(
+            snapshots,
+            &target_addresses[..],
+            pointer_scan_parameters,
+            modules,
+            with_logging,
+            sorted_scratch,
+            target_ranges,
+            lower_bounds,
+            upper_bounds,
+            target_range_buckets,
+            tasks_scratch,
+            byte_arena,
+            module_order_scratch
+        );
+    let results_builder: PointerScanResultsBuilder = PointerScanResultsBuilder {};
+    results_builder.build_results(
+        pointer_scan_session_id,
+        pointer_scan_parameters,
+        target_descriptor,
+        target_addresses,
+        target_address_count,
+        address_space,
+        modules,
+        &mut discovered_pointer_levels,
+        level_out,
+        heap_address_scratch,
+        module_names_out,
+        levels_out,
+        level_spans_out,
+        level_candidates_out,
+        static_candidate_arena,
+        heap_candidate_arena,
+        materialized_nodes,
+        materialized_node_id_slab,
+        page_key_cache,
+        with_logging
+    )
+}
+
+// Upstream PointerScanLevelCollector::discover_pointer_levels call surface —
+// exposed for callers that compose discovery and building themselves
+// (upstream's `build_session_from_collected_values` closure boundary).
+pub machine PointerScanExecutor::discover_pointer_levels<'frontier, 'tasks, 'values, 'params>(
+    &self,
+    snapshots: &[&Snapshot],
+    target_addresses: &[u64],
+    pointer_scan_parameters: &'params PointerScanParameters,
+    modules: &[NormalizedModule],
+    with_logging: bool,
+    sorted_scratch: &'frontier mut [u64],
+    target_ranges: &'frontier mut [normalized_region::NormalizedRegion],
+    lower_bounds: &'frontier mut [u64],
+    upper_bounds: &'frontier mut [u64],
+    target_range_buckets: &'frontier mut [PointerScanTargetRangeBucket],
+    tasks_scratch: &'tasks mut [SnapshotRegionScanTask],
+    byte_arena: &'values mut [u8],
+    module_order_scratch: &mut [u64]
+) -> PointerScanDiscoveredLevels<'frontier, 'tasks, 'values, 'params> {
+    let level_collector: PointerScanLevelCollector = PointerScanLevelCollector {};
+    level_collector.discover_pointer_levels(
+        snapshots,
+        target_addresses,
+        pointer_scan_parameters,
+        modules,
+        with_logging,
+        sorted_scratch,
+        target_ranges,
+        lower_bounds,
+        upper_bounds,
+        target_range_buckets,
+        tasks_scratch,
+        byte_arena,
+        module_order_scratch
+    )
+}
