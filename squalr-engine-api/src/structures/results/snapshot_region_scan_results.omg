@@ -1,0 +1,903 @@
+module src::structures::results::snapshot_region_scan_results;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use src::structures::scan_results::scan_result_data_type_count::ScanResultDataTypeCount;
+use src::structures::snapshots::snapshot_region::DataTypeRefSet;
+
+// Port of structures/results/snapshot_region_scan_results.rs: the per-type
+// filter collections a snapshot region owns. Upstream holds
+// `Vec<SnapshotRegionFilterCollection>`; the port bounds it
+// (MAX_COLLECTIONS = 4 — more requested data types truncate, a named
+// deviation).
+//
+// Result ordering: upstream pages results by walking a min-heap of
+// per-collection cursors, so the visible order is ascending address merged
+// across collections. The port keeps that order via an explicit min-address
+// pick over bounded collection cursors — same output, no heap.
+pub data SnapshotRegionScanResults {
+    snapshot_region_filter_collections: [SnapshotRegionFilterCollection; 4];
+    collection_count: u64;
+}
+
+pub machine SnapshotRegionScanResults::new(
+    snapshot_region_filter_collections: [SnapshotRegionFilterCollection; 4],
+    collection_count: u64
+) -> SnapshotRegionScanResults {
+    transition { _ -> clamp(snapshot_region_filter_collections, collection_count) }
+    state clamp(
+        snapshot_region_filter_collections: [SnapshotRegionFilterCollection; 4],
+        collection_count: u64
+    ) -> SnapshotRegionScanResults {
+        transition collection_count <= 4 {
+            true -> (SnapshotRegionScanResults {
+                collection_count: collection_count,
+                snapshot_region_filter_collections: snapshot_region_filter_collections,
+            })
+            false -> (SnapshotRegionScanResults {
+                collection_count: 4,
+                snapshot_region_filter_collections: snapshot_region_filter_collections,
+            })
+        }
+    }
+}
+
+pub machine SnapshotRegionScanResults::empty() -> SnapshotRegionScanResults {
+    SnapshotRegionScanResults { collection_count: 0 }
+}
+
+pub machine SnapshotRegionScanResults::clone(source: &SnapshotRegionScanResults) -> SnapshotRegionScanResults {
+    let mut results: SnapshotRegionScanResults = SnapshotRegionScanResults::empty();
+    results.clone_from(source);
+    results
+}
+
+pub machine SnapshotRegionScanResults::clone_from(&mut self, source: &SnapshotRegionScanResults) {
+    self.collection_count = source.collection_count;
+    self.copy_collections(source, 0);
+}
+
+machine SnapshotRegionScanResults::copy_collections(&mut self, source: &SnapshotRegionScanResults, position: u64) {
+    transition position < source.collection_count && position < 4 {
+        true -> copy(source, position)
+        false -> done()
+    }
+    state copy(&mut self, source: &SnapshotRegionScanResults, position: u64) {
+        self.snapshot_region_filter_collections[position].clone_from(
+            &source.snapshot_region_filter_collections[position]);
+        transition { _ -> copy_collections(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.collection_count = self.collection_count;
+    }
+}
+
+pub machine SnapshotRegionScanResults::get_collection_count(&self) -> u64 {
+    self.collection_count
+}
+
+// Upstream `get_filter_collections()` — indexed access over the flat set.
+pub machine SnapshotRegionScanResults::get_filter_collection(
+    &self,
+    collection_index: u64
+) -> SnapshotRegionFilterCollection {
+    transition collection_index < self.collection_count && collection_index < 4 {
+        true -> (self.snapshot_region_filter_collections[collection_index])
+        false -> (SnapshotRegionFilterCollection::empty(
+            DataTypeRef::default(),
+            MemoryAlignment::Alignment1,
+            0))
+    }
+}
+
+// Replace one collection (the element scanner writes narrowed results back).
+pub machine SnapshotRegionScanResults::set_filter_collection(
+    &mut self,
+    collection_index: u64,
+    collection: &SnapshotRegionFilterCollection
+) {
+    transition collection_index < self.collection_count && collection_index < 4 {
+        true -> store(collection_index, collection)
+        false -> done()
+    }
+    state store(&mut self, collection_index: u64, collection: &SnapshotRegionFilterCollection) {
+        self.snapshot_region_filter_collections[collection_index].clone_from(collection);
+        self.collection_count = self.collection_count;
+    }
+    state done(&mut self) {
+        self.collection_count = self.collection_count;
+    }
+}
+
+// Push a new collection (initialize_scan_results seeds one per data type).
+pub machine SnapshotRegionScanResults::push_collection(
+    &mut self,
+    collection: &SnapshotRegionFilterCollection
+) -> bool {
+    transition self.collection_count < 4 {
+        true -> push(collection)
+        false -> (false)
+    }
+    state push(&mut self, collection: &SnapshotRegionFilterCollection) -> bool {
+        self.snapshot_region_filter_collections[self.collection_count].clone_from(collection);
+        self.collection_count = self.collection_count + 1;
+        true
+    }
+}
+
+// Upstream `get_number_of_results` — total across collections.
+pub machine SnapshotRegionScanResults::get_number_of_results(&self) -> u64
+crashes Abort
+{
+    transition { _ -> total(0, 0) }
+    state total(&self, position: u64, count: u64) -> u64 {
+        transition position < self.collection_count && position < 4 {
+            true -> add(position, count)
+            false -> (count)
+        }
+    }
+    state add(&self, position: u64, count: u64) -> u64 {
+        let collection: SnapshotRegionFilterCollection =
+            SnapshotRegionFilterCollection::clone(&self.snapshot_region_filter_collections[position]);
+        transition { _ -> total(position + 1, ((count as u64 in Saturating) + (collection.get_number_of_results() as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_result_counts_by_data_type` — one ScanResultDataTypeCount
+// per collection.
+pub machine SnapshotRegionScanResults::get_result_counts_by_data_type(
+    &self
+) -> DataTypeResultCounts
+crashes Abort
+{
+    let mut counts: DataTypeResultCounts = DataTypeResultCounts { count: 0 };
+    counts.fill(self, 0);
+    counts
+}
+
+pub data DataTypeResultCounts {
+    counts: [ScanResultDataTypeCount; 4];
+    count: u64;
+}
+
+machine DataTypeResultCounts::fill(&mut self, source: &SnapshotRegionScanResults, position: u64)
+crashes Abort
+{
+    transition position < source.collection_count && position < 4 {
+        true -> store(source, position)
+        false -> done()
+    }
+    state store(&mut self, source: &SnapshotRegionScanResults, position: u64 [0..4]) {
+        let collection: SnapshotRegionFilterCollection =
+            SnapshotRegionFilterCollection::clone(&source.snapshot_region_filter_collections[position]);
+        self.counts[position].data_type_ref.clone_from(&collection.data_type_ref);
+        self.counts[position].count = collection.get_number_of_results();
+        self.count = position + 1;
+        transition { _ -> fill(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.count = self.count;
+    }
+}
+
+pub machine DataTypeResultCounts::get_count(&self) -> u64 {
+    self.count
+}
+
+pub machine DataTypeResultCounts::get(&self, position: u64) -> ScanResultDataTypeCount {
+    transition position < self.count && position < 4 {
+        true -> (self.counts[position])
+        false -> (ScanResultDataTypeCount::default())
+    }
+}
+
+// Upstream `get_number_of_results_for_data_types` — total over the selected
+// data types only (empty filter set = all types selected).
+pub machine SnapshotRegionScanResults::get_number_of_results_for_data_types(
+    &self,
+    filtered_data_types: &[DataTypeRef],
+    filtered_data_type_count: u64
+) -> u64
+crashes Abort
+{
+    transition { _ -> total(0, 0, filtered_data_types, filtered_data_type_count) }
+    state total(&self, position: u64, count: u64, filtered_data_types: &[DataTypeRef], filtered_data_type_count: u64) -> u64 {
+        transition position < self.collection_count && position < 4 {
+            true -> add(position, count, filtered_data_types, filtered_data_type_count)
+            false -> (count)
+        }
+    }
+    state add(&self, position: u64, count: u64, filtered_data_types: &[DataTypeRef], filtered_data_type_count: u64) -> u64 {
+        let collection: SnapshotRegionFilterCollection =
+            SnapshotRegionFilterCollection::clone(&self.snapshot_region_filter_collections[position]);
+        let selected: bool = is_data_type_selected(&collection.data_type_ref, filtered_data_types, filtered_data_type_count);
+        transition selected {
+            true -> total(position + 1, ((count as u64 in Saturating) + (collection.get_number_of_results() as u64 in Saturating)) as u64, filtered_data_types, filtered_data_type_count)
+            false -> total(position + 1, count, filtered_data_types, filtered_data_type_count)
+        }
+    }
+}
+
+// Upstream `is_data_type_selected`: an empty filter list selects every type;
+// otherwise the collection's own data type must appear.
+pub machine is_data_type_selected(
+    data_type_ref: &DataTypeRef,
+    filtered_data_types: &[DataTypeRef],
+    filtered_data_type_count: u64
+) -> bool {
+    transition filtered_data_type_count == 0 {
+        true -> (true)
+        false -> scan(data_type_ref, filtered_data_types, filtered_data_type_count, 0)
+    }
+    state scan(data_type_ref: &DataTypeRef, filtered_data_types: &[DataTypeRef], filtered_data_type_count: u64, position: u64) -> bool {
+        transition position < filtered_data_type_count && position < filtered_data_types.len {
+            true -> compare(data_type_ref, filtered_data_types, filtered_data_type_count, position)
+            false -> (false)
+        }
+    }
+    state compare(data_type_ref: &DataTypeRef, filtered_data_types: &[DataTypeRef], filtered_data_type_count: u64, position: u64) -> bool {
+        transition data_type_ref.equals(&filtered_data_types[position]) {
+            true -> (true)
+            false -> scan(data_type_ref, filtered_data_types, filtered_data_type_count, position + 1)
+        }
+    }
+}
+
+// Result merge cursor — where one collection's enumeration stands. Upstream
+// ScanResultsPageCursor holds the same (collection, filter, element offset)
+// triple behind its heap entries; `finished` mirrors the iterator returning
+// None.
+pub data ResultCursor {
+    finished: bool;
+    collection_index: u64;
+    filter_index: u64;
+    element_index: u64;
+}
+
+pub machine ResultCursor::active(collection_index: u64) -> ResultCursor {
+    ResultCursor {
+        finished: false,
+        collection_index: collection_index,
+        filter_index: 0,
+        element_index: 0,
+    }
+}
+
+pub machine ResultCursor::finished(collection_index: u64) -> ResultCursor {
+    ResultCursor {
+        finished: true,
+        collection_index: collection_index,
+        filter_index: 0,
+        element_index: 0,
+    }
+}
+
+pub machine ResultCursor::clone(source: &ResultCursor) -> ResultCursor {
+    ResultCursor {
+        finished: source.finished,
+        collection_index: source.collection_index,
+        filter_index: source.filter_index,
+        element_index: source.element_index,
+    }
+}
+
+pub machine ResultCursor::clone_from(&mut self, source: &ResultCursor) {
+    self.finished = source.finished;
+    self.collection_index = source.collection_index;
+    self.filter_index = source.filter_index;
+    self.element_index = source.element_index;
+}
+
+// Bounded cursor set — one entry per collection slot (MAX_COLLECTIONS = 4).
+pub data MergeCursors {
+    cursors: [ResultCursor; 4];
+}
+
+pub machine MergeCursors::unfinished() -> MergeCursors {
+    transition { _ -> fill(MergeCursors {}, 0) }
+    state fill(out: MergeCursors, position: u64) -> MergeCursors {
+        transition position < 4 {
+            true -> store(out, position)
+            false -> (out)
+        }
+    }
+    state store(out: MergeCursors, position: u64 [0..4]) -> MergeCursors {
+        let mut carried: MergeCursors = out;
+        carried.cursors[position] = ResultCursor::active(position);
+        transition { _ -> fill(carried, position + 1) }
+    }
+}
+
+pub machine MergeCursors::get_cursor(&self, cursor_index: u64) -> ResultCursor {
+    transition cursor_index < 4 {
+        true -> (ResultCursor::clone(&self.cursors[cursor_index]))
+        false -> (ResultCursor::finished(0))
+    }
+}
+
+pub machine MergeCursors::set_cursor(&mut self, cursor_index: u64, cursor: &ResultCursor) {
+    transition cursor_index < 4 {
+        true -> store(cursor_index, cursor)
+        false -> done()
+    }
+    state store(&mut self, cursor_index: u64 [0..4], cursor: &ResultCursor) {
+        self.cursors[cursor_index].clone_from(cursor);
+    }
+    state done(&mut self) {
+        self.cursors = self.cursors;
+    }
+}
+
+// One candidate address in the merge — upstream's `Reverse((address, index))`
+// heap entries.
+pub data CursorProbe {
+    active: bool;
+    owner: u64;
+    address: u64;
+}
+
+pub machine CursorProbe::inactive() -> CursorProbe {
+    CursorProbe { active: false, owner: 0, address: 0 }
+}
+
+// The smaller live probe wins; ties fall to the lower collection slot.
+pub machine CursorProbe::smaller(a: &CursorProbe, b: &CursorProbe) -> CursorProbe {
+    transition a.active && b.active {
+        true -> both(a, b)
+        false -> either(a, b)
+    }
+    state both(a: &CursorProbe, b: &CursorProbe) -> CursorProbe {
+        transition b.address < a.address {
+            true -> (CursorProbe { active: true, owner: b.owner, address: b.address })
+            false -> (CursorProbe { active: true, owner: a.owner, address: a.address })
+        }
+    }
+    state either(a: &CursorProbe, b: &CursorProbe) -> CursorProbe {
+        transition a.active {
+            true -> (CursorProbe { active: true, owner: a.owner, address: a.address })
+            false -> (CursorProbe { active: b.active, owner: b.owner, address: b.address })
+        }
+    }
+}
+
+// One enumerated page element — upstream materializes a ScanResult here; the
+// port keeps the merge-visible fields and lets the executor materialize the
+// current/previous values from the owning region's element windows.
+pub data PageElement {
+    address: u64;
+    collection_index: u64;
+    filter_index: u64;
+    element_index: u64;
+    data_type_ref: DataTypeRef;
+}
+
+pub machine PageElement::of(
+    address: u64,
+    collection_index: u64,
+    filter_index: u64,
+    element_index: u64,
+    data_type_ref: DataTypeRef
+) -> PageElement {
+    PageElement {
+        address: address,
+        collection_index: collection_index,
+        filter_index: filter_index,
+        element_index: element_index,
+        data_type_ref: data_type_ref,
+    }
+}
+
+// Page results buffer — bounded at 64 (the CLI page surface is 22; extra
+// results on the final page drop off, a named deviation from Vec growth).
+pub data PageElementList {
+    page_elements: [PageElement; 64];
+    element_count: u64;
+}
+
+pub machine PageElementList::empty() -> PageElementList {
+    // Zero-init — element slots are dead until insert_sorted writes them.
+    PageElementList { element_count: 0 }
+}
+
+pub machine PageElementList::get_element_count(&self) -> u64 {
+    self.element_count
+}
+
+pub machine PageElementList::clone(source: &PageElementList) -> PageElementList {
+    let mut copy: PageElementList = PageElementList::empty();
+    copy.copy_from(source);
+    copy
+}
+
+machine PageElementList::copy_from(&mut self, source: &PageElementList) {
+    self.element_count = source.element_count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &PageElementList, position: u64) {
+        transition position < source.element_count && position < 64 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &PageElementList, position: u64 [0..64]) {
+        self.page_elements[position].clone_from(&source.page_elements[position]);
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.element_count = self.element_count;
+    }
+}
+
+pub machine PageElementList::get_page_element(&self, element_index: u64) -> PageElement {
+    transition element_index < self.element_count && element_index < 64 {
+        true -> found(element_index)
+        false -> empty()
+    }
+    state found(&self, element_index: u64 [0..64]) -> PageElement {
+        let mut page_element: PageElement = PageElement::of(0, 0, 0, 0, DataTypeRef::default());
+        page_element.clone_from(&self.page_elements[element_index]);
+        page_element
+    }
+    state empty(&self) -> PageElement {
+        PageElement::of(0, 0, 0, 0, DataTypeRef::default())
+    }
+}
+
+pub machine PageElementList::push(&mut self, page_element: &PageElement) -> bool {
+    transition self.element_count < 64 {
+        true -> store(page_element)
+        false -> (false)
+    }
+    state store(&mut self, page_element: &PageElement) -> bool {
+        self.page_elements[self.element_count].clone_from(page_element);
+        self.element_count = self.element_count + 1;
+        true
+    }
+}
+
+pub machine PageElement::clone_from(&mut self, source: &PageElement) {
+    self.address = source.address;
+    self.collection_index = source.collection_index;
+    self.filter_index = source.filter_index;
+    self.element_index = source.element_index;
+    self.data_type_ref.clone_from(&source.data_type_ref);
+}
+
+// The address a live cursor would emit next — upstream's
+// `ScanResultsPageCursor::get_current_address` = filter base + element
+// offset * stride, where stride is `max(memory_alignment, 1)`.
+pub machine SnapshotRegionScanResults::probe_cursor(
+    &self,
+    cursor: &ResultCursor
+) -> CursorProbe {
+    transition cursor.finished {
+        true -> (CursorProbe::inactive())
+        false -> bound_collection(cursor)
+    }
+    state bound_collection(&self, cursor: &ResultCursor) -> CursorProbe {
+        transition cursor.collection_index < self.collection_count && cursor.collection_index < 4 {
+            true -> bound_filter(cursor, cursor.collection_index)
+            false -> (CursorProbe::inactive())
+        }
+    }
+    state bound_filter(&self, cursor: &ResultCursor, collection_index: u64 [0..4]) -> CursorProbe {
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[collection_index]);
+        transition cursor.filter_index < collection.filter_count && cursor.filter_index < 64 {
+            true -> locate(&collection, cursor.filter_index, cursor.element_index, collection_index)
+            false -> (CursorProbe::inactive())
+        }
+    }
+    state locate(
+        &self,
+        collection: &SnapshotRegionFilterCollection,
+        filter_index: u64 [0..64],
+        element_index: u64,
+        owner: u64
+    ) -> CursorProbe {
+        let filter: SnapshotRegionFilter = collection.get_filter(filter_index);
+        let stride: u64 [1..=8] = collection.memory_alignment.get_size_in_bytes();
+        let address: u64 = ((filter.get_base_address() as u64 in Wrapping)
+            + ((element_index as u64 in Wrapping) * (stride as u64 in Wrapping))) as u64;
+        transition { _ -> (CursorProbe { active: true, owner: owner, address: address }) }
+    }
+}
+
+// Upstream `advance_results(1)`: step the element offset inside the current
+// filter, rolling to the next filter when its element count is spent, and to
+// finished when the collection's filters are spent.
+machine SnapshotRegionScanResults::advance_cursor(
+    &self,
+    cursors: &mut MergeCursors,
+    owner: u64
+)
+crashes Abort
+{
+    transition owner < 4 {
+        true -> bound(cursors, owner)
+        false -> done()
+    }
+    state bound(&self, cursors: &mut MergeCursors, owner: u64 [0..4]) {
+        let cursor: ResultCursor = cursors.get_cursor(owner);
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[owner]);
+        transition cursor.filter_index < collection.filter_count && cursor.filter_index < 64 {
+            true -> within(&collection, cursors, owner, cursor)
+            false -> finish(cursors, owner, cursor)
+        }
+    }
+    state within(
+        &self,
+        collection: &SnapshotRegionFilterCollection,
+        cursors: &mut MergeCursors,
+        owner: u64,
+        cursor: ResultCursor
+    ) {
+        let filter: SnapshotRegionFilter = collection.get_filter(cursor.filter_index);
+        let elements: u64 = filter.get_element_count(
+            collection.result_value_size_in_bytes,
+            collection.memory_alignment);
+        let next_element: u64 = ((cursor.element_index as u64 in Wrapping) + 1) as u64;
+        transition next_element < elements {
+            true -> bump_element(cursors, owner, cursor, next_element)
+            false -> bump_filter(collection, cursors, owner, cursor)
+        }
+    }
+    state bump_element(
+        &self,
+        cursors: &mut MergeCursors,
+        owner: u64,
+        cursor: ResultCursor,
+        next_element: u64
+    ) {
+        let mut updated: ResultCursor = ResultCursor::clone(&cursor);
+        updated.element_index = next_element;
+        cursors.set_cursor(owner, &updated);
+    }
+    state bump_filter(
+        &self,
+        collection: &SnapshotRegionFilterCollection,
+        cursors: &mut MergeCursors,
+        owner: u64,
+        cursor: ResultCursor
+    ) {
+        let next_filter: u64 = ((cursor.filter_index as u64 in Wrapping) + 1) as u64;
+        transition next_filter < collection.filter_count {
+            true -> next_filter(cursors, owner, cursor, next_filter)
+            false -> finish(cursors, owner, cursor)
+        }
+    }
+    state next_filter(
+        &self,
+        cursors: &mut MergeCursors,
+        owner: u64,
+        cursor: ResultCursor,
+        next_filter: u64
+    ) {
+        let mut updated: ResultCursor = ResultCursor::clone(&cursor);
+        updated.filter_index = next_filter;
+        updated.element_index = 0;
+        cursors.set_cursor(owner, &updated);
+    }
+    state finish(&self, cursors: &mut MergeCursors, owner: u64, cursor: ResultCursor) {
+        let mut updated: ResultCursor = ResultCursor::clone(&cursor);
+        updated.finished = true;
+        cursors.set_cursor(owner, &updated);
+    }
+    state done(&self) {
+    }
+}
+
+// Whether the collection's data type survives the filter list — set-scoped
+// version of `is_data_type_selected`.
+pub machine SnapshotRegionScanResults::is_data_type_in_set(
+    data_type_ref: &DataTypeRef,
+    filtered_data_types: &DataTypeRefSet
+) -> bool {
+    transition filtered_data_types.count == 0 {
+        true -> (true)
+        false -> scan(data_type_ref, filtered_data_types, 0)
+    }
+    state scan(data_type_ref: &DataTypeRef, filtered_data_types: &DataTypeRefSet, position: u64) -> bool {
+        transition position < filtered_data_types.count && position < 4 {
+            true -> compare(data_type_ref, filtered_data_types, position)
+            false -> (false)
+        }
+    }
+    state compare(data_type_ref: &DataTypeRef, filtered_data_types: &DataTypeRefSet, position: u64 [0..4]) -> bool {
+        transition data_type_ref.equals(&filtered_data_types.data_type_refs[position]) {
+            true -> (true)
+            false -> again(data_type_ref, filtered_data_types, position)
+            _ -> (false)
+        }
+    }
+    state again(data_type_ref: &DataTypeRef, filtered_data_types: &DataTypeRefSet, position: u64) -> bool {
+        transition { _ -> scan(data_type_ref, filtered_data_types, position + 1) }
+    }
+}
+
+// Upstream `get_scan_results_page`'s cursor merge: seed one cursor per
+// selected non-empty collection, then repeatedly take the smallest live
+// address — upstream pops a BinaryHeap; the port picks the smallest of the
+// four bounded probes, which yields the same ascending-address order.
+pub machine SnapshotRegionScanResults::enumerate_page(
+    &self,
+    results_to_skip: u64,
+    page_size: u64,
+    filtered_data_types: &DataTypeRefSet
+) -> PageElementList
+crashes Abort
+{
+    let mut page: PageElementList = PageElementList::empty();
+    let mut cursors: MergeCursors = MergeCursors::unfinished();
+    transition { _ -> seed(0, &mut cursors, filtered_data_types, results_to_skip, page_size, &mut page) }
+    state seed(
+        &self,
+        position: u64,
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        skip: u64,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        transition position < self.collection_count && position < 4 {
+            true -> seed_one(position, cursors, filtered_data_types, skip, take, page)
+            false -> step(cursors, filtered_data_types, skip, take, page)
+        }
+    }
+    state seed_one(
+        &self,
+        position: u64 [0..4],
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        skip: u64,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[position]);
+        let selected: bool = SnapshotRegionScanResults::is_data_type_in_set(
+            &collection.data_type_ref, filtered_data_types);
+        transition selected && collection.filter_count > 0 {
+            true -> activate(position, cursors, filtered_data_types, skip, take, page)
+            false -> seed(position + 1, cursors, filtered_data_types, skip, take, page)
+        }
+    }
+    state activate(
+        &self,
+        position: u64 [0..4],
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        skip: u64,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        let cursor: ResultCursor = ResultCursor::active(position);
+        cursors.set_cursor(position, &cursor);
+        transition { _ -> seed(position + 1, cursors, filtered_data_types, skip, take, page) }
+    }
+    state step(
+        &self,
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        skip: u64,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        transition take > 0 {
+            true -> probe(cursors, filtered_data_types, skip, take, page)
+            false -> (PageElementList::clone(page))
+        }
+    }
+    state probe(
+        &self,
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        skip: u64,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        let c0: ResultCursor = cursors.get_cursor(0);
+        let c1: ResultCursor = cursors.get_cursor(1);
+        let c2: ResultCursor = cursors.get_cursor(2);
+        let c3: ResultCursor = cursors.get_cursor(3);
+        let p0: CursorProbe = self.probe_cursor(&c0);
+        let p1: CursorProbe = self.probe_cursor(&c1);
+        let p2: CursorProbe = self.probe_cursor(&c2);
+        let p3: CursorProbe = self.probe_cursor(&c3);
+        let m01: CursorProbe = CursorProbe::smaller(&p0, &p1);
+        let m23: CursorProbe = CursorProbe::smaller(&p2, &p3);
+        let best: CursorProbe = CursorProbe::smaller(&m01, &m23);
+        transition best.active {
+            true -> emit(best, cursors, filtered_data_types, skip, take, page)
+            false -> (PageElementList::clone(page))
+        }
+    }
+    state emit(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        skip: u64,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        transition skip > 0 {
+            true -> advance_skip(best, cursors, filtered_data_types, skip, take, page)
+            false -> emit_element(best, cursors, filtered_data_types, take, page)
+        }
+    }
+    state advance_skip(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        skip: u64,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        self.advance_cursor(cursors, best.owner);
+        transition { _ -> step(cursors, filtered_data_types, ((skip as u64 in Wrapping) - 1) as u64, take, page) }
+    }
+    state emit_element(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        transition best.owner < self.collection_count && best.owner < 4 {
+            true -> store_element(best, best.owner, cursors, filtered_data_types, take, page)
+            false -> step(cursors, filtered_data_types, 0, take, page)
+        }
+    }
+    state store_element(
+        &self,
+        best: CursorProbe,
+        owner: u64 [0..4],
+        cursors: &mut MergeCursors,
+        filtered_data_types: &DataTypeRefSet,
+        take: u64,
+        page: &mut PageElementList
+    ) -> PageElementList {
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[owner]);
+        let cursor: ResultCursor = cursors.get_cursor(best.owner);
+        let page_element: PageElement = PageElement::of(
+            best.address,
+            best.owner,
+            cursor.filter_index,
+            cursor.element_index,
+            DataTypeRef::clone(&collection.data_type_ref));
+        let pushed: bool = page.push(&page_element);
+        self.advance_cursor(cursors, best.owner);
+        transition pushed {
+            true -> step(cursors, filtered_data_types, 0, ((take as u64 in Wrapping) - 1) as u64, page)
+            false -> step(cursors, filtered_data_types, 0, 0, page)
+            _ -> (PageElementList::clone(page))
+        }
+    }
+}
+
+// Address-sorted insertion — upstream's BinaryHeap ordering kept on the
+// bounded page carrier. Shifts elements down to open the slot; the bound
+// truncates past-capacity inserts (named deviation).
+pub machine PageElementList::insert_sorted(&mut self, page_element: &PageElement) -> bool {
+    transition self.element_count < 64 {
+        true -> seek(page_element, 0)
+        false -> (false)
+    }
+    state seek(&mut self, page_element: &PageElement, position: u64) -> bool {
+        transition position < self.element_count && position < 64 {
+            true -> compare(page_element, position)
+            false -> store(page_element, position)
+        }
+    }
+    state compare(&mut self, page_element: &PageElement, position: u64 [0..64]) -> bool {
+        transition self.page_elements[position].address < page_element.address {
+            true -> seek(page_element, position + 1)
+            false -> store(page_element, position)
+        }
+    }
+    // Shift the tail down one slot starting from the back, then write.
+    state store(&mut self, page_element: &PageElement, position: u64) -> bool {
+        self.shift_down(self.element_count, position);
+        transition position < 64 {
+            true -> write(page_element, position)
+            false -> (false)
+        }
+    }
+    state write(&mut self, page_element: &PageElement, position: u64 [0..64]) -> bool {
+        self.page_elements[position].clone_from(page_element);
+        self.element_count = ((self.element_count as u64 in Wrapping) + 1) as u64;
+        true
+    }
+}
+
+// `insert_sorted`'s tail shift: copy `page_elements[prior]` up to
+// `page_elements[prior+1]` while `prior >= low`. `at` enters at
+// `element_count` ≤ 63 (proven by the insert guard), so `at < 64` holds.
+pub machine PageElementList::shift_down(&mut self, at: u64, low: u64) {
+    transition at > low && at > 0 && at < 64 {
+        true -> step(at, low)
+        false -> done()
+        _ -> done()
+    }
+    state step(&mut self, at: u64 [0..64], low: u64) {
+        let prior: u64 = ((at as u64 in Wrapping) - 1) as u64;
+        transition { _ -> copy_slot(prior, at, low) }
+    }
+    state copy_slot(&mut self, prior: u64, at: u64 [0..64], low: u64) {
+        transition prior < 64 {
+            true -> write_slot(prior, at, low)
+            false -> done()
+        }
+    }
+    state write_slot(&mut self, prior: u64 [0..64], at: u64 [0..64], low: u64) {
+        let element: PageElement = PageElement::clone(&self.page_elements[prior]);
+        self.page_elements[at].clone_from(&element);
+        transition { _ -> shift_down(prior, low) }
+    }
+    state done(&mut self) {
+        self.element_count = self.element_count;
+    }
+}
+
+pub machine PageElement::clone(source: &PageElement) -> PageElement {
+    let mut copy: PageElement = PageElement::of(0, 0, 0, 0, DataTypeRef::default());
+    copy.clone_from(source);
+    copy
+}
+
+// Upstream response aggregate — fold one region's counts into another.
+// Same data type merges counts; new types append (bounded at 4).
+pub machine DataTypeResultCounts::merge_from(&mut self, source: &DataTypeResultCounts) {
+    transition { _ -> each(source, 0) }
+    state each(&mut self, source: &DataTypeResultCounts, position: u64) {
+        transition position < source.count && position < 4 {
+            true -> merge_one(source, position)
+            false -> done()
+        }
+    }
+    state merge_one(&mut self, source: &DataTypeResultCounts, position: u64 [0..4]) {
+        let entry: ScanResultDataTypeCount = source.get(position);
+        transition { _ -> seek(&entry, 0) }
+    }
+    state seek(&mut self, entry: &ScanResultDataTypeCount, position: u64) {
+        transition position < self.count && position < 4 {
+            true -> compare(entry, position)
+            false -> append(entry)
+        }
+    }
+    state compare(&mut self, entry: &ScanResultDataTypeCount, position: u64 [0..4]) {
+        transition self.counts[position].data_type_ref.equals(&entry.data_type_ref) {
+            true -> add(entry, position)
+            false -> seek(entry, position + 1)
+        }
+    }
+    state add(&mut self, entry: &ScanResultDataTypeCount, position: u64 [0..4]) {
+        self.counts[position].count = ((self.counts[position].count as u64 in Saturating)
+            + (entry.count as u64 in Saturating)) as u64;
+        transition { _ -> done() }
+    }
+    state append(&mut self, entry: &ScanResultDataTypeCount) {
+        transition self.count < 4 {
+            true -> store(entry)
+            false -> done()
+        }
+    }
+    state store(&mut self, entry: &ScanResultDataTypeCount) {
+        self.counts[self.count].clone_from(entry);
+        self.count = self.count + 1;
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
+        self.count = self.count;
+    }
+}
+
+pub machine DataTypeResultCounts::empty() -> DataTypeResultCounts {
+    DataTypeResultCounts { count: 0 }
+}

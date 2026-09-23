@@ -1,0 +1,324 @@
+module src::command_executors::scan_results_list_request_executor;
+
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_request::ScanResultsListRequest;
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultPage;
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultsListResponse;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::DataTypeResultCounts;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::PageElement;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::PageElementList;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
+use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
+use squalr_engine_api::src::structures::scan_results::scan_result_base::ScanResultBase;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
+use squalr_engine_api::src::structures::settings::scan_settings::ScanSettings;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
+
+// Port of commands/scan_results/list/scan_results_list_request_executor.rs:
+// `last_page = (count-1)/page_size` (saturating), page contents = the
+// globally merged, address-ordered enumeration of every region's scan
+// results (upstream's shared BinaryHeap merge — here sorted insertion into
+// the bounded page carrier, a named deviation for pages beyond 64
+// elements). Each listed element materializes a `ScanResult::Valued` with
+// the best-effort live read and the stored previous value.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ScanResultsListRequestExecutor {}
+
+pub machine ScanResultsListRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    scan_results_list_request: &ScanResultsListRequest
+) -> ScanResultsListResponse
+crashes Abort
+{
+    transition engine_privileged_state.has_opened_process() {
+        true -> count(engine_privileged_state, scan_results_list_request)
+        false -> (ScanResultsListResponse::default())
+        _ -> (ScanResultsListResponse::default())
+    }
+
+    state count(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_list_request: &ScanResultsListRequest
+    ) -> ScanResultsListResponse
+    {
+        let settings: ScanSettings = engine_privileged_state.get_scan_settings();
+        let snapshot: &Snapshot = engine_privileged_state.borrow_snapshot();
+        let result_count: u64 = ScanResultsListRequestExecutor::count_results(
+            snapshot, scan_results_list_request);
+        transition { _ -> page(
+            engine_privileged_state, scan_results_list_request, settings, result_count) }
+    }
+
+    state page(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_list_request: &ScanResultsListRequest,
+        settings: ScanSettings,
+        result_count: u64
+    ) -> ScanResultsListResponse
+    {
+        let page_size: u64 = settings.get_results_page_size();
+        transition page_size == 0 {
+            true -> sized(engine_privileged_state, scan_results_list_request, settings, result_count, 22)
+            false -> sized(engine_privileged_state, scan_results_list_request, settings, result_count, page_size)
+            _ -> sized(engine_privileged_state, scan_results_list_request, settings, result_count, page_size)
+        }
+    }
+    state sized(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_list_request: &ScanResultsListRequest,
+        settings: ScanSettings,
+        result_count: u64,
+        bounded_page_size: u64
+    ) -> ScanResultsListResponse
+    {
+        transition bounded_page_size > 0 {
+            true -> paged(engine_privileged_state, scan_results_list_request, settings, result_count, bounded_page_size)
+            false -> paged(engine_privileged_state, scan_results_list_request, settings, result_count, 1)
+            _ -> paged(engine_privileged_state, scan_results_list_request, settings, result_count, 1)
+        }
+    }
+    state paged(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_list_request: &ScanResultsListRequest,
+        settings: ScanSettings,
+        result_count: u64,
+        bounded_page_size: u64
+    ) -> ScanResultsListResponse
+    {
+        let last_page: u64 = (((result_count as u64 in Saturating)
+            - 1) as u64) / bounded_page_size;
+        let results_to_skip: u64 = ((scan_results_list_request.page_index as u64 in Saturating)
+            * (bounded_page_size as u64 in Saturating)) as u64;
+        // The global merge needs up to `results_to_skip + page_size`
+        // head-room per region — every surviving element of a region can
+        // sort ahead of another region's.
+        let headroom: u64 = ((results_to_skip as u64 in Saturating)
+            + (bounded_page_size as u64 in Saturating)) as u64;
+        let snapshot: &Snapshot = engine_privileged_state.borrow_snapshot();
+        let all: PageElementList = ScanResultsListRequestExecutor::enumerate_all(
+            snapshot, scan_results_list_request, headroom);
+        transition { _ -> window(
+            engine_privileged_state, scan_results_list_request, &all, results_to_skip,
+            bounded_page_size, ScanResultPage::empty(), 0, result_count, last_page) }
+    }
+
+    // Materialize the page window — elements [skip, skip+page_size) of the
+    // merged ordering.
+    state window(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_list_request: &ScanResultsListRequest,
+        all: &PageElementList,
+        results_to_skip: u64,
+        page_size: u64,
+        page: ScanResultPage,
+        position: u64,
+        result_count: u64,
+        last_page: u64
+    ) -> ScanResultsListResponse
+    {
+        transition position < all.get_element_count()
+            && position >= results_to_skip
+            && page.get_count() < page_size {
+            true -> element(
+                engine_privileged_state, scan_results_list_request, all, results_to_skip,
+                page_size, page, position, result_count, last_page)
+            false -> finish(engine_privileged_state, scan_results_list_request, page, result_count, last_page, page_size)
+        }
+    }
+
+    state element(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_list_request: &ScanResultsListRequest,
+        all: &PageElementList,
+        results_to_skip: u64,
+        page_size: u64,
+        page: ScanResultPage,
+        position: u64,
+        result_count: u64,
+        last_page: u64
+    ) -> ScanResultsListResponse
+    {
+        let element: PageElement = all.get_page_element(position);
+        // Upstream's best-effort live read for the displayed current value;
+        // the previous value comes from the stored snapshot window.
+        let source: &SuppliedMemorySource = engine_privileged_state.get_supplied_memory_source();
+        let current_value: u64 = source.read_u64(element.address);
+        let snapshot: &Snapshot = engine_privileged_state.borrow_snapshot();
+        let region: SnapshotRegion = snapshot.get_region(element.collection_index);
+        let previous: u64 = region.get_previous_element(element.element_index);
+        let base_dtr: DataTypeRef = element.data_type_ref;
+        let base: ScanResultBase = ScanResultBase::new(
+            element.address, base_dtr, ScanResultRef::new(element.element_index, false));
+        let valued: ScanResultValued = ScanResultValued::new(
+            base, true, current_value, true, previous);
+        let mut carried: ScanResultPage = page;
+        let pushed: bool = carried.push(&ScanResult::Valued { valued_result: valued });
+        transition { _ -> window(
+            engine_privileged_state, scan_results_list_request, all, results_to_skip,
+            page_size, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, result_count, last_page) }
+    }
+
+    state finish(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_list_request: &ScanResultsListRequest,
+        page: ScanResultPage,
+        result_count: u64,
+        last_page: u64,
+        page_size: u64
+    ) -> ScanResultsListResponse {
+        // Upstream fills `data_type_result_counts` +
+        // `total_size_in_bytes` from the same snapshot counters.
+        let snapshot: &Snapshot = engine_privileged_state.borrow_snapshot();
+        let counts: DataTypeResultCounts = ScanResultsListRequestExecutor::count_by_type(
+            snapshot, scan_results_list_request);
+        ScanResultsListResponse {
+            scan_results: page,
+            data_type_result_counts: counts,
+            page_index: scan_results_list_request.page_index,
+            page_size: page_size,
+            last_page_index: last_page,
+            result_count: result_count,
+            total_size_in_bytes: snapshot.get_collected_byte_count(),
+        }
+    }
+}
+
+// Upstream `get_number_of_results_for_data_types` across every region.
+pub machine ScanResultsListRequestExecutor::count_results(
+    snapshot: &Snapshot,
+    scan_results_list_request: &ScanResultsListRequest
+) -> u64 
+crashes Abort
+{
+    transition { _ -> each(snapshot, scan_results_list_request, 0, 0) }
+    state each(
+        snapshot: &Snapshot,
+        scan_results_list_request: &ScanResultsListRequest,
+        position: u64,
+        total: u64
+    ) -> u64 {
+        transition position < snapshot.get_region_count() {
+            true -> tally(snapshot, scan_results_list_request, position, total)
+            false -> (total)
+            _ -> (total)
+        }
+    }
+    state tally(
+        snapshot: &Snapshot,
+        scan_results_list_request: &ScanResultsListRequest,
+        position: u64,
+        total: u64
+    ) -> u64 {
+        let region: SnapshotRegion = snapshot.get_region(position);
+        let scan_results: SnapshotRegionScanResults = region.get_scan_results();
+        let region_count: u64 = scan_results.get_number_of_results_for_data_types(
+            &scan_results_list_request.data_type_filters.data_type_refs,
+            scan_results_list_request.data_type_filters.get_count());
+        let next_total: u64 = ((total as u64 in Saturating)
+            + (region_count as u64 in Saturating)) as u64;
+        transition { _ -> each(snapshot, scan_results_list_request, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next_total) }
+    }
+}
+
+// Merge every region's `enumerate_page` output into one address-sorted
+// list — upstream's BinaryHeap merge over per-region cursors. The headroom
+// bound truncates pages deeper than 64 (a named deviation).
+pub machine ScanResultsListRequestExecutor::enumerate_all(
+    snapshot: &Snapshot,
+    scan_results_list_request: &ScanResultsListRequest,
+    headroom: u64
+) -> PageElementList
+crashes Abort
+{
+    transition { _ -> each(snapshot, scan_results_list_request, headroom,
+        PageElementList::empty(), 0) }
+    state each(
+        snapshot: &Snapshot,
+        scan_results_list_request: &ScanResultsListRequest,
+        headroom: u64,
+        out: PageElementList,
+        region_index: u64
+    ) -> PageElementList
+    {
+        transition region_index < snapshot.get_region_count() {
+            true -> merge(snapshot, scan_results_list_request, headroom, out, region_index)
+            false -> (out)
+        }
+    }
+    state merge(
+        snapshot: &Snapshot,
+        scan_results_list_request: &ScanResultsListRequest,
+        headroom: u64,
+        out: PageElementList,
+        region_index: u64
+    ) -> PageElementList
+    {
+        let region: SnapshotRegion = snapshot.get_region(region_index);
+        let scan_results: SnapshotRegionScanResults = region.get_scan_results();
+        // `enumerate_page` is per-region: zero skip, `headroom` take — the
+        // global skip/window applies after the merge.
+        let region_page: PageElementList = scan_results.enumerate_page(
+            0, headroom, &scan_results_list_request.data_type_filters);
+        let merged: PageElementList = ScanResultsListRequestExecutor::merge_sorted(
+            out, &region_page, 0);
+        transition { _ -> each(snapshot, scan_results_list_request, headroom,
+            merged, ((region_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Sorted-insertion merge of `source` into `dest`.
+pub machine ScanResultsListRequestExecutor::merge_sorted(
+    dest: PageElementList,
+    source: &PageElementList,
+    position: u64
+) -> PageElementList {
+    transition position < source.get_element_count() {
+        true -> insert(dest, source, position)
+        false -> (dest)
+        _ -> (dest)
+    }
+    state insert(dest: PageElementList, source: &PageElementList, position: u64) -> PageElementList {
+        let element: PageElement = source.get_page_element(position);
+        let mut carried: PageElementList = dest;
+        let _merged: bool = carried.insert_sorted(&element);
+        transition { _ -> merge_sorted(carried, source, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Upstream `get_result_counts_by_data_type` merged across regions.
+pub machine ScanResultsListRequestExecutor::count_by_type(
+    snapshot: &Snapshot,
+    scan_results_list_request: &ScanResultsListRequest
+) -> DataTypeResultCounts 
+crashes Abort
+{
+    transition { _ -> each(snapshot, scan_results_list_request, DataTypeResultCounts::empty(), 0) }
+    state each(
+        snapshot: &Snapshot,
+        scan_results_list_request: &ScanResultsListRequest,
+        out: DataTypeResultCounts,
+        position: u64
+    ) -> DataTypeResultCounts {
+        transition position < snapshot.get_region_count() {
+            true -> merge(snapshot, scan_results_list_request, out, position)
+            false -> (out)
+            _ -> (out)
+        }
+    }
+    state merge(
+        snapshot: &Snapshot,
+        scan_results_list_request: &ScanResultsListRequest,
+        out: DataTypeResultCounts,
+        position: u64
+    ) -> DataTypeResultCounts {
+        let region: SnapshotRegion = snapshot.get_region(position);
+        let scan_results: SnapshotRegionScanResults = region.get_scan_results();
+        let mut carried: DataTypeResultCounts = out;
+        carried.merge_from(&scan_results.get_result_counts_by_data_type());
+        transition { _ -> each(snapshot, scan_results_list_request, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}

@@ -1,0 +1,190 @@
+module src::structures::data_types::data_type_ref;
+
+// Port of structures/data_types/data_type_ref.rs. Upstream keeps the type
+// identifier in a growable String; the byte domain keeps it in a bounded
+// inline buffer plus a length — the same translation ProcessInfo::name and
+// AnonymousValueString use, bounded at 32 bytes ("f32 [4]" style ids are far
+// shorter; longer ids refuse to parse rather than truncate — named
+// deviation).
+//
+// Upstream is Clone, not Copy, so the record carries no [copy]. Parse
+// failure collapses to `DataTypeRefParse::Refused`, matching the package's
+// refusal convention (Optional<T> is unmatchable downstream in this pin).
+pub data DataTypeRef {
+    data_type_id: [u8; 32];
+    data_type_id_len: u64;
+}
+
+pub data DataTypeRefParse {
+    case Refused;
+    case Parsed(value: DataTypeRef);
+}
+
+// Upstream `DataTypeRef::new` — stores the id verbatim.
+pub machine DataTypeRef::new(data_type_id: &[u8]) -> DataTypeRef {
+    let mut data_type_ref: DataTypeRef = DataTypeRef { data_type_id_len: 0 };
+    data_type_ref.set_data_type_id(data_type_id);
+    data_type_ref
+}
+
+pub machine DataTypeRef::default() -> DataTypeRef {
+    DataTypeRef { data_type_id_len: 0 }
+}
+
+// Upstream FromStr surface for the CLI parser: any nonempty id within the
+// bound parses; an empty or over-long id refuses.
+pub machine DataTypeRef::parse(text: &[u8]) -> DataTypeRefParse {
+    transition text.len > 0 && text.len <= 32 {
+        true -> (DataTypeRefParse::Parsed { value: DataTypeRef::new(text) })
+        false -> (DataTypeRefParse::Refused)
+    }
+}
+
+pub machine DataTypeRef::clone(source: &DataTypeRef) -> DataTypeRef {
+    DataTypeRef::new_from_window(source, 0, source.data_type_id_len)
+}
+
+// Builds a ref whose id is a byte window of an existing ref's stored id.
+pub machine DataTypeRef::new_from_window(
+    source: &DataTypeRef,
+    start: u64,
+    end: u64
+) -> DataTypeRef {
+    let mut data_type_ref: DataTypeRef = DataTypeRef { data_type_id_len: 0 };
+    data_type_ref.copy_id_window(source, start, end);
+    data_type_ref
+}
+
+pub machine DataTypeRef::clone_from(&mut self, source: &DataTypeRef) {
+    self.copy_id_window(source, 0, source.data_type_id_len);
+}
+
+machine DataTypeRef::copy_id_window(&mut self, source: &DataTypeRef, start: u64, end: u64) {
+    transition { _ -> copy(source, start, end, 0) }
+    state copy(&mut self, source: &DataTypeRef, at: u64, end: u64, position: u64) {
+        transition at < end && at < source.data_type_id_len && at < 32 && position < 32 {
+            true -> store(source, at, end, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, source: &DataTypeRef, at: u64, end: u64, position: u64) {
+        self.data_type_id[position] = source.data_type_id[at];
+        transition { _ -> copy(source, at + 1, end, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.data_type_id_len = count;
+    }
+}
+
+// Upstream `set_data_type_id` / `get_data_type_id` — the borrowed &str view
+// is not retainable, so reads are length + per-byte access.
+pub machine DataTypeRef::set_data_type_id(&mut self, data_type_id: &[u8]) {
+    transition { _ -> copy(data_type_id, 0) }
+    state copy(&mut self, data_type_id: &[u8], position: u64) {
+        transition position < data_type_id.len && position < 32 {
+            true -> store(data_type_id, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, data_type_id: &[u8], position: u64) {
+        self.data_type_id[position] = data_type_id[position];
+        transition { _ -> copy(data_type_id, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.data_type_id_len = count;
+    }
+}
+
+pub machine DataTypeRef::get_data_type_id_len(&self) -> u64 {
+    self.data_type_id_len
+}
+
+pub machine DataTypeRef::get_data_type_id_byte(&self, position: u64) -> u8 {
+    transition position < self.data_type_id_len && position < 32 {
+        true -> (self.data_type_id[position])
+        false -> (0)
+    }
+}
+
+// Upstream `PartialEq` for DataTypeRef — compares the stored ids.
+pub machine DataTypeRef::equals(&self, other: &DataTypeRef) -> bool {
+    transition self.data_type_id_len == other.data_type_id_len {
+        true -> scan(0, other)
+        false -> (false)
+    }
+    state scan(&self, position: u64, other: &DataTypeRef) -> bool {
+        transition position < self.data_type_id_len && position < 32 {
+            true -> compare(position, other)
+            false -> (true)
+        }
+    }
+    state compare(&self, position: u64 [0..32], other: &DataTypeRef) -> bool {
+        transition self.data_type_id[position] == other.data_type_id[position] {
+            true -> scan(position + 1, other)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `get_base_data_type_id` — for generics the id is written
+// "name{arg,...}"; the base is the prefix before '{'. Here the flag depth is
+// reported instead of slicing the buffer: callers compare the base by window.
+pub machine DataTypeRef::get_base_data_type_id_len(&self) -> u64 {
+    transition { _ -> scan(0) }
+    state scan(&self, position: u64) -> u64 {
+        transition position < self.data_type_id_len && position < 32 {
+            true -> probe(position)
+            false -> (self.data_type_id_len)
+        }
+    }
+    // '{' (byte 123) starts the generic argument list; the base ends there.
+    state probe(&self, position: u64 [0..32]) -> u64 {
+        transition self.data_type_id[position] == 123 {
+            true -> (position)
+            false -> scan(position + 1)
+            _ -> scan(position + 1)
+        }
+    }
+}
+
+// The element byte width this ref carries in a scan. The ported scalar leg
+// plans u64 scans (unit 8); any other id yields 0, which callers treat as
+// unsupported — a named deviation for the data-type matrix.
+pub machine DataTypeRef::get_unit_size_in_bytes(&self) -> u64 {
+    transition self.id_is("u64") {
+        true -> (8)
+        false -> (0)
+    }
+}
+
+pub machine DataTypeRef::id_is(&self, text: &[u8]) -> bool {
+    transition self.data_type_id_len == text.len && text.len <= 32 {
+        true -> scan(0, text)
+        false -> (false)
+    }
+    state scan(&self, position: u64, text: &[u8]) -> bool {
+        transition position < self.data_type_id_len && position < text.len && position < 32 {
+            true -> compare(position, text)
+            false -> tail(position)
+        }
+    }
+    state compare(&self, position: u64 [0..text.len], text: &[u8]) -> bool {
+        transition position < 32 && self.data_type_id[position] == text[position] {
+            true -> next(position, text)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state next(&self, position: u64, text: &[u8]) -> bool {
+        transition { _ -> scan(position + 1, text) }
+    }
+    state tail(&self, position: u64) -> bool {
+        transition position >= self.data_type_id_len {
+            true -> (true)
+            false -> (false)
+        }
+    }
+}
+
+// Upstream `PartialEq` for DataTypeRef — compares the stored ids.
