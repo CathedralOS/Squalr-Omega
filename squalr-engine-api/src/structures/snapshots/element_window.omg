@@ -1,0 +1,178 @@
+module src::structures::snapshots::element_window;
+
+// Port-local value window: the snapshot's per-region current/previous value
+// storage. Upstream stores raw bytes (`current_values: Vec<u8>`) and the
+// scalar scanners reinterpret-load elements; the ported scanners consume
+// decoded `&[u64]` element views, so the window stores one u64 per aligned
+// element — the byte-level decode the ported scanner comments delegate to
+// "the snapshot/value layer". A region covering `region_size` bytes at unit
+// size 8 holds `region_size / 8` elements.
+//
+// No growable Vec exists in this pin: the window is a bounded inline buffer
+// plus a length (MAX_ELEMENTS = 1024 elements = 8 KiB of covered memory per
+// region — regions wider than that truncate their collected values, a named
+// deviation from upstream's unbounded Vec<u8>; live capture sources bound
+// their supplied windows accordingly).
+pub data ElementWindow {
+    elements: [u64; 1024];
+    element_count: u64;
+}
+
+pub machine ElementWindow::empty() -> ElementWindow {
+    ElementWindow { element_count: 0 }
+}
+
+pub machine ElementWindow::of_length(element_count: u64) -> ElementWindow {
+    transition element_count <= 1024 {
+        true -> (ElementWindow { element_count: element_count })
+        false -> (ElementWindow { element_count: 1024 })
+    }
+}
+
+pub machine ElementWindow::clone(source: &ElementWindow) -> ElementWindow {
+    let mut window: ElementWindow = ElementWindow { element_count: source.element_count };
+    window.copy_from(source, 0);
+    window
+}
+
+pub machine ElementWindow::clone_from(&mut self, source: &ElementWindow) {
+    self.element_count = source.element_count;
+    self.copy_from(source, 0);
+}
+
+machine ElementWindow::copy_from(&mut self, source: &ElementWindow, position: u64) {
+    transition position < source.element_count && position < 1024 {
+        true -> copy(source, position)
+        false -> done()
+    }
+    state copy(&mut self, source: &ElementWindow, position: u64) {
+        self.elements[position] = source.elements[position];
+        transition { _ -> copy_from(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.element_count = self.element_count;
+    }
+}
+
+pub machine ElementWindow::get_element_count(&self) -> u64 {
+    self.element_count
+}
+
+pub machine ElementWindow::is_empty(&self) -> bool {
+    self.element_count == 0
+}
+
+pub machine ElementWindow::get_element(&self, position: u64) -> u64 {
+    transition position < self.element_count && position < 1024 {
+        true -> (self.elements[position])
+        false -> (0)
+    }
+}
+
+pub machine ElementWindow::set_element(&mut self, position: u64, value: u64) {
+    transition position < 1024 {
+        true -> store(position, value)
+        false -> done()
+    }
+    state store(&mut self, position: u64, value: u64) {
+        self.elements[position] = value;
+        // Writes extend the window only at the tail — scattered writes past
+        // the stored length still record their byte but do not move `count`.
+        transition position == self.element_count {
+            true -> grow(position)
+            false -> done()
+        }
+    }
+    state grow(&mut self, position: u64) {
+        self.element_count = position + 1;
+    }
+    state done(&mut self) {
+        self.element_count = self.element_count;
+    }
+}
+
+// Drops the first `element_index` elements and shifts the remainder down —
+// the element-space half of SnapshotRegion::resize_to_filters moving the
+// window base to the surviving filter union.
+pub machine ElementWindow::truncate_front(&mut self, element_index: u64) {
+    // A drop point at or past the window's bound empties it — same verdict
+    // the loop's `finish(0)` yields, short-circuited at entry.
+    transition element_index < 1024 {
+        true -> shift(element_index, 0)
+        false -> finish(0)
+    }
+    state shift(&mut self, element_index: u64 [0..1024], position: u64) {
+        let source: u64 = ((element_index as u64 in Saturating) + (position as u64 in Saturating)) as u64;
+        transition source < self.element_count && source < 1024 && position < 1024 {
+            true -> move_one(element_index, position, source)
+            false -> finish(position)
+        }
+    }
+    state move_one(&mut self, element_index: u64 [0..1024], position: u64 [0..1024], source: u64 [0..1024]) {
+        self.elements[position] = self.elements[source];
+        transition { _ -> shift(element_index, position + 1) }
+    }
+    state finish(&mut self, kept: u64) {
+        self.element_count = kept;
+    }
+}
+
+// Upstream byte-count surface: the window covers `element_count * unit`
+// bytes of the region.
+pub machine ElementWindow::get_covered_byte_count(&self, unit_size_in_bytes: u64) -> u64 {
+    ((self.element_count as u64 in Saturating) * (unit_size_in_bytes as u64 in Saturating)) as u64
+}
+
+// Upstream Vec::clear parity — drop the window back to empty.
+pub machine ElementWindow::clear(&mut self) {
+    self.element_count = 0;
+}
+
+// Clamp the window to at most `element_count` trailing elements — the
+// resize-to-filters back-edge cull. Larger inputs keep all elements.
+pub machine ElementWindow::truncate_back(&mut self, element_count: u64) {
+    transition self.element_count > element_count {
+        true -> clamp(element_count)
+        false -> keep()
+    }
+    state clamp(&mut self, element_count: u64) {
+        self.element_count = element_count;
+    }
+    state keep(&mut self) {
+        self.element_count = self.element_count;
+    }
+}
+
+// Upstream's filter-relative value views — `&window.elements[start..end]`.
+// The dominating `start <= 1024 - count` proves the subslice bound; the
+// returned slice's length is opaque to callers, so downstream indexing is
+// guarded against `slice.len` as the scanner legs already do.
+pub machine ElementWindow::slice(&self, start: u64, count: u64) -> &[u64] {
+    transition count <= 1024 && start < 1024 && start <= 1024 - count {
+        true -> windowed(start, count)
+        false -> (&self.elements[0..0])
+        _ -> (&self.elements[0..0])
+    }
+    state windowed(&self, start: u64 [0..1024], count: u64 [0..1025]) -> &[u64] {
+        let end: u64 = start + count;
+        transition start <= end && end <= 1024 {
+            true -> (&self.elements[start..end])
+            false -> (&self.elements[0..0])
+            _ -> (&self.elements[0..0])
+        }
+    }
+}
+
+// Upstream `Vec::push` on the decoded element list — appends one element,
+// truncating at the window bound (the carrier's named deviation).
+pub machine ElementWindow::push_element(&mut self, value: u64) -> bool {
+    transition self.element_count < 1024 {
+        true -> store(value)
+        false -> (false)
+    }
+    state store(&mut self, value: u64) -> bool {
+        self.elements[self.element_count] = value;
+        self.element_count = self.element_count + 1;
+        true
+    }
+}

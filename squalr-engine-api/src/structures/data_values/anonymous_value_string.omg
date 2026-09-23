@@ -58,6 +58,25 @@ pub machine AnonymousValueString::set_anonymous_value_string(&mut self, text: &[
     self.fill_value(text, 0, text.len);
 }
 
+// Windowed `new`: stores text[start..end] verbatim under the default
+// format/container — the constructor callers reach when the operand arrives
+// inside a larger token (e.g. the anonymous-scan-constraint prefix split).
+pub machine AnonymousValueString::new_window(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    anonymous_value_string_format: AnonymousValueStringFormat,
+    container_type: ContainerType
+) -> AnonymousValueString {
+    let mut value: AnonymousValueString = AnonymousValueString {
+        anonymous_value_string_len: 0,
+        anonymous_value_string_format: anonymous_value_string_format,
+        container_type: container_type
+    };
+    value.fill_value(text, start, end);
+    value
+}
+
 // Copies text[start..end] into the inline buffer, clamped at the bound, and
 // records the stored length — the same shape ProcessInfo::set_name uses.
 machine AnonymousValueString::fill_value(&mut self, text: &[u8], start: u64, end: u64) {
@@ -80,8 +99,48 @@ machine AnonymousValueString::fill_value(&mut self, text: &[u8], start: u64, end
 // Upstream `get_anonymous_value_string` returns `&str`; a borrowed view of
 // the inline buffer is not retainable here, so the byte-domain read is
 // length + explicit copy-out into a bound-sized buffer.
+// Derived `Clone` parity for moving parsed constraint operands by value.
+pub machine AnonymousValueString::clone(source: &AnonymousValueString) -> AnonymousValueString {
+    let mut value: AnonymousValueString = AnonymousValueString::new(
+        "", source.get_anonymous_value_string_format(), source.get_container_type());
+    value.clone_from(source);
+    value
+}
+
+pub machine AnonymousValueString::clone_from(&mut self, source: &AnonymousValueString) {
+    self.anonymous_value_string_len = source.anonymous_value_string_len;
+    self.anonymous_value_string_format = source.anonymous_value_string_format;
+    self.container_type = source.container_type;
+    self.copy_bytes(source, 0);
+}
+
+machine AnonymousValueString::copy_bytes(&mut self, source: &AnonymousValueString, position: u64) {
+    transition position < source.anonymous_value_string_len && position < 4096 {
+        true -> copy(source, position)
+        false -> done()
+    }
+    state copy(&mut self, source: &AnonymousValueString, position: u64) {
+        self.anonymous_value_string[position] = source.anonymous_value_string[position];
+        transition { _ -> copy_bytes(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.anonymous_value_string_len = self.anonymous_value_string_len;
+    }
+}
+
 pub machine AnonymousValueString::get_anonymous_value_string_len(&self) -> u64 {
     self.anonymous_value_string_len
+}
+
+// Byte-domain read without borrow: callers outside the package page the
+// stored operand text byte by byte (`copy_anonymous_value_string` keeps the
+// bulk copy-out; its `&mut` out-buffer does not cross packages under
+// selected entry establishment).
+pub machine AnonymousValueString::get_anonymous_value_string_byte(&self, position: u64) -> u8 {
+    transition position < self.anonymous_value_string_len && position < 4096 {
+        true -> (self.anonymous_value_string[position])
+        false -> (0)
+    }
 }
 
 // Copies the stored value into `out` and returns the byte count written —
@@ -243,5 +302,71 @@ machine holds(result: AnonymousValueStringParse, value_len: u64, total: u64) -> 
         AnonymousValueStringParse::Parsed { value } -> (value.get_anonymous_value_string_len() == value_len
             && value.get_container_type().get_total_size_in_bytes(1) == total)
         AnonymousValueStringParse::Refused -> (false)
+    }
+}
+
+// Upstream `DataValue::new_from_string`-equivalent for the u64 leg: parses
+// the stored operand as `0x`/`0X` hex or decimal — the two spellings
+// upstream `u64::from_str_radix`/`str::parse` accept for scan values.
+// Overflow wraps (the upstream clamp saturates into the data type — for u64
+// the whole range is representable, so a wrap never happens in practice; a
+// Wrapping accumulate keeps the arithmetic domain honest either way).
+pub data U64ValueParse {
+    case Refused;
+    case Parsed(value: u64);
+}
+
+pub machine AnonymousValueString::parse_u64(&self) -> U64ValueParse {
+    transition self.anonymous_value_string_len == 0 {
+        true -> (U64ValueParse::Refused)
+        false -> prefix()
+    }
+    state prefix(&self) -> U64ValueParse {
+        let has_hex: bool = self.anonymous_value_string_len > 2
+            && self.anonymous_value_string[0] == 48
+            && (self.anonymous_value_string[1] == 120 || self.anonymous_value_string[1] == 88);
+        transition has_hex {
+            true -> scan(2, 0, 16)
+            false -> scan(0, 0, 10)
+        }
+    }
+    state scan(&self, position: u64, acc: u64, radix: u64) -> U64ValueParse {
+        transition position < self.anonymous_value_string_len && position < 4096 {
+            true -> digit(position, acc, radix)
+            false -> (U64ValueParse::Parsed { value: acc })
+        }
+    }
+    state digit(&self, position: u64 [0..4096], acc: u64, radix: u64) -> U64ValueParse {
+        let byte: u8 = self.anonymous_value_string[position];
+        transition byte >= 48 && byte <= 57 {
+            true -> merge(position, acc, radix, ((byte as u64 in Wrapping) - 48) as u64)
+            false -> alpha(byte, position, acc, radix)
+            _ -> (U64ValueParse::Refused)
+        }
+    }
+    state alpha(&self, byte: u8, position: u64, acc: u64, radix: u64) -> U64ValueParse {
+        transition radix == 16 && byte >= 97 && byte <= 102 {
+            true -> merge(position, acc, radix, ((byte as u64 in Wrapping) - 87) as u64)
+            false -> upper(byte, position, acc, radix)
+            _ -> (U64ValueParse::Refused)
+        }
+    }
+    state upper(&self, byte: u8, position: u64, acc: u64, radix: u64) -> U64ValueParse {
+        transition radix == 16 && byte >= 65 && byte <= 70 {
+            true -> merge(position, acc, radix, ((byte as u64 in Wrapping) - 55) as u64)
+            false -> (U64ValueParse::Refused)
+            _ -> (U64ValueParse::Refused)
+        }
+    }
+    state merge(&self, position: u64, acc: u64, radix: u64, digit_value: u64) -> U64ValueParse {
+        transition digit_value < radix {
+            true -> next(position, acc, radix, digit_value)
+            false -> (U64ValueParse::Refused)
+        }
+    }
+    state next(&self, position: u64, acc: u64, radix: u64, digit_value: u64) -> U64ValueParse {
+        let next_acc: u64 = (((acc as u64 in Wrapping) * (radix as u64 in Wrapping))
+            + (digit_value as u64 in Wrapping)) as u64;
+        transition { _ -> scan(position + 1, next_acc, radix) }
     }
 }

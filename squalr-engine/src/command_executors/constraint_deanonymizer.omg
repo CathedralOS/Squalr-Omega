@@ -1,0 +1,113 @@
+module src::command_executors::constraint_deanonymizer;
+
+use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ScanConstraintSet;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::U64ValueParse;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
+use squalr_engine_api::src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraint;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
+
+// Port of the executor's deanonymize step: `ScanConstraintBuilder::build`
+// per (anonymous constraint, data type) — parses the value text against the
+// type — followed by the parameter-rule pass that finalizes each
+// `ScanConstraintFinalized`. For the scalar u64 leg the built constraint is
+// the same record upstream produces: compare type + parsed operand + the
+// scalar compare-function marker (immediate scans carry no scalar function).
+//
+// Constraints whose value refuses to parse are dropped exactly as upstream's
+// `filter_map` drops builder errors. The parse itself covers the scalar u64
+// leg's operand spellings (decimal and `0x` hex); other type spellings are
+// their own board legs.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ConstraintDeanonymizer {}
+
+pub machine ConstraintDeanonymizer::build_type_plan_list(
+    scan_constraints: &ScanConstraintSet,
+    data_type_ref: &DataTypeRef,
+    memory_alignment: MemoryAlignment
+) -> TypePlanList {
+    let mut plan_list: TypePlanList = TypePlanList::empty();
+    transition { _ -> each(&mut plan_list, scan_constraints, data_type_ref, memory_alignment, 0) }
+
+    state each(
+        plan_list: &mut TypePlanList,
+        scan_constraints: &ScanConstraintSet,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        transition position < scan_constraints.get_count() {
+            true -> build(plan_list, scan_constraints, data_type_ref, memory_alignment, position)
+            false -> done(plan_list)
+        }
+    }
+
+    state build(
+        plan_list: &mut TypePlanList,
+        scan_constraints: &ScanConstraintSet,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let constraint: AnonymousScanConstraint = scan_constraints.get(position);
+        let value_text: AnonymousValueString = constraint.get_anonymous_value_string();
+        let parse: U64ValueParse = value_text.parse_u64();
+        transition parse {
+            U64ValueParse::Parsed { value } -> plan(
+                plan_list, scan_constraints, constraint, value, data_type_ref, memory_alignment, position)
+            U64ValueParse::Refused -> next(plan_list, scan_constraints, data_type_ref, memory_alignment, position)
+            _ -> next(plan_list, scan_constraints, data_type_ref, memory_alignment, position)
+        }
+    }
+
+    // The built plan: `operand_value` is the parsed operand,
+    // `unit_size_in_bytes` the data type's unit; `has_scan_function_scalar`
+    // marks immediate scans (no two-pointer compare needed).
+    state plan(
+        plan_list: &mut TypePlanList,
+        scan_constraints: &ScanConstraintSet,
+        constraint: AnonymousScanConstraint,
+        operand_value: u64,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let has_value: bool = constraint.has_value();
+        let mut built: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::new(
+            constraint.get_scan_compare_type(),
+            operand_value,
+            data_type_ref.get_unit_size_in_bytes(),
+            has_value,
+            ScanFunctionScalar::Immediate,
+            memory_alignment);
+        // The scalar leg's plan-type rule: a present current window makes
+        // the filter scannable scalar-iteratively (upstream's byte-array and
+        // vector specializations land with their own legs; scalar covers the
+        // same filter set, only less specialized).
+        built.set_planned_scan_type(PlannedScanType::Scalar {
+            scan_type: PlannedScanTypeScalar::ScalarIterative });
+        let pushed: bool = plan_list.push(&built);
+        transition { _ -> next(plan_list, scan_constraints, data_type_ref, memory_alignment, position) }
+    }
+
+    state next(
+        plan_list: &mut TypePlanList,
+        scan_constraints: &ScanConstraintSet,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        transition { _ -> each(plan_list, scan_constraints, data_type_ref, memory_alignment, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state done(plan_list: &mut TypePlanList) -> TypePlanList {
+        (TypePlanList::clone(plan_list))
+    }
+}

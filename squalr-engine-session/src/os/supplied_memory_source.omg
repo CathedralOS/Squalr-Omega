@@ -1,0 +1,235 @@
+module src::os::supplied_memory_source;
+
+use squalr_engine_api::src::structures::memory::normalized_region::NormalizedRegion;
+use squalr_engine_api::src::structures::snapshots::element_window::ElementWindow;
+
+// Sanctioned test adapter for the headless command leg: a fault-injected
+// memory source standing in for the live process reader, in the spirit of
+// upstream's test `MemoryViewInstance` implementations. The CLI leg has no
+// real target to open, so the engine drives scans over the supplied regions;
+// the native target leg swaps in the real reader unchanged downstream of the
+// provider boundary. One supplied region is one mergeable page run —
+// `get_memory_page_bounds` reports each region as one page so the engine's
+// merge keeps upstream's shape.
+pub data SuppliedRegion {
+    base_address: u64;
+    elements: ElementWindow;
+    element_stride_bytes: u64;
+}
+
+pub data SuppliedMemorySource {
+    regions: [SuppliedRegion; 16];
+    region_count: u64;
+}
+
+pub machine SuppliedRegion::new(
+    base_address: u64,
+    elements: &ElementWindow,
+    element_stride_bytes: u64
+) -> SuppliedRegion {
+    SuppliedRegion {
+        base_address: base_address,
+        elements: ElementWindow::clone(elements),
+        element_stride_bytes: element_stride_bytes,
+    }
+}
+
+pub machine SuppliedRegion::get_base_address(&self) -> u64 {
+    self.base_address
+}
+
+// Owned-window variant of `new` for construction sites that cannot form a
+// borrow (the fixture path's entry-closure admissibility).
+pub machine SuppliedRegion::of_window(
+    base_address: u64,
+    elements: ElementWindow,
+    element_stride_bytes: u64
+) -> SuppliedRegion {
+    SuppliedRegion {
+        base_address: base_address,
+        elements: elements,
+        element_stride_bytes: element_stride_bytes,
+    }
+}
+
+// The region's byte extent — upstream computes
+// `current_values.len() * element_stride` worth of covered bytes.
+pub machine SuppliedRegion::get_region_size(&self) -> u64 {
+    ((self.elements.get_element_count() as u64 in Saturating)
+        * (self.element_stride_bytes as u64 in Saturating)) as u64
+}
+
+pub machine SuppliedRegion::get_elements(&self) -> ElementWindow {
+    ElementWindow::clone(&self.elements)
+}
+
+pub machine SuppliedMemorySource::empty() -> SuppliedMemorySource {
+    SuppliedMemorySource { region_count: 0 }
+}
+
+// Single-region fixture source: record-literal construction, the only shape
+// the entry-closure local-construction stage admits for aggregates.
+pub machine SuppliedMemorySource::of_region(region: SuppliedRegion) -> SuppliedMemorySource {
+    SuppliedMemorySource {
+        regions: [
+            region,
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 }
+        ],
+        region_count: 1,
+    }
+}
+
+pub machine SuppliedMemorySource::get_region_count(&self) -> u64 {
+    self.region_count
+}
+
+pub machine SuppliedMemorySource::push_region(&mut self, region: &SuppliedRegion) -> bool {
+    transition self.region_count < 16 {
+        true -> store(region)
+        false -> (false)
+    }
+    state store(&mut self, region: &SuppliedRegion) -> bool {
+        self.regions[self.region_count].clone_from(region);
+        self.region_count = self.region_count + 1;
+        true
+    }
+}
+
+pub machine SuppliedRegion::clone_from(&mut self, source: &SuppliedRegion) {
+    self.base_address = source.base_address;
+    self.elements.clone_from(&source.elements);
+    self.element_stride_bytes = source.element_stride_bytes;
+}
+
+pub machine SuppliedRegion::clone(source: &SuppliedRegion) -> SuppliedRegion {
+    SuppliedRegion {
+        base_address: source.base_address,
+        elements: ElementWindow::clone(&source.elements),
+        element_stride_bytes: source.element_stride_bytes,
+    }
+}
+
+// Upstream `get_memory_page_bounds` over the supplied set — yields each
+// region's normalized bounds one at a time through the cursor.
+pub machine SuppliedMemorySource::get_page_bounds(
+    &self,
+    position: u64
+) -> NormalizedRegion {
+    transition position < self.region_count && position < 16 {
+        true -> found(position)
+        false -> (NormalizedRegion::new(0, 0))
+    }
+    state found(&self, position: u64 [0..16]) -> NormalizedRegion {
+        NormalizedRegion::new(
+            self.regions[position].get_base_address(),
+            self.regions[position].get_region_size())
+    }
+}
+
+// The collector's read of one snapshot region — upstream issues a byte
+// read over `[base, base+size)`; the adapter answers by walking the supplied
+// regions in order and concatenating the windows that overlap the range.
+// Elements carry `element_stride_bytes`; the window bound truncates.
+pub machine SuppliedMemorySource::read_window(
+    &self,
+    base_address: u64,
+    size_in_bytes: u64
+) -> ElementWindow {
+    let mut window: ElementWindow = ElementWindow::empty();
+    transition { _ -> each(&mut window, base_address, size_in_bytes, 0) }
+    state each(&self, window: &mut ElementWindow, base_address: u64, size_in_bytes: u64, position: u64) {
+        transition position < self.region_count && position < 16 {
+            true -> overlap(window, base_address, size_in_bytes, position)
+            false -> done(window)
+        }
+    }
+    state overlap(&self, window: &mut ElementWindow, base_address: u64, size_in_bytes: u64, position: u64 [0..16]) {
+        let region_base: u64 = self.regions[position].get_base_address();
+        let region_end: u64 = ((region_base as u64 in Saturating)
+            + (self.regions[position].get_region_size() as u64 in Saturating)) as u64;
+        let read_end: u64 = ((base_address as u64 in Saturating)
+            + (size_in_bytes as u64 in Saturating)) as u64;
+        transition region_base < read_end && region_end > base_address {
+            true -> append(window, base_address, size_in_bytes, position)
+            false -> each(window, base_address, size_in_bytes, position + 1)
+        }
+    }
+    state append(&self, window: &mut ElementWindow, base_address: u64, size_in_bytes: u64, position: u64 [0..16]) {
+        let supplied: ElementWindow = self.regions[position].get_elements();
+        transition { _ -> append_at(window, &supplied, base_address, size_in_bytes, 0, position) }
+    }
+    state append_at(&self, window: &mut ElementWindow, supplied: &ElementWindow, base_address: u64, size_in_bytes: u64, element_index: u64, position: u64 [0..16]) {
+        transition element_index < supplied.get_element_count() {
+            true -> push(window, supplied, base_address, size_in_bytes, element_index, position)
+            false -> each(window, base_address, size_in_bytes, position + 1)
+        }
+    }
+    state push(&self, window: &mut ElementWindow, supplied: &ElementWindow, base_address: u64, size_in_bytes: u64, element_index: u64, position: u64 [0..16]) {
+        let value: u64 = supplied.get_element(element_index);
+        let pushed: bool = window.push_element(value);
+        transition { _ -> append_at(window, supplied, base_address, size_in_bytes, ((element_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, position) }
+    }
+    state done(&self, window: &mut ElementWindow) -> ElementWindow {
+        (ElementWindow::clone(window))
+    }
+}
+
+// Best-effort live read for `scan-results list` display — the value at the
+// element offset under `address`, or 0 when the address misses every
+// supplied region (upstream logs the read failure and shows the default).
+pub machine SuppliedMemorySource::read_u64(&self, address: u64) -> u64 {
+    transition { _ -> each(address, 0) }
+    state each(&self, address: u64, position: u64) -> u64 {
+        transition position < self.region_count && position < 16 {
+            true -> inside(address, position)
+            false -> (0)
+        }
+    }
+    state inside(&self, address: u64, position: u64 [0..16]) -> u64 {
+        let base: u64 = self.regions[position].get_base_address();
+        let size: u64 = self.regions[position].get_region_size();
+        let stride: u64 = self.regions[position].element_stride_bytes;
+        let limit: u64 = ((base as u64 in Saturating) + (size as u64 in Saturating)) as u64;
+        transition address >= base && address < limit && stride > 0 {
+            true -> at(address, position, base, stride)
+            false -> each(address, position + 1)
+        }
+    }
+    state at(&self, address: u64, position: u64 [0..16], base: u64, stride: u64) -> u64 {
+        let element_index: u64 = (((address as u64 in Saturating) - (base as u64 in Saturating))
+            / (stride as u64 in Saturating)) as u64;
+        self.regions[position].elements.get_element(element_index)
+    }
+}
+
+pub machine SuppliedMemorySource::clone_from(&mut self, source: &SuppliedMemorySource) {
+    self.region_count = source.region_count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &SuppliedMemorySource, position: u64) {
+        transition position < source.region_count && position < 16 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &SuppliedMemorySource, position: u64 [0..16]) {
+        self.regions[position].clone_from(&source.regions[position]);
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}

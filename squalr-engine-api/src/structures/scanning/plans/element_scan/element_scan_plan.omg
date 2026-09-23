@@ -1,0 +1,199 @@
+module src::structures::scanning::plans::element_scan::element_scan_plan;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
+use src::structures::scanning::memory_read_mode::MemoryReadMode;
+use src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
+use src::structures::snapshots::snapshot_region::DataTypeRefSet;
+
+// Port of structures/scanning/plans/element_scan/element_scan_plan.rs, scalar
+// leg: the finalized plan set the element scan executor builds by
+// deanonymizing anonymous constraints per data type. Upstream keeps
+// `HashMap<DataTypeRef, Vec<ScanConstraintFinalized>>`; the port keeps the
+// same shape as a bounded per-type plan list (MAX_TYPES = 4 types, up to 4
+// constraints each — a named deviation; the CLI surface accepts more
+// spellings but truncates).
+//
+// Upstream also carries `floating_point_tolerance` and
+// `debug_perform_validation_scan` — deferred to their own board legs.
+pub data TypePlanList {
+    plans: [SnapshotFilterElementScanPlan; 4];
+    plan_count: u64;
+}
+
+pub data ElementScanPlan {
+    data_type_refs: DataTypeRefSet;
+    plan_lists: [TypePlanList; 4];
+    memory_alignment: MemoryAlignment;
+    memory_read_mode: MemoryReadMode;
+    is_single_threaded_scan: bool;
+}
+
+pub machine TypePlanList::empty() -> TypePlanList {
+    TypePlanList { plan_count: 0 }
+}
+
+pub machine TypePlanList::push(&mut self, plan: &SnapshotFilterElementScanPlan) -> bool {
+    transition self.plan_count < 4 {
+        true -> store(plan)
+        false -> (false)
+    }
+    state store(&mut self, plan: &SnapshotFilterElementScanPlan) -> bool {
+        self.plans[self.plan_count].clone_from(plan);
+        self.plan_count = self.plan_count + 1;
+        true
+    }
+}
+
+pub machine TypePlanList::get_plan_count(&self) -> u64 {
+    self.plan_count
+}
+
+pub machine TypePlanList::get_plan(&self, plan_index: u64) -> SnapshotFilterElementScanPlan {
+    transition plan_index < self.plan_count && plan_index < 4 {
+        true -> found(plan_index)
+        false -> (SnapshotFilterElementScanPlan::new(
+            ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::Equal },
+            0, 0, false, ScanFunctionScalar::Immediate, MemoryAlignment::Alignment1))
+    }
+    state found(&self, plan_index: u64 [0..4]) -> SnapshotFilterElementScanPlan {
+        SnapshotFilterElementScanPlan::clone(&self.plans[plan_index])
+    }
+}
+
+pub machine TypePlanList::clone_from(&mut self, source: &TypePlanList) {
+    self.plan_count = source.plan_count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &TypePlanList, position: u64) {
+        transition position < source.plan_count && position < 4 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &TypePlanList, position: u64 [0..4]) {
+        self.plans[position].clone_from(&source.plans[position]);
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.plan_count = self.plan_count;
+    }
+}
+
+pub machine TypePlanList::clone(source: &TypePlanList) -> TypePlanList {
+    let mut copy: TypePlanList = TypePlanList::empty();
+    copy.clone_from(source);
+    copy
+}
+
+// Upstream `ElementScanPlan::new` defaults; the executor fills plan lists per
+// deanonymized type afterwards.
+pub machine ElementScanPlan::new(
+    memory_alignment: MemoryAlignment,
+    memory_read_mode: MemoryReadMode,
+    is_single_threaded_scan: bool
+) -> ElementScanPlan {
+    // Zero-init covers `plan_lists` — equal to TypePlanList::empty() slots.
+    ElementScanPlan {
+        data_type_refs: DataTypeRefSet::empty(),
+        memory_alignment: memory_alignment,
+        memory_read_mode: memory_read_mode,
+        is_single_threaded_scan: is_single_threaded_scan,
+    }
+}
+
+// Append one data type with its finalized plan list — upstream's
+// `scan_constraints_by_data_type.insert(data_type_ref, constraints)`.
+pub machine ElementScanPlan::push_type_plans(
+    &mut self,
+    data_type_ref: &DataTypeRef,
+    plan_list: &TypePlanList
+) -> bool {
+    transition self.data_type_refs.count < 4 {
+        true -> store(data_type_ref, plan_list)
+        false -> (false)
+    }
+    state store(&mut self, data_type_ref: &DataTypeRef, plan_list: &TypePlanList) -> bool {
+        let pushed: bool = self.data_type_refs.push(data_type_ref);
+        let last: u64 = ((self.data_type_refs.count as u64 in Wrapping) - 1) as u64;
+        transition pushed && last < 4 {
+            true -> install(last, plan_list)
+            false -> (pushed)
+            _ -> (pushed)
+        }
+    }
+    state install(&mut self, last: u64 [0..4], plan_list: &TypePlanList) -> bool {
+        self.plan_lists[last].clone_from(plan_list);
+        true
+    }
+}
+
+pub machine ElementScanPlan::get_data_type_ref_count(&self) -> u64 {
+    self.data_type_refs.count
+}
+
+pub machine ElementScanPlan::get_data_type_ref(&self, position: u64) -> DataTypeRef {
+    self.data_type_refs.get(position)
+}
+
+pub machine ElementScanPlan::get_plan_list(&self, type_index: u64) -> TypePlanList {
+    transition type_index < self.data_type_refs.count && type_index < 4 {
+        true -> found(type_index)
+        false -> (TypePlanList::empty())
+    }
+    state found(&self, type_index: u64 [0..4]) -> TypePlanList {
+        TypePlanList::clone(&self.plan_lists[type_index])
+    }
+}
+
+pub machine ElementScanPlan::get_memory_alignment(&self) -> MemoryAlignment {
+    self.memory_alignment
+}
+
+pub machine ElementScanPlan::get_memory_read_mode(&self) -> MemoryReadMode {
+    self.memory_read_mode
+}
+
+pub machine ElementScanPlan::get_is_single_threaded_scan(&self) -> bool {
+    self.is_single_threaded_scan
+}
+
+pub machine ElementScanPlan::clone_data_type_refs(&self) -> DataTypeRefSet {
+    transition { _ -> each(DataTypeRefSet::empty(), 0) }
+    state each(&self, copy: DataTypeRefSet, position: u64) -> DataTypeRefSet {
+        transition position < self.data_type_refs.count && position < 4 {
+            true -> push(copy, position)
+            false -> (copy)
+        }
+    }
+    state push(&self, copy: DataTypeRefSet, position: u64 [0..4]) -> DataTypeRefSet {
+        let data_type_ref: DataTypeRef = self.data_type_refs.get(position);
+        let mut carried: DataTypeRefSet = copy;
+        let pushed: bool = carried.push(&data_type_ref);
+        transition { _ -> each(carried, position + 1) }
+    }
+}
+
+// Upstream `get_scan_constraints_by_data_type().get(data_type_ref)` — the
+// plan list registered for the collection's data type, or empty.
+pub machine ElementScanPlan::get_plan_list_for(&self, data_type_ref: &DataTypeRef) -> TypePlanList {
+    transition { _ -> seek(data_type_ref, 0) }
+    state seek(&self, data_type_ref: &DataTypeRef, position: u64) -> TypePlanList {
+        transition position < self.data_type_refs.count && position < 4 {
+            true -> compare(data_type_ref, position)
+            false -> (TypePlanList::empty())
+        }
+    }
+    state compare(&self, data_type_ref: &DataTypeRef, position: u64 [0..4]) -> TypePlanList {
+        let candidate: DataTypeRef = self.data_type_refs.get(position);
+        transition candidate.equals(data_type_ref) {
+            true -> found(position)
+            false -> seek(data_type_ref, position + 1)
+        }
+    }
+    state found(&self, position: u64 [0..4]) -> TypePlanList {
+        TypePlanList::clone(&self.plan_lists[position])
+    }
+}

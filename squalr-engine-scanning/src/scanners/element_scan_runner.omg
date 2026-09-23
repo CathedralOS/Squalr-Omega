@@ -1,0 +1,207 @@
+module src::scanners::element_scan_runner;
+
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
+use src::scanners::scalar::scanner_scalar_single_element::ScannerScalarSingleElement;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
+
+// The in-package drain of `ElementScanDispatcher`'s pull contract. Upstream
+// `dispatch_scan_for_snapshot_filter` acquires a scanner per plan and calls
+// `scan_region(snapshot_region, snapshot_region_filter, plan)`, which walks
+// the filter's element window via the region's filter-relative value
+// pointers. The port slices `region`'s element windows at the filter's first
+// element index — identical coverage since a window begins at the region
+// base and elements step by the scan's memory alignment.
+//
+// `Optional<ScalarRegionScan>` is unmatchable even in-package, so the runner
+// replicates the dispatcher's plan routing: a Scalar plan drains
+// `ScalarIterativeScan` (or resolves SingleElement through the dedicated
+// one-shot scanner); other plan kinds yield an empty collection exactly as
+// upstream's unplanned case does. Drained filters are bounded at the
+// collection's capacity — upstream grows without bound; overflow truncates
+// (a named deviation at the bounded carrier, not a semantic change to which
+// filters the scanner emits).
+// Empty receiver carrying the runner's machines — mirrors upstream's
+// `impl` namespace.
+pub data ElementScanRunner {}
+
+pub machine ElementScanRunner::run_region(
+    snapshot_region: &SnapshotRegion,
+    snapshot_region_filter: &SnapshotRegionFilter,
+    plan: &SnapshotFilterElementScanPlan,
+    data_type_ref: &DataTypeRef
+) -> SnapshotRegionFilterCollection
+crashes Abort
+{
+    let result: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(
+        DataTypeRef::clone(data_type_ref),
+        plan.get_memory_alignment(),
+        plan.get_unit_size_in_bytes());
+    transition plan.get_planned_scan_type() {
+        PlannedScanType::Scalar { scan_type } -> scalar(
+            scan_type, snapshot_region, snapshot_region_filter, plan, result)
+        PlannedScanType::Invalid -> (result)
+        PlannedScanType::Vector { scan_type, vectorization_size } -> (result)
+        PlannedScanType::ByteArray { scan_type } -> (result)
+        _ -> (result)
+    }
+
+    state scalar(
+        scan_type: PlannedScanTypeScalar,
+        snapshot_region: &SnapshotRegion,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        result: SnapshotRegionFilterCollection
+    ) -> SnapshotRegionFilterCollection
+    {
+        transition scan_type {
+            PlannedScanTypeScalar::ScalarIterative -> iterative(
+                snapshot_region, snapshot_region_filter, plan, result)
+            PlannedScanTypeScalar::SingleElement -> single(
+                snapshot_region, snapshot_region_filter, plan, result)
+        }
+    }
+
+    // The filter's window-relative element index — upstream derives the
+    // pointer offset as `filter.base - region.base` bytes; the element model
+    // divides that byte offset by the scan alignment to index the decoded
+    // window.
+    state iterative(
+        snapshot_region: &SnapshotRegion,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        result: SnapshotRegionFilterCollection
+    ) -> SnapshotRegionFilterCollection
+    {
+        let mut scan: ScalarIterativeScan = ScalarIterativeScan::new(snapshot_region_filter, plan);
+        let mut collected: SnapshotRegionFilterCollection = result;
+        let base_difference: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+            - (snapshot_region.get_base_address() as u64 in Saturating)) as u64;
+        let memory_alignment: MemoryAlignment = plan.get_memory_alignment();
+        let alignment_size: u64 = memory_alignment.get_size_in_bytes();
+        let start: u64 = ((base_difference as u64 in Saturating)
+            / (alignment_size as u64 in Saturating)) as u64;
+        let count: u64 = snapshot_region_filter.get_element_count(
+            plan.get_unit_size_in_bytes(),
+            plan.get_memory_alignment());
+        let current_values: &[u64] = snapshot_region.get_current_values_slice(start, count);
+        let previous_values: &[u64] = snapshot_region.get_previous_values_slice(start, count);
+        ElementScanRunner::drain_iterative(&mut scan, current_values, previous_values, &mut collected);
+        (collected)
+    }
+
+    // Upstream `scalar_single_element_scan`: compares the filter's single
+    // element and emits either the whole-filter region or nothing — the same
+    // one-or-empty result the dispatcher's pending path yields.
+    state single(
+        snapshot_region: &SnapshotRegion,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        result: SnapshotRegionFilterCollection
+    ) -> SnapshotRegionFilterCollection
+    {
+        let mut collected: SnapshotRegionFilterCollection = result;
+        let base_difference: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+            - (snapshot_region.get_base_address() as u64 in Saturating)) as u64;
+        let memory_alignment: MemoryAlignment = plan.get_memory_alignment();
+        let alignment_size: u64 = memory_alignment.get_size_in_bytes();
+        let start: u64 = ((base_difference as u64 in Saturating)
+            / (alignment_size as u64 in Saturating)) as u64;
+        let count: u64 = snapshot_region_filter.get_element_count(
+            plan.get_unit_size_in_bytes(),
+            plan.get_memory_alignment());
+        let current_values: &[u64] = snapshot_region.get_current_values_slice(start, count);
+        let previous_values: &[u64] = snapshot_region.get_previous_values_slice(start, count);
+        transition current_values.len > 0 && previous_values.len > 0 {
+            true -> eval(current_values, previous_values, snapshot_region_filter, plan, collected)
+            false -> (collected)
+            _ -> (collected)
+        }
+    }
+
+    state eval(
+        current_values: &[u64],
+        previous_values: &[u64],
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        collected: SnapshotRegionFilterCollection
+    ) -> SnapshotRegionFilterCollection {
+        let emitted: EmittedRegion = ScannerScalarSingleElement::scan_region(
+            snapshot_region_filter,
+            plan,
+            current_values[0],
+            previous_values[0]);
+        let mut collected_inner: SnapshotRegionFilterCollection = collected;
+        transition emitted {
+            EmittedRegion::Region { region } -> push(collected_inner, region)
+            EmittedRegion::Empty -> (collected_inner)
+            _ -> (collected_inner)
+        }
+    }
+
+    state push(
+        collected: SnapshotRegionFilterCollection,
+        region: SnapshotRegionFilter
+    ) -> SnapshotRegionFilterCollection {
+        let mut inner: SnapshotRegionFilterCollection = collected;
+        let pushed: bool = inner.push_filter(&region);
+        transition pushed {
+            true -> (inner)
+            false -> (inner)
+            _ -> (inner)
+        }
+    }
+}
+
+// Upstream `scalar_iterative_scan`'s driver loop: pull `next` until
+// `EmittedRegion::Empty`, appending each emitted region in order. Kept as a
+// sibling machine so the mutable scanner and collection can ride `&mut`
+// params through the state chain — state params cannot hold mutable locals.
+pub machine ElementScanRunner::drain_iterative(
+    scan: &mut ScalarIterativeScan,
+    current_values: &[u64],
+    previous_values: &[u64],
+    collected: &mut SnapshotRegionFilterCollection
+) {
+    transition { _ -> pump(scan, current_values, previous_values, collected) }
+
+    state pump(
+        scan: &mut ScalarIterativeScan,
+        current_values: &[u64],
+        previous_values: &[u64],
+        collected: &mut SnapshotRegionFilterCollection
+    ) {
+        let emitted: EmittedRegion = scan.next(current_values, previous_values);
+        transition emitted {
+            EmittedRegion::Region { region } -> collect(
+                scan, current_values, previous_values, collected, region)
+            EmittedRegion::Empty -> done()
+            _ -> done()
+        }
+    }
+
+    state collect(
+        scan: &mut ScalarIterativeScan,
+        current_values: &[u64],
+        previous_values: &[u64],
+        collected: &mut SnapshotRegionFilterCollection,
+        region: SnapshotRegionFilter
+    ) {
+        let pushed: bool = collected.push_filter(&region);
+        transition pushed {
+            true -> pump(scan, current_values, previous_values, collected)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state done() {
+    }
+}
