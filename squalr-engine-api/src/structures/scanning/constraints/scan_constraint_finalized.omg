@@ -1,0 +1,242 @@
+module src::structures::scanning::constraints::scan_constraint_finalized;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
+use src::structures::scanning::constraints::scan_constraint::ScanConstraint;
+
+// Port of structures/scanning/constraints/scan_constraint_finalized.rs,
+// scalar leg: a ScanConstraint after the parameter rules ran, plus the
+// derived facts the scanners consume (periodicity, unit size, the selected
+// compare function family). Upstream stores Option<ScanFunctionScalar>
+// beside three Option<ScanFunctionVector<N>> fields; the vector functions
+// land with the SIMD leg, so only the scalar slot is carried — split into a
+// presence flag plus the payload (the Option-over-package-type convention
+// used by the plan file).
+pub data ScanConstraintFinalized<'a> {
+    scan_constraint: ScanConstraint<'a>;
+    periodicity: u64;
+    unit_size_in_bytes: u64;
+    has_scan_function_scalar: bool;
+    scan_function_scalar: ScanFunctionScalar;
+}
+
+// Upstream `ScanConstraintFinalized::new`. `unit_size_in_bytes` upstream
+// comes from `symbol_registry.get_unit_size_in_bytes`; the caller supplies
+// it here (the data type's natural element size — what the registry would
+// return for a registered primitive).
+pub machine ScanConstraintFinalized::new<'a>(
+    scan_constraint: ScanConstraint<'a>,
+    unit_size_in_bytes: u64
+) -> ScanConstraintFinalized<'a> {
+    let compare_type: ScanCompareType = scan_constraint.get_scan_compare_type();
+    let operand_value: u64 = scan_constraint.get_operand_value();
+    let operand_size_in_bytes: u64 = scan_constraint.get_operand_size_in_bytes();
+    ScanConstraintFinalized {
+        scan_constraint: scan_constraint,
+        periodicity: ScanConstraintFinalized::calculate_periodicity(
+            compare_type,
+            operand_value,
+            operand_size_in_bytes,
+            unit_size_in_bytes
+        ),
+        unit_size_in_bytes: unit_size_in_bytes,
+        has_scan_function_scalar: true,
+        scan_function_scalar: ScanConstraintFinalized::build_scan_function_scalar(compare_type),
+    }
+}
+
+// Upstream `get_scan_constraint`; rebuilt field-wise through `&self` (the
+// record is not [copy] since DataTypeRef carries a borrow).
+pub machine ScanConstraintFinalized::get_scan_constraint<'a>(&self) -> ScanConstraint<'a> {
+    ScanConstraint {
+        data_type_ref: self.scan_constraint.get_data_type_ref(),
+        scan_compare_type: self.scan_constraint.get_scan_compare_type(),
+        operand_value: self.scan_constraint.get_operand_value(),
+        operand_size_in_bytes: self.scan_constraint.get_operand_size_in_bytes(),
+        is_signed: self.scan_constraint.is_signed(),
+        is_floating_point: self.scan_constraint.is_floating_point(),
+        prefer_type_scanner: self.scan_constraint.prefers_type_scanner(),
+        has_mask: self.scan_constraint.has_mask(),
+        is_byte_array: self.scan_constraint.is_byte_array(),
+        result_container_type: self.scan_constraint.get_result_container_type(),
+    }
+}
+
+pub machine ScanConstraintFinalized::get_data_type_ref<'a>(&self) -> DataTypeRef<'a> {
+    self.scan_constraint.get_data_type_ref()
+}
+
+pub machine ScanConstraintFinalized::get_scan_compare_type(&self) -> ScanCompareType {
+    self.scan_constraint.get_scan_compare_type()
+}
+
+pub machine ScanConstraintFinalized::get_operand_value(&self) -> u64 {
+    self.scan_constraint.get_operand_value()
+}
+
+pub machine ScanConstraintFinalized::get_operand_size_in_bytes(&self) -> u64 {
+    self.scan_constraint.get_operand_size_in_bytes()
+}
+
+pub machine ScanConstraintFinalized::get_periodicity(&self) -> u64 {
+    self.periodicity
+}
+
+// Upstream `get_unit_size_in_bytes`.
+pub machine ScanConstraintFinalized::get_unit_size_in_bytes(&self) -> u64 {
+    self.unit_size_in_bytes
+}
+
+pub machine ScanConstraintFinalized::has_scan_function_scalar(&self) -> bool {
+    self.has_scan_function_scalar
+}
+
+pub machine ScanConstraintFinalized::get_scan_function_scalar(&self) -> ScanFunctionScalar {
+    self.scan_function_scalar
+}
+
+// Upstream `build_scan_function_scalar`: the symbol registry hands back a
+// per-(compare, type) closure; the scalar leg's compare dispatch lives on
+// ScanCompareType::compare, so only the arity family is selected here —
+// the same match arms upstream uses to pick Immediate vs RelativeOrDelta.
+machine ScanConstraintFinalized::build_scan_function_scalar(
+    scan_compare_type: ScanCompareType
+) -> ScanFunctionScalar {
+    transition scan_compare_type {
+        ScanCompareType::Immediate { compare_type } -> (ScanFunctionScalar::Immediate)
+        ScanCompareType::Relative { compare_type } -> (ScanFunctionScalar::RelativeOrDelta)
+        ScanCompareType::Delta { compare_type } -> (ScanFunctionScalar::RelativeOrDelta)
+        _ -> (ScanFunctionScalar::Immediate)
+    }
+}
+
+// Upstream `calculate_periodicity`: only Immediate and Delta compare kinds
+// produce a byte-period; everything else reports 0.
+machine ScanConstraintFinalized::calculate_periodicity(
+    scan_compare_type: ScanCompareType,
+    operand_value: u64,
+    operand_size_in_bytes: u64,
+    unit_size_in_bytes: u64
+) -> u64 {
+    transition scan_compare_type {
+        ScanCompareType::Immediate { compare_type } -> (
+            ScanConstraintFinalized::calculate_periodicity_from_immediate(
+                operand_value, operand_size_in_bytes, unit_size_in_bytes
+            )
+        )
+        ScanCompareType::Delta { compare_type } -> (
+            ScanConstraintFinalized::calculate_periodicity_from_immediate(
+                operand_value, operand_size_in_bytes, unit_size_in_bytes
+            )
+        )
+        _ -> (0)
+    }
+}
+
+// Upstream `calculate_periodicity_from_immediate`: assume period 1, then for
+// each byte index 1..unit_size compare byte[index] against
+// byte[index % period]; a mismatch grows the period to index+1. The
+// operand's little-endian bytes stand in for the upstream value bytes (a
+// DataValue never stores fewer than unit bytes, so operand-width clamping
+// never reads past it upstream either).
+machine ScanConstraintFinalized::calculate_periodicity_from_immediate(
+    operand_value: u64,
+    operand_size_in_bytes: u64,
+    unit_size_in_bytes: u64
+) -> u64 {
+    ScanConstraintFinalized::periodicity_walk(
+        operand_value, operand_size_in_bytes, unit_size_in_bytes, 1, 1
+    )
+}
+
+machine ScanConstraintFinalized::periodicity_walk(
+    operand_value: u64,
+    operand_size_in_bytes: u64,
+    unit_size_in_bytes: u64,
+    byte_index: u64,
+    period: u64
+) -> u64 {
+    transition byte_index < unit_size_in_bytes {
+        true -> compare_byte(operand_value, operand_size_in_bytes, unit_size_in_bytes, byte_index, period)
+        false -> (period)
+        _ -> (period)
+    }
+
+    state compare_byte(
+        operand_value: u64,
+        operand_size_in_bytes: u64,
+        unit_size_in_bytes: u64,
+        byte_index: u64,
+        period: u64
+    ) -> u64 {
+        let operand_byte: u8 = ScanConstraintFinalized::operand_byte(operand_value, operand_size_in_bytes, byte_index);
+        let period_index: u64 = ((byte_index as u64 in Wrapping) % (period as u64 in Wrapping)) as u64;
+        let period_byte: u8 = ScanConstraintFinalized::operand_byte(operand_value, operand_size_in_bytes, period_index);
+        transition operand_byte == period_byte {
+            true -> keep_period(operand_value, operand_size_in_bytes, unit_size_in_bytes, byte_index, period)
+            false -> grow_period(operand_value, operand_size_in_bytes, unit_size_in_bytes, byte_index)
+            _ -> grow_period(operand_value, operand_size_in_bytes, unit_size_in_bytes, byte_index)
+        }
+    }
+
+    state keep_period(
+        operand_value: u64,
+        operand_size_in_bytes: u64,
+        unit_size_in_bytes: u64,
+        byte_index: u64,
+        period: u64
+    ) -> u64 {
+        ScanConstraintFinalized::periodicity_walk(
+            operand_value,
+            operand_size_in_bytes,
+            unit_size_in_bytes,
+            ((byte_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            period
+        )
+    }
+
+    state grow_period(
+        operand_value: u64,
+        operand_size_in_bytes: u64,
+        unit_size_in_bytes: u64,
+        byte_index: u64
+    ) -> u64 {
+        ScanConstraintFinalized::periodicity_walk(
+            operand_value,
+            operand_size_in_bytes,
+            unit_size_in_bytes,
+            ((byte_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            ((byte_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        )
+    }
+}
+
+// Little-endian byte `byte_index` of the operand; indexes past the operand
+// width read as 0 (unreachable for a well-formed constraint — upstream reads
+// value_bytes directly, which are exactly the operand bytes).
+machine ScanConstraintFinalized::operand_byte(
+    operand_value: u64,
+    operand_size_in_bytes: u64,
+    byte_index: u64
+) -> u8 {
+    transition byte_index < operand_size_in_bytes {
+        true -> shift(operand_value, byte_index)
+        false -> (0)
+        _ -> (0)
+    }
+
+    state shift(operand_value: u64, byte_index: u64) -> u8 {
+        transition byte_index < 8 {
+            true -> bounded(operand_value, byte_index)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+
+    state bounded(operand_value: u64, byte_index: u64) -> u8 {
+        let shift_bits: u64 = ((byte_index as u64 in Saturating) * (8 as u64 in Saturating)) as u64;
+        let shifted: u64 = operand_value >> shift_bits;
+        ((shifted as u64 in Wrapping) % (256 as u64 in Wrapping)) as u8
+    }
+}
