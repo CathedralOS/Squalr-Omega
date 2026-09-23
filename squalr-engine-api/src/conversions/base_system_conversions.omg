@@ -1,0 +1,673 @@
+module src::conversions::base_system_conversions;
+
+use src::conversions::conversion_error::ConversionError;
+use src::conversions::conversion_error::ConversionResult;
+
+// Port of conversions/base_system_conversions.rs: the radix engine behind
+// the per-source-format conversion modules. Upstream parses through
+// u128::from_str_radix and formats through std::fmt over whole strings;
+// authored text here is a byte domain, so parse runs byte-wise over a
+// [start, end) window and results land in caller buffers (Ok reports the
+// byte count written — the read_all convention).
+//
+// Named deviations:
+// - Upstream supports up to a 128-bit integer; Omega's widest authored
+//   scalar is u64, so parsed magnitude is bounded at u64::MAX and the
+//   32-digit u128 arm of convert_to_address is unreachable at this width.
+// - Rust's parse error classes (Empty/InvalidDigit/PosOverflow) all land in
+//   ConversionError::ParseError upstream — RadixParse keeps one Failed case.
+// - clean_string drops ASCII whitespace (9/10/11/12/13/32) and commas;
+//   char::is_whitespace's exotic Unicode whitespace is out of the byte
+//   domain, same as conversions_from_hex_pattern.
+pub data BaseSystemConversions {}
+
+// Radix parse carrier — Rust's Result<u64, ParseIntError> collapsed to
+// Failed|Value since the caller-visible error is one ParseError case.
+pub data RadixParse {
+    case Failed;
+    case Value(value: u64);
+}
+
+pub data DigitParse {
+    case Invalid;
+    case Digit(digit: u64);
+}
+
+// Rust's char::to_digit(36): '0'-'9', 'a'-'z', 'A'-'Z'.
+machine digit_value(byte: u8) -> DigitParse {
+    transition byte >= 48 && byte <= 57 {
+        true -> (DigitParse::Digit { digit: ((byte as u64 in Wrapping) - (48 as u64 in Wrapping)) })
+        false -> letter_lower(byte)
+    }
+    state letter_lower(byte: u8) -> DigitParse {
+        transition byte >= 97 && byte <= 122 {
+            true -> (DigitParse::Digit { digit: ((byte as u64 in Wrapping) - (87 as u64 in Wrapping)) })
+            false -> letter_upper(byte)
+        }
+    }
+    state letter_upper(byte: u8) -> DigitParse {
+        transition byte >= 65 && byte <= 90 {
+            true -> (DigitParse::Digit { digit: ((byte as u64 in Wrapping) - (55 as u64 in Wrapping)) })
+            false -> (DigitParse::Invalid)
+        }
+    }
+}
+
+// 9/10/11/12/13/32 — the byte-domain subset of char::is_whitespace.
+machine is_ascii_whitespace(byte: u8) -> bool {
+    transition byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 || byte == 32 {
+        true -> (true)
+        false -> (false)
+    }
+}
+
+// char::to_ascii_lowercase on the byte domain.
+machine ascii_lower(byte: u8) -> u8 {
+    transition byte >= 65 && byte <= 90 {
+        true -> (byte + 32)
+        false -> (byte)
+    }
+}
+
+// Radix digit emission: 0-9 -> '0'-'9'; above 9 -> 'A'-'F' or 'a'-'f'.
+pub machine BaseSystemConversions::digit_char(digit: u64, uppercase: bool) -> u8 {
+    transition digit < 10 {
+        true -> (((48 as u8 in Wrapping) + (digit as u8 in Wrapping)) as u8)
+        false -> letter(digit, uppercase)
+    }
+    state letter(digit: u64, uppercase: bool) -> u8 {
+        transition uppercase {
+            true -> (((55 as u8 in Wrapping) + (digit as u8 in Wrapping)) as u8)
+            false -> (((87 as u8 in Wrapping) + (digit as u8 in Wrapping)) as u8)
+        }
+    }
+}
+
+// Upstream u128::from_str_radix narrowed to u64: a single leading '+' is
+// accepted, at least one digit is required, any invalid byte fails, and the
+// accumulated value is bounded at u64::MAX (upstream overflow becomes the
+// same caller-visible ParseError class).
+pub machine BaseSystemConversions::parse_radix_window(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    base: u64
+) -> RadixParse {
+    transition base >= 2 && base <= 36 {
+        true -> sign(text, start, end, base)
+        false -> (RadixParse::Failed)
+    }
+    state sign(text: &[u8], start: u64, end: u64, base: u64) -> RadixParse {
+        transition start < end {
+            true -> sign_at(text, start, end, base)
+            false -> digits(text, start, end, base, 0, false)
+        }
+    }
+    state sign_at(text: &[u8], start: u64, end: u64, base: u64) -> RadixParse {
+        transition start < text.len {
+            true -> sign_probe(text, start, end, base)
+            false -> digits(text, start, end, base, 0, false)
+        }
+    }
+    state sign_probe(text: &[u8], start: u64, end: u64, base: u64) -> RadixParse {
+        transition text[start] == 43 {
+            true -> digits(text, ((start as u64 in Wrapping) + (1 as u64 in Wrapping)), end, base, 0, false)
+            false -> digits(text, start, end, base, 0, false)
+        }
+    }
+    state digits(
+        text: &[u8],
+        position: u64,
+        end: u64,
+        base: u64,
+        value: u64,
+        saw_digit: bool
+    ) -> RadixParse {
+        transition position < end && position < text.len {
+            true -> step(text, position, end, base, value, saw_digit)
+            false -> finish(value, saw_digit)
+        }
+    }
+    state step(
+        text: &[u8],
+        position: u64,
+        end: u64,
+        base: u64,
+        value: u64,
+        saw_digit: bool
+    ) -> RadixParse {
+        let digit_parse: DigitParse = digit_value(text[position]);
+        transition digit_parse {
+            DigitParse::Digit { digit } -> accumulate(text, position, end, base, value, digit)
+            DigitParse::Invalid -> (RadixParse::Failed)
+        }
+    }
+    state accumulate(
+        text: &[u8],
+        position: u64,
+        end: u64,
+        base: u64,
+        value: u64,
+        digit_value: u64
+    ) -> RadixParse {
+        // value * base + digit overflows u64 exactly when
+        // value > (u64::MAX - digit) / base — checked_mul/checked_add upstream.
+        let limit_diff: u64 = (((18446744073709551615 as u64 in Wrapping) - (digit_value as u64 in Wrapping)));
+        let limit: u64 = limit_diff / base;
+        let next_value: u64 = (((value as u64 in Wrapping) * (base as u64 in Wrapping)) as u64 in Wrapping) + (digit_value as u64 in Wrapping);
+        transition value <= limit {
+            true -> digits(text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)), end, base, next_value, true)
+            false -> (RadixParse::Failed)
+        }
+    }
+    state finish(value: u64, saw_digit: bool) -> RadixParse {
+        transition saw_digit {
+            true -> (RadixParse::Value { value: value })
+            false -> (RadixParse::Failed)
+        }
+    }
+}
+
+// Upstream clean_string: strip a 0x/0b prefix (case-folded through the
+// lowercased comparison upstream performs) then drop whitespace and commas.
+pub machine BaseSystemConversions::clean_string_window(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    from_base: u64,
+    out: &mut [u8]
+) -> u64 {
+    transition {
+        _ -> probe_prefix(text, start, end, from_base, out)
+    }
+    state probe_prefix(text: &[u8], start: u64, end: u64, from_base: u64, out: &mut [u8]) -> u64 {
+        transition ((start as u64 in Wrapping) + (1 as u64 in Wrapping)) < end && end <= text.len {
+            true -> prefix_bytes(text, start, end, from_base, out)
+            false -> copy(text, start, end, out, 0)
+        }
+    }
+    state with_prefixed(text: &[u8], start: u64, end: u64, out: &mut [u8]) -> u64 {
+        let after_prefix: u64 = (((start as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 in Wrapping) + (1 as u64 in Wrapping);
+        transition {
+            _ -> copy(text, after_prefix, end, out, 0)
+        }
+    }
+    state prefix_bytes(text: &[u8], start: u64, end: u64, from_base: u64, out: &mut [u8]) -> u64 {
+        let second: u64 = ((start as u64 in Wrapping) + (1 as u64 in Wrapping));
+        transition second < text.len && start < text.len {
+            true -> prefix_read(text, start, second, end, from_base, out)
+            false -> copy(text, start, end, out, 0)
+        }
+    }
+    state prefix_read(text: &[u8], start: u64, second: u64, end: u64, from_base: u64, out: &mut [u8]) -> u64 {
+        let lead: u8 = ascii_lower(text[start]);
+        let marker: u8 = ascii_lower(text[second]);
+        let stripped: bool = (lead == 48)
+            && (((from_base == 16 && marker == 120) || (from_base == 2 && marker == 98)));
+        transition stripped {
+            true -> with_prefixed(text, start, end, out)
+            false -> copy(text, start, end, out, 0)
+        }
+    }
+    state copy(text: &[u8], at: u64, end: u64, out: &mut [u8], written: u64) -> u64 {
+        transition at < end && at < text.len && written < out.len {
+            true -> keep(text, at, end, out, written)
+            false -> (written)
+        }
+    }
+    state keep(text: &[u8], at: u64, end: u64, out: &mut [u8], written: u64) -> u64 {
+        let byte: u8 = text[at];
+        let dropped: bool = is_ascii_whitespace(byte) || byte == 44;
+        transition dropped {
+            true -> copy(text, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)), end, out, written)
+            false -> store(text, at, end, out, written, byte)
+        }
+    }
+    state store(text: &[u8], at: u64, end: u64, out: &mut [u8], written: u64, byte: u8) -> u64 {
+        out[written] = byte;
+        transition {
+            _ -> copy(text, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)), end, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+}
+
+// Emit `value`'s digits in `base` into out at `position` (most significant
+// first); returns the count emitted. Callers pre-check capacity.
+pub machine BaseSystemConversions::emit_radix(
+    value: u64,
+    base: u64,
+    uppercase: bool,
+    out: &mut [u8],
+    position: u64
+) -> u64 {
+    transition base >= 2 && base <= 36 {
+        true -> count(value, value, 1, base, uppercase, out, position)
+        false -> (0)
+    }
+    state count(
+        value: u64,
+        remaining: u64,
+        divisor: u64,
+        base: u64,
+        uppercase: bool,
+        out: &mut [u8],
+        position: u64
+    ) -> u64 {
+        transition remaining >= base {
+            true -> count(value, remaining / base, ((divisor as u64 in Wrapping) * (base as u64 in Wrapping)), base, uppercase, out, position)
+            false -> write(value, divisor, base, uppercase, out, position, 0)
+        }
+    }
+    state write(
+        value: u64,
+        divisor: u64,
+        base: u64,
+        uppercase: bool,
+        out: &mut [u8],
+        position: u64,
+        emitted: u64
+    ) -> u64 {
+        let digit: u64 = (value / divisor) % base;
+        let character: u8 = BaseSystemConversions::digit_char(digit, uppercase);
+        transition position < out.len {
+            true -> store_digit(value, divisor, base, uppercase, out, position, emitted, character)
+            false -> (emitted)
+        }
+    }
+    state store_digit(
+        value: u64,
+        divisor: u64,
+        base: u64,
+        uppercase: bool,
+        out: &mut [u8],
+        position: u64,
+        emitted: u64,
+        character: u8
+    ) -> u64 {
+        out[position] = character;
+        transition divisor >= base {
+            true -> write(value, divisor / base, base, uppercase, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)), ((emitted as u64 in Wrapping) + (1 as u64 in Wrapping)))
+            false -> (((emitted as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+}
+
+// Emit exactly `width` digits of `value` in `base` (zero-padded, MSB-first)
+// into out at `position`; returns `width`. Callers pre-check capacity.
+pub machine BaseSystemConversions::emit_fixed_radix(
+    value: u64,
+    base: u64,
+    width: u64,
+    uppercase: bool,
+    out: &mut [u8],
+    position: u64
+) -> u64 {
+    transition width > 0 && (((position as u64 in Wrapping) + (width as u64 in Wrapping))) <= out.len && base >= 2 && base <= 36 {
+        true -> fill(value, base, width, uppercase, out, position, width)
+        false -> (0)
+    }
+    state fill(
+        remaining: u64,
+        base: u64,
+        width: u64,
+        uppercase: bool,
+        out: &mut [u8],
+        position: u64,
+        slot: u64
+    ) -> u64 {
+        let digit: u64 = remaining % base;
+        let character: u8 = BaseSystemConversions::digit_char(digit, uppercase);
+        let fill_index: u64 = (((position as u64 in Wrapping) + (slot as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping);
+        transition fill_index < out.len {
+            true -> fill_store(remaining, base, width, uppercase, out, position, fill_index, slot, character)
+            false -> (0)
+        }
+    }
+    state fill_store(
+        remaining: u64,
+        base: u64,
+        width: u64,
+        uppercase: bool,
+        out: &mut [u8],
+        position: u64,
+        fill_index: u64,
+        slot: u64,
+        character: u8
+    ) -> u64 {
+        out[fill_index] = character;
+        transition slot > 1 {
+            true -> fill(remaining / base, base, width, uppercase, out, position, ((slot as u64 in Wrapping) - (1 as u64 in Wrapping)))
+            false -> (width)
+        }
+    }
+}
+
+// Upstream convert_to_base: parse `text` as `from_base`, re-emit in
+// `to_base` (2 binary, 10 decimal, 16 lowercase hexadecimal). Parse consumes
+// the raw window — the 0x/0b prefix strip is a clean_string concern.
+pub machine BaseSystemConversions::convert_to_base(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    from_base: u64,
+    to_base: u64,
+    out: &mut [u8]
+) -> ConversionResult {
+    transition out.len >= 64 {
+        true -> parse(text, start, end, from_base, to_base, out)
+        false -> (ConversionResult::Error { error: ConversionError::OutputFull })
+    }
+    state parse(text: &[u8], start: u64, end: u64, from_base: u64, to_base: u64, out: &mut [u8]) -> ConversionResult {
+        let parsed: RadixParse = BaseSystemConversions::parse_radix_window(text, start, end, from_base);
+        transition parsed {
+            RadixParse::Value { value } -> emit(value, to_base, out)
+            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        }
+    }
+    state emit(value: u64, to_base: u64, out: &mut [u8]) -> ConversionResult {
+        transition to_base == 2 || to_base == 10 || to_base == 16 {
+            true -> emit_ok(value, to_base, out)
+            false -> (ConversionResult::Error { error: ConversionError::UnsupportedConversion })
+        }
+    }
+    state emit_ok(value: u64, to_base: u64, out: &mut [u8]) -> ConversionResult {
+        let written: u64 = BaseSystemConversions::emit_radix(value, to_base, false, out, 0);
+        (ConversionResult::Ok { count: written })
+    }
+}
+
+// Upstream convert_to_address: parse as `from_base` then emit lowercase hex
+// padded to 8 digits (<= u32::MAX) or 16 (<= u64::MAX). Upstream's 32-digit
+// u128 arm is unreachable at the u64 parse bound — named deviation.
+pub machine BaseSystemConversions::convert_to_address(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    from_base: u64,
+    out: &mut [u8]
+) -> ConversionResult {
+    transition out.len >= 16 {
+        true -> parse(text, start, end, from_base, out)
+        false -> (ConversionResult::Error { error: ConversionError::OutputFull })
+    }
+    state parse(text: &[u8], start: u64, end: u64, from_base: u64, out: &mut [u8]) -> ConversionResult {
+        let parsed: RadixParse = BaseSystemConversions::parse_radix_window(text, start, end, from_base);
+        transition parsed {
+            RadixParse::Value { value } -> width(value, out)
+            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        }
+    }
+    state width(value: u64, out: &mut [u8]) -> ConversionResult {
+        transition value <= 4294967295 {
+            true -> emit8(value, out)
+            false -> emit16(value, out)
+        }
+    }
+    state emit8(value: u64, out: &mut [u8]) -> ConversionResult {
+        let written: u64 = BaseSystemConversions::emit_fixed_radix(value, 16, 8, false, out, 0);
+        (ConversionResult::Ok { count: written })
+    }
+    state emit16(value: u64, out: &mut [u8]) -> ConversionResult {
+        let written: u64 = BaseSystemConversions::emit_fixed_radix(value, 16, 16, false, out, 0);
+        (ConversionResult::Ok { count: written })
+    }
+}
+
+// Upstream convert_to_bytes: cleaned parse -> minimal big-endian byte string
+// with leading zeros trimmed; an empty cleaned window parses to no bytes,
+// and a zero value emits exactly [0].
+pub machine BaseSystemConversions::convert_to_bytes(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    from_base: u64,
+    out: &mut [u8]
+) -> ConversionResult {
+    transition out.len >= 8 {
+        true -> clean(text, start, end, from_base, out)
+        false -> (ConversionResult::Error { error: ConversionError::OutputFull })
+    }
+    state clean(text: &[u8], start: u64, end: u64, from_base: u64, out: &mut [u8]) -> ConversionResult {
+        let mut cleaned: [u8; 4096];
+        let cleaned_len: u64 = BaseSystemConversions::clean_string_window(text, start, end, from_base, &mut cleaned);
+        transition cleaned_len > 0 {
+            true -> parse(&cleaned, cleaned_len, from_base, out)
+            false -> (ConversionResult::Ok { count: 0 })
+        }
+    }
+    state parse(cleaned: &[u8], cleaned_len: u64, from_base: u64, out: &mut [u8]) -> ConversionResult {
+        let parsed: RadixParse = BaseSystemConversions::parse_radix_window(cleaned, 0, cleaned_len, from_base);
+        transition parsed {
+            RadixParse::Value { value } -> measure(value, 0, out)
+            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        }
+    }
+    // First nonzero byte position scanning most-significant byte first.
+    state measure(value: u64, index: u64, out: &mut [u8]) -> ConversionResult {
+        transition index < 8 {
+            true -> byte_at(value, index, out)
+            false -> emit_zero(out)
+        }
+    }
+    state byte_at(value: u64, index: u64, out: &mut [u8]) -> ConversionResult {
+        let inv: u64 = (((7 as u64 in Wrapping) - (index as u64 in Wrapping)));
+        let shift: u64 = (((inv as u64 in Wrapping) * (8 as u64 in Wrapping)));
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping))) % 256;
+        transition byte != 0 {
+            true -> emit_bytes(value, index, out)
+            false -> measure(value, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)), out)
+        }
+    }
+    state emit_zero(out: &mut [u8]) -> ConversionResult {
+        out[0] = 0;
+        (ConversionResult::Ok { count: 1 })
+    }
+    state emit_bytes(value: u64, first: u64, out: &mut [u8]) -> ConversionResult {
+        transition { _ -> emit_next(value, first, 0, out) }
+    }
+    state emit_next(value: u64, byte_index: u64, written: u64, out: &mut [u8]) -> ConversionResult {
+        transition byte_index < 8 && written < out.len {
+            true -> store_byte(value, byte_index, written, out)
+            false -> (ConversionResult::Ok { count: written })
+        }
+    }
+    state store_byte(value: u64, byte_index: u64, written: u64, out: &mut [u8]) -> ConversionResult {
+        let inv: u64 = (((7 as u64 in Wrapping) - (byte_index as u64 in Wrapping)));
+        let shift: u64 = (((inv as u64 in Wrapping) * (8 as u64 in Wrapping)));
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping))) % 256;
+        out[written] = (byte as u8);
+        transition {
+            _ -> emit_next(value, ((byte_index as u64 in Wrapping) + (1 as u64 in Wrapping)), ((written as u64 in Wrapping) + (1 as u64 in Wrapping)), out)
+        }
+    }
+}
+
+// Upstream convert_to_primitive_aligned_bytes<T>: cleaned parse, bound at
+// the caller's type maximum (upstream T::max_value — the port takes it as a
+// parameter since the primitive shape is explicit, not generic — named
+// deviation), minimal big-endian bytes, pad to `primitive_size`, then
+// reverse only when the caller expects little-endian.
+pub machine BaseSystemConversions::convert_to_primitive_aligned_bytes(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    from_base: u64,
+    is_big_endian: bool,
+    primitive_size: u64,
+    max_value: u64,
+    out: &mut [u8]
+) -> ConversionResult {
+    transition out.len >= primitive_size && primitive_size <= 8 && primitive_size > 0 {
+        true -> clean(text, start, end, from_base, is_big_endian, primitive_size, max_value, out)
+        false -> (ConversionResult::Error { error: ConversionError::OutputFull })
+    }
+    state clean(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        from_base: u64,
+        is_big_endian: bool,
+        primitive_size: u64,
+        max_value: u64,
+        out: &mut [u8]
+    ) -> ConversionResult {
+        let mut cleaned: [u8; 4096];
+        let cleaned_len: u64 = BaseSystemConversions::clean_string_window(text, start, end, from_base, &mut cleaned);
+        transition cleaned_len > 0 {
+            true -> parse(&cleaned, cleaned_len, from_base, is_big_endian, primitive_size, max_value, out)
+            false -> bound(0, is_big_endian, primitive_size, max_value, out)
+        }
+    }
+    state parse(
+        cleaned: &[u8],
+        cleaned_len: u64,
+        from_base: u64,
+        is_big_endian: bool,
+        primitive_size: u64,
+        max_value: u64,
+        out: &mut [u8]
+    ) -> ConversionResult {
+        let parsed: RadixParse = BaseSystemConversions::parse_radix_window(cleaned, 0, cleaned_len, from_base);
+        transition parsed {
+            RadixParse::Value { value } -> bound(value, is_big_endian, primitive_size, max_value, out)
+            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        }
+    }
+    state bound(
+        value: u64,
+        is_big_endian: bool,
+        primitive_size: u64,
+        max_value: u64,
+        out: &mut [u8]
+    ) -> ConversionResult {
+        transition value <= max_value {
+            true -> measure(value, 0, is_big_endian, primitive_size, out)
+            false -> (ConversionResult::Error { error: ConversionError::UnsupportedConversion })
+        }
+    }
+    // Minimal big-endian width of the value (value 0 needs exactly 1).
+    state measure(value: u64, index: u64, is_big_endian: bool, primitive_size: u64, out: &mut [u8]) -> ConversionResult {
+        transition index < 8 {
+            true -> byte_at(value, index, is_big_endian, primitive_size, out)
+            false -> fit(value, 1, is_big_endian, primitive_size, out)
+        }
+    }
+    state byte_at(value: u64, index: u64, is_big_endian: bool, primitive_size: u64, out: &mut [u8]) -> ConversionResult {
+        let inv: u64 = (((7 as u64 in Wrapping) - (index as u64 in Wrapping)));
+        let shift: u64 = (((inv as u64 in Wrapping) * (8 as u64 in Wrapping)));
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping))) % 256;
+        transition byte != 0 {
+            true -> fit(value, ((8 as u64 in Wrapping) - (index as u64 in Wrapping)), is_big_endian, primitive_size, out)
+            false -> measure(value, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)), is_big_endian, primitive_size, out)
+        }
+    }
+    state fit(value: u64, needed: u64, is_big_endian: bool, primitive_size: u64, out: &mut [u8]) -> ConversionResult {
+        transition needed <= primitive_size {
+            true -> fill(value, needed, is_big_endian, primitive_size, out, 0)
+            false -> (ConversionResult::Error { error: ConversionError::UnsupportedConversion })
+        }
+    }
+    // out[i] is big-endian padded when is_big_endian, the reversed layout
+    // otherwise: LE byte i is the value's i-th low byte for i < needed.
+    state fill(
+        value: u64,
+        needed: u64,
+        is_big_endian: bool,
+        primitive_size: u64,
+        out: &mut [u8],
+        index: u64
+    ) -> ConversionResult {
+        transition index < primitive_size {
+            true -> bounded(value, needed, is_big_endian, primitive_size, out, index)
+            false -> (ConversionResult::Ok { count: primitive_size })
+        }
+    }
+    state bounded(
+        value: u64,
+        needed: u64,
+        is_big_endian: bool,
+        primitive_size: u64,
+        out: &mut [u8],
+        index: u64
+    ) -> ConversionResult {
+        transition index < out.len {
+            true -> put(value, needed, is_big_endian, primitive_size, out, index)
+            false -> (ConversionResult::Error { error: ConversionError::OutputFull })
+        }
+    }
+    state put(
+        value: u64,
+        needed: u64,
+        is_big_endian: bool,
+        primitive_size: u64,
+        out: &mut [u8],
+        index: u64
+    ) -> ConversionResult {
+        let pad: u64 = (((primitive_size as u64 in Wrapping) - (needed as u64 in Wrapping)));
+        transition is_big_endian {
+            true -> put_big_endian(value, needed, pad, primitive_size, out, index)
+            false -> put_little_endian(value, needed, ((index as u64 in Wrapping) * (8 as u64 in Wrapping)), primitive_size, out, index)
+        }
+    }
+    state put_big_endian(
+        value: u64,
+        needed: u64,
+        pad: u64,
+        primitive_size: u64,
+        out: &mut [u8],
+        index: u64
+    ) -> ConversionResult {
+        transition index >= pad {
+            true -> shift_and_store(value, needed, pad, primitive_size, out, index)
+            false -> store_zero(value, needed, primitive_size, out, index)
+        }
+    }
+    state store_zero(value: u64, needed: u64, primitive_size: u64, out: &mut [u8], index: u64) -> ConversionResult {
+        out[index] = 0;
+        transition {
+            _ -> fill(value, needed, true, primitive_size, out, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+    state shift_and_store(value: u64, needed: u64, pad: u64, primitive_size: u64, out: &mut [u8], index: u64) -> ConversionResult {
+        let slot_from_back: u64 = (((needed as u64 in Wrapping) - (1 as u64 in Wrapping)));
+        let offset_in: u64 = (((index as u64 in Wrapping) - (pad as u64 in Wrapping)));
+        let rel: u64 = (((slot_from_back as u64 in Wrapping) - (offset_in as u64 in Wrapping)));
+        let shift: u64 = (((rel as u64 in Wrapping) * (8 as u64 in Wrapping)));
+        transition {
+            _ -> store_byte(value, shift, needed, primitive_size, out, index)
+        }
+    }
+    state store_byte(value: u64, shift: u64, needed: u64, primitive_size: u64, out: &mut [u8], index: u64) -> ConversionResult {
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping))) % 256;
+        out[index] = (byte as u8);
+        transition {
+            _ -> fill(value, needed, true, primitive_size, out, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+    state put_little_endian(
+        value: u64,
+        needed: u64,
+        shift: u64,
+        primitive_size: u64,
+        out: &mut [u8],
+        index: u64
+    ) -> ConversionResult {
+        transition index < needed {
+            true -> store_byte_le(value, shift, needed, primitive_size, out, index)
+            false -> store_zero_le(needed, primitive_size, out, index)
+        }
+    }
+    state store_byte_le(value: u64, shift: u64, needed: u64, primitive_size: u64, out: &mut [u8], index: u64) -> ConversionResult {
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping))) % 256;
+        out[index] = (byte as u8);
+        transition {
+            _ -> fill(value, needed, false, primitive_size, out, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+    state store_zero_le(needed: u64, primitive_size: u64, out: &mut [u8], index: u64) -> ConversionResult {
+        out[index] = 0;
+        transition {
+            _ -> fill(0, needed, false, primitive_size, out, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+}
