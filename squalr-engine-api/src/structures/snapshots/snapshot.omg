@@ -3,6 +3,7 @@ module src::structures::snapshots::snapshot;
 use src::structures::memory::normalized_region;
 use src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
 use src::structures::snapshots::element_window::ElementWindow;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
 use src::structures::snapshots::snapshot_region::DataTypeRefSet;
 use src::structures::snapshots::snapshot_region::SnapshotRegion;
 use src::structures::memory::memory_alignment::MemoryAlignment;
@@ -134,6 +135,74 @@ pub machine Snapshot::discard_empty_regions(&mut self) {
 // boundaries. These snapshot-level batch machines perform the same steps
 // inside this package so squalr-engine can drive them per region.
 
+// Upstream `snapshot_region.initialize_scan_results` for one region — seeds
+// a whole-region filter collection per requested data type where the region
+// has none yet (existing collections are kept — the successive-scan input).
+pub machine Snapshot::initialize_region_scan_results(
+    &mut self,
+    region_index: u64,
+    data_type_refs: DataTypeRefSet,
+    memory_alignment: MemoryAlignment
+) {
+    transition region_index < self.region_count && region_index < 1 {
+        true -> plant(region_index, data_type_refs, memory_alignment)
+        false -> done()
+    }
+    state plant(&mut self, region_index: u64 [0..1], data_type_refs: DataTypeRefSet, memory_alignment: MemoryAlignment) {
+        self.regions[region_index].initialize_scan_results(&data_type_refs, memory_alignment);
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+// Upstream `set_scan_results` staged for the scan's install step: the fresh
+// result set starts empty, the scan pushes each dispatched collection
+// through `push_region_scan_result_collection`, then
+// `resize_region_to_filters` collapses value coverage to the survivors.
+pub machine Snapshot::reset_region_scan_results(&mut self, region_index: u64) {
+    transition region_index < self.region_count && region_index < 1 {
+        true -> store(region_index)
+        false -> done()
+    }
+    state store(&mut self, region_index: u64 [0..1]) {
+        let empty_results: SnapshotRegionScanResults = SnapshotRegionScanResults::empty();
+        self.regions[region_index].set_scan_results(&empty_results);
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+pub machine Snapshot::push_region_scan_result_collection(
+    &mut self,
+    region_index: u64,
+    collection: SnapshotRegionFilterCollection
+) -> bool {
+    transition region_index < self.region_count && region_index < 1 {
+        true -> push(region_index, collection)
+        false -> (false)
+    }
+    state push(&mut self, region_index: u64 [0..1], collection: SnapshotRegionFilterCollection) -> bool {
+        self.regions[region_index].push_scan_result_collection(collection)
+    }
+}
+
+// Upstream `resize_to_filters` — shrink the region's value coverage to the
+// union of surviving filters after the install completes.
+pub machine Snapshot::resize_region_to_filters(&mut self, region_index: u64) {
+    transition region_index < self.region_count && region_index < 1 {
+        true -> resize(region_index)
+        false -> done()
+    }
+    state resize(&mut self, region_index: u64 [0..1]) {
+        self.regions[region_index].resize_to_filters();
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
 // Upstream `snapshot_region.initialize_scan_results` over every region —
 // seeds a whole-region filter collection per requested data type where a
 // region has none yet.
@@ -239,6 +308,27 @@ pub machine Snapshot::get_collected_byte_count(&self) -> u64 {
     state tally(&self, position: u64 [0..1], total: u64) -> u64 {
         let next_total: u64 = ((total as u64 in Saturating)
             + (self.regions[position].get_collected_byte_count() as u64 in Saturating)) as u64;
+        transition { _ -> each(position + 1, next_total) }
+    }
+}
+
+// Upstream `get_number_of_results`: the visible result count — structural
+// counts minus pending delete tombstones. The tombstone set ships with the
+// delete command leg (header deviation), so the visible count is the
+// structural count until then.
+pub machine Snapshot::get_number_of_results(&self) -> u64
+crashes Abort
+{
+    transition { _ -> each(0, 0) }
+    state each(&self, position: u64, total: u64) -> u64 {
+        transition position < self.region_count && position < 1 {
+            true -> tally(position, total)
+            false -> (total)
+        }
+    }
+    state tally(&self, position: u64 [0..1], total: u64) -> u64 {
+        let next_total: u64 = ((total as u64 in Saturating)
+            + (self.regions[position].get_scan_results().get_number_of_results() as u64 in Saturating)) as u64;
         transition { _ -> each(position + 1, next_total) }
     }
 }
