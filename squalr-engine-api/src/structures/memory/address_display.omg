@@ -1,0 +1,357 @@
+module src::structures::memory::address_display;
+
+use omega::language::core::option;
+
+// Port of structures/memory/address_display.rs: module-relative and absolute
+// address formatting plus the emulated-console virtual-module layout
+// (GameCube/Wii MEM1+MEM2 and GBA work/internal RAM slots).
+
+// '0'..'9' then 'A'..'F' — upstream {:X} casing.
+machine hex_digit_char(digit: u64) -> u8 {
+    transition (digit < 10) {
+        true -> (((48 as u8 in Wrapping) + (digit as u8 in Wrapping)) as u8)
+        false -> (((55 as u8 in Wrapping) + (digit as u8 in Wrapping)) as u8)
+    }
+}
+
+// Uppercase-hex width writes into a caller buffer; returns the count written.
+// width is domain-bounded so the shift count is provable.
+machine write_hex_upper(out: &mut [u8; 17], value: u64, width: u64) -> u64 {
+    transition {
+        _ -> fill(out, value, width, 0)
+    }
+    state fill(out: &mut [u8; 17], value: u64, width: u64, position: u64) -> u64 {
+        transition (position < width && position < out.len) {
+            true -> write_digit(out, value, width, position)
+            false -> (width)
+        }
+    }
+    state write_digit(out: &mut [u8; 17], value: u64, width: u64, position: u64) -> u64 {
+        let shift_base: u64 = (((width as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64 in Wrapping) - (position as u64 in Wrapping);
+        let shift: u64 = ((shift_base as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64;
+        let digit: u64 = ((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) % 16;
+        out[position] = hex_digit_char(digit);
+        transition {
+            _ -> fill(out, value, width, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Positional hex writer for larger caller buffers: emits `width` hex digits of
+// `value` starting at `start` (MSB first). Returns the position after the last
+// digit written.
+pub machine write_hex_upper_at(out: &mut [u8; 512], value: u64, start: u64, width: u64) -> u64 {
+    transition {
+        _ -> fill(out, value, width, 0, start)
+    }
+    state fill(out: &mut [u8; 512], value: u64, width: u64, position: u64, start: u64) -> u64 {
+        transition (position < width && start < out.len) {
+            true -> write_digit(out, value, width, position, start)
+            false -> (start)
+        }
+    }
+    state write_digit(out: &mut [u8; 512], value: u64, width: u64, position: u64, start: u64) -> u64 {
+        let shift_base: u64 = (((width as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64 in Wrapping) - (position as u64 in Wrapping);
+        let shift: u64 = ((shift_base as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64;
+        let digit: u64 = ((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) % 16;
+        out[start] = hex_digit_char(digit);
+        transition {
+            _ -> fill(out, value, width, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((start as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `format_absolute_address`: 8 hex digits for 32-bit-range values,
+// 16 above. `out` receives exactly the produced text; returns its length.
+pub machine format_absolute_address(out: &mut [u8; 17], address: u64) -> u64 {
+    transition (address <= 4294967295) {
+        true -> narrow(out, address)
+        false -> wide(out, address)
+    }
+    state narrow(out: &mut [u8; 17], address: u64) -> u64 {
+        write_hex_upper(out, address, 8)
+    }
+    state wide(out: &mut [u8; 17], address: u64) -> u64 {
+        write_hex_upper(out, address, 16)
+    }
+}
+
+// Count of significant hex digits in value (1..16); upstream {:X} of 0 prints
+// one digit.
+machine offset_width(value: u64) -> u64 {
+    transition {
+        _ -> measure(value, 0)
+    }
+    state measure(remaining: u64, count: u64) -> u64 {
+        transition (remaining > 0) {
+            true -> measure(remaining / 16, ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> finish(count)
+        }
+    }
+    state finish(count: u64) -> u64 {
+        transition (count > 0) {
+            true -> (count)
+            false -> (1)
+        }
+    }
+}
+
+// Upstream `format_module_address`: "<module_name>+0x<offset-uppercase-hex>".
+// `out` receives exactly the produced text; returns its length.
+pub machine format_module_address(out: &mut [u8; 512], module_name: &[u8], module_offset: u64) -> u64 {
+    transition {
+        _ -> copy_name(out, module_name, module_offset, 0)
+    }
+    state copy_name(out: &mut [u8; 512], module_name: &[u8], module_offset: u64, position: u64) -> u64 {
+        transition (position < module_name.len && position < 493) {
+            true -> store_name(out, module_name, module_offset, position)
+            false -> write_separator(out, position, module_offset)
+        }
+    }
+    state store_name(out: &mut [u8; 512], module_name: &[u8], module_offset: u64, position: u64) -> u64 {
+        out[position] = module_name[position];
+        transition {
+            _ -> copy_name(out, module_name, module_offset, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state write_separator(out: &mut [u8; 512], position: u64, module_offset: u64) -> u64 {
+        transition position < out.len {
+            true -> sep_plus(out, position, module_offset)
+            false -> (position)
+        }
+    }
+    state sep_plus(out: &mut [u8; 512], position: u64, module_offset: u64) -> u64 {
+        out[position] = 43;
+        let p1: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition p1 < out.len {
+            true -> sep_zero(out, position, module_offset, p1)
+            false -> (position)
+        }
+    }
+    state sep_zero(out: &mut [u8; 512], position: u64, module_offset: u64, p1: u64) -> u64 {
+        out[p1] = 48;
+        let p2: u64 = ((position as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64;
+        transition p2 < out.len {
+            true -> sep_x(out, position, module_offset, p2)
+            false -> (position)
+        }
+    }
+    state sep_x(out: &mut [u8; 512], position: u64, module_offset: u64, p2: u64) -> u64 {
+        out[p2] = 120;
+        transition {
+            _ -> emit_offset(out, ((position as u64 in Wrapping) + (3 as u64 in Wrapping)) as u64, module_offset, offset_width(module_offset), 0)
+        }
+    }
+    state emit_offset(out: &mut [u8; 512], position: u64, module_offset: u64, width: u64, digit_index: u64) -> u64 {
+        transition (digit_index < width) {
+            true -> store_offset_digit(out, position, module_offset, width, digit_index)
+            false -> (((position as u64 in Wrapping) + (width as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_offset_digit(out: &mut [u8; 512], position: u64, module_offset: u64, width: u64, digit_index: u64) -> u64 {
+        let shift_base: u64 = (((width as u64 in Wrapping) - (digit_index as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping);
+        let shift: u64 = ((shift_base as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64;
+        let digit: u64 = ((module_offset as u64 in Wrapping) >> (shift as u64 in Wrapping)) % 16;
+        let target: u64 = ((position as u64 in Wrapping) + (digit_index as u64 in Wrapping)) as u64;
+        transition target < 512 {
+            true -> store_digit(out, position, module_offset, width, digit_index, target, digit)
+            false -> emit_next(out, position, module_offset, width, digit_index)
+        }
+    }
+    state store_digit(out: &mut [u8; 512], position: u64, module_offset: u64, width: u64, digit_index: u64, target: u64, digit: u64) -> u64 {
+        out[target] = hex_digit_char(digit);
+        transition {
+            _ -> emit_next(out, position, module_offset, width, digit_index)
+        }
+    }
+    state emit_next(out: &mut [u8; 512], position: u64, module_offset: u64, width: u64, digit_index: u64) -> u64 {
+        transition {
+            _ -> emit_offset(out, position, module_offset, width, ((digit_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// ASCII case-insensitive equality against a lowercase expected name
+// (upstream eq_ignore_ascii_case / to_ascii_lowercase).
+machine ascii_eq_fold(name: &[u8], expected: &[u8]) -> bool {
+    transition (name.len != expected.len) {
+        true -> (false)
+        false -> fold(name, expected, 0)
+    }
+    state fold(name: &[u8], expected: &[u8], position: u64) -> bool {
+        transition (position < expected.len && position < name.len) {
+            true -> inspect_char(name, expected, position)
+            false -> (true)
+        }
+    }
+    state inspect_char(name: &[u8], expected: &[u8], position: u64) -> bool {
+        let lower: u8 = ascii_lower(name[position]);
+        transition (lower != expected[position]) {
+            true -> (false)
+            false -> fold(name, expected, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine ascii_lower(byte: u8) -> u8 {
+    transition (byte >= 65 && byte <= 90) {
+        true -> (byte + 32)
+        false -> (byte)
+    }
+}
+
+// Upstream parse_gba_slot's Option<u8>: a flag+payload carrier since
+// Optional's scalar payload cannot be matched out in this pin.
+pub data GbaSlotParse [copy] {
+    found: bool;
+    slot_index: u64;
+}
+
+// "gba_wm_1".."gba_wm_4" / "gba_im_1".."gba_im_4" -> 0..3, prefix compared
+// case-insensitively against a lowercase caller-provided prefix.
+machine parse_gba_slot(module_name: &[u8], module_prefix: &[u8]) -> GbaSlotParse {
+    transition {
+        _ -> probe(module_name, module_prefix, 0)
+    }
+    state probe(module_name: &[u8], module_prefix: &[u8], position: u64) -> GbaSlotParse {
+        transition (position < module_prefix.len) {
+            true -> compare_char(module_name, module_prefix, position)
+            false -> read_slot(module_name, module_prefix)
+        }
+    }
+    state compare_char(module_name: &[u8], module_prefix: &[u8], position: u64) -> GbaSlotParse {
+        transition (position >= module_name.len) {
+            true -> (GbaSlotParse { found: false, slot_index: 0 })
+            false -> check_char(module_name, module_prefix, position)
+        }
+    }
+    state check_char(module_name: &[u8], module_prefix: &[u8], position: u64) -> GbaSlotParse {
+        let lower: u8 = ascii_lower(module_name[position]);
+        transition (lower != module_prefix[position]) {
+            true -> (GbaSlotParse { found: false, slot_index: 0 })
+            false -> probe(module_name, module_prefix, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state read_slot(module_name: &[u8], module_prefix: &[u8]) -> GbaSlotParse {
+        // Upstream parses the remainder with str::parse::<u8>; names longer
+        // than the single digit we accept fail there identically.
+        transition (module_name.len == ((module_prefix.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) {
+            true -> boundary(module_name, module_prefix)
+            false -> (GbaSlotParse { found: false, slot_index: 0 })
+        }
+    }
+    state boundary(module_name: &[u8], module_prefix: &[u8]) -> GbaSlotParse {
+        transition module_prefix.len < module_name.len {
+            true -> read_digit(module_name, module_prefix)
+            false -> (GbaSlotParse { found: false, slot_index: 0 })
+        }
+    }
+    state read_digit(module_name: &[u8], module_prefix: &[u8]) -> GbaSlotParse {
+        let slot_index: u64 = module_prefix.len;
+        transition slot_index < module_name.len {
+            true -> accept_at(module_name, slot_index)
+            false -> (GbaSlotParse { found: false, slot_index: 0 })
+        }
+    }
+    state accept_at(module_name: &[u8], slot_index: u64) -> GbaSlotParse {
+        accept_slot(module_name[slot_index])
+    }
+    state accept_slot(digit: u8) -> GbaSlotParse {
+        transition (digit >= 49 && digit <= 52) {
+            true -> (GbaSlotParse { found: true, slot_index: ((digit as u64 in Wrapping) - (49 as u64 in Wrapping)) as u64 })
+            false -> (GbaSlotParse { found: false, slot_index: 0 })
+        }
+    }
+}
+
+// Upstream try_resolve_virtual_module_address returns Option<u64>.
+pub machine try_resolve_virtual_module_address(module_name: &[u8], module_offset: u64) -> Optional<u64> {
+    transition ascii_eq_fold(module_name, ("gc_wii")) {
+        true -> resolve_gc_wii(module_offset)
+        false -> resolve_named(module_name, module_offset)
+    }
+    state resolve_gc_wii(module_offset: u64) -> Optional<u64> {
+        transition (module_offset < 0x02000000) {
+            true -> (Optional::Some { value: ((0x80000000 as u64 in Wrapping) + (module_offset as u64 in Wrapping)) as u64 })
+            false -> resolve_wii_extension(module_offset)
+        }
+    }
+    state resolve_wii_extension(module_offset: u64) -> Optional<u64> {
+        let wii_offset: u64 = ((module_offset as u64 in Wrapping) - (0x02000000 as u64 in Wrapping)) as u64;
+        transition (wii_offset < 0x04000000) {
+            true -> (Optional::Some { value: ((0x90000000 as u64 in Wrapping) + (wii_offset as u64 in Wrapping)) as u64 })
+            false -> (Optional::None)
+        }
+    }
+    state resolve_named(module_name: &[u8], module_offset: u64) -> Optional<u64> {
+        transition (ascii_eq_fold(module_name, ("mem1")) || ascii_eq_fold(module_name, ("gc"))) {
+            true -> resolve_mem1(module_offset)
+            false -> resolve_mem2(module_name, module_offset)
+        }
+    }
+    state resolve_mem1(module_offset: u64) -> Optional<u64> {
+        transition (module_offset < 0x02000000) {
+            true -> (Optional::Some { value: ((0x80000000 as u64 in Wrapping) + (module_offset as u64 in Wrapping)) as u64 })
+            false -> (Optional::None)
+        }
+    }
+    state resolve_mem2(module_name: &[u8], module_offset: u64) -> Optional<u64> {
+        transition (ascii_eq_fold(module_name, ("mem2")) || ascii_eq_fold(module_name, ("wii"))) {
+            true -> resolve_wii(module_offset)
+            false -> resolve_gba_work(module_name, module_offset)
+        }
+    }
+    state resolve_wii(module_offset: u64) -> Optional<u64> {
+        transition (module_offset < 0x04000000) {
+            true -> (Optional::Some { value: ((0x90000000 as u64 in Wrapping) + (module_offset as u64 in Wrapping)) as u64 })
+            false -> (Optional::None)
+        }
+    }
+    state resolve_gba_work(module_name: &[u8], module_offset: u64) -> Optional<u64> {
+        let slot: GbaSlotParse = parse_gba_slot(module_name, ("gba_wm_"));
+        transition slot.found {
+            true -> resolve_work_slot(module_offset, slot.slot_index)
+            false -> resolve_gba_internal(module_name, module_offset)
+        }
+    }
+    state resolve_work_slot(module_offset: u64, slot_index: u64) -> Optional<u64> {
+        transition (module_offset < 0x00040000) {
+            true -> work_resolved(module_offset, slot_index)
+            false -> (Optional::None)
+        }
+    }
+    state resolve_gba_internal(module_name: &[u8], module_offset: u64) -> Optional<u64> {
+        let slot: GbaSlotParse = parse_gba_slot(module_name, ("gba_im_"));
+        transition slot.found {
+            true -> resolve_internal_slot(module_offset, slot.slot_index)
+            false -> (Optional::None)
+        }
+    }
+    state resolve_internal_slot(module_offset: u64, slot_index: u64) -> Optional<u64> {
+        transition (module_offset < 0x00008000) {
+            true -> internal_resolved(module_offset, slot_index)
+            false -> (Optional::None)
+        }
+    }
+}
+
+// Upstream resolve_* slot arithmetic: base + slot*stride + offset.
+machine work_resolved(module_offset: u64, slot_index: u64) -> Optional<u64> {
+    (Optional::Some { value: ((((0xA0000000 as u64 in Wrapping)
+        + ((slot_index as u64 in Wrapping) * (0x00100000 as u64 in Wrapping)) as u64 in Wrapping)
+        + (module_offset as u64 in Wrapping)) as u64) })
+}
+
+machine internal_resolved(module_offset: u64, slot_index: u64) -> Optional<u64> {
+    (Optional::Some { value: ((((0xA0040000 as u64 in Wrapping)
+        + ((slot_index as u64 in Wrapping) * (0x00100000 as u64 in Wrapping)) as u64 in Wrapping)
+        + (module_offset as u64 in Wrapping)) as u64) })
+}
+
+// Upstream is_virtual_module_address.
+pub machine is_virtual_module_address(address: u64) -> bool {
+    (address >= 0x80000000 && address < 0x82000000)
+        || (address >= 0x90000000 && address < 0x94000000)
+        || (address >= 0xA0000000 && address < 0xA0400000)
+        || (address >= 0xA0040000 && address < 0xA0440000)
+}

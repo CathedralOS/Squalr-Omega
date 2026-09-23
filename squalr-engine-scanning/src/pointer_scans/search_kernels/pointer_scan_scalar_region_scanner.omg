@@ -1,0 +1,213 @@
+module src::pointer_scans::search_kernels::pointer_scan_scalar_region_scanner;
+
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::pointer_scans::search_kernels::pointer_scan_pointer_value_reader::read_pointer_value_unchecked;
+use src::pointer_scans::search_kernels::pointer_scan_simd_linear_search_kernel::PointerScanMatchVisitor;
+use src::pointer_scans::structures::pointer_scan_region_match::PointerScanRegionMatch;
+use src::pointer_scans::structures::pointer_scan_target_ranges::PointerScanTargetRangeSet;
+use src::pointer_scans::structures::pointer_scan_target_ranges::pointer_scan_target_range_set_contains_value_linear;
+use src::pointer_scans::structures::pointer_scan_target_ranges::pointer_scan_target_range_set_contains_value_binary;
+
+
+// Port of search_kernels/pointer_scan_scalar_region_scanner.rs.
+//
+// Upstream's generic `matches_pointer_value: FnMut(u64) -> bool` closure is
+// the target-range-set membership check; the two closures used at call
+// sites (`contains_value_linear`, `contains_value_binary`) become the
+// `use_binary_search` tag — upstream chose between the same two predicates
+// by kernel kind.
+// `visit_match: &mut dyn FnMut(PointerScanRegionMatch)` ports to the erased
+// PointerScanMatchVisitor trait exactly as the search kernels do.
+
+pub machine scan_region_scalar_with_predicate<'ranges>(
+    base_address: u64,
+    current_values: &[u8],
+    start_offset: u64,
+    pointer_size: PointerScanPointerSize,
+    target_range_set: &'ranges PointerScanTargetRangeSet<'ranges>,
+    use_binary_search: bool,
+    visit_match: &mut dyn PointerScanMatchVisitor
+) {
+    scan_loop(
+        base_address,
+        current_values,
+        start_offset,
+        pointer_size,
+        target_range_set,
+        use_binary_search,
+        &mut visit_match
+    );
+
+    // Upstream `while offset + pointer_size <= len` loop guard, with the
+    // `PointerScanRegionMatch::new(base + offset, pointer_value)` emit.
+    state scan_loop(
+        base_address: u64,
+        current_values: &[u8],
+        pointer_value_offset: u64,
+        pointer_size: PointerScanPointerSize,
+        target_range_set: &'ranges PointerScanTargetRangeSet<'ranges>,
+        use_binary_search: bool,
+        visit_match: &mut dyn PointerScanMatchVisitor
+    ) {
+        let pointer_size_in_bytes: u64 = pointer_size.get_size_in_bytes();
+        let covered: u64 = ((pointer_value_offset as u64 in Saturating) + (pointer_size_in_bytes as u64 in Saturating)) as u64;
+        transition (covered <= current_values.len) {
+            true -> probe(
+                base_address,
+                current_values,
+                pointer_value_offset,
+                pointer_size,
+                target_range_set,
+                use_binary_search,
+                &mut visit_match
+            )
+            false -> finished()
+        }
+    }
+
+    state probe(
+        base_address: u64,
+        current_values: &[u8],
+        pointer_value_offset: u64,
+        pointer_size: PointerScanPointerSize,
+        target_range_set: &'ranges PointerScanTargetRangeSet<'ranges>,
+        use_binary_search: bool,
+        visit_match: &mut dyn PointerScanMatchVisitor
+    ) {
+        let pointer_value: u64 = read_pointer_value_unchecked(current_values, pointer_value_offset, pointer_size);
+        transition (use_binary_search) {
+            true -> probe_binary(
+                base_address,
+                current_values,
+                pointer_value_offset,
+                pointer_size,
+                target_range_set,
+                &mut visit_match,
+                pointer_value
+            )
+            false -> probe_linear(
+                base_address,
+                current_values,
+                pointer_value_offset,
+                pointer_size,
+                target_range_set,
+                &mut visit_match,
+                pointer_value
+            )
+        }
+    }
+
+    state probe_linear(
+        base_address: u64,
+        current_values: &[u8],
+        pointer_value_offset: u64,
+        pointer_size: PointerScanPointerSize,
+        target_range_set: &'ranges PointerScanTargetRangeSet<'ranges>,
+        visit_match: &mut dyn PointerScanMatchVisitor,
+        pointer_value: u64
+    ) {
+        let transition_guard: bool = pointer_scan_target_range_set_contains_value_linear(target_range_set, pointer_value);
+        transition (transition_guard) {
+            true -> emit(
+                base_address,
+                current_values,
+                pointer_value_offset,
+                pointer_size,
+                target_range_set,
+                false,
+                &mut visit_match,
+                pointer_value
+            )
+            false -> advance(
+                base_address,
+                current_values,
+                pointer_value_offset,
+                pointer_size,
+                target_range_set,
+                false,
+                &mut visit_match
+            )
+        }
+    }
+
+    state probe_binary(
+        base_address: u64,
+        current_values: &[u8],
+        pointer_value_offset: u64,
+        pointer_size: PointerScanPointerSize,
+        target_range_set: &'ranges PointerScanTargetRangeSet<'ranges>,
+        visit_match: &mut dyn PointerScanMatchVisitor,
+        pointer_value: u64
+    ) {
+        let transition_guard: bool = pointer_scan_target_range_set_contains_value_binary(target_range_set, pointer_value);
+        transition (transition_guard) {
+            true -> emit(
+                base_address,
+                current_values,
+                pointer_value_offset,
+                pointer_size,
+                target_range_set,
+                true,
+                &mut visit_match,
+                pointer_value
+            )
+            false -> advance(
+                base_address,
+                current_values,
+                pointer_value_offset,
+                pointer_size,
+                target_range_set,
+                true,
+                &mut visit_match
+            )
+        }
+    }
+
+    state emit(
+        base_address: u64,
+        current_values: &[u8],
+        pointer_value_offset: u64,
+        pointer_size: PointerScanPointerSize,
+        target_range_set: &'ranges PointerScanTargetRangeSet<'ranges>,
+        use_binary_search: bool,
+        visit_match: &mut dyn PointerScanMatchVisitor,
+        pointer_value: u64
+    ) {
+        visit_match.visit(PointerScanRegionMatch::new(
+            ((base_address as u64 in Saturating) + (pointer_value_offset as u64 in Saturating)) as u64,
+            pointer_value
+        ));
+        advance(
+            base_address,
+            current_values,
+            pointer_value_offset,
+            pointer_size,
+            target_range_set,
+            use_binary_search,
+            &mut visit_match
+        )
+    }
+
+    state advance(
+        base_address: u64,
+        current_values: &[u8],
+        pointer_value_offset: u64,
+        pointer_size: PointerScanPointerSize,
+        target_range_set: &'ranges PointerScanTargetRangeSet<'ranges>,
+        use_binary_search: bool,
+        visit_match: &mut dyn PointerScanMatchVisitor
+    ) {
+        let pointer_size_in_bytes: u64 = pointer_size.get_size_in_bytes();
+        scan_loop(
+            base_address,
+            current_values,
+            ((pointer_value_offset as u64 in Saturating) + (pointer_size_in_bytes as u64 in Saturating)) as u64,
+            pointer_size,
+            target_range_set,
+            use_binary_search,
+            &mut visit_match
+        )
+    }
+
+    state finished() {}
+}
