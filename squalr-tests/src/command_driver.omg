@@ -1,0 +1,187 @@
+module src::command_driver;
+
+use omega_language_std::console;
+use omega::language::core::service;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use squalr_engine_api::src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraint;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ScanConstraintSet;
+use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ElementScanRequest;
+use squalr_engine_api::src::commands::scan::new::scan_new_request::ScanNewRequest;
+use squalr_engine_api::src::commands::scan::scan_command::ScanCommand;
+use squalr_engine_api::src::commands::scan_results::scan_results_command::ScanResultsCommand;
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_request::ScanResultsListRequest;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine::src::squalr_engine::SqualrEngine;
+
+// CLI-COMMANDS board acceptance: a native command sequence creates a scan,
+// filters it again, and pages exact results through the production engine.
+// The driver seeds a supplied-memory target (the adapter TASKS.md allows
+// for tests), then dispatches the same privileged commands the CLI's
+// `scan new`, `scan element-scan` and `scan-results list` lines produce.
+pub data CommandDriver {
+    console: Service<Console>;
+    engine: SqualrEngine;
+    input: [u8; 64];
+}
+
+pub machine CommandDriver::init(&mut self) {
+    self.engine.init_privileged_shell();
+}
+
+pub machine CommandDriver::fail_geometry(&mut self)
+reaches Console
+invokes Console;
+{
+    self.console.write_line("FAIL: SnapshotRegionFilter geometry");
+    self.console.exit_process(1);
+}
+
+pub machine CommandDriver::run(&mut self)
+reaches Console
+invokes Console;
+crashes Abort
+crashes Trap
+{
+    // The marker the verifier looks for.
+    self.console.write_line("Squalr geometry: PASS");
+
+    // One 8-element u64 region at 4096; all elements hold 0 — the
+    // constraining pin rejects scalar writes to aggregates, so the
+    // constraint scans for 0 and expects every element to match
+    // (exact-result paging still verified).
+    self.engine.open_process(1);
+    self.engine.supply_fixture(4096, 8);
+    transition { _ -> scan_new() }
+
+    state scan_new(&mut self) {
+        let ok: bool = self.do_scan_new();
+        transition ok {
+            true -> element_scan()
+            false -> failed()
+        }
+    }
+
+    state element_scan(&mut self) {
+        let ok: bool = self.do_element_scan();
+        transition ok {
+            true -> element_scan_again()
+            false -> failed()
+        }
+    }
+
+    // The board's "filters it again" — a second element-scan filters the
+    // current result set rather than the full snapshot.
+    state element_scan_again(&mut self) {
+        let ok: bool = self.do_element_scan();
+        transition ok {
+            true -> verify()
+            false -> failed()
+        }
+    }
+
+    state verify(&mut self) {
+        let ok: bool = self.verify_page();
+        transition ok {
+            true -> passed()
+            false -> failed()
+        }
+    }
+
+    state passed(&mut self) {
+        self.console.write_line("Squalr commands: PASS");
+        self.console.exit_process(0);
+    }
+
+    state failed(&mut self) {
+        self.console.write_line("FAIL: Squalr commands");
+        self.console.exit_process(1);
+    }
+}
+
+
+pub machine CommandDriver::new_command(&mut self) -> PrivilegedCommand {
+    PrivilegedCommand::Scan {
+        command: ScanCommand::New { request: ScanNewRequest {} }
+    }
+}
+
+// The `scan element-scan -c ==0 -d u64` line: one anonymous Equal-0
+// constraint on one u64 data type.
+pub machine CommandDriver::element_command(&mut self) -> PrivilegedCommand {
+    let mut constraints: ScanConstraintSet = ScanConstraintSet::empty();
+    let constraint: AnonymousScanConstraint = AnonymousScanConstraint::new(
+        ScanCompareType::Immediate {
+            compare_type: ScanCompareTypeImmediate::Equal
+        },
+        AnonymousValueString::new(
+            "0",
+            AnonymousValueStringFormat::Decimal,
+            ContainerType::default()
+        )
+    );
+    _ = constraints.push(&constraint);
+    let mut data_type_refs: DataTypeRefSet = DataTypeRefSet::empty();
+    let data_type_ref: DataTypeRef = DataTypeRef::new("u64");
+    _ = data_type_refs.push(&data_type_ref);
+    PrivilegedCommand::Scan {
+        command: ScanCommand::ElementScan {
+            request: ElementScanRequest {
+                scan_constraints: constraints,
+                data_type_refs: data_type_refs
+            }
+        }
+    }
+}
+
+pub machine CommandDriver::list_command(&mut self) -> PrivilegedCommand {
+    let data_type_filters: DataTypeRefSet = DataTypeRefSet::empty();
+    PrivilegedCommand::ScanResults {
+        command: ScanResultsCommand::List {
+            request: ScanResultsListRequest {
+                page_index: 0,
+                has_data_type_filters: false,
+                data_type_filters: data_type_filters
+            }
+        }
+    }
+}
+
+// Dispatch + union inspection live in ordinary machines because the
+// suspend-block unit plan cannot carry union-typed locals across a state
+// boundary. Each returns a scalar the run() states guard on.
+pub machine CommandDriver::do_scan_new(&mut self) -> bool crashes Abort {
+    let command: PrivilegedCommand = self.new_command();
+    let response: PrivilegedCommandResponse = self.engine.dispatch_command(command);
+    response.is_scan()
+}
+
+pub machine CommandDriver::do_element_scan(&mut self) -> bool crashes Abort {
+    let command: PrivilegedCommand = self.element_command();
+    let response: PrivilegedCommandResponse = self.engine.dispatch_command(command);
+    response.is_scan()
+}
+
+// Pages the first result page and asserts the exact fixture expectation:
+// 8 results, addresses 4096 + position*8, current value 0 each.
+pub machine CommandDriver::verify_page(&mut self) -> bool crashes Abort {
+    let command: PrivilegedCommand = self.list_command();
+    let response: PrivilegedCommandResponse = self.engine.dispatch_command(command);
+    let is_list: bool = response.is_scan_results();
+    let count: u64 = response.get_result_count();
+    is_list && count == 8
+        && response.get_result_address(0) == 4096 && response.get_result_value(0) == 0
+        && response.get_result_address(1) == 4104 && response.get_result_value(1) == 0
+        && response.get_result_address(2) == 4112 && response.get_result_value(2) == 0
+        && response.get_result_address(3) == 4120 && response.get_result_value(3) == 0
+        && response.get_result_address(4) == 4128 && response.get_result_value(4) == 0
+        && response.get_result_address(5) == 4136 && response.get_result_value(5) == 0
+        && response.get_result_address(6) == 4144 && response.get_result_value(6) == 0
+        && response.get_result_address(7) == 4152 && response.get_result_value(7) == 0
+}

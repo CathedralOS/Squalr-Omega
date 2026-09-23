@@ -1,0 +1,218 @@
+module src::structures::scanning::constraints::anonymous_scan_constraint;
+
+use src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use src::structures::scanning::comparisons::scan_compare_type_delta::ScanCompareTypeDelta;
+use src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use src::structures::scanning::comparisons::scan_compare_type_relative::ScanCompareTypeRelative;
+
+// Port of structures/scanning/constraints/anonymous_scan_constraint.rs: the
+// comparison operator plus its still-string operand, exactly as parsed from
+// the command line (`AnonymousScanConstraint { scan_compare_type,
+// anonymous_value_string }`). The operand stays an AnonymousValueString —
+// deanonymization per data type is the constraint builder's job (executor
+// side).
+//
+// Upstream `FromStr` walks (prefix, needs_value) pairs in a fixed order:
+//   relative without value: != -> Changed, == -> Unchanged, + -> Increased,
+//                           - -> Decreased
+//   immediate with value:   >=, <=, >, <, ==, !=
+//   delta with value:       +, -
+// For each prefix, when needs_value is false the tail must be empty and when
+// true it must be nonempty; a matched prefix with the wrong tail falls
+// through to the next pair (so "==42" skips relative `==` and lands on
+// immediate `==`, bare "+" is Relative::Increased while "+5" is
+// Delta::IncreasedByX). Unmatched input is Err -> Refused.
+//
+// `has_value` reports whether an operand was supplied at all (upstream marks
+// this by holding an optional value string).
+pub data AnonymousScanConstraint {
+    scan_compare_type: ScanCompareType;
+    has_value: bool;
+    anonymous_value_string: AnonymousValueString;
+}
+
+pub data AnonymousScanConstraintParse {
+    case Refused;
+    case Parsed(value: AnonymousScanConstraint);
+}
+
+pub machine AnonymousScanConstraint::new(
+    scan_compare_type: ScanCompareType,
+    anonymous_value_string: AnonymousValueString
+) -> AnonymousScanConstraint {
+    AnonymousScanConstraint {
+        scan_compare_type: scan_compare_type,
+        has_value: true,
+        anonymous_value_string: anonymous_value_string,
+    }
+}
+
+// No operand: relative comparisons (Changed/Unchanged/Increased/Decreased)
+// never carry one.
+pub machine AnonymousScanConstraint::new_no_value(
+    scan_compare_type: ScanCompareType
+) -> AnonymousScanConstraint {
+    AnonymousScanConstraint {
+        scan_compare_type: scan_compare_type,
+        has_value: false,
+        anonymous_value_string: AnonymousValueString::new(
+            "",
+            AnonymousValueStringFormat::default(),
+            ContainerType::default()
+        ),
+    }
+}
+
+// Derived `Clone` parity — constraint lists move across packages by value.
+pub machine AnonymousScanConstraint::clone(source: &AnonymousScanConstraint) -> AnonymousScanConstraint {
+    AnonymousScanConstraint {
+        scan_compare_type: source.scan_compare_type,
+        has_value: source.has_value,
+        anonymous_value_string: AnonymousValueString::clone(&source.anonymous_value_string),
+    }
+}
+
+pub machine AnonymousScanConstraint::clone_from(&mut self, source: &AnonymousScanConstraint) {
+    self.scan_compare_type = source.scan_compare_type;
+    self.has_value = source.has_value;
+    self.anonymous_value_string.clone_from(&source.anonymous_value_string);
+}
+
+pub machine AnonymousScanConstraint::get_scan_compare_type(&self) -> ScanCompareType {
+    self.scan_compare_type
+}
+
+pub machine AnonymousScanConstraint::has_value(&self) -> bool {
+    self.has_value
+}
+
+pub machine AnonymousScanConstraint::get_anonymous_value_string(&self) -> AnonymousValueString {
+    AnonymousValueString::clone(&self.anonymous_value_string)
+}
+
+// Upstream `FromStr` over the whole token, faithful prefix ordering.
+pub machine AnonymousScanConstraint::parse(text: &[u8]) -> AnonymousScanConstraintParse {
+    transition { _ -> head(text, 0) }
+    // First byte: '!' (33) tries `!=`; '=' (61) tries `==`; '+' (43) tries
+    // `+`; '-' (45) tries `-`; '>' (62) tries `>=`/`>`; '<' (60) tries `<=`/`<`.
+    state head(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at < text.len {
+            true -> dispatch(text, text[at])
+            false -> refused()
+        }
+    }
+    state dispatch(text: &[u8], byte: u8) -> AnonymousScanConstraintParse {
+        transition byte {
+            33 -> bang(text, 0)
+            61 -> equal_equal(text, 0)
+            43 -> plus(text, 0)
+            45 -> minus(text, 0)
+            62 -> greater(text, 0)
+            60 -> less(text, 0)
+            _ -> refused()
+        }
+    }
+    // `!=` — relative Changed when bare, immediate NotEqual when a value tail
+    // follows (upstream tries the relative arm first; a nonempty tail falls
+    // through to the immediate arm).
+    state bang(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len && text[at + 1] == 61 {
+            true -> bang_eq(text, at)
+            false -> refused()
+        }
+    }
+    state bang_eq(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 2 < text.len {
+            true -> (with_value(text, at + 2,
+                ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::NotEqual }))
+            false -> (no_value(
+                ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Changed }))
+        }
+    }
+    // `==` — relative Unchanged when bare, immediate Equal with a value tail.
+    state equal_equal(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len && text[at + 1] == 61 {
+            true -> eq_eq(text, at)
+            false -> refused()
+        }
+    }
+    state eq_eq(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 2 < text.len {
+            true -> (with_value(text, at + 2,
+                ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::Equal }))
+            false -> (no_value(
+                ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Unchanged }))
+        }
+    }
+    // `+` — relative Increased when bare, Delta::IncreasedByX with a value.
+    state plus(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len {
+            true -> (with_value(text, at + 1,
+                ScanCompareType::Delta { compare_type: ScanCompareTypeDelta::IncreasedByX }))
+            false -> (no_value(
+                ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Increased }))
+        }
+    }
+    // `-` — relative Decreased when bare, Delta::DecreasedByX with a value.
+    state minus(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len {
+            true -> (with_value(text, at + 1,
+                ScanCompareType::Delta { compare_type: ScanCompareTypeDelta::DecreasedByX }))
+            false -> (no_value(
+                ScanCompareType::Relative { compare_type: ScanCompareTypeRelative::Decreased }))
+        }
+    }
+    // `>` — GreaterThanOrEqual when followed by '=', GreaterThan otherwise;
+    // both require a value tail.
+    state greater(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len && text[at + 1] == 61 {
+            true -> (with_value(text, at + 2,
+                ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::GreaterThanOrEqual }))
+            false -> greater_bare(text, at)
+        }
+    }
+    state greater_bare(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len {
+            true -> (with_value(text, at + 1,
+                ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::GreaterThan }))
+            false -> refused()
+        }
+    }
+    // `<` — LessThanOrEqual when followed by '=', LessThan otherwise.
+    state less(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len && text[at + 1] == 61 {
+            true -> (with_value(text, at + 2,
+                ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::LessThanOrEqual }))
+            false -> less_bare(text, at)
+        }
+    }
+    state less_bare(text: &[u8], at: u64) -> AnonymousScanConstraintParse {
+        transition at + 1 < text.len {
+            true -> (with_value(text, at + 1,
+                ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::LessThan }))
+            false -> refused()
+        }
+    }
+    // Value arm: the tail becomes the anonymous operand verbatim under the
+    // default format/container — deanonymization happens per data type in the
+    // executor's constraint builder.
+    state with_value(text: &[u8], at: u64, compare_type: ScanCompareType) -> AnonymousScanConstraintParse {
+        AnonymousScanConstraintParse::Parsed {
+            value: AnonymousScanConstraint::new(
+                compare_type,
+                AnonymousValueString::new_window(
+                    text, at, text.len,
+                    AnonymousValueStringFormat::default(),
+                    ContainerType::default()))
+        }
+    }
+    state no_value(compare_type: ScanCompareType) -> AnonymousScanConstraint {
+        AnonymousScanConstraint::new_no_value(compare_type)
+    }
+    state refused() -> AnonymousScanConstraintParse {
+        AnonymousScanConstraintParse::Refused
+    }
+}

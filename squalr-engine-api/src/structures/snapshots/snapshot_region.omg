@@ -1,0 +1,387 @@
+module src::structures::snapshots::snapshot_region;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::memory::normalized_region::NormalizedRegion;
+use src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use src::structures::snapshots::element_window::ElementWindow;
+
+// Port of structures/snapshots/snapshot_region.rs: a normalized memory span
+// plus its collected values and the per-type filter results scans produce.
+//
+// Value model: upstream stores raw `current_values`/`previous_values` byte
+// vectors; the port stores decoded element windows (ElementWindow — one u64
+// per aligned element), the representation the ported scalar scanners
+// consume. Byte coverage stays exact: `region_size` is bytes and element i
+// covers `[base + i*8, base + i*8 + 8)`.
+//
+// `page_boundaries` records where adjacent pages merged into this region —
+// value collection must not read across them (upstream keeps the boundary
+// addresses at merge time for exactly this). Bounded at 64 boundaries.
+//
+// No Vec in this pin: scan results and windows are bounded; overflow is a
+// named deviation recorded at the bounded carriers.
+pub data SnapshotRegion {
+    normalized_region: NormalizedRegion;
+    current_values: ElementWindow;
+    previous_values: ElementWindow;
+    page_boundaries: [u64; 64];
+    page_boundary_count: u64;
+    scan_results: SnapshotRegionScanResults;
+}
+
+pub machine SnapshotRegion::new(base_address: u64, region_size: u64) -> SnapshotRegion {
+    SnapshotRegion {
+        normalized_region: NormalizedRegion {
+            base_address: base_address,
+            region_size: region_size,
+        },
+        current_values: ElementWindow::empty(),
+        previous_values: ElementWindow::empty(),
+        page_boundary_count: 0,
+        scan_results: SnapshotRegionScanResults::empty(),
+    }
+}
+
+// The captured-input adapter, element-domain analogue of upstream
+// `SnapshotRegion::from_bytes`: caller-supplied current values with the
+// region sized to their byte coverage (element stride 8). Supplied
+// snapshots are the sanctioned testing adapter — the scan engine itself is
+// unmodified.
+pub machine SnapshotRegion::from_elements(
+    base_address: u64,
+    current_values: ElementWindow
+) -> SnapshotRegion {
+    let mut region: SnapshotRegion = SnapshotRegion::new(base_address, 0);
+    region.set_region_size(current_values.get_covered_byte_count(8));
+    region.set_current_values(&current_values);
+    region
+}
+
+pub machine SnapshotRegion::clone(source: &SnapshotRegion) -> SnapshotRegion {
+    let mut region: SnapshotRegion = SnapshotRegion::new(
+        source.normalized_region.get_base_address(),
+        source.normalized_region.get_region_size(),
+    );
+    region.clone_from(source);
+    region
+}
+
+pub machine SnapshotRegion::clone_from(&mut self, source: &SnapshotRegion) {
+    self.normalized_region.clone_from(&source.normalized_region);
+    self.current_values.clone_from(&source.current_values);
+    self.previous_values.clone_from(&source.previous_values);
+    self.scan_results.clone_from(&source.scan_results);
+    self.page_boundary_count = source.page_boundary_count;
+    self.copy_boundaries(source, 0);
+}
+
+machine SnapshotRegion::copy_boundaries(&mut self, source: &SnapshotRegion, position: u64) {
+    transition position < source.page_boundary_count && position < 64 {
+        true -> copy(source, position)
+        false -> done()
+    }
+    state copy(&mut self, source: &SnapshotRegion, position: u64) {
+        self.page_boundaries[position] = source.page_boundaries[position];
+        transition { _ -> copy_boundaries(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.page_boundary_count = self.page_boundary_count;
+    }
+}
+
+pub machine SnapshotRegion::get_base_address(&self) -> u64 {
+    self.normalized_region.get_base_address()
+}
+
+pub machine SnapshotRegion::set_base_address(&mut self, base_address: u64) {
+    self.normalized_region.set_base_address(base_address);
+}
+
+pub machine SnapshotRegion::get_end_address(&self) -> u64 {
+    self.normalized_region.get_end_address()
+}
+
+pub machine SnapshotRegion::get_region_size(&self) -> u64 {
+    self.normalized_region.get_region_size()
+}
+
+pub machine SnapshotRegion::set_region_size(&mut self, region_size: u64) {
+    self.normalized_region.set_region_size(region_size);
+}
+
+// The region's normalized span, for callers building filters over it.
+pub machine SnapshotRegion::get_normalized_region(&self) -> NormalizedRegion {
+    NormalizedRegion::clone(&self.normalized_region)
+}
+
+pub machine SnapshotRegion::has_current_values(&self) -> bool {
+    !self.current_values.is_empty()
+}
+
+pub machine SnapshotRegion::get_current_element_count(&self) -> u64 {
+    self.current_values.get_element_count()
+}
+
+pub machine SnapshotRegion::get_current_element(&self, position: u64) -> u64 {
+    self.current_values.get_element(position)
+}
+
+pub machine SnapshotRegion::get_previous_element_count(&self) -> u64 {
+    self.previous_values.get_element_count()
+}
+
+pub machine SnapshotRegion::get_previous_element(&self, position: u64) -> u64 {
+    self.previous_values.get_element(position)
+}
+
+// Upstream `set_current_values`: installs a freshly collected window.
+pub machine SnapshotRegion::set_current_values(&mut self, values: &ElementWindow) {
+    self.current_values.clone_from(values);
+}
+
+// Upstream's collect swap: current becomes previous before the next read.
+pub machine SnapshotRegion::rotate_values_for_collection(&mut self) {
+    self.previous_values.clone_from(&self.current_values);
+}
+
+pub machine SnapshotRegion::push_page_boundary(&mut self, address: u64) -> bool {
+    transition self.page_boundary_count < 64 {
+        true -> push(address)
+        false -> (false)
+    }
+    state push(&mut self, address: u64) -> bool {
+        self.page_boundaries[self.page_boundary_count] = address;
+        self.page_boundary_count = self.page_boundary_count + 1;
+        true
+    }
+}
+
+pub machine SnapshotRegion::get_page_boundary_count(&self) -> u64 {
+    self.page_boundary_count
+}
+
+pub machine SnapshotRegion::get_page_boundary(&self, position: u64) -> u64 {
+    transition position < self.page_boundary_count && position < 64 {
+        true -> (self.page_boundaries[position])
+        false -> (0)
+    }
+}
+
+// Upstream `get_scan_results` — the whole per-type filter set.
+pub machine SnapshotRegion::get_scan_results(&self) -> SnapshotRegionScanResults {
+    SnapshotRegionScanResults::clone(&self.scan_results)
+}
+
+
+// The bounded set of data types a scan request carries across packages.
+pub data DataTypeRefSet {
+    data_type_refs: [DataTypeRef; 4];
+    count: u64;
+}
+
+pub machine DataTypeRefSet::empty() -> DataTypeRefSet {
+    DataTypeRefSet { count: 0 }
+}
+
+pub machine DataTypeRefSet::get_count(&self) -> u64 {
+    self.count
+}
+
+pub machine DataTypeRefSet::push(&mut self, data_type_ref: &DataTypeRef) -> bool {
+    transition self.count < 4 {
+        true -> store(data_type_ref)
+        false -> (false)
+    }
+    state store(&mut self, data_type_ref: &DataTypeRef) -> bool {
+        self.data_type_refs[self.count].clone_from(data_type_ref);
+        self.count = self.count + 1;
+        true
+    }
+}
+
+pub machine DataTypeRefSet::get(&self, position: u64) -> DataTypeRef {
+    transition position < self.count && position < 4 {
+        true -> clone_at(position)
+        false -> (DataTypeRef::default())
+    }
+    state clone_at(&self, position: u64) -> DataTypeRef {
+        DataTypeRef::clone(&self.data_type_refs[position])
+    }
+}
+
+// Upstream `initialize_scan_results`: a region with no collections gets one
+// whole-region filter per requested data type; existing collections are kept.
+pub machine SnapshotRegion::initialize_scan_results(
+    &mut self,
+    data_type_refs: &DataTypeRefSet,
+    memory_alignment: MemoryAlignment
+) {
+    transition self.scan_results.get_collection_count() == 0 {
+        true -> seed(data_type_refs, memory_alignment)
+        false -> done()
+    }
+    state seed(&mut self, data_type_refs: &DataTypeRefSet, memory_alignment: MemoryAlignment) {
+        transition { _ -> each(data_type_refs, memory_alignment, 0) }
+    }
+    state each(&mut self, data_type_refs: &DataTypeRefSet, memory_alignment: MemoryAlignment, position: u64) {
+        transition position < data_type_refs.get_count() && position < 4 {
+            true -> plant(data_type_refs, memory_alignment, position)
+            false -> done()
+        }
+    }
+    state plant(&mut self, data_type_refs: &DataTypeRefSet, memory_alignment: MemoryAlignment, position: u64) {
+        let data_type_ref: DataTypeRef = data_type_refs.get(position);
+        let seed_filter: SnapshotRegionFilter = SnapshotRegionFilter::new(
+            self.normalized_region.get_base_address(),
+            self.normalized_region.get_region_size());
+        // The collection's result width is the data type's unit size — the
+        // ported scalar leg resolves u64 to 8; an unknown type yields an
+        // empty collection upstream of plan selection.
+        let unit: u64 = data_type_ref.get_unit_size_in_bytes();
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::from_single_filter(
+            &seed_filter, &data_type_ref, memory_alignment, unit);
+        let pushed: bool = self.scan_results.push_collection(&collection);
+        transition pushed {
+            true -> each(data_type_refs, memory_alignment, position + 1)
+            false -> done()
+            _ -> done()
+        }
+    }
+    state done(&mut self) {
+        self.page_boundary_count = self.page_boundary_count;
+    }
+}
+
+// Upstream `resize_to_filters`: after results narrow, the region shrinks to
+// the union of surviving filters — base moves to the lowest filter start,
+// size to their union coverage, and value windows realign to the new base.
+// With no surviving filters the region is left empty for discard.
+machine SnapshotRegion::resize_to_filters(&mut self) {
+    let bounds: FilterBounds = self.compute_filter_bounds();
+    transition bounds.has_filters {
+        true -> shrink(bounds)
+        false -> empty_self()
+    }
+    state shrink(&mut self, bounds: FilterBounds) {
+        let base: u64 = self.normalized_region.get_base_address();
+        // Element-space realign: surviving filters start `lead` elements in.
+        let lead: u64 = (((bounds.min_address as u64 in Saturating) - (base as u64 in Saturating)) as u64) / 8;
+        self.current_values.truncate_front(lead);
+        self.previous_values.truncate_front(lead);
+        self.normalized_region.set_base_address(bounds.min_address);
+        self.normalized_region.set_region_size(((bounds.max_address as u64 in Saturating) - (bounds.min_address as u64 in Saturating)) as u64);
+        transition { _ -> clip() }
+    }
+    // Windows may extend past the surviving union — clamp the element counts
+    // to the new size so stale elements are not observable as results.
+    state clip(&mut self) {
+        let elements: u64 = self.normalized_region.get_region_size() / 8;
+        self.current_values.truncate_back(elements);
+        self.previous_values.truncate_back(elements);
+        self.page_boundary_count = self.page_boundary_count;
+    }
+    state empty_self(&mut self) {
+        self.normalized_region.set_region_size(0);
+        self.current_values.clear();
+        self.previous_values.clear();
+    }
+}
+
+// Upstream `get_collected_byte_count`: the byte coverage the surviving
+// filters claim, clamped by the collected window's coverage.
+pub machine SnapshotRegion::get_collected_byte_count(&self) -> u64 {
+    let window_bytes: u64 = self.current_values.get_covered_byte_count(8);
+    let filtered: u64 = self.covered_by_filters(self.normalized_region.get_base_address());
+    transition filtered < window_bytes {
+        true -> (filtered)
+        false -> (window_bytes)
+    }
+}
+
+// Sum of filter coverage restricted to [window_base, window_base +
+// window_bytes) — upstream's per-filter clamp loop.
+machine SnapshotRegion::covered_by_filters(&self, window_base: u64) -> u64 {
+    let window_end: u64 = ((window_base as u64 in Saturating) + (self.current_values.get_covered_byte_count(8) as u64 in Saturating)) as u64;
+    transition { _ -> total(0, 0, window_base, window_end) }
+    state total(&self, collection_index: u64, covered: u64, window_base: u64, window_end: u64) -> u64 {
+        transition collection_index < self.scan_results.get_collection_count() && collection_index < 4 {
+            true -> per_collection(collection_index, covered, window_base, window_end)
+            false -> (covered)
+        }
+    }
+    state per_collection(&self, collection_index: u64, covered: u64, window_base: u64, window_end: u64) -> u64 {
+        let collection: SnapshotRegionFilterCollection =
+            self.scan_results.get_filter_collection(collection_index);
+        let added: u64 = collection.covered_in_range(window_base, window_end);
+        transition { _ -> total(((collection_index as u64 in Wrapping) + 1) as u64, ((covered as u64 in Saturating) + (added as u64 in Saturating)) as u64, window_base, window_end) }
+    }
+}
+
+// In-package bounds probe used by resize: the union of all surviving
+// filter addresses across collections.
+pub data FilterBounds {
+    has_filters: bool;
+    min_address: u64;
+    max_address: u64;
+}
+
+// Union of filter min/max across every collection — upstream's
+// resize_to_filters reads the same union before culling the region.
+machine SnapshotRegion::compute_filter_bounds(&self) -> FilterBounds {
+    transition { _ -> seek(0, false, 0, 0) }
+    state seek(&self, collection_index: u64, has_filters: bool, min_address: u64, max_address: u64) -> FilterBounds {
+        transition collection_index < self.scan_results.get_collection_count() && collection_index < 4 {
+            true -> merge(collection_index, has_filters, min_address, max_address)
+            false -> (FilterBounds { has_filters: has_filters, min_address: min_address, max_address: max_address })
+        }
+    }
+    state merge(&self, collection_index: u64, has_filters: bool, min_address: u64, max_address: u64) -> FilterBounds {
+        let collection: SnapshotRegionFilterCollection =
+            self.scan_results.get_filter_collection(collection_index);
+        let lo: u64 = collection.get_filter_minimum_address();
+        let hi: u64 = collection.get_filter_maximum_address();
+        let has_any: bool = collection.get_filter_count() > 0;
+        let merged_min: u64 = SnapshotRegion::pick_min(has_filters, min_address, lo);
+        let merged_max: u64 = SnapshotRegion::pick_max(has_filters, max_address, hi);
+        let still_has: bool = has_filters || has_any;
+        transition { _ -> seek(collection_index + 1, still_has, merged_min, merged_max) }
+    }
+}
+
+machine SnapshotRegion::pick_min(has_filters: bool, min_address: u64, candidate: u64) -> u64 {
+    transition has_filters && min_address <= candidate {
+        true -> (min_address)
+        false -> (candidate)
+        _ -> (candidate)
+    }
+}
+
+machine SnapshotRegion::pick_max(has_filters: bool, max_address: u64, candidate: u64) -> u64 {
+    transition has_filters && max_address >= candidate {
+        true -> (max_address)
+        false -> (candidate)
+        _ -> (candidate)
+    }
+}
+
+// Upstream `get_current_values_filter_pointer`/`get_previous_values_filter_pointer`
+// — the filter-relative element views scanners consume. `start` is the
+// filter's first element index within the region window and `count` its
+// element count; out-of-window requests yield an empty slice, exactly as
+// upstream's clamped pointer arithmetic yields zero readable elements.
+pub machine SnapshotRegion::get_current_values_slice(&self, start: u64, count: u64) -> &[u64] {
+    self.current_values.slice(start, count)
+}
+
+pub machine SnapshotRegion::get_previous_values_slice(&self, start: u64, count: u64) -> &[u64] {
+    self.previous_values.slice(start, count)
+}
+
+// Upstream `set_scan_results`: replaces the region's result collections with
+// the scan's per-collection output — the post-dispatch install step.
+pub machine SnapshotRegion::set_scan_results(&mut self, scan_results: &SnapshotRegionScanResults) {
+    self.scan_results.clone_from(scan_results);
+}

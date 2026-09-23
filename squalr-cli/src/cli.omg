@@ -1,0 +1,316 @@
+module src::cli;
+
+use squalr_engine_api::src::commands::command_line::command_line_command::CommandLineCommand;
+use squalr_engine_api::src::commands::command_line::command_line_parser::CommandLineParse;
+use squalr_engine_api::src::commands::command_line::command_line_parser::CommandLineParser;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::commands::scan_results::scan_results_response::ScanResultsResponse;
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultsListResponse;
+use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
+use squalr_engine::src::squalr_engine::SqualrEngine;
+use omega_language_std::console;
+use omega::language::core::service;
+use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
+
+// Port of cli.rs `Cli::run_loop` for the headless leg: read stdin lines,
+// `exit`/`close`/`quit` (case-insensitive) breaks, each line parses to a
+// privileged command and dispatches through the engine. Scan responses
+// print nothing — upstream's empty scan handlers — and `scan-results list`
+// prints one `0x<address> = <current>` line per result.
+pub data Cli {
+    console: Service<Console>;
+    engine: SqualrEngine;
+    line_buffer: [u8; 512];
+    last_list: ScanResultsListResponse;
+}
+
+pub machine Cli::init(&mut self) {
+    self.engine.init_privileged_shell();
+}
+
+// `exit`/`close`/`quit` — case-insensitive per upstream.
+pub machine Cli::is_exit_line(&mut self, count: u64) -> bool {
+    let is_exit: bool = Cli::token_is_ci(&self.line_buffer, count, 0, "exit");
+    let is_close: bool = Cli::token_is_ci(&self.line_buffer, count, 0, "close");
+    let is_quit: bool = Cli::token_is_ci(&self.line_buffer, count, 0, "quit");
+    is_exit || is_close || is_quit
+}
+
+// One-token, case-folded compare of `line[0..count]` against `word`.
+machine Cli::token_is_ci(line: &[u8; 512], count: u64, position: u64, word: &[u8]) -> bool {
+    transition position < count && position < word.len {
+        true -> compare(line, count, position, word)
+        false -> finish(line, count, position, word)
+        _ -> finish(line, count, position, word)
+    }
+    state compare(line: &[u8; 512], count: u64, position: u64, word: &[u8]) -> bool {
+        transition position < 512 {
+            true -> check(line, count, position, word)
+            false -> (false)
+        }
+    }
+    state check(line: &[u8; 512], count: u64, position: u64 [0..512], word: &[u8]) -> bool {
+        transition position < word.len {
+            true -> letters(line, count, position, word)
+            false -> (false)
+        }
+    }
+    state letters(line: &[u8; 512], count: u64, position: u64 [0..512], word: &[u8]) -> bool {
+        transition position < word.len && position < word.len {
+            true -> fold(line, count, position, word)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state fold(line: &[u8; 512], count: u64, position: u64 [0..512], word: &[u8]) -> bool {
+        transition position < word.len {
+            true -> bytes(line, count, position, word)
+            false -> (false)
+        }
+    }
+    state bytes(line: &[u8; 512], count: u64, position: u64 [0..512], word: &[u8]) -> bool {
+        transition position < word.len {
+            true -> matches_at(line, count, position, word)
+            false -> (false)
+        }
+    }
+    state matches_at(line: &[u8; 512], count: u64, position: u64 [0..512], word: &[u8]) -> bool {
+        let upper: u8 = Cli::to_upper(line[position]);
+        let expected: u8 = word[position];
+        transition upper == expected {
+            true -> token_is_ci(line, count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, word)
+            false -> (false)
+        }
+    }
+    state finish(line: &[u8; 512], count: u64, position: u64, word: &[u8]) -> bool {
+        transition position == count && position == word.len {
+            true -> (true)
+            false -> (false)
+        }
+    }
+}
+
+// ASCII fold — uppercase the letter byte.
+machine Cli::to_upper(byte: u8) -> u8 {
+    transition byte >= 97 && byte <= 122 {
+        true -> ((byte - 32) as u8)
+        false -> (byte)
+        _ -> (byte)
+    }
+}
+
+// Largest power-of-ten ≤ value — the print_dec64 cursor seed.
+machine Cli::dec_places(&mut self, value: u64) -> u64 {
+    transition { _ -> grow(value, 1) }
+    state grow(value: u64, place: u64) -> u64 {
+        transition value >= 10 && place <= 1000000000000000000 {
+            true -> check(value, place)
+            false -> (place)
+        }
+    }
+    state check(value: u64, place: u64) -> u64 {
+        let next: u64 = ((place as u64 in Wrapping) * 10) as u64;
+        transition next <= value {
+            true -> grow(value, next)
+            false -> (place)
+        }
+    }
+}
+
+// Upstream `Cli::run_loop`: read stdin lines, `exit`/`close`/`quit`
+// (case-insensitive) breaks, each line parses to a privileged command and
+// dispatches through the engine. Scan responses print nothing —
+// upstream's empty scan handlers — and `scan-results list` prints one
+// `0x<address> = <current>` line per result.
+pub machine Cli::run(&mut self)
+reaches Console
+invokes Console;
+suspends; blocks;
+crashes Abort
+crashes Trap
+{
+    transition { _ -> read() }
+
+    state read(&mut self) {
+        transition block self.console.read_line(&mut self.line_buffer) {
+            LineReadResult::LineComplete { count } -> got_line(count, false)
+            LineReadResult::EndOfInput { count } -> got_line(count, true)
+            _ -> read()
+        }
+    }
+
+    state got_line(&mut self, count: u64, end_after: bool) {
+        let is_exit: bool = self.is_exit_line(count);
+        transition is_exit {
+            true -> exit()
+            false -> do_parse(count, end_after)
+        }
+    }
+
+    state do_parse(&mut self, count: u64, end_after: bool) {
+        transition count <= 512 {
+            true -> parsed(count, end_after)
+            false -> refuse(end_after)
+        }
+    }
+
+    state parsed(&mut self, count: u64 [0..=512], end_after: bool) {
+        let line: &[u8] = &self.line_buffer[0..count];
+        let parse: CommandLineParse = CommandLineParser::parse(line);
+        transition parse {
+            CommandLineParse::Parsed { command } -> dispatch(command, end_after)
+            _ -> refuse(end_after)
+        }
+    }
+
+    state dispatch(&mut self, command: CommandLineCommand, end_after: bool) {
+        transition command {
+            CommandLineCommand::Privileged { command } -> privileged(command, end_after)
+        }
+    }
+
+    state privileged(&mut self, command: PrivilegedCommand, end_after: bool) {
+        let response: PrivilegedCommandResponse = self.engine.dispatch_command(command);
+        transition response {
+            PrivilegedCommandResponse::Scan { response } -> next(end_after)
+            PrivilegedCommandResponse::ScanResults { response } -> scan_results(response, end_after)
+            _ -> next(end_after)
+        }
+    }
+
+    state scan_results(&mut self, response: ScanResultsResponse, end_after: bool) {
+        transition response {
+            ScanResultsResponse::List { response } -> stash(response, end_after)
+            _ -> next(end_after)
+        }
+    }
+
+    state stash(&mut self, response: ScanResultsListResponse, end_after: bool) {
+        self.last_list = response;
+        transition { _ -> print_head(end_after) }
+    }
+
+    state print_head(&mut self, end_after: bool) {
+        let count: u64 = self.last_list.scan_results.get_count();
+        transition { _ -> print_at(count, 0, end_after) }
+    }
+
+    state print_at(&mut self, count: u64, position: u64, end_after: bool) {
+        transition position < count {
+            true -> print_one(count, position, end_after)
+            false -> next(end_after)
+        }
+    }
+
+    state print_one(&mut self, count: u64, position: u64, end_after: bool) {
+        let scan_result: ScanResult = self.last_list.scan_results.get(position);
+        transition scan_result {
+            ScanResult::Valued { valued_result } -> print_valued(valued_result, count, position, end_after)
+            _ -> print_next(count, position, end_after)
+        }
+    }
+
+    // `0x` + 16 hex digits — the list line's address column.
+    state print_valued(&mut self, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        self.console.write_byte(48);
+        self.console.write_byte(120);
+        transition { _ -> hex_digit(valued_result.get_address(), 60, valued_result, count, position, end_after) }
+    }
+
+    state hex_digit(&mut self, value: u64, shift: u64, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        let nibble: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) as u64) & 15;
+        transition nibble < 10 {
+            true -> hex_decimal(value, shift, nibble, valued_result, count, position, end_after)
+            false -> hex_letter(value, shift, nibble, valued_result, count, position, end_after)
+        }
+    }
+
+    state hex_decimal(&mut self, value: u64, shift: u64, nibble: u64, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        let glyph: u8 = (nibble + 48) as u8;
+        self.console.write_byte(glyph as i32);
+        transition { _ -> hex_next(value, shift, valued_result, count, position, end_after) }
+    }
+
+    state hex_letter(&mut self, value: u64, shift: u64, nibble: u64, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        let glyph: u8 = (nibble + 87) as u8;
+        self.console.write_byte(glyph as i32);
+        transition { _ -> hex_next(value, shift, valued_result, count, position, end_after) }
+    }
+
+    state hex_next(&mut self, value: u64, shift: u64, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        transition shift > 0 {
+            true -> hex_digit(value, ((shift as u64 in Wrapping) - (4 as u64 in Wrapping)) as u64, valued_result, count, position, end_after)
+            false -> hex_done(valued_result, count, position, end_after)
+        }
+    }
+
+    state hex_done(&mut self, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        self.console.write(" = ");
+        transition valued_result.has_current_value() {
+            true -> dec_head(valued_result, count, position, end_after)
+            false -> print_no_value(count, position, end_after)
+        }
+    }
+
+    state dec_head(&mut self, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        transition valued_result.get_current_value() > 0 {
+            true -> dec_places_head(valued_result, count, position, end_after)
+            false -> dec_zero(count, position, end_after)
+        }
+    }
+
+    state dec_places_head(&mut self, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        let current: u64 = valued_result.get_current_value();
+        let place: u64 = self.dec_places(current);
+        transition { _ -> dec_digit(current, place, valued_result, count, position, end_after) }
+    }
+
+    state dec_zero(&mut self, count: u64, position: u64, end_after: bool) {
+        self.console.write_byte(48);
+        transition { _ -> dec_done(count, position, end_after) }
+    }
+
+    state dec_digit(&mut self, value: u64, place: u64, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        let digit: u8 = ((((value as u64 in Wrapping) / (place as u64 in Wrapping)) as u64) % 10) as u8;
+        self.console.write_byte((digit + 48) as i32);
+        transition place > 1 {
+            true -> dec_down(value, place, valued_result, count, position, end_after)
+            false -> dec_done(count, position, end_after)
+        }
+    }
+
+    state dec_down(&mut self, value: u64, place: u64, valued_result: ScanResultValued, count: u64, position: u64, end_after: bool) {
+        transition { _ -> dec_digit(value, place / 10, valued_result, count, position, end_after) }
+    }
+
+    state dec_done(&mut self, count: u64, position: u64, end_after: bool) {
+        self.console.write_byte(10);
+        transition { _ -> print_next(count, position, end_after) }
+    }
+
+    state print_no_value(&mut self, count: u64, position: u64, end_after: bool) {
+        self.console.write_line("?");
+        transition { _ -> print_next(count, position, end_after) }
+    }
+
+    state print_next(&mut self, count: u64, position: u64, end_after: bool) {
+        transition { _ -> print_at(count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end_after) }
+    }
+
+    state refuse(&mut self, end_after: bool) {
+        self.console.write_line("unrecognized command");
+        transition { _ -> next(end_after) }
+    }
+
+    state next(&mut self, end_after: bool) {
+        transition end_after {
+            true -> exit()
+            false -> read()
+        }
+    }
+
+    state exit(&mut self) {
+        self.console.exit_process(0);
+    }
+}

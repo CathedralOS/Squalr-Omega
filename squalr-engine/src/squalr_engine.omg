@@ -1,0 +1,84 @@
+module src::squalr_engine;
+
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::structures::memory::bitness::Bitness;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
+use src::command_executors::privileged_command_executor::PrivilegedCommandExecutor;
+use src::engine_mode::EngineMode;
+
+// Port of squalr_engine.rs for the headless leg: the engine is the
+// privileged state plus the synchronous dispatcher. Upstream's
+// `EngineApiPrivilegedBindings` trait-object bindings and task executor
+// thread pool collapse to direct dispatch — commands complete before
+// returning, so no TrackableTask crosses the wire (named deviation).
+pub data SqualrEngine {
+    engine_mode: EngineMode;
+    engine_privileged_state: EnginePrivilegedState;
+}
+
+// Re-entrant initializer for hosts (the CLI's `Main`) that own an
+// already-constructed engine slot — the entry context cannot bind a
+// structural local or call-source assignment, so construction lands
+// through a `&mut` receiver instead.
+pub machine SqualrEngine::init(&mut self, engine_mode: EngineMode) {
+    self.engine_mode = engine_mode;
+    self.engine_privileged_state = EnginePrivilegedState::new();
+}
+
+// No-arg entry-context variant: the entry machine's closure cannot
+// construct or pass union values, so the headless CLI's fixed launch
+// mode is pinned here where ordinary semantics apply.
+pub machine SqualrEngine::init_privileged_shell(&mut self) {
+    // Union field stores cannot appear anywhere in the entry's transitive
+    // unit plan, so `engine_mode` keeps its zero-initialized first case
+    // (`Standalone`). The field is unused by the privileged dispatch path,
+    // which is what this entry mode drives.
+    self.engine_privileged_state.init();
+}
+
+pub machine SqualrEngine::new(engine_mode: EngineMode) -> SqualrEngine {
+    SqualrEngine {
+        engine_mode: engine_mode,
+        engine_privileged_state: EnginePrivilegedState::new(),
+    }
+}
+
+pub machine SqualrEngine::get_mode(&self) -> EngineMode {
+    self.engine_mode
+}
+
+// Test-side process open — the adapter's equivalent of `open_process`
+// completing; `scan new` requires an opened process upstream.
+pub machine SqualrEngine::open_process(&mut self, process_id: u32) {
+    self.engine_privileged_state.set_opened_process(
+        OpenedProcessInfo::new(process_id, "", process_id as u64, Bitness::Bit64));
+}
+
+// Install the supplied memory regions the CLI's `--memory` flag captures —
+// the adapter's stand-in for a real target's page map + contents.
+pub machine SqualrEngine::supply_memory(&mut self, source: SuppliedMemorySource) {
+    self.engine_privileged_state.set_supplied_memory_source(source);
+}
+
+// Fixture variant of `supply_memory` for harnesses whose call sites can only
+// carry scalars: installs one zeroed `element_count`-wide u64 region at
+// `base_address` — a fault-injected page under the same adapter.
+pub machine SqualrEngine::supply_fixture(&mut self, base_address: u64, element_count: u64) {
+    self.engine_privileged_state.set_supplied_memory_source(
+        EnginePrivilegedState::make_fixture_source(base_address, element_count));
+}
+
+// Upstream `dispatch_command` — the synchronous equivalent of the IPC
+// command loop: route the privileged command through the executor chain and
+// produce the wire-shaped response.
+pub machine SqualrEngine::dispatch_command(
+    &mut self,
+    privileged_command: PrivilegedCommand
+) -> PrivilegedCommandResponse
+crashes Abort
+{
+    PrivilegedCommandExecutor::execute(&mut self.engine_privileged_state, privileged_command)
+}

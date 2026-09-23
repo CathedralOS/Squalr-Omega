@@ -1,0 +1,123 @@
+module src::command_executors::element_scan_request_executor;
+
+use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ElementScanRequest;
+use squalr_engine_api::src::commands::scan::element_scan::element_scan_response::ElementScanResponse;
+use squalr_engine_api::src::structures::scan_results::scan_results_metadata::ScanResultsMetadata;
+use squalr_engine_api::src::structures::settings::scan_settings::ScanSettings;
+use squalr_engine_api::src::structures::scanning::memory_read_mode::MemoryReadMode;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use src::command_executors::constraint_deanonymizer::ConstraintDeanonymizer;
+use src::command_executors::element_scanner::ElementScannerDriver;
+use src::command_executors::snapshot_value_collector::SnapshotValueCollector;
+
+// Port of commands/scan/element_scan/element_scan_request_executor.rs:
+// settings → deanonymize per data type → collect values (unless
+// MemoryReadMode::Skip) → scan_snapshot → respond with the collected
+// metadata. No opened process → upstream's default (success=false).
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ElementScanRequestExecutor {}
+
+pub machine ElementScanRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    element_scan_request: &ElementScanRequest
+) -> ElementScanResponse
+crashes Abort
+{
+    transition engine_privileged_state.has_opened_process() {
+        true -> plan(engine_privileged_state, element_scan_request)
+        false -> (ElementScanResponse::default())
+        _ -> (ElementScanResponse::default())
+    }
+
+    // Upstream: `ElementScanPlan::new` then deanonymize per requested data
+    // type. Settings come from the session's stored ScanSettings.
+    state plan(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        element_scan_request: &ElementScanRequest
+    ) -> ElementScanResponse
+    {
+        let settings: ScanSettings = engine_privileged_state.get_scan_settings();
+        let mut plan: ElementScanPlan = ElementScanPlan::new(
+            settings.get_memory_alignment(),
+            settings.get_memory_read_mode(),
+            settings.get_is_single_threaded_scan());
+        transition { _ -> deanonymize(engine_privileged_state, element_scan_request, plan, settings, 0) }
+    }
+
+    state deanonymize(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        element_scan_request: &ElementScanRequest,
+        plan: ElementScanPlan,
+        settings: ScanSettings,
+        type_index: u64
+    ) -> ElementScanResponse
+    {
+        transition type_index < element_scan_request.data_type_refs.count {
+            true -> build_type(engine_privileged_state, element_scan_request, plan, settings, type_index)
+            false -> collect(engine_privileged_state, plan, settings)
+        }
+    }
+
+    state build_type(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        element_scan_request: &ElementScanRequest,
+        plan: ElementScanPlan,
+        settings: ScanSettings,
+        type_index: u64
+    ) -> ElementScanResponse
+    {
+        let data_type_ref: DataTypeRef = element_scan_request.data_type_refs.get(type_index);
+        let plan_list: TypePlanList = ConstraintDeanonymizer::build_type_plan_list(
+            &element_scan_request.scan_constraints,
+            &data_type_ref,
+            settings.get_memory_alignment());
+        let mut carried: ElementScanPlan = plan;
+        let pushed: bool = carried.push_type_plans(&data_type_ref, &plan_list);
+        transition { _ -> deanonymize(
+            engine_privileged_state, element_scan_request, carried, settings, ((type_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state collect(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        plan: ElementScanPlan,
+        settings: ScanSettings
+    ) -> ElementScanResponse
+    {
+        // Upstream reads live values unless MemoryReadMode::Skip — the
+        // supplied source answers the read for the captured target.
+        transition plan.get_memory_read_mode() {
+            MemoryReadMode::ReadBeforeScan -> read(engine_privileged_state, plan)
+            MemoryReadMode::Skip -> scan(engine_privileged_state, plan)
+            _ -> scan(engine_privileged_state, plan)
+        }
+    }
+
+    state read(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        plan: ElementScanPlan
+    ) -> ElementScanResponse
+    {
+        SnapshotValueCollector::collect_all_regions(engine_privileged_state);
+        transition { _ -> scan(engine_privileged_state, plan) }
+    }
+
+    state scan(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        plan: ElementScanPlan
+    ) -> ElementScanResponse
+    {
+        let metadata: ScanResultsMetadata = ElementScannerDriver::scan_snapshot(
+            engine_privileged_state.borrow_snapshot_mut(), &plan);
+        transition { _ -> finish(metadata) }
+    }
+
+    state finish(metadata: ScanResultsMetadata) -> ElementScanResponse {
+        ElementScanResponse {
+            success: true,
+            scan_results_metadata: metadata,
+        }
+    }
+}

@@ -1,0 +1,417 @@
+module src::structures::scanning::filters::snapshot_region_filter_collection;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+
+// Port of structures/scanning/filters/snapshot_region_filter_collection.rs:
+// the filters (scan results) one data type owns inside a snapshot region.
+// Upstream keeps `Vec<Vec<SnapshotRegionFilter>>` — the inner vectors are
+// per-parallelization batches; this port holds one flat bounded set
+// (MAX_FILTERS = 64 — scans emitting more surviving ranges truncate, a
+// named deviation from upstream's unbounded Vec). Parallelism is the SIMD/
+// parallel leg's work, not this item's.
+//
+// Upstream caches `number_of_results` at construction; the port recomputes
+// on read — same value, no cached copy.
+pub data SnapshotRegionFilterCollection {
+    snapshot_region_filters: [SnapshotRegionFilter; 64];
+    filter_count: u64;
+    data_type_ref: DataTypeRef;
+    memory_alignment: MemoryAlignment;
+    result_value_size_in_bytes: u64;
+}
+
+// Upstream `new_with_result_size`: retains only filters whose region can
+// hold a whole logical result, then sorts. The SymbolRegistry is not part
+// of this slice — `result_value_size_in_bytes` arrives already resolved.
+pub machine SnapshotRegionFilterCollection::new_with_result_size(
+    snapshot_region_filters: [SnapshotRegionFilter; 64],
+    filter_count: u64,
+    data_type_ref: DataTypeRef,
+    memory_alignment: MemoryAlignment,
+    result_value_size_in_bytes: u64
+) -> SnapshotRegionFilterCollection {
+    let mut collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection {
+        filter_count: 0,
+        data_type_ref: data_type_ref,
+        memory_alignment: memory_alignment,
+        result_value_size_in_bytes: result_value_size_in_bytes,
+    };
+    collection.retain_result_sized_filters(snapshot_region_filters, filter_count);
+    collection.sort_filters();
+    collection
+}
+
+pub machine SnapshotRegionFilterCollection::empty(
+    data_type_ref: DataTypeRef,
+    memory_alignment: MemoryAlignment,
+    result_value_size_in_bytes: u64
+) -> SnapshotRegionFilterCollection {
+    SnapshotRegionFilterCollection {
+        filter_count: 0,
+        data_type_ref: data_type_ref,
+        memory_alignment: memory_alignment,
+        result_value_size_in_bytes: result_value_size_in_bytes,
+    }
+}
+
+// Upstream's construction-time `retain`: trailing windows narrower than the
+// logical result width cannot materialize results and are dropped here.
+machine SnapshotRegionFilterCollection::retain_result_sized_filters(
+    &mut self,
+    snapshot_region_filters: [SnapshotRegionFilter; 64],
+    filter_count: u64
+) {
+    transition { _ -> next(&snapshot_region_filters, filter_count, 0) }
+    state next(&mut self, snapshot_region_filters: &[SnapshotRegionFilter; 64], filter_count: u64, position: u64) {
+        transition position < filter_count && position < 64 {
+            true -> probe(snapshot_region_filters, filter_count, position)
+            false -> done()
+        }
+    }
+    state probe(&mut self, snapshot_region_filters: &[SnapshotRegionFilter; 64], filter_count: u64, position: u64 [0..64]) {
+        transition snapshot_region_filters[position].get_region_size() >= self.result_value_size_in_bytes
+            && self.filter_count < 64 {
+            true -> keep(snapshot_region_filters, filter_count, position)
+            false -> next(snapshot_region_filters, filter_count, position + 1)
+        }
+    }
+    state keep(&mut self, snapshot_region_filters: &[SnapshotRegionFilter; 64], filter_count: u64, position: u64 [0..64]) {
+        transition self.filter_count < 64 {
+            true -> store(snapshot_region_filters, filter_count, position, self.filter_count)
+            false -> next(snapshot_region_filters, filter_count, position + 1)
+        }
+    }
+    state store(&mut self, snapshot_region_filters: &[SnapshotRegionFilter; 64], filter_count: u64, position: u64 [0..64], at: u64 [0..64]) {
+        let kept: SnapshotRegionFilter = SnapshotRegionFilter::clone(&snapshot_region_filters[position]);
+        self.snapshot_region_filters[at].clone_from(&kept);
+        self.filter_count = ((self.filter_count as u64 in Wrapping) + 1) as u64;
+        transition { _ -> next(snapshot_region_filters, filter_count, position + 1) }
+    }
+    state done(&mut self) {
+        self.filter_count = self.filter_count;
+    }
+}
+
+// Upstream sorts each filter batch by base address (Ord on NormalizedRegion
+// orders by base alone) — insertion sort over the bounded set.
+machine SnapshotRegionFilterCollection::sort_filters(&mut self) {
+    transition { _ -> outer(1) }
+    state outer(&mut self, index: u64) {
+        transition index < self.filter_count && index < 64 {
+            true -> inner(index, index)
+            false -> done()
+        }
+    }
+    state inner(&mut self, index: u64, position: u64) {
+        transition position > 0 && position < 64 {
+            true -> order(index, position)
+            false -> outer(((index as u64 in Wrapping) + 1) as u64)
+        }
+    }
+    state order(&mut self, index: u64, position: u64 [0..64]) {
+        let prior: u64 = ((position as u64 in Wrapping) - 1) as u64;
+        transition prior < 64
+            && self.snapshot_region_filters[prior].get_base_address()
+               > self.snapshot_region_filters[position].get_base_address() {
+            true -> swap(index, position, prior)
+            false -> outer(((index as u64 in Wrapping) + 1) as u64)
+            _ -> outer(((index as u64 in Wrapping) + 1) as u64)
+        }
+    }
+    state swap(&mut self, index: u64, position: u64 [0..64], prior: u64 [0..64]) {
+        let mut held_at: SnapshotRegionFilter = SnapshotRegionFilter::new(0, 0);
+        held_at.clone_from(&self.snapshot_region_filters[position]);
+        let mut held_prior: SnapshotRegionFilter = SnapshotRegionFilter::new(0, 0);
+        held_prior.clone_from(&self.snapshot_region_filters[prior]);
+        self.snapshot_region_filters[position].clone_from(&held_prior);
+        self.snapshot_region_filters[prior].clone_from(&held_at);
+        transition { _ -> inner(index, prior) }
+    }
+    state done(&mut self) {
+        self.filter_count = self.filter_count;
+    }
+}
+
+// Single-filter seed constructor used by upstream `initialize_scan_results`:
+// a fresh collection holding exactly the given filter.
+pub machine SnapshotRegionFilterCollection::from_single_filter(
+    seed_filter: &SnapshotRegionFilter,
+    data_type_ref: &DataTypeRef,
+    memory_alignment: MemoryAlignment,
+    result_value_size_in_bytes: u64
+) -> SnapshotRegionFilterCollection {
+    let mut collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(
+        DataTypeRef::clone(data_type_ref), memory_alignment, result_value_size_in_bytes);
+    collection.snapshot_region_filters[0].clone_from(seed_filter);
+    collection.filter_count = 1;
+    collection
+}
+
+// Upstream's collected-byte-count clamp: the coverage this collection's
+// filters claim within [window_base, window_end).
+pub machine SnapshotRegionFilterCollection::covered_in_range(
+    &self,
+    window_base: u64,
+    window_end: u64
+) -> u64 {
+    transition { _ -> total(0, 0, window_base, window_end) }
+    state total(&self, filter_index: u64, covered: u64, window_base: u64, window_end: u64) -> u64 {
+        transition filter_index < self.filter_count && filter_index < 64 {
+            true -> add(filter_index, covered, window_base, window_end)
+            false -> (covered)
+        }
+    }
+    state add(&self, filter_index: u64, covered: u64, window_base: u64, window_end: u64) -> u64 {
+        let lo: u64 = self.snapshot_region_filters[filter_index].get_base_address();
+        let hi: u64 = ((lo as u64 in Wrapping)
+            + (self.snapshot_region_filters[filter_index].get_region_size() as u64 in Wrapping)) as u64;
+        let clamped_lo: u64 = SnapshotRegionFilterCollection::clamp_lo(lo, window_base);
+        let clamped_hi: u64 = SnapshotRegionFilterCollection::clamp_hi(hi, window_end);
+        let added: u64 = SnapshotRegionFilterCollection::overlap(clamped_lo, clamped_hi);
+        transition { _ -> total(((filter_index as u64 in Wrapping) + 1) as u64,
+            ((covered as u64 in Saturating) + (added as u64 in Saturating)) as u64, window_base, window_end) }
+    }
+    state edge() -> u64 {
+        0
+    }
+}
+
+machine SnapshotRegionFilterCollection::clamp_lo(lo: u64, window_base: u64) -> u64 {
+    transition lo >= window_base {
+        true -> (lo)
+        false -> (window_base)
+        _ -> (window_base)
+    }
+}
+
+machine SnapshotRegionFilterCollection::clamp_hi(hi: u64, window_end: u64) -> u64 {
+    transition hi <= window_end {
+        true -> (hi)
+        false -> (window_end)
+        _ -> (window_end)
+    }
+}
+
+machine SnapshotRegionFilterCollection::overlap(clamped_lo: u64, clamped_hi: u64) -> u64 {
+    transition clamped_hi > clamped_lo {
+        true -> (clamped_hi - clamped_lo)
+        false -> (0)
+    }
+}
+
+// Derived `Clone` parity — element-wise copy into a fresh record.
+pub machine SnapshotRegionFilterCollection::clone(
+    source: &SnapshotRegionFilterCollection
+) -> SnapshotRegionFilterCollection {
+    let mut collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(
+        DataTypeRef::clone(&source.data_type_ref),
+        source.memory_alignment,
+        source.result_value_size_in_bytes,
+    );
+    collection.copy_filters(source, 0);
+    collection
+}
+
+pub machine SnapshotRegionFilterCollection::clone_from(
+    &mut self,
+    source: &SnapshotRegionFilterCollection
+) {
+    self.data_type_ref.clone_from(&source.data_type_ref);
+    self.memory_alignment = source.memory_alignment;
+    self.result_value_size_in_bytes = source.result_value_size_in_bytes;
+    self.filter_count = 0;
+    self.copy_filters(source, 0);
+}
+
+machine SnapshotRegionFilterCollection::copy_filters(
+    &mut self,
+    source: &SnapshotRegionFilterCollection,
+    position: u64
+) {
+    transition position < source.filter_count && position < 64 {
+        true -> copy(source, position)
+        false -> done()
+    }
+    state copy(&mut self, source: &SnapshotRegionFilterCollection, position: u64) {
+        self.snapshot_region_filters[position].clone_from(&source.snapshot_region_filters[position]);
+        self.filter_count = position + 1;
+        transition { _ -> copy_filters(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.filter_count = self.filter_count;
+    }
+}
+
+pub machine SnapshotRegionFilterCollection::get_filter_count(&self) -> u64 {
+    self.filter_count
+}
+
+// Upstream `iter` — flat enumeration by index (callers bound the loop).
+pub machine SnapshotRegionFilterCollection::get_filter(&self, filter_index: u64) -> SnapshotRegionFilter {
+    transition filter_index < self.filter_count && filter_index < 64 {
+        true -> clone_at(filter_index)
+        false -> empty()
+    }
+    state clone_at(&self, filter_index: u64) -> SnapshotRegionFilter {
+        SnapshotRegionFilter::clone(&self.snapshot_region_filters[filter_index])
+    }
+    state empty(&self) -> SnapshotRegionFilter {
+        SnapshotRegionFilter::new(0, 0)
+    }
+}
+
+// Upstream `snapshot_region_filters.push` — the scan drain appends emitted
+// filters; capacity is the bound.
+pub machine SnapshotRegionFilterCollection::push_filter(
+    &mut self,
+    filter: &SnapshotRegionFilter
+) -> bool {
+    transition self.filter_count < 64 {
+        true -> push(filter)
+        false -> (false)
+    }
+    state push(&mut self, filter: &SnapshotRegionFilter) -> bool {
+        self.snapshot_region_filters[self.filter_count].clone_from(filter);
+        self.filter_count = self.filter_count + 1;
+        true
+    }
+}
+
+// Upstream `set` half of `iter_mut` — replaces one filter in place.
+pub machine SnapshotRegionFilterCollection::set_filter(
+    &mut self,
+    filter_index: u64,
+    filter: &SnapshotRegionFilter
+) {
+    transition filter_index < self.filter_count && filter_index < 64 {
+        true -> store(filter_index, filter)
+        false -> done()
+    }
+    state store(&mut self, filter_index: u64, filter: &SnapshotRegionFilter) {
+        self.snapshot_region_filters[filter_index].clone_from(filter);
+        self.filter_count = self.filter_count;
+    }
+    state done(&mut self) {
+        self.filter_count = self.filter_count;
+    }
+}
+
+pub machine SnapshotRegionFilterCollection::get_data_type_ref(&self) -> DataTypeRef {
+    DataTypeRef::clone(&self.data_type_ref)
+}
+
+pub machine SnapshotRegionFilterCollection::get_memory_alignment(&self) -> MemoryAlignment {
+    self.memory_alignment
+}
+
+pub machine SnapshotRegionFilterCollection::get_result_value_size_in_bytes(&self) -> u64 {
+    self.result_value_size_in_bytes
+}
+
+pub machine SnapshotRegionFilterCollection::get_filter_minimum_address(&self) -> u64 {
+    transition self.filter_count > 0 {
+        true -> (self.snapshot_region_filters[0].get_base_address())
+        false -> (0)
+    }
+}
+
+pub machine SnapshotRegionFilterCollection::get_filter_maximum_address(&self) -> u64 {
+    transition self.filter_count > 0 {
+        true -> maximum(0)
+        false -> (0)
+    }
+    state maximum(&self, position: u64) -> u64 {
+        let next: u64 = ((position as u64 in Wrapping) + 1) as u64;
+        transition next < self.filter_count && next < 64 && position < 64 {
+            true -> compare(position, next)
+            false -> tail(position)
+            _ -> (0)
+        }
+    }
+    state tail(&self, position: u64) -> u64 {
+        transition position < 64 {
+            true -> (self.snapshot_region_filters[position].get_end_address())
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state compare(&self, position: u64 [0..64], next: u64 [0..64]) -> u64 {
+        transition self.snapshot_region_filters[next].get_end_address()
+                 > self.snapshot_region_filters[position].get_end_address() {
+            true -> maximum(next)
+            false -> maximum_keep(position)
+        }
+    }
+    state maximum_keep(&self, position: u64) -> u64 {
+        let next: u64 = ((position as u64 in Wrapping) + 1) as u64;
+        transition next < self.filter_count && next < 64 && position < 64 {
+            true -> keep_max(next, self.snapshot_region_filters[position].get_end_address())
+            false -> tail(position)
+            _ -> (0)
+        }
+    }
+    state keep_max(&self, position: u64, best: u64) -> u64 {
+        transition position < self.filter_count && position < 64 {
+            true -> keep_scan(position, best)
+            false -> (best)
+        }
+    }
+    state keep_scan(&self, position: u64 [0..64], best: u64) -> u64 {
+        transition self.snapshot_region_filters[position].get_end_address() > best {
+            true -> keep_max(position + 1, self.snapshot_region_filters[position].get_end_address())
+            false -> keep_max(position + 1, best)
+        }
+    }
+}
+
+// Upstream `get_number_of_results` — sum of per-filter element counts.
+pub machine SnapshotRegionFilterCollection::get_number_of_results(&self) -> u64
+crashes Abort
+{
+    transition { _ -> total(0, 0) }
+    state total(&self, position: u64, count: u64) -> u64 {
+        transition position < self.filter_count && position < 64 {
+            true -> add(position, count)
+            false -> (count)
+        }
+    }
+    state add(&self, position: u64, count: u64) -> u64 {
+        let elements: u64 = self.snapshot_region_filters[position].get_element_count(
+            self.result_value_size_in_bytes, self.memory_alignment);
+        transition { _ -> total(((position as u64 in Wrapping) + 1) as u64,
+            ((count as u64 in Saturating) + (elements as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_structural_scan_result`: resolve a local result index to
+// (filter_index, element_index) — the address is filter_base +
+// element_index * result stride. Returns by value.
+pub data LocatedResult {
+    case Found(filter_index: u64, element_index: u64);
+    case OutOfRange;
+}
+
+pub machine SnapshotRegionFilterCollection::locate_result(
+    &self,
+    local_scan_result_index: u64
+) -> LocatedResult
+crashes Abort
+{
+    transition { _ -> scan(0, local_scan_result_index) }
+    state scan(&self, filter_index: u64, remaining: u64) -> LocatedResult {
+        transition filter_index < self.filter_count && filter_index < 64 {
+            true -> within(filter_index, remaining)
+            false -> (LocatedResult::OutOfRange)
+        }
+    }
+    state within(&self, filter_index: u64, remaining: u64) -> LocatedResult {
+        let elements: u64 = self.snapshot_region_filters[filter_index].get_element_count(
+            self.result_value_size_in_bytes, self.memory_alignment);
+        transition remaining < elements {
+            true -> (LocatedResult::Found { filter_index: filter_index, element_index: remaining })
+            false -> scan(((filter_index as u64 in Wrapping) + 1) as u64, remaining - elements)
+        }
+    }
+}

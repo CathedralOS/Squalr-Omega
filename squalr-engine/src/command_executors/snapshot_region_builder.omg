@@ -1,0 +1,138 @@
+module src::command_executors::snapshot_region_builder;
+
+use squalr_engine_api::src::structures::memory::normalized_region::NormalizedRegion;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
+
+// Port of snapshot/snapshot_region_builder.rs `merge_memory_regions_into_snapshot_regions`
+// — walk page bounds in order; a page adjacent to the open region
+// (`current.end == next.base`) merges in and records the boundary, otherwise
+// the region is closed and a new one starts.
+pub data SnapshotRegionBuilder {
+    regions: [SnapshotRegion; 16];
+    region_count: u64;
+}
+
+pub machine SnapshotRegionBuilder::new() -> SnapshotRegionBuilder {
+    SnapshotRegionBuilder { region_count: 0 }
+}
+
+pub machine SnapshotRegionBuilder::get_region_count(&self) -> u64 {
+    self.region_count
+}
+
+// Upstream's `add_memory_region`: merge-or-push.
+pub machine SnapshotRegionBuilder::add_memory_region(&mut self, region: &NormalizedRegion) -> bool {
+    transition self.region_count > 0 {
+        true -> maybe_merge(region)
+        false -> push_new(region)
+    }
+    state maybe_merge(&mut self, region: &NormalizedRegion) -> bool {
+        let last_index: u64 = ((self.region_count as u64 in Wrapping) - 1) as u64;
+        transition last_index < 16 {
+            true -> check_adjacent(region, last_index)
+            false -> push_new(region)
+        }
+    }
+    state check_adjacent(&mut self, region: &NormalizedRegion, last_index: u64 [0..16]) -> bool {
+        let open_end: u64 = self.regions[last_index].get_end_address();
+        transition region.get_base_address() == open_end {
+            true -> merge(region, last_index)
+            false -> push_new(region)
+        }
+    }
+    state merge(&mut self, region: &NormalizedRegion, last_index: u64 [0..16]) -> bool {
+        let merged_size: u64 = ((self.regions[last_index].get_region_size() as u64 in Saturating)
+            + (region.get_region_size() as u64 in Saturating)) as u64;
+        self.regions[last_index].set_region_size(merged_size);
+        let region_base: u64 = region.get_base_address();
+        let boundary: bool = self.regions[last_index].push_page_boundary(region_base);
+        boundary
+    }
+    state push_new(&mut self, region: &NormalizedRegion) -> bool {
+        transition self.region_count < 16 {
+            true -> store(region)
+            false -> (false)
+        }
+    }
+    state store(&mut self, region: &NormalizedRegion) -> bool {
+        let fresh_base: u64 = region.get_base_address();
+        let fresh_size: u64 = region.get_region_size();
+        let fresh: SnapshotRegion = SnapshotRegion::new(fresh_base, fresh_size);
+        self.regions[self.region_count].clone_from(&fresh);
+        self.region_count = ((self.region_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        true
+    }
+}
+
+pub machine SnapshotRegionBuilder::get_region(&self, position: u64) -> SnapshotRegion {
+    transition position < self.region_count && position < 16 {
+        true -> found(position)
+        false -> (SnapshotRegion::new(0, 0))
+    }
+    state found(&self, position: u64 [0..16]) -> SnapshotRegion {
+        SnapshotRegion::clone(&self.regions[position])
+    }
+}
+
+// The scan-new walk over the supplied page-bound stream — fills the builder
+// one page at a time, then `fill_from_builder` empties it into the snapshot.
+// Both live in-engine because `&mut` calls on locals can't cross packages.
+pub machine SnapshotRegionBuilder::fill_from_supplied_source(
+    builder: &mut SnapshotRegionBuilder,
+    source: &SuppliedMemorySource
+) {
+    transition { _ -> each(builder, source, 0) }
+    state each(
+        builder: &mut SnapshotRegionBuilder,
+        source: &SuppliedMemorySource,
+        position: u64
+    ) {
+        transition position < source.get_region_count() {
+            true -> page(builder, source, position)
+            false -> done()
+        }
+    }
+    state page(
+        builder: &mut SnapshotRegionBuilder,
+        source: &SuppliedMemorySource,
+        position: u64
+    ) {
+        let bounds: NormalizedRegion = source.get_page_bounds(position);
+        let added: bool = builder.add_memory_region(&bounds);
+        transition { _ -> each(builder, source, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done() {
+    }
+}
+
+// Installs each built region into the snapshot in order — the bounded
+// equivalent of upstream's `set_snapshot_regions(Vec)`.
+pub machine SnapshotRegionBuilder::fill_snapshot(
+    builder: &SnapshotRegionBuilder,
+    snapshot: &mut Snapshot
+) {
+    transition { _ -> each(builder, snapshot, 0) }
+    state each(
+        builder: &SnapshotRegionBuilder,
+        snapshot: &mut Snapshot,
+        position: u64
+    ) {
+        transition position < builder.get_region_count() {
+            true -> store(builder, snapshot, position)
+            false -> done()
+        }
+    }
+    state store(
+        builder: &SnapshotRegionBuilder,
+        snapshot: &mut Snapshot,
+        position: u64
+    ) {
+        let region: SnapshotRegion = builder.get_region(position);
+        let pushed: bool = snapshot.push_region(&region);
+        transition { _ -> each(builder, snapshot, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done() {
+    }
+}

@@ -1,0 +1,195 @@
+module src::command_executors::element_scan_dispatcher;
+
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
+use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use squalr_engine_scanning::src::scanners::element_scan_runner::ElementScanRunner;
+
+// Port of `ElementScanDispatcher::dispatch_scan` +
+// `dispatch_scan_for_snapshot_filter_collection` (single-threaded leg). Per
+// filter of the incoming collection, constraints run SEQUENTIALLY — each
+// constraint's scan maps the current filter set to a new set; a filter whose
+// chain empties contributes nothing (upstream's filter_map drop). The chain
+// carrier is the filter collection itself, matching upstream's Vec of
+// filters one stage deep.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ElementScanChainDispatcher {}
+
+pub machine ElementScanChainDispatcher::dispatch_collection(
+    snapshot_region: &SnapshotRegion,
+    collection: &SnapshotRegionFilterCollection,
+    element_scan_plan: &ElementScanPlan,
+    plan_list: &TypePlanList
+) -> SnapshotRegionFilterCollection
+crashes Abort
+{
+    let dtr: DataTypeRef = collection.get_data_type_ref();
+    let ma: MemoryAlignment = collection.get_memory_alignment();
+    let rv: u64 = collection.get_result_value_size_in_bytes();
+    let out: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(dtr, ma, rv);
+    transition { _ -> each_filter(
+        snapshot_region, collection, element_scan_plan, plan_list, out, 0) }
+
+    state each_filter(
+        snapshot_region: &SnapshotRegion,
+        collection: &SnapshotRegionFilterCollection,
+        element_scan_plan: &ElementScanPlan,
+        plan_list: &TypePlanList,
+        out: SnapshotRegionFilterCollection,
+        filter_index: u64
+    ) -> SnapshotRegionFilterCollection
+    {
+        transition filter_index < collection.get_filter_count() {
+            true -> chain(
+                snapshot_region, collection, element_scan_plan, plan_list, out, filter_index)
+            false -> (out)
+        }
+    }
+
+    // Run one input filter through every plan in the list. `stage` is the
+    // collection-shaped carrier of the surviving filters between
+    // constraints — upstream's `scan_result_filters` Vec.
+    state chain(
+        snapshot_region: &SnapshotRegion,
+        collection: &SnapshotRegionFilterCollection,
+        element_scan_plan: &ElementScanPlan,
+        plan_list: &TypePlanList,
+        out: SnapshotRegionFilterCollection,
+        filter_index: u64
+    ) -> SnapshotRegionFilterCollection
+    {
+        let filter: SnapshotRegionFilter = collection.get_filter(filter_index);
+        let stage_dtr: DataTypeRef = collection.get_data_type_ref();
+        let stage_ma: MemoryAlignment = collection.get_memory_alignment();
+        let stage_rv: u64 = collection.get_result_value_size_in_bytes();
+        let mut stage: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(
+            stage_dtr, stage_ma, stage_rv);
+        let seeded: bool = stage.push_filter(&filter);
+        let survived: SnapshotRegionFilterCollection = ElementScanChainDispatcher::run_chain(
+            snapshot_region, stage, collection, element_scan_plan, plan_list, 0);
+        let merged: SnapshotRegionFilterCollection = ElementScanChainDispatcher::append_filters(
+            out, &survived, 0);
+        transition { _ -> each_filter(
+            snapshot_region, collection, element_scan_plan, plan_list, merged, ((filter_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// The sequential constraint pass over one input filter — plan-by-plan.
+pub machine ElementScanChainDispatcher::run_chain(
+    snapshot_region: &SnapshotRegion,
+    stage: SnapshotRegionFilterCollection,
+    collection: &SnapshotRegionFilterCollection,
+    element_scan_plan: &ElementScanPlan,
+    plan_list: &TypePlanList,
+    plan_index: u64
+) -> SnapshotRegionFilterCollection
+crashes Abort
+{
+    transition plan_index < plan_list.get_plan_count() && stage.get_filter_count() > 0 {
+        true -> apply(snapshot_region, stage, collection, element_scan_plan, plan_list, plan_index)
+        false -> (stage)
+        _ -> (stage)
+    }
+
+    state apply(
+        snapshot_region: &SnapshotRegion,
+        stage: SnapshotRegionFilterCollection,
+        collection: &SnapshotRegionFilterCollection,
+        element_scan_plan: &ElementScanPlan,
+        plan_list: &TypePlanList,
+        plan_index: u64
+    ) -> SnapshotRegionFilterCollection
+    {
+        let plan: SnapshotFilterElementScanPlan = plan_list.get_plan(plan_index);
+        let empty_dtr: DataTypeRef = collection.get_data_type_ref();
+        let empty_ma: MemoryAlignment = collection.get_memory_alignment();
+        let empty_rv: u64 = collection.get_result_value_size_in_bytes();
+        let empty_collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(
+            empty_dtr, empty_ma, empty_rv);
+        let next_stage: SnapshotRegionFilterCollection = ElementScanChainDispatcher::apply_plan(
+            snapshot_region, &stage, collection, &plan, 0, empty_collection);
+        transition { _ -> continue(
+            snapshot_region, next_stage, collection, element_scan_plan, plan_list, ((plan_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state continue(
+        snapshot_region: &SnapshotRegion,
+        stage: SnapshotRegionFilterCollection,
+        collection: &SnapshotRegionFilterCollection,
+        element_scan_plan: &ElementScanPlan,
+        plan_list: &TypePlanList,
+        next_plan_index: u64
+    ) -> SnapshotRegionFilterCollection
+    {
+        ElementScanChainDispatcher::run_chain(
+            snapshot_region, stage, collection, element_scan_plan, plan_list, next_plan_index)
+    }
+}
+
+// One plan over every staged filter — the flat_map body. A filter surviving
+// the runner contributes its emitted filters to the next stage.
+pub machine ElementScanChainDispatcher::apply_plan(
+    snapshot_region: &SnapshotRegion,
+    stage: &SnapshotRegionFilterCollection,
+    collection: &SnapshotRegionFilterCollection,
+    plan: &SnapshotFilterElementScanPlan,
+    filter_index: u64,
+    next_stage: SnapshotRegionFilterCollection
+) -> SnapshotRegionFilterCollection
+crashes Abort
+{
+    transition filter_index < stage.get_filter_count() {
+        true -> scan(snapshot_region, stage, collection, plan, filter_index, next_stage)
+        false -> (next_stage)
+        _ -> (next_stage)
+    }
+
+    state scan(
+        snapshot_region: &SnapshotRegion,
+        stage: &SnapshotRegionFilterCollection,
+        collection: &SnapshotRegionFilterCollection,
+        plan: &SnapshotFilterElementScanPlan,
+        filter_index: u64,
+        next_stage: SnapshotRegionFilterCollection
+    ) -> SnapshotRegionFilterCollection
+    {
+        let filter: SnapshotRegionFilter = stage.get_filter(filter_index);
+        let dtr: DataTypeRef = collection.get_data_type_ref();
+        let emitted: SnapshotRegionFilterCollection = ElementScanRunner::run_region(
+            snapshot_region, &filter, plan, &dtr);
+        let merged: SnapshotRegionFilterCollection = ElementScanChainDispatcher::append_filters(
+            next_stage, &emitted, 0);
+        transition { _ -> apply_plan(
+            snapshot_region, stage, collection, plan, ((filter_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, merged) }
+    }
+}
+
+// Append every filter of `source` into `dest` — upstream's collect-after-
+// flat_map flattening.
+pub machine ElementScanChainDispatcher::append_filters(
+    dest: SnapshotRegionFilterCollection,
+    source: &SnapshotRegionFilterCollection,
+    position: u64
+) -> SnapshotRegionFilterCollection {
+    transition position < source.get_filter_count() {
+        true -> push(dest, source, position)
+        false -> (dest)
+        _ -> (dest)
+    }
+
+    state push(
+        dest: SnapshotRegionFilterCollection,
+        source: &SnapshotRegionFilterCollection,
+        position: u64
+    ) -> SnapshotRegionFilterCollection {
+        let filter: SnapshotRegionFilter = source.get_filter(position);
+        let mut carried: SnapshotRegionFilterCollection = dest;
+        let pushed: bool = carried.push_filter(&filter);
+        transition { _ -> append_filters(carried, source, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}

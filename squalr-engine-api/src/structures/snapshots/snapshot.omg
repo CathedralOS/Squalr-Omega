@@ -1,0 +1,242 @@
+module src::structures::snapshots::snapshot;
+
+use src::structures::memory::normalized_region;
+use src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
+use src::structures::snapshots::element_window::ElementWindow;
+use src::structures::snapshots::snapshot_region::DataTypeRefSet;
+use src::structures::snapshots::snapshot_region::SnapshotRegion;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+
+// Port of structures/snapshots/snapshot.rs: the ordered set of regions a
+// scan operates over. Upstream holds `Vec<SnapshotRegion>` plus a
+// `deleted_scan_result_indices` set; the port bounds regions at 16 (the
+// supplied-snapshot leg) — named deviation. The deleted-index set ships
+// with the delete command leg; until then results stay append-only.
+pub data Snapshot {
+    regions: [SnapshotRegion; 16];
+    region_count: u64;
+}
+
+pub machine Snapshot::new() -> Snapshot {
+    Snapshot { region_count: 0 }
+}
+
+pub machine Snapshot::get_region_count(&self) -> u64 {
+    self.region_count
+}
+
+pub machine Snapshot::get_region(&self, region_index: u64) -> SnapshotRegion {
+    transition region_index < self.region_count && region_index < 16 {
+        true -> clone_at(region_index)
+        false -> (SnapshotRegion::new(0, 0))
+    }
+    state clone_at(&self, region_index: u64) -> SnapshotRegion {
+        SnapshotRegion::clone(&self.regions[region_index])
+    }
+}
+
+// Upstream `set_region`: replace the stored region — value collection and
+// scan writes funnel through it.
+pub machine Snapshot::set_region(&mut self, region_index: u64, region: SnapshotRegion) {
+    transition region_index < self.region_count && region_index < 16 {
+        true -> store(region_index, region)
+        false -> done()
+    }
+    state store(&mut self, region_index: u64, region: SnapshotRegion) {
+        self.regions[region_index].clone_from(&region);
+        self.region_count = self.region_count;
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+// Upstream `set_snapshot_regions`: replaces the full region set (the scan-new
+// path replaces the snapshot outright).
+pub machine Snapshot::set_snapshot_regions(&mut self, regions: &[SnapshotRegion; 16], region_count: u64) {
+    self.region_count = 0;
+    self.store_regions(regions, region_count, 0);
+}
+
+machine Snapshot::store_regions(&mut self, regions: &[SnapshotRegion; 16], region_count: u64, position: u64) {
+    transition position < region_count && position < 16 {
+        true -> store(regions, region_count, position)
+        false -> done()
+    }
+    state store(&mut self, regions: &[SnapshotRegion; 16], region_count: u64, position: u64) {
+        let source: SnapshotRegion = SnapshotRegion::clone(&regions[position]);
+        self.regions[position].clone_from(&source);
+        self.region_count = position + 1;
+        transition { _ -> store_regions(regions, region_count, position + 1) }
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+// Upstream `push` — `snapshot.regions.push(region)` at build/merge sites.
+pub machine Snapshot::push_region(&mut self, region: SnapshotRegion) -> bool {
+    transition self.region_count < 16 {
+        true -> push(region)
+        false -> (false)
+    }
+    state push(&mut self, region: SnapshotRegion) -> bool {
+        self.regions[self.region_count].clone_from(&region);
+        self.region_count = self.region_count + 1;
+        true
+    }
+}
+
+// Upstream `clear`: `scan reset` empties the snapshot.
+pub machine Snapshot::clear(&mut self) {
+    self.region_count = 0;
+}
+
+// Upstream `discard_empty_regions`: regions whose size reached zero (post
+// resize) are dropped, keeping address order.
+pub machine Snapshot::discard_empty_regions(&mut self) {
+    let mut kept: Snapshot = Snapshot::new();
+    transition { _ -> each(kept, 0) }
+    state each(&mut self, kept: Snapshot, position: u64) {
+        transition position < self.region_count && position < 16 {
+            true -> inspect(kept, position)
+            false -> install(kept)
+        }
+    }
+    state inspect(&mut self, kept: Snapshot, position: u64 [0..16]) {
+        let is_nonempty: bool = self.regions[position].get_region_size() > 0;
+        transition is_nonempty {
+            true -> keep(kept, position)
+            false -> each(kept, position + 1)
+        }
+    }
+    state keep(&mut self, kept: Snapshot, position: u64 [0..16]) {
+        let region: SnapshotRegion = SnapshotRegion::clone(&self.regions[position]);
+        let mut carried: Snapshot = kept;
+        let pushed: bool = carried.push_region(region);
+        transition pushed {
+            true -> each(carried, position + 1)
+            false -> install(carried)
+            _ -> install(carried)
+        }
+    }
+    state install(&mut self, kept: Snapshot) {
+        self.clone_from(&kept);
+    }
+}
+
+// ————— Cross-package scan step entries —————
+// `initialize_scan_results`, `set_scan_results`, `resize_to_filters`,
+// `rotate_values_for_collection` and `set_current_values` are `&mut`-receiver
+// machines with borrowed arguments, which do not compose across package
+// boundaries. These snapshot-level batch machines perform the same steps
+// inside this package so squalr-engine can drive them per region.
+
+// Upstream `snapshot_region.initialize_scan_results` over every region —
+// seeds a whole-region filter collection per requested data type where a
+// region has none yet.
+pub machine Snapshot::initialize_all_scan_results(
+    &mut self,
+    data_type_refs: DataTypeRefSet,
+    memory_alignment: MemoryAlignment
+) {
+    transition { _ -> each(data_type_refs, memory_alignment, 0) }
+    state each(&mut self, data_type_refs: DataTypeRefSet, memory_alignment: MemoryAlignment, position: u64) {
+        transition position < self.region_count && position < 16 {
+            true -> plant(data_type_refs, memory_alignment, position)
+            false -> done()
+        }
+    }
+    state plant(&mut self, data_type_refs: DataTypeRefSet, memory_alignment: MemoryAlignment, position: u64 [0..16]) {
+        self.regions[position].initialize_scan_results(&data_type_refs, memory_alignment);
+        transition { _ -> each(data_type_refs, memory_alignment, position + 1) }
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+// Upstream `snapshot_region.set_scan_results` + `resize_to_filters` for one
+// region — installs the dispatch-produced collections and shrinks the
+// region's value coverage to the surviving filters.
+pub machine Snapshot::apply_region_scan_results(
+    &mut self,
+    region_index: u64,
+    scan_results: SnapshotRegionScanResults
+) {
+    transition region_index < self.region_count && region_index < 16 {
+        true -> store(region_index, scan_results)
+        false -> done()
+    }
+    state store(&mut self, region_index: u64 [0..16], scan_results: SnapshotRegionScanResults) {
+        self.regions[region_index].set_scan_results(&scan_results);
+        self.regions[region_index].resize_to_filters();
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+// Upstream `SnapshotValueCollector`'s per-region write: rotate the current
+// values into previous, then install the freshly collected elements.
+pub machine Snapshot::collect_region_values(
+    &mut self,
+    region_index: u64,
+    elements: ElementWindow
+) {
+    transition region_index < self.region_count && region_index < 16 {
+        true -> store(region_index, elements)
+        false -> done()
+    }
+    state store(&mut self, region_index: u64 [0..16], elements: ElementWindow) {
+        self.regions[region_index].rotate_values_for_collection();
+        self.regions[region_index].set_current_values(&elements);
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+// Deep copy parity — `Snapshot::clone`/`clone_from` per region, matching
+// upstream's `#[derive(Clone)]`.
+pub machine Snapshot::clone(source: &Snapshot) -> Snapshot {
+    let mut copy: Snapshot = Snapshot::new();
+    copy.clone_from(source);
+    copy
+}
+
+pub machine Snapshot::clone_from(&mut self, source: &Snapshot) {
+    self.region_count = source.region_count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &Snapshot, position: u64) {
+        transition position < source.region_count && position < 16 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &Snapshot, position: u64 [0..16]) {
+        self.regions[position].clone_from(&source.regions[position]);
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.region_count = self.region_count;
+    }
+}
+
+
+// Upstream `get_collected_byte_count`: total byte coverage of the surviving
+// regions — the report's `scanned_byte_count` source.
+pub machine Snapshot::get_collected_byte_count(&self) -> u64 {
+    transition { _ -> each(0, 0) }
+    state each(&self, position: u64, total: u64) -> u64 {
+        transition position < self.region_count && position < 16 {
+            true -> tally(position, total)
+            false -> (total)
+        }
+    }
+    state tally(&self, position: u64 [0..16], total: u64) -> u64 {
+        let next_total: u64 = ((total as u64 in Saturating)
+            + (self.regions[position].get_collected_byte_count() as u64 in Saturating)) as u64;
+        transition { _ -> each(position + 1, next_total) }
+    }
+}
