@@ -1,3 +1,36 @@
+# Native-execution admission findings (2026-09-23, pin b5ac760ff4, z2 witness leg)
+
+`omega run` of `squalr-tests/main.omg` now reaches native lowering — the
+crash-route gap below is repaired at this pin — then dies inside the
+optimizer. Three bounds were measured this leg:
+
+1. **Lowering rejects unreachable `state` declarations** —
+   `Lowering(Unsupported("Unit graph has unreachable states"))`. Every
+   named state in an entry-closure unit needs an incoming transition
+   edge, including ones only authored as unreachable crash arms; prune
+   dead states rather than parking them.
+2. **Structural types are capped at ~64KiB.**
+   `structural_layout.rs` stores record `byte_size` in `u16`
+   (`u16::try_from` -> `StructuralTypeTooLarge`); nested fields sum.
+   Measured on `omega-b5ac76`: `[u64; 8192]` (64KiB) lowers,
+   `[u64; 8193]` fails. Consequence: `Snapshot.regions`,
+   `SnapshotRegionBuilder.regions`, `SuppliedMemorySource.regions` are
+   now bounded at 1/1/4 elements (deviation comments in place); the
+   `EnginePrivilegedState` closure sits at ~55KiB.
+3. **THE CURRENT BLOCKER — `SourceCustodyMismatch` (regression).**
+   `Selection(Legalization(SourceCustodyMismatch))` fires when ANY
+   machine below the entry declares `crashes` — minimal repro committed
+   at `tools/callee-crash-custody-repro/` (one call, one `crash Trap;`
+   arm). Route kind irrelevant (`Abort`/`Trap` identical); entry-machine
+   `crashes` unaffected; removing the callee declarations runs clean but
+   check then reports the uncovered route, so they are mandatory. The
+   crash-route fix (93489c3a05) admitted crash-path bodies into the plan;
+   `validation/projection/custody.rs`'s ledger replay then has no source
+   occurrence to settle them against. w9's pin printed
+   `Squalr geometry: PASS` with the same shapes, so this regressed
+   between w9 and b5ac760ff4. Every authored debug-assert parity arm
+   (`get_element_count`, `scan_snapshot`, dispatch) sits behind it.
+
 # TARGETS-AND-THROUGHPUT resume evidence (2026-09-20, linux_x86_64, swarm-w9)
 
 This note lives here instead of the board item because
