@@ -1,0 +1,404 @@
+module src::structures::results::snapshot_region_scan_results;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+
+// Port of structures/results/snapshot_region_scan_results.rs: the scan
+// results of one snapshot region, preserving the scan-time filter layout —
+// generally one filter collection per scanned data type.
+//
+// Upstream's `Vec<SnapshotRegionFilterCollection>` lands as a caller-lent
+// view (the results are built where the collections are already materialized
+// — no growable owner exists yet). The paged ScanResultValued merge
+// (get_scan_results_page / get_structural_scan_result) needs the
+// DataValue/SymbolRegistry value layer and lands with the scan-results-page
+// leg; the deleted-indices machinery (get_visible_*,
+// remove_scan_results_by_global_indices) lands with the result-deletion leg.
+pub data SnapshotRegionScanResults<'a, 't> {
+    snapshot_region_filter_collections: &'a [SnapshotRegionFilterCollection<'a, 't>];
+}
+
+// The scan-result lookup for `get_scan_results_by_data_type` — Optional over
+// a package type cannot be matched by downstream packages (package
+// convention), so presence is a bespoke carrier.
+pub data CollectionLookup [copy] {
+    case Missing;
+    case Found(index: u64);
+}
+
+// Borrowed-collection lookup: the borrowed element lands as an enum field so
+// callers can branch on Missing (a machine tail cannot prove an element
+// borrow; the requires-machine `collection_at` carries the actual index
+// proof). Upstream returns `Option<&...>` — same shape.
+pub data CollectionRef<'a, 't> {
+    case Missing;
+    case Found(collection: &'a SnapshotRegionFilterCollection<'a, 't>);
+}
+
+// Upstream `new`: takes the materialized collections.
+pub machine SnapshotRegionScanResults::new<'a, 't>(
+    snapshot_region_filter_collections: &'a [SnapshotRegionFilterCollection<'a, 't>]
+) -> SnapshotRegionScanResults<'a, 't> {
+    SnapshotRegionScanResults {
+        snapshot_region_filter_collections: snapshot_region_filter_collections,
+    }
+}
+
+// Upstream `get_scan_results_by_data_type` (the Option is flattened to the
+// CollectionLookup carrier per the package convention).
+pub machine SnapshotRegionScanResults::get_scan_results_by_data_type<'a, 't>(
+    &self,
+    data_type: &DataTypeRef<'t>
+) -> CollectionLookup {
+    SnapshotRegionScanResults::find_collection(self.snapshot_region_filter_collections, data_type, 0)
+}
+
+machine SnapshotRegionScanResults::find_collection<'a, 't>(
+    collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+    data_type: &DataTypeRef<'t>,
+    index: u64
+) -> CollectionLookup {
+    transition index < collections.len {
+        true -> compare(collections, data_type, index)
+        false -> (CollectionLookup::Missing)
+    }
+
+    state compare(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        data_type: &DataTypeRef<'t>,
+        index: u64
+    ) -> CollectionLookup {
+        let collection_ref: DataTypeRef<'t> = collections[index].get_data_type_ref();
+        transition collection_ref.equals(data_type) {
+            true -> (CollectionLookup::Found { index: index })
+            false -> find_collection(collections, data_type, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+}
+
+// Upstream `get_number_of_results`: Σ collection result counts.
+pub machine SnapshotRegionScanResults::get_number_of_results(&self) -> u64 {
+    SnapshotRegionScanResults::sum_results(self.snapshot_region_filter_collections, 0, 0)
+}
+
+machine SnapshotRegionScanResults::sum_results<'a, 't>(
+    collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+    index: u64,
+    running: u64
+) -> u64 {
+    transition index < collections.len {
+        true -> step(collections, index, running)
+        false -> (running)
+    }
+
+    state step(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        index: u64,
+        running: u64
+    ) -> u64 {
+        let result_count: u64 = collections[index].get_number_of_results();
+        transition { _ -> sum_results(collections, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((running as u64 in Saturating) + (result_count as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_number_of_results_for_data_types` — the Option<&[DataTypeRef]>
+// selection splits per the package convention: `has_selection` distinguishes
+// None from an empty Some list.
+pub machine SnapshotRegionScanResults::get_number_of_results_for_data_types<'a, 't>(
+    &self,
+    filtered_data_types: &[DataTypeRef<'t>],
+    has_selection: bool
+) -> u64 {
+    SnapshotRegionScanResults::sum_selected(
+        self.snapshot_region_filter_collections,
+        filtered_data_types,
+        has_selection,
+        0,
+        0
+    )
+}
+
+machine SnapshotRegionScanResults::sum_selected<'a, 't>(
+    collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+    filtered_data_types: &[DataTypeRef<'t>],
+    has_selection: bool,
+    index: u64,
+    running: u64
+) -> u64 {
+    transition index < collections.len {
+        true -> step(collections, filtered_data_types, has_selection, index, running)
+        false -> (running)
+    }
+
+    state step(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        filtered_data_types: &[DataTypeRef<'t>],
+        has_selection: bool,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        let collection_ref: DataTypeRef<'t> = collections[index].get_data_type_ref();
+        transition SnapshotRegionScanResults::is_selected(has_selection, filtered_data_types, &collection_ref) {
+            true -> add(collections, filtered_data_types, has_selection, index, running)
+            false -> sum_selected(collections, filtered_data_types, has_selection, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, running)
+        }
+    }
+
+    state add(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        filtered_data_types: &[DataTypeRef<'t>],
+        has_selection: bool,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        let result_count: u64 = collections[index].get_number_of_results();
+        transition { _ -> sum_selected(collections, filtered_data_types, has_selection, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((running as u64 in Saturating) + (result_count as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `is_data_type_selected`: None selects all; Some selects by id.
+machine SnapshotRegionScanResults::is_selected<'a, 't>(
+    has_selection: bool,
+    filtered_data_types: &[DataTypeRef<'t>],
+    data_type_ref: &DataTypeRef<'t>
+) -> bool {
+    transition has_selection {
+        true -> selected_match(filtered_data_types, data_type_ref, 0)
+        false -> (true)
+        _ -> selected_match(filtered_data_types, data_type_ref, 0)
+    }
+
+    state selected_match(
+        filtered_data_types: &[DataTypeRef<'t>],
+        data_type_ref: &DataTypeRef<'t>,
+        index: u64
+    ) -> bool {
+        transition index < filtered_data_types.len {
+            true -> compare(filtered_data_types, data_type_ref, index)
+            false -> (false)
+        }
+    }
+
+    state compare(
+        filtered_data_types: &[DataTypeRef<'t>],
+        data_type_ref: &DataTypeRef<'t>,
+        index: u64
+    ) -> bool {
+        transition filtered_data_types[index].equals(data_type_ref) {
+            true -> (true)
+            false -> selected_match(filtered_data_types, data_type_ref, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+}
+
+// Upstream `get_result_counts_by_data_type`: one ScanResultDataTypeCount per
+// collection with a nonzero count. Upstream returns Vec; the caller lends
+// `out` (capacity >= collection count) and the live count is returned —
+// same contents and order.
+pub machine SnapshotRegionScanResults::get_result_counts_by_data_type<'a, 't>(
+    &self,
+    out: &mut [DataTypeRef<'t>],
+    out_counts: &mut [u64]
+) -> u64 {
+    SnapshotRegionScanResults::fill_counts(
+        self.snapshot_region_filter_collections,
+        out,
+        out_counts,
+        0,
+        0
+    )
+}
+
+machine SnapshotRegionScanResults::fill_counts<'a, 't>(
+    collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+    out: &mut [DataTypeRef<'t>],
+    out_counts: &mut [u64],
+    index: u64,
+    emitted: u64
+) -> u64 {
+    transition index < collections.len && emitted < out.len && emitted < out_counts.len {
+        true -> step(collections, out, out_counts, index, emitted)
+        false -> (emitted)
+    }
+
+    state step(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        out: &mut [DataTypeRef<'t>],
+        out_counts: &mut [u64],
+        index: u64,
+        emitted: u64
+    ) -> u64 {
+        let result_count: u64 = collections[index].get_number_of_results();
+        transition result_count > 0 {
+            true -> emit(collections, out, out_counts, index, emitted)
+            false -> fill_counts(collections, out, out_counts, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, emitted)
+        }
+    }
+
+    state emit(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        out: &mut [DataTypeRef<'t>],
+        out_counts: &mut [u64],
+        index: u64,
+        emitted: u64
+    ) -> u64 {
+        let collection_ref: DataTypeRef<'t> = collections[index].get_data_type_ref();
+        let result_count: u64 = collections[index].get_number_of_results();
+        out[emitted] = collection_ref;
+        out_counts[emitted] = result_count;
+        transition { _ -> fill_counts(collections, out, out_counts, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((emitted as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_filter_collections` surface: the collection count.
+pub machine SnapshotRegionScanResults::get_collection_count(&self) -> u64 {
+    self.snapshot_region_filter_collections.len
+}
+
+// The lent collections view (upstream `get_filter_collections` returns
+// &Vec<..>; iteration reads the same slice).
+pub machine SnapshotRegionScanResults::get_filter_collections<'a, 't>(
+    &self
+) -> &'a [SnapshotRegionFilterCollection<'a, 't>] {
+    self.snapshot_region_filter_collections
+}
+
+machine collection_at<'a, 't>(
+    collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+    index: u64
+) -> &'a SnapshotRegionFilterCollection<'a, 't>
+requires
+    index < collections.len
+{
+    &collections[index]
+}
+
+// Upstream `get_collection(index)`-style access for serial iteration.
+pub machine SnapshotRegionScanResults::get_collection<'a, 't>(
+    &self,
+    index: u64
+) -> CollectionRef<'a, 't> {
+    let bound_collections: &'a [SnapshotRegionFilterCollection<'a, 't>] = self.snapshot_region_filter_collections;
+    transition index < bound_collections.len {
+        true -> fetch(bound_collections, index)
+        false -> missing(bound_collections)
+        _ -> missing(bound_collections)
+    }
+
+    state fetch(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        index: u64
+    ) -> CollectionRef<'a, 't> {
+        let found: &'a SnapshotRegionFilterCollection<'a, 't> = collection_at(collections, index);
+        CollectionRef::Found { collection: found }
+    }
+
+    state missing(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>]
+    ) -> CollectionRef<'a, 't> {
+        CollectionRef::Missing
+    }
+}
+
+// Upstream `get_filter_bounds`: (min base, max end) across every nonempty
+// collection, (0,0) when nothing has results; the returned pair is the same
+// tuple, split here into two machines for caller convenience.
+pub machine SnapshotRegionScanResults::get_filter_bounds_low(&self) -> u64 {
+    let running_min: u64 = 18446744073709551615;
+    SnapshotRegionScanResults::bounds_low(self.snapshot_region_filter_collections, 0, running_min, false)
+}
+
+pub machine SnapshotRegionScanResults::get_filter_bounds_high(&self) -> u64 {
+    SnapshotRegionScanResults::bounds_high(self.snapshot_region_filter_collections, 0, 0, false)
+}
+
+machine SnapshotRegionScanResults::bounds_low<'a, 't>(
+    collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+    index: u64,
+    running_min: u64,
+    has_results: bool
+) -> u64 {
+    transition index < collections.len {
+        true -> step(collections, index, running_min, has_results)
+        false -> done(running_min, has_results)
+    }
+
+    state step(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        index: u64,
+        running_min: u64,
+        has_results: bool
+    ) -> u64 {
+        let result_count: u64 = collections[index].get_number_of_results();
+        transition result_count == 0 {
+            true -> bounds_low(collections, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, running_min, has_results)
+            false -> lower(collections, index, running_min)
+        }
+    }
+
+    state lower(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        index: u64,
+        running_min: u64
+    ) -> u64 {
+        let candidate: u64 = collections[index].get_filter_minimum_address();
+        transition candidate < running_min {
+            true -> bounds_low(collections, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, candidate, true)
+            false -> bounds_low(collections, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, running_min, true)
+        }
+    }
+
+    state done(running_min: u64, has_results: bool) -> u64 {
+        transition has_results {
+            true -> (running_min)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+}
+
+machine SnapshotRegionScanResults::bounds_high<'a, 't>(
+    collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+    index: u64,
+    running_max: u64,
+    has_results: bool
+) -> u64 {
+    transition index < collections.len {
+        true -> step(collections, index, running_max, has_results)
+        false -> done(running_max, has_results)
+    }
+
+    state step(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        index: u64,
+        running_max: u64,
+        has_results: bool
+    ) -> u64 {
+        let result_count: u64 = collections[index].get_number_of_results();
+        transition result_count == 0 {
+            true -> bounds_high(collections, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, running_max, has_results)
+            false -> higher(collections, index, running_max)
+        }
+    }
+
+    state higher(
+        collections: &'a [SnapshotRegionFilterCollection<'a, 't>],
+        index: u64,
+        running_max: u64
+    ) -> u64 {
+        let candidate: u64 = collections[index].get_filter_maximum_address();
+        transition candidate > running_max {
+            true -> bounds_high(collections, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, candidate, true)
+            false -> bounds_high(collections, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, running_max, true)
+        }
+    }
+
+    state done(running_max: u64, has_results: bool) -> u64 {
+        transition has_results {
+            true -> (running_max)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+}

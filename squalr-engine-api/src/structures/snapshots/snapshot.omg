@@ -1,0 +1,844 @@
+module src::structures::snapshots::snapshot;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::memory::memory_alignment::MemoryAlignment;
+use src::structures::results::snapshot_region_scan_results::CollectionLookup;
+use src::structures::results::snapshot_region_scan_results::CollectionRef;
+use src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use src::structures::snapshots::snapshot_region::SnapshotRegion;
+
+// Port of structures/snapshots/snapshot.rs: the ordered set of snapshot
+// regions plus deleted-result bookkeeping.
+//
+// Storage: upstream's `Vec<SnapshotRegion>` lands as a caller-lent mutable
+// slice with a live `region_count` (no growable owner yet) — the same
+// caller-lent convention as the collections inside the regions.
+// `deleted_scan_result_indices` (upstream BTreeSet<u64>) rides as a
+// caller-lent `u64` list kept sorted; `commit_deleted_scan_result_indices`
+// is the empty-set fast path only — the collection rebuild it drives lands
+// with the result-deletion leg (named deviation, recorded on the method).
+// The ScanResultValued paging surface (get_scan_result[s]_page /
+// get_structural_scan_result) needs the registry value layer and is part of
+// the scan-results-page leg.
+//
+// Lifetimes: each borrowed input names its own lifetime — 'a the regions
+// backing, 'p each region's previous-values window, 'r the results
+// collection backing, 't the data-type ids, 'd the deleted-index list.
+//
+// Mutation: writes to borrow-carrying elements through `self.field` are
+// fenced ("persistent loans"), so element writes take the mutable backing
+// as an explicit `&mut [SnapshotRegion]`/`&mut [u64]` parameter — the same
+// storage upstream's `&mut self` writes reach, with the receiver spelled
+// out.
+pub data Snapshot<'a, 'p, 'r, 't, 'd> {
+    snapshot_regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>];
+    region_count: u64;
+    deleted_scan_result_indices: &'d mut [u64];
+    deleted_scan_result_count: u64;
+}
+
+// Upstream `Snapshot::new`: empty region list and no deletions.
+pub machine Snapshot::new<'a, 'p, 'r, 't, 'd>(
+    snapshot_regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
+    deleted_scan_result_indices: &'d mut [u64]
+) -> Snapshot<'a, 'p, 'r, 't, 'd> {
+    Snapshot {
+        snapshot_regions: snapshot_regions,
+        region_count: 0,
+        deleted_scan_result_indices: deleted_scan_result_indices,
+        deleted_scan_result_count: 0,
+    }
+}
+
+// Upstream `from_regions` -> `set_snapshot_regions` with
+// retain_deleted_results=false: clear the deleted set, discard
+// empty regions, sort base-ascending.
+pub machine Snapshot::from_regions<'a, 'p, 'r, 't, 'd>(
+    snapshot_regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64,
+    deleted_scan_result_indices: &'d mut [u64]
+) -> Snapshot<'a, 'p, 'r, 't, 'd> {
+    let mut snapshot: Snapshot<'a, 'p, 'r, 't, 'd> = Snapshot {
+        snapshot_regions: snapshot_regions,
+        region_count: region_count,
+        deleted_scan_result_indices: deleted_scan_result_indices,
+        deleted_scan_result_count: 0,
+    };
+    Snapshot::set_snapshot_regions(&mut snapshot, region_count, false);
+    snapshot
+}
+
+// Upstream `set_snapshot_regions`.
+pub machine Snapshot::set_snapshot_regions<'a, 'p, 'r, 't, 'd>(
+    snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>,
+    region_count: u64,
+    retain_deleted_results: bool
+) {
+    transition retain_deleted_results {
+        true -> discard(snapshot, region_count)
+        false -> clear_then(snapshot, region_count)
+        _ -> clear_then(snapshot, region_count)
+    }
+
+    state clear_then(snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>, region_count: u64) {
+        snapshot.deleted_scan_result_count = 0;
+        transition { _ -> discard(snapshot, region_count) }
+    }
+
+    state discard(snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>, region_count: u64) {
+        let live: u64 = Snapshot::discard_empty_regions_in(snapshot.snapshot_regions, region_count);
+        Snapshot::sort_regions(snapshot.snapshot_regions, live);
+        snapshot.region_count = live;
+    }
+}
+
+// Upstream `discard_empty_regions`: compacts out regions whose region size
+// fell to zero (resize_to_filters marks them); order is preserved.
+pub machine Snapshot::discard_empty_regions<'a, 'p, 'r, 't, 'd>(
+    snapshot: &mut Snapshot<'a, 'p, 'r, 't, 'd>
+) {
+    let live: u64 = Snapshot::discard_empty_regions_in(snapshot.snapshot_regions, snapshot.region_count);
+    snapshot.region_count = live;
+}
+
+machine Snapshot::discard_empty_regions_in<'a, 'p, 'r, 't>(
+    regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64
+) -> u64 {
+    Snapshot::compact_nonempty(regions, region_count, 0, 0)
+}
+
+machine Snapshot::compact_nonempty<'a, 'p, 'r, 't>(
+    regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64,
+    read_index: u64,
+    write_index: u64
+) -> u64 {
+    transition read_index < region_count {
+        true -> step(regions, region_count, read_index, write_index)
+        false -> (write_index)
+    }
+
+    state step(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        transition read_index < regions.len {
+            true -> size_check(regions, region_count, read_index, write_index)
+            false -> (write_index)
+            _ -> (write_index)
+        }
+    }
+
+    state size_check(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        let region_size: u64 = regions[read_index].get_region_size();
+        transition region_size > 0 {
+            true -> keep(regions, region_count, read_index, write_index)
+            false -> compact_nonempty(regions, region_count, ((read_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, write_index)
+        }
+    }
+
+    state keep(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        transition read_index > write_index {
+            true -> move_forward(regions, region_count, read_index, write_index)
+            false -> compact_nonempty(regions, region_count, ((read_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((write_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            _ -> compact_nonempty(regions, region_count, ((read_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((write_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    // Single-statement clone+write is the admitted element-move shape:
+    // the clone's borrow lives and dies inside the one statement. The
+    // forward-only order is safe — write_index < read_index always, so the
+    // overwritten element was already consumed or is dead space.
+    state move_forward(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        transition read_index < regions.len && write_index < regions.len {
+            true -> write_forward(regions, region_count, read_index, write_index)
+            false -> (write_index)
+            _ -> (write_index)
+        }
+    }
+
+    state write_forward(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        read_index: u64,
+        write_index: u64
+    ) -> u64 {
+        regions[write_index] = regions[read_index].clone_region();
+        transition { _ -> compact_nonempty(regions, region_count, ((read_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((write_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream sort_by_key on base address — insertion over the live prefix.
+// The swap's temporary rides in `scratch_index`, a caller-lent dead slot
+// beyond the live prefix (backing len > live count, e.g. `region_count`):
+// the prover admits only same-statement clone+element-writes, and a
+// borrowed value can neither mutate the slice it came from nor cross
+// state boundaries beside it, so a dead slot is the only materializable
+// temp. When the backing has no spare slot (live == len), sorting is
+// skipped — a documented storage-surface deviation: callers lending a
+// packed backing get compaction only, and sort order is preserved if the
+// input was already ascending.
+machine Snapshot::sort_regions<'a, 'p, 'r, 't>(
+    regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64
+) {
+    transition region_count < regions.len {
+        true -> sort_walk(regions, region_count, region_count, 1)
+        false -> done()
+        _ -> done()
+    }
+
+    state done() {
+    }
+
+    state sort_walk(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        scratch_index: u64,
+        index: u64
+    ) {
+        transition index < region_count {
+            true -> sift(regions, region_count, scratch_index, index)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state sift(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        scratch_index: u64,
+        index: u64
+    ) {
+        Snapshot::sift_left(regions, scratch_index, index);
+        transition { _ -> sort_walk(regions, region_count, scratch_index, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+machine Snapshot::sift_left<'a, 'p, 'r, 't>(
+    regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+    scratch_index: u64,
+    index: u64
+) {
+    transition index > 0 && index < regions.len {
+        true -> compare(regions, scratch_index, index)
+        false -> done()
+        _ -> done()
+    }
+
+    state compare(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        scratch_index: u64,
+        index: u64
+    ) {
+        let previous_index: u64 = ((index as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition previous_index < regions.len {
+            true -> read_bases(regions, scratch_index, index, previous_index)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state read_bases(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        scratch_index: u64,
+        index: u64,
+        previous_index: u64
+    ) {
+        let previous_base: u64 = regions[previous_index].get_base_address();
+        let current_base: u64 = regions[index].get_base_address();
+        transition previous_base > current_base {
+            true -> swap_to_scratch(regions, scratch_index, index, previous_index)
+            false -> done()
+        }
+    }
+
+    // Three single-statement copies through the dead scratch slot realize
+    // the swap — each clone+write pair lives inside one statement.
+    state swap_to_scratch(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        scratch_index: u64,
+        index: u64,
+        previous_index: u64
+    ) {
+        transition scratch_index < regions.len {
+            true -> stage_scratch(regions, scratch_index, index, previous_index)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state stage_scratch(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        scratch_index: u64,
+        index: u64,
+        previous_index: u64
+    ) {
+        regions[scratch_index] = regions[index].clone_region();
+        transition { _ -> swap_down(regions, scratch_index, index, previous_index) }
+    }
+
+    state swap_down(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        scratch_index: u64,
+        index: u64,
+        previous_index: u64
+    ) {
+        regions[index] = regions[previous_index].clone_region();
+        transition { _ -> swap_from_scratch(regions, scratch_index, index, previous_index) }
+    }
+
+    state swap_from_scratch(
+        regions: &mut [SnapshotRegion<'a, 'p, 'r, 't>],
+        scratch_index: u64,
+        index: u64,
+        previous_index: u64
+    ) {
+        regions[previous_index] = regions[scratch_index].clone_region();
+        transition { _ -> sift_left(regions, scratch_index, previous_index) }
+    }
+
+    state done() {
+    }
+}
+
+// Upstream `get_region_count`.
+pub machine Snapshot::get_region_count(&self) -> u64 {
+    self.region_count
+}
+
+// Upstream `get_snapshot_regions_mut` surface: per-region mutable access
+// for the scan pipeline (the explicit receiver form — self-field mutation
+// of borrow-carrying data is fenced).
+pub machine Snapshot::get_region<'a, 'p, 'r, 't>(
+    regions: &'a mut [SnapshotRegion<'a, 'p, 'r, 't>],
+    index: u64
+) -> &'a mut SnapshotRegion<'a, 'p, 'r, 't>
+requires
+    index < regions.len
+{
+    // requires is discharged by the caller's established index fact — the
+    // only shape that proves an element borrow in a machine tail.
+    &mut regions[index]
+}
+
+// Upstream `get_snapshot_regions` read view for the caller-side pipeline.
+pub machine Snapshot::get_regions<'a, 'p, 'r, 't>(
+    regions: &'a [SnapshotRegion<'a, 'p, 'r, 't>],
+    index: u64
+) -> &'a SnapshotRegion<'a, 'p, 'r, 't>
+requires
+    index < regions.len
+{
+    &regions[index]
+}
+
+// Upstream `get_number_of_results`: Σ region result counts.
+pub machine Snapshot::get_number_of_results(&self) -> u64 {
+    Snapshot::sum_results(self.snapshot_regions, self.region_count, 0, 0)
+}
+
+machine Snapshot::sum_results<'a, 'p, 'r, 't>(
+    regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64,
+    index: u64,
+    running: u64
+) -> u64 {
+    transition index < region_count {
+        true -> step(regions, region_count, index, running)
+        false -> (running)
+    }
+
+    state step(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        transition index < regions.len {
+            true -> add(regions, region_count, index, running)
+            false -> (running)
+            _ -> (running)
+        }
+    }
+
+    state add(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        let region_results: SnapshotRegionScanResults<'r, 't> = regions[index].get_scan_results();
+        let region_result_count: u64 = region_results.get_number_of_results();
+        transition { _ -> sum_results(regions, region_count, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((running as u64 in Saturating) + (region_result_count as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_number_of_results_for_data_types`.
+pub machine Snapshot::get_number_of_results_for_data_types<'t>(
+    &self,
+    filtered_data_types: &[DataTypeRef<'t>],
+    has_selection: bool
+) -> u64 {
+    Snapshot::sum_selected(self.snapshot_regions, self.region_count, filtered_data_types, has_selection, 0, 0)
+}
+
+machine Snapshot::sum_selected<'a, 'p, 'r, 't>(
+    regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64,
+    filtered_data_types: &[DataTypeRef<'t>],
+    has_selection: bool,
+    index: u64,
+    running: u64
+) -> u64 {
+    transition index < region_count {
+        true -> step(regions, region_count, filtered_data_types, has_selection, index, running)
+        false -> (running)
+    }
+
+    state step(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        filtered_data_types: &[DataTypeRef<'t>],
+        has_selection: bool,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        transition index < regions.len {
+            true -> add(regions, region_count, filtered_data_types, has_selection, index, running)
+            false -> (running)
+            _ -> (running)
+        }
+    }
+
+    state add(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        filtered_data_types: &[DataTypeRef<'t>],
+        has_selection: bool,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        let region_results: SnapshotRegionScanResults<'r, 't> = regions[index].get_scan_results();
+        let selected_count: u64 = region_results.get_number_of_results_for_data_types(filtered_data_types, has_selection);
+        transition { _ -> sum_selected(regions, region_count, filtered_data_types, has_selection, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((running as u64 in Saturating) + (selected_count as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_byte_count` (retained collected bytes across regions).
+pub machine Snapshot::get_byte_count(&self) -> u64 {
+    Snapshot::sum_bytes(self.snapshot_regions, self.region_count, 0, 0)
+}
+
+machine Snapshot::sum_bytes<'a, 'p, 'r, 't>(
+    regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64,
+    index: u64,
+    running: u64
+) -> u64 {
+    transition index < region_count {
+        true -> step(regions, region_count, index, running)
+        false -> (running)
+    }
+
+    state step(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        transition index < regions.len {
+            true -> add(regions, region_count, index, running)
+            false -> (running)
+            _ -> (running)
+        }
+    }
+
+    state add(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        index: u64,
+        running: u64
+    ) -> u64 {
+        let region_bytes: u64 = regions[index].get_collected_byte_count();
+        transition { _ -> sum_bytes(regions, region_count, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((running as u64 in Saturating) + (region_bytes as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `collect_scan_result_addresses_for_data_type`: every candidate
+// address of the given data type, region order then base-ascending within
+// each collection. The returned Vec lands as a caller-lent `out` plus the
+// live count (no growable owner yet).
+pub machine Snapshot::collect_scan_result_addresses_for_data_type<'t>(
+    &self,
+    data_type_ref: &DataTypeRef<'t>,
+    out: &mut [u64]
+) -> u64
+crashes Abort
+{
+    Snapshot::collect_addresses(self.snapshot_regions, self.region_count, data_type_ref, out, 0, 0)
+}
+
+machine Snapshot::collect_addresses<'a, 'p, 'r, 't>(
+    regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+    region_count: u64,
+    data_type_ref: &DataTypeRef<'t>,
+    out: &mut [u64],
+    region_index: u64,
+    emitted: u64
+) -> u64
+crashes Abort
+{
+    transition region_index < region_count {
+        true -> step(regions, region_count, data_type_ref, out, region_index, emitted)
+        false -> (emitted)
+    }
+
+    state step(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        data_type_ref: &DataTypeRef<'t>,
+        out: &mut [u64],
+        region_index: u64,
+        emitted: u64
+    ) -> u64 {
+        transition region_index < regions.len {
+            true -> resolve(regions, region_count, data_type_ref, out, region_index, emitted)
+            false -> (emitted)
+            _ -> (emitted)
+        }
+    }
+
+    state resolve(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        data_type_ref: &DataTypeRef<'t>,
+        out: &mut [u64],
+        region_index: u64,
+        emitted: u64
+    ) -> u64 {
+        let region_results: SnapshotRegionScanResults<'r, 't> = regions[region_index].get_scan_results();
+        let lookup: CollectionLookup = region_results.get_scan_results_by_data_type(data_type_ref);
+        transition lookup {
+            CollectionLookup::Found { index } -> emit_region(regions, region_count, data_type_ref, out, region_index, emitted, index)
+            _ -> collect_addresses(regions, region_count, data_type_ref, out, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, emitted)
+        }
+    }
+
+    state emit_region(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        data_type_ref: &DataTypeRef<'t>,
+        out: &mut [u64],
+        region_index: u64,
+        emitted: u64,
+        collection_index: u64
+    ) -> u64 {
+        transition region_index < regions.len {
+            true -> emit_checked(regions, region_count, data_type_ref, out, region_index, emitted, collection_index)
+            false -> (emitted)
+            _ -> (emitted)
+        }
+    }
+
+    state emit_checked(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        data_type_ref: &DataTypeRef<'t>,
+        out: &mut [u64],
+        region_index: u64,
+        emitted: u64,
+        collection_index: u64
+    ) -> u64 {
+        let region_results: SnapshotRegionScanResults<'r, 't> = regions[region_index].get_scan_results();
+        let collection_lookup: CollectionRef<'a, 't> = region_results.get_collection(collection_index);
+        transition collection_lookup {
+            CollectionRef::Found { collection } -> emit_found(regions, region_count, data_type_ref, out, region_index, emitted, collection)
+            _ -> collect_addresses(regions, region_count, data_type_ref, out, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, emitted)
+        }
+    }
+
+    state emit_found(
+        regions: &[SnapshotRegion<'a, 'p, 'r, 't>],
+        region_count: u64,
+        data_type_ref: &DataTypeRef<'t>,
+        out: &mut [u64],
+        region_index: u64,
+        emitted: u64,
+        collection: &'a SnapshotRegionFilterCollection<'a, 't>
+    ) -> u64 {
+        let emitted_after: u64 = Snapshot::emit_collection_addresses(
+            collection,
+            out,
+            emitted,
+            0
+        );
+        transition { _ -> collect_addresses(regions, region_count, data_type_ref, out, ((region_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64, emitted_after) }
+    }
+}
+
+// For one collection: for each filter, emit base + i*max(alignment,1) for
+// i in 0..element_count(result_value_size, alignment).
+machine Snapshot::emit_collection_addresses<'a, 't>(
+    collection: &SnapshotRegionFilterCollection<'a, 't>,
+    out: &mut [u64],
+    emitted: u64,
+    filter_index: u64
+) -> u64
+crashes Abort
+{
+    let collection_count: u64 = collection.get_filter_count();
+    transition filter_index < collection_count {
+        true -> step(collection, out, emitted, filter_index)
+        false -> (emitted)
+        _ -> (emitted)
+    }
+
+    state step(
+        collection: &SnapshotRegionFilterCollection<'a, 't>,
+        out: &mut [u64],
+        emitted: u64,
+        filter_index: u64
+    ) -> u64 {
+        let emitted_after: u64 = Snapshot::emit_filter_addresses(
+            collection,
+            filter_index,
+            out,
+            emitted,
+            0
+        );
+        transition { _ -> emit_collection_addresses(collection, out, emitted_after, ((filter_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+machine Snapshot::emit_filter_addresses<'a, 't>(
+    collection: &SnapshotRegionFilterCollection<'a, 't>,
+    filter_index: u64,
+    out: &mut [u64],
+    emitted: u64,
+    result_index: u64
+) -> u64
+crashes Abort
+{
+    let filters: &[SnapshotRegionFilter] = collection.get_filters();
+    transition filter_index < filters.len {
+        true -> count(collection, filters, filter_index, out, emitted, result_index)
+        false -> (emitted)
+        _ -> (emitted)
+    }
+
+    state count(
+        collection: &SnapshotRegionFilterCollection<'a, 't>,
+        filters: &[SnapshotRegionFilter],
+        filter_index: u64,
+        out: &mut [u64],
+        emitted: u64,
+        result_index: u64
+    ) -> u64 {
+        let result_value_size: u64 = collection.get_result_value_size_in_bytes();
+        let memory_alignment: MemoryAlignment = collection.get_memory_alignment();
+        let filter_ref: &SnapshotRegionFilter = &filters[filter_index];
+        let filter_count: u64 = filter_ref.get_element_count(
+            result_value_size,
+            memory_alignment
+        );
+        transition result_index < filter_count && emitted < out.len {
+            true -> step(collection, filters, filter_index, out, emitted, result_index)
+            false -> (emitted)
+            _ -> (emitted)
+        }
+    }
+
+    state step(
+        collection: &SnapshotRegionFilterCollection<'a, 't>,
+        filters: &[SnapshotRegionFilter],
+        filter_index: u64,
+        out: &mut [u64],
+        emitted: u64,
+        result_index: u64
+    ) -> u64 {
+        transition emitted < out.len {
+            true -> write(collection, filters, filter_index, out, emitted, result_index)
+            false -> (emitted)
+            _ -> (emitted)
+        }
+    }
+
+    state write(
+        collection: &SnapshotRegionFilterCollection<'a, 't>,
+        filters: &[SnapshotRegionFilter],
+        filter_index: u64,
+        out: &mut [u64],
+        emitted: u64,
+        result_index: u64
+    ) -> u64 {
+        let filter_ref: &SnapshotRegionFilter = &filters[filter_index];
+        let filter_base: u64 = filter_ref.get_base_address();
+        let memory_alignment: MemoryAlignment = collection.get_memory_alignment();
+        let alignment_bytes: u64 = memory_alignment.get_size_in_bytes();
+        let alignment: u64 = Snapshot::u64_max(alignment_bytes, 1);
+        let covered: u64 = ((result_index as u64 in Saturating) * (alignment as u64 in Saturating)) as u64;
+        let address: u64 = ((filter_base as u64 in Saturating)
+            + (covered as u64 in Saturating)) as u64;
+        out[emitted] = address;
+        transition { _ -> emit_filter_addresses(collection, filter_index, out, ((emitted as u64 in Saturating) + (1 as u64 in Saturating)) as u64, ((result_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `mark_deleted_scan_result`: inserts into the sorted deleted set
+// (deduped, like BTreeSet::insert). The commit path is the empty-set fast
+// path — full removal rebuilds are the result-deletion leg.
+pub machine Snapshot::mark_deleted_scan_result<'d>(
+    deleted_scan_result_indices: &'d mut [u64],
+    deleted_scan_result_count: u64,
+    global_scan_result_index: u64
+) -> u64 {
+    Snapshot::insert_deleted_index(deleted_scan_result_indices, deleted_scan_result_count, global_scan_result_index, 0)
+}
+
+machine Snapshot::insert_deleted_index<'d>(
+    deleted: &'d mut [u64],
+    deleted_count: u64,
+    global_scan_result_index: u64,
+    index: u64
+) -> u64 {
+    transition index < deleted_count {
+        true -> compare(deleted, deleted_count, global_scan_result_index, index)
+        false -> place(deleted, deleted_count, global_scan_result_index, index)
+        _ -> place(deleted, deleted_count, global_scan_result_index, index)
+    }
+
+    state compare(
+        deleted: &'d mut [u64],
+        deleted_count: u64,
+        global_scan_result_index: u64,
+        index: u64
+    ) -> u64 {
+        transition index < deleted.len && deleted[index] == global_scan_result_index {
+            true -> (deleted_count)
+            false -> before(deleted, deleted_count, global_scan_result_index, index)
+        }
+    }
+
+    state before(
+        deleted: &'d mut [u64],
+        deleted_count: u64,
+        global_scan_result_index: u64,
+        index: u64
+    ) -> u64 {
+        transition index < deleted.len && deleted[index] > global_scan_result_index {
+            true -> shift_and_place(deleted, deleted_count, global_scan_result_index, index, deleted_count)
+            false -> insert_deleted_index(deleted, deleted_count, global_scan_result_index, ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+        }
+    }
+
+    state shift_and_place(
+        deleted: &'d mut [u64],
+        deleted_count: u64,
+        global_scan_result_index: u64,
+        index: u64,
+        move_index: u64
+    ) -> u64 {
+        transition move_index > index && move_index < deleted.len {
+            true -> shift_one(deleted, deleted_count, global_scan_result_index, index, move_index)
+            false -> place(deleted, deleted_count, global_scan_result_index, index)
+            _ -> place(deleted, deleted_count, global_scan_result_index, index)
+        }
+    }
+
+    state shift_one(
+        deleted: &'d mut [u64],
+        deleted_count: u64,
+        global_scan_result_index: u64,
+        index: u64,
+        move_index: u64
+    ) -> u64 {
+        let previous_index: u64 = ((move_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition previous_index < deleted.len {
+            true -> shift_checked(deleted, deleted_count, global_scan_result_index, index, move_index, previous_index)
+            false -> place(deleted, deleted_count, global_scan_result_index, index)
+            _ -> place(deleted, deleted_count, global_scan_result_index, index)
+        }
+    }
+
+    state shift_checked(
+        deleted: &'d mut [u64],
+        deleted_count: u64,
+        global_scan_result_index: u64,
+        index: u64,
+        move_index: u64,
+        previous_index: u64
+    ) -> u64 {
+        deleted[move_index] = deleted[previous_index];
+        transition { _ -> shift_and_place(deleted, deleted_count, global_scan_result_index, index, ((move_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64) }
+    }
+
+    state place(
+        deleted: &'d mut [u64],
+        deleted_count: u64,
+        global_scan_result_index: u64,
+        index: u64
+    ) -> u64 {
+        transition index < deleted.len {
+            true -> write(deleted, deleted_count, index, global_scan_result_index)
+            false -> (deleted_count)
+            _ -> (deleted_count)
+        }
+    }
+
+    state write(
+        deleted: &'d mut [u64],
+        deleted_count: u64,
+        index: u64,
+        global_scan_result_index: u64
+    ) -> u64 {
+        deleted[index] = global_scan_result_index;
+        ((deleted_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+    }
+}
+
+// Upstream `commit_deleted_scan_result_indices`: ElementScanner calls this
+// at scan start. The empty-set fast path is the only shape the scalar leg
+// needs (deletion rebuilds land with the result-deletion leg); a nonempty
+// deleted set is an Abort rather than silently dropping results.
+pub machine Snapshot::commit_deleted_scan_result_indices(&self) -> u64
+crashes Abort
+{
+    transition self.deleted_scan_result_count == 0 {
+        true -> (0)
+        false -> unported()
+        _ -> unported()
+    }
+
+    state unported(&self) -> u64 {
+        crash Abort;
+    }
+}
+
+machine Snapshot::u64_max(left: u64, right: u64) -> u64 {
+    transition left > right {
+        true -> (left)
+        false -> (right)
+        _ -> (right)
+    }
+}
