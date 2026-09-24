@@ -1,6 +1,7 @@
 module src::structures::scanning::filters::snapshot_region_filter_collection;
 
 use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::container_type::ContainerType;
 use src::structures::memory::memory_alignment::MemoryAlignment;
 use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
 use src::structures::snapshots::deleted_scan_result_index_set::DeletedScanResultIndexSet;
@@ -21,6 +22,7 @@ pub data SnapshotRegionFilterCollection {
     data_type_ref: DataTypeRef;
     memory_alignment: MemoryAlignment;
     result_value_size_in_bytes: u64;
+    result_container_type: ContainerType;
 }
 
 // Upstream `new_with_result_size`: retains only filters whose region can
@@ -38,6 +40,7 @@ pub machine SnapshotRegionFilterCollection::new_with_result_size(
         data_type_ref: data_type_ref,
         memory_alignment: memory_alignment,
         result_value_size_in_bytes: result_value_size_in_bytes,
+        result_container_type: ContainerType::None,
     };
     collection.retain_result_sized_filters(snapshot_region_filters, filter_count);
     collection.sort_filters();
@@ -54,6 +57,7 @@ pub machine SnapshotRegionFilterCollection::empty(
         data_type_ref: data_type_ref,
         memory_alignment: memory_alignment,
         result_value_size_in_bytes: result_value_size_in_bytes,
+        result_container_type: ContainerType::None,
     }
 }
 
@@ -97,7 +101,7 @@ machine SnapshotRegionFilterCollection::retain_result_sized_filters(
 
 // Upstream sorts each filter batch by base address (Ord on NormalizedRegion
 // orders by base alone) — insertion sort over the bounded set.
-machine SnapshotRegionFilterCollection::sort_filters(&mut self) {
+pub machine SnapshotRegionFilterCollection::sort_filters(&mut self) {
     transition { _ -> outer(1) }
     state outer(&mut self, index: u64) {
         transition index < self.filter_count && index < 64 {
@@ -211,6 +215,7 @@ pub machine SnapshotRegionFilterCollection::clone(
         source.memory_alignment,
         source.result_value_size_in_bytes,
     );
+    collection.result_container_type = source.result_container_type;
     collection.copy_filters(source, 0);
     collection
 }
@@ -222,6 +227,7 @@ pub machine SnapshotRegionFilterCollection::clone_from(
     self.data_type_ref.clone_from(&source.data_type_ref);
     self.memory_alignment = source.memory_alignment;
     self.result_value_size_in_bytes = source.result_value_size_in_bytes;
+    self.result_container_type = source.result_container_type;
     self.filter_count = 0;
     self.copy_filters(source, 0);
 }
@@ -309,6 +315,69 @@ pub machine SnapshotRegionFilterCollection::get_memory_alignment(&self) -> Memor
 
 pub machine SnapshotRegionFilterCollection::get_result_value_size_in_bytes(&self) -> u64 {
     self.result_value_size_in_bytes
+}
+
+pub machine SnapshotRegionFilterCollection::get_result_container_type(&self) -> ContainerType {
+    self.result_container_type
+}
+
+// Upstream `with_result_container_type` — respelled as a set-in-place
+// mutator (the owned-return builder shape does not compose across package
+// boundaries under the omega borrowing rules; same value, same timing).
+pub machine SnapshotRegionFilterCollection::set_result_container_type(
+    &mut self,
+    result_container_type: ContainerType
+) {
+    self.result_container_type = result_container_type;
+}
+
+// `push_filter` variant taking the filter by value — the borrowed-argument
+// form cannot be invoked on an api-owned `&mut` receiver from scanning.
+pub machine SnapshotRegionFilterCollection::push_filter_value(
+    &mut self,
+    filter: SnapshotRegionFilter
+) -> bool {
+    transition self.filter_count < 64 {
+        true -> push(filter)
+        false -> (false)
+    }
+    state push(&mut self, filter: SnapshotRegionFilter) -> bool {
+        self.snapshot_region_filters[self.filter_count].clone_from(&filter);
+        self.filter_count = ((self.filter_count as u64 in Wrapping) + 1) as u64;
+        true
+    }
+}
+
+// In-place twin of `retain_result_sized_filters` for collections assembled
+// element-by-element (the by-value push path above): drops trailing windows
+// narrower than the logical result width, exactly as upstream's
+// construction-time retain does. `sort_filters` remains the caller's next
+// step, matching `new_with_result_size`'s retain-then-sort order.
+pub machine SnapshotRegionFilterCollection::finalize_result_sized(&mut self) {
+    transition { _ -> next(0, 0) }
+    state next(&mut self, read: u64, kept: u64) {
+        transition read < self.filter_count && read < 64 {
+            true -> probe(read, kept)
+            false -> done(kept)
+        }
+    }
+    state probe(&mut self, read: u64 [0..64], kept: u64) {
+        let region_size: u64 = self.snapshot_region_filters[read].get_region_size();
+        transition region_size >= self.result_value_size_in_bytes && kept < 64 {
+            true -> keep(read, kept)
+            false -> next(read + 1, kept)
+            _ -> done(kept)
+        }
+    }
+    state keep(&mut self, read: u64 [0..64], kept: u64 [0..64]) {
+        let mut kept_filter: SnapshotRegionFilter = SnapshotRegionFilter::new(0, 0);
+        kept_filter.clone_from(&self.snapshot_region_filters[read]);
+        self.snapshot_region_filters[kept].clone_from(&kept_filter);
+        transition { _ -> next(read + 1, kept + 1) }
+    }
+    state done(&mut self, kept: u64) {
+        self.filter_count = kept;
+    }
 }
 
 pub machine SnapshotRegionFilterCollection::get_filter_minimum_address(&self) -> u64 {

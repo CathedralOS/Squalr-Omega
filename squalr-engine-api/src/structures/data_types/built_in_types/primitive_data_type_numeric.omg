@@ -1,0 +1,1147 @@
+module src::structures::data_types::built_in_types::primitive_data_type_numeric;
+
+use src::conversions::base_system_conversions::BaseSystemConversions;
+use src::conversions::base_system_conversions::RadixParse;
+use src::conversions::conversions_from_binary::ConversionsFromBinary;
+use src::conversions::conversions_from_hexadecimal::ConversionsFromHexadecimal;
+use src::conversions::conversion_error::ConversionResult;
+use src::structures::data_types::data_type_error::DataTypeError;
+use src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::container_type::ContainerType;
+
+// Port of structures/data_types/built_in_types/primitive_data_type_numeric.rs:
+// the shared string<->bytes value parser the primitive numeric data types
+// delegate to. Upstream is generic over T (FromStr + ToBytes + Bounded +
+// ToPrimitive, plus the AsBits formatting trait); the port flattens that
+// genericity into explicit (element_size, is_signed) parameters and covers
+// the integer primitives u8..u64 / i8..i64 — named deviation: floating point
+// (f32/f64/f32be/f64be) decimal parse/format is deferred to the float
+// data-type leg; binary/hex paths already match their bit-level behavior.
+//
+// Other named deviations:
+// - Output buffers replace the upstream Vec<u8>/String returns; Ok reports
+//   the byte count written and a too-small buffer refuses with ParseError
+//   (upstream can never run out of room — capacity refusal noted).
+// - Upstream's u128 parse headroom narrows to u64; u64/i64 are the widest
+//   primitives this port serves anyway (upstream is asked for u128 only by
+//   tests of the generic engine).
+// - AsBits/usize/isize arms unused by any data type are not carried.
+pub data PrimitiveDataTypeNumeric {}
+
+// Upstream's Result<Vec<u8>, DataTypeError>: bytes land in the caller
+// buffer; Bytes reports the count written.
+pub data DeanonymizeResult {
+    case Error(error: DataTypeError);
+    case Bytes(count: u64);
+}
+
+// Upstream's Result<AnonymousValueString, DataTypeError>.
+pub data AnonymizeResult {
+    case Error(error: DataTypeError);
+    case Text(value: AnonymousValueString);
+}
+
+// Upstream T::max_value's unsigned arm: size 8 is u64::MAX itself.
+machine unsigned_max(element_size: u64) -> u64 {
+    let bit_count: u64 = ((element_size as u64 in Wrapping) * (8 as u64 in Wrapping));
+    let top_bit: u64 = ((1 as u64 in Wrapping) << (bit_count as u64 in Wrapping));
+    let bounded: u64 = ((top_bit as u64 in Wrapping) - (1 as u64 in Wrapping));
+    transition element_size < 8 {
+        true -> (bounded)
+        false -> (18446744073709551615)
+    }
+}
+
+// Upstream T::max_value over (element_size, is_signed): signed size s is
+// 2^(8s-1)-1; unsigned size s<8 is 2^(8s)-1.
+machine max_value_for(element_size: u64, is_signed: bool) -> u64 {
+    let bit_count: u64 = ((element_size as u64 in Wrapping) * (8 as u64 in Wrapping));
+    let magnitude_bits: u64 = ((bit_count as u64 in Wrapping) - (1 as u64 in Wrapping));
+    let signed_top: u64 = ((1 as u64 in Wrapping) << (magnitude_bits as u64 in Wrapping));
+    let signed_bound: u64 = ((signed_top as u64 in Wrapping) - (1 as u64 in Wrapping));
+    transition is_signed {
+        true -> (signed_bound)
+        false -> (unsigned_max(element_size))
+    }
+}
+
+// The byte-domain subset of char::is_whitespace (9/10/11/12/13/32).
+machine is_ascii_whitespace(byte: u8) -> bool {
+    transition byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 || byte == 32 {
+        true -> (true)
+        false -> (false)
+    }
+}
+
+// Upstream's array split predicate: ',' or whitespace.
+machine is_value_separator(byte: u8) -> bool {
+    transition byte == 44 || is_ascii_whitespace(byte) {
+        true -> (true)
+        false -> (false)
+    }
+}
+
+// Upstream get_supported_anonymous_value_string_formats — the Vec return is
+// a caller-buffer write with a count (named deviation).
+pub machine PrimitiveDataTypeNumeric::get_supported_anonymous_value_string_formats(
+    &self,
+    out: &mut [AnonymousValueStringFormat]
+) -> u64 {
+    transition out.len >= 3 {
+        true -> write(out)
+        false -> (0)
+    }
+    state write(out: &mut [AnonymousValueStringFormat]) -> u64 {
+        out[0] = AnonymousValueStringFormat::Binary;
+        out[1] = AnonymousValueStringFormat::Decimal;
+        out[2] = AnonymousValueStringFormat::Hexadecimal;
+        (3)
+    }
+}
+
+// Upstream deanonymize: a single value parses the whole stored string;
+// ContainerType::Array / ArrayFixed split the stored string on ',' /
+// whitespace into per-element windows. ArrayFixed requires exactly `length`
+// parts (checked before any parse, as upstream does) and an empty array
+// input is a ParseError.
+pub machine PrimitiveDataTypeNumeric::deanonymize(
+    &self,
+    anonymous_value_string: &AnonymousValueString,
+    is_big_endian: bool,
+    element_size: u64,
+    is_signed: bool,
+    out: &mut [u8]
+) -> DeanonymizeResult {
+    transition {
+        _ -> start(anonymous_value_string, is_big_endian, element_size, is_signed, out)
+    }
+    state start(
+        anonymous_value_string: &AnonymousValueString,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8]
+    ) -> DeanonymizeResult {
+        let mut value_text: [u8; 4096];
+        let value_len: u64 = anonymous_value_string.copy_anonymous_value_string(&mut value_text);
+        let container: ContainerType = anonymous_value_string.get_container_type();
+        let format: AnonymousValueStringFormat = anonymous_value_string.get_anonymous_value_string_format();
+        transition container {
+            ContainerType::Array -> find_part(&value_text, 0, value_len, format, is_big_endian, element_size, is_signed, out, 0, 0)
+            ContainerType::ArrayFixed { length } -> count_fixed(&value_text, 0, value_len, length, format, is_big_endian, element_size, is_signed, out)
+            _ -> single(&value_text, value_len, format, is_big_endian, element_size, is_signed, out)
+        }
+    }
+    state single(
+        text: &[u8],
+        value_len: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8]
+    ) -> DeanonymizeResult {
+        let parsed: DeanonymizeResult = deanonymize_single(text, 0, value_len, format, is_big_endian, element_size, is_signed, out, 0);
+        transition {
+            _ -> (parsed)
+        }
+    }
+    // First pass: count non-empty parts without writing output — upstream
+    // checks emptiness and the fixed count before parsing anything.
+    state find_part(
+        text: &[u8],
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        part_count: u64,
+        expected: u64
+    ) -> DeanonymizeResult {
+        transition at < end && at < text.len {
+            true -> probe_part(text, at, end, format, is_big_endian, element_size, is_signed, out, part_count, expected)
+            false -> counted(part_count, expected, text, end, format, is_big_endian, element_size, is_signed, out)
+        }
+    }
+    state probe_part(
+        text: &[u8],
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        part_count: u64,
+        expected: u64
+    ) -> DeanonymizeResult {
+        let separator: bool = is_value_separator(text[at]);
+        transition separator {
+            true -> find_part(text, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)), end, format, is_big_endian, element_size, is_signed, out, part_count, expected)
+            false -> measure_part(text, at, at, end, format, is_big_endian, element_size, is_signed, out, part_count, expected)
+        }
+    }
+    state measure_part(
+        text: &[u8],
+        part_start: u64,
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        part_count: u64,
+        expected: u64
+    ) -> DeanonymizeResult {
+        transition at < end && at < text.len {
+            true -> probe_part_end(text, part_start, at, end, format, is_big_endian, element_size, is_signed, out, part_count, expected)
+            false -> part_done(text, part_start, end, end, format, is_big_endian, element_size, is_signed, out, part_count, expected)
+        }
+    }
+    state probe_part_end(
+        text: &[u8],
+        part_start: u64,
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        part_count: u64,
+        expected: u64
+    ) -> DeanonymizeResult {
+        let separator: bool = is_value_separator(text[at]);
+        transition separator {
+            true -> part_done(text, part_start, at, end, format, is_big_endian, element_size, is_signed, out, part_count, expected)
+            false -> measure_part(text, part_start, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)), end, format, is_big_endian, element_size, is_signed, out, part_count, expected)
+        }
+    }
+    // Counted one part; continue scanning after it.
+    state part_done(
+        text: &[u8],
+        part_start: u64,
+        part_end: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        part_count: u64,
+        expected: u64
+    ) -> DeanonymizeResult {
+        transition { _ -> find_part(text, part_end, end, format, is_big_endian, element_size, is_signed, out, ((part_count as u64 in Wrapping) + (1 as u64 in Wrapping)), expected) }
+    }
+    state counted(
+        part_count: u64,
+        expected: u64,
+        text: &[u8],
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8]
+    ) -> DeanonymizeResult {
+        // Upstream: empty part list -> "Numeric array scans require at least
+        // one value."; ArrayFixed count mismatch -> ParseError.
+        transition part_count > 0 && (expected == 0 || expected == part_count) {
+            true -> parse_parts(text, 0, end, format, is_big_endian, element_size, is_signed, out, 0)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    // Second pass: parse each part's bytes into out, back to back.
+    state parse_parts(
+        text: &[u8],
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        written: u64
+    ) -> DeanonymizeResult {
+        transition at < end && at < text.len {
+            true -> seek_part(text, at, end, format, is_big_endian, element_size, is_signed, out, written)
+            false -> (DeanonymizeResult::Bytes { count: written })
+        }
+    }
+    state seek_part_guard(
+        text: &[u8],
+        seek_at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        written: u64
+    ) -> DeanonymizeResult {
+        transition seek_at < end && seek_at < text.len {
+            true -> seek_part(text, seek_at, end, format, is_big_endian, element_size, is_signed, out, written)
+            false -> (DeanonymizeResult::Bytes { count: written })
+        }
+    }
+    state seek_part(
+        text: &[u8],
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        written: u64
+    ) -> DeanonymizeResult {
+        let separator: bool = is_value_separator(text[at]);
+        transition separator {
+            true -> seek_part_guard(text, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)), end, format, is_big_endian, element_size, is_signed, out, written)
+            false -> bound_part(text, at, at, end, format, is_big_endian, element_size, is_signed, out, written)
+        }
+    }
+    state bound_part(
+        text: &[u8],
+        part_start: u64,
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        written: u64
+    ) -> DeanonymizeResult {
+        transition at < end && at < text.len {
+            true -> probe_bound(text, part_start, at, end, format, is_big_endian, element_size, is_signed, out, written)
+            false -> emit_part(text, part_start, end, end, format, is_big_endian, element_size, is_signed, out, written)
+        }
+    }
+    state probe_bound(
+        text: &[u8],
+        part_start: u64,
+        at: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        written: u64
+    ) -> DeanonymizeResult {
+        let separator: bool = is_value_separator(text[at]);
+        transition separator {
+            true -> emit_part(text, part_start, at, end, format, is_big_endian, element_size, is_signed, out, written)
+            false -> bound_part(text, part_start, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)), end, format, is_big_endian, element_size, is_signed, out, written)
+        }
+    }
+    state emit_part(
+        text: &[u8],
+        part_start: u64,
+        part_end: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        written: u64
+    ) -> DeanonymizeResult {
+        transition (((written as u64 in Wrapping) + (element_size as u64 in Wrapping))) <= out.len {
+            true -> parse_part(text, part_start, part_end, end, format, is_big_endian, element_size, is_signed, out, written)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state parse_part(
+        text: &[u8],
+        part_start: u64,
+        part_end: u64,
+        end: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        written: u64
+    ) -> DeanonymizeResult {
+        let parsed: DeanonymizeResult = deanonymize_single(text, part_start, part_end, format, is_big_endian, element_size, is_signed, out, written);
+        transition parsed {
+            DeanonymizeResult::Bytes { count } -> parse_parts(text, part_end, end, format, is_big_endian, element_size, is_signed, out, ((written as u64 in Wrapping) + (count as u64 in Wrapping)))
+            DeanonymizeResult::Error { error } -> (DeanonymizeResult::Error { error: error })
+        }
+    }
+    // ArrayFixed entry: count parts first, gated on the expected length.
+    state count_fixed(
+        text: &[u8],
+        at: u64,
+        end: u64,
+        expected: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8]
+    ) -> DeanonymizeResult {
+        transition { _ -> find_part(text, at, end, format, is_big_endian, element_size, is_signed, out, 0, expected) }
+    }
+}
+
+// Upstream deanonymize_single<T>: the per-format parse for one element.
+// Binary goes through binary_to_primitive_aligned_bytes, Address and
+// Hexadecimal through the hex equivalent, and every remaining format is the
+// upstream `_` arm — str::parse::<T>() decimal. The produced byte count is
+// asserted against the primitive width exactly as upstream does.
+machine deanonymize_single(
+    text: &[u8],
+    start: u64,
+    end: u64,
+    format: AnonymousValueStringFormat,
+    is_big_endian: bool,
+    element_size: u64,
+    is_signed: bool,
+    out: &mut [u8],
+    out_position: u64
+) -> DeanonymizeResult {
+    transition {
+        _ -> route(format, text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+    }
+    state route(
+        format: AnonymousValueStringFormat,
+        text: &[u8],
+        start: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition format {
+            AnonymousValueStringFormat::Binary -> via_binary(text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+            AnonymousValueStringFormat::Address -> via_hexadecimal(text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+            AnonymousValueStringFormat::Hexadecimal -> via_hexadecimal(text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+            _ -> via_decimal(text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+        }
+    }
+    state via_binary(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        let maximum: u64 = max_value_for(element_size, is_signed);
+        let mut primitive_bytes: [u8; 8];
+        let converted: ConversionResult = ConversionsFromBinary::binary_to_primitive_aligned_bytes(
+            text,
+            start,
+            end,
+            is_big_endian,
+            element_size,
+            maximum,
+            &mut primitive_bytes
+        );
+        transition converted {
+            ConversionResult::Ok { count } -> check_width(count, primitive_bytes, element_size, out, out_position)
+            ConversionResult::Error { error } -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state via_hexadecimal(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        let maximum: u64 = max_value_for(element_size, is_signed);
+        let mut primitive_bytes: [u8; 8];
+        let converted: ConversionResult = ConversionsFromHexadecimal::hex_to_primitive_aligned_bytes(
+            text,
+            start,
+            end,
+            is_big_endian,
+            element_size,
+            maximum,
+            &mut primitive_bytes
+        );
+        transition converted {
+            ConversionResult::Ok { count } -> check_width(count, primitive_bytes, element_size, out, out_position)
+            ConversionResult::Error { error } -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    // Upstream asserts value_bytes.len >= primitive_size after the aligned
+    // conversion — the aligned path emits exactly primitive_size bytes.
+    state check_width(
+        count: u64,
+        primitive_bytes: [u8; 8],
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition count >= element_size {
+            true -> copy_bytes(primitive_bytes, element_size, out, out_position, 0)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state copy_bytes(
+        primitive_bytes: [u8; 8],
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64,
+        index: u64
+    ) -> DeanonymizeResult {
+        let target: u64 = ((out_position as u64 in Wrapping) + (index as u64 in Wrapping));
+        transition index < element_size && index < 8 && target < out.len {
+            true -> store_byte(primitive_bytes, element_size, out, target, index)
+            false -> done(element_size, index)
+        }
+    }
+    state store_byte(
+        primitive_bytes: [u8; 8],
+        element_size: u64,
+        out: &mut [u8],
+        target: u64,
+        index: u64
+    ) -> DeanonymizeResult {
+        out[target] = primitive_bytes[index];
+        transition {
+            _ -> copy_bytes_next(primitive_bytes, element_size, out, target, index)
+        }
+    }
+    state copy_bytes_next(
+        primitive_bytes: [u8; 8],
+        element_size: u64,
+        out: &mut [u8],
+        target: u64,
+        index: u64
+    ) -> DeanonymizeResult {
+        let out_position: u64 = (((target as u64 in Wrapping) - (index as u64 in Wrapping)) as u64);
+        transition {
+            _ -> copy_bytes(primitive_bytes, element_size, out, out_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+    state done(element_size: u64, index: u64) -> DeanonymizeResult {
+        transition index == element_size {
+            true -> (DeanonymizeResult::Bytes { count: element_size })
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    // Upstream `value_string.parse::<T>()` for decimal: a leading '-' is
+    // accepted only for signed types, '+' for both; magnitude is bounded by
+    // the type's range (signed negatives reach |min| = max+1); the parsed
+    // value emits element_size bytes little- or big-endian.
+    state via_decimal(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition start < end && start < text.len {
+            true -> sign(text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state sign(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition text[start] == 45 {
+            true -> negative_sign(text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+            false -> positive_sign(text, start, end, is_big_endian, element_size, is_signed, out, out_position)
+        }
+    }
+    state negative_sign(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition is_signed {
+            true -> digits(text, ((start as u64 in Wrapping) + (1 as u64 in Wrapping)), end, is_big_endian, element_size, is_signed, true, 0, false, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state positive_sign(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition text[start] == 43 {
+            true -> digits(text, ((start as u64 in Wrapping) + (1 as u64 in Wrapping)), end, is_big_endian, element_size, is_signed, false, 0, false, out, out_position)
+            false -> digits(text, start, end, is_big_endian, element_size, is_signed, false, 0, false, out, out_position)
+        }
+    }
+    // Magnitude accumulate; bound checked against the signed/unsigned range
+    // edge (negative magnitude may reach max+1, the type's |min|).
+    state digits(
+        text: &[u8],
+        position: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        negative: bool,
+        magnitude: u64,
+        saw_digit: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition position < end && position < text.len {
+            true -> digit_at(text, position, end, is_big_endian, element_size, is_signed, negative, magnitude, saw_digit, out, out_position)
+            false -> magnitude_check(text, is_big_endian, element_size, is_signed, negative, magnitude, saw_digit, out, out_position)
+        }
+    }
+    state digit_at(
+        text: &[u8],
+        position: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        negative: bool,
+        magnitude: u64,
+        saw_digit: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        let byte: u8 = text[position];
+        transition byte >= 48 && byte <= 57 {
+            true -> accumulate(text, position, end, is_big_endian, element_size, is_signed, negative, magnitude, ((byte as u64 in Wrapping) - (48 as u64 in Wrapping)), out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state accumulate(
+        text: &[u8],
+        position: u64,
+        end: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        negative: bool,
+        magnitude: u64,
+        digit: u64,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        let limit_diff: u64 = ((18446744073709551615 as u64 in Wrapping) - (digit as u64 in Wrapping));
+        let limit: u64 = limit_diff / 10;
+        let next_magnitude: u64 = (((magnitude as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64 in Wrapping) + (digit as u64 in Wrapping);
+        transition magnitude <= limit {
+            true -> digits(text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)), end, is_big_endian, element_size, is_signed, negative, next_magnitude, true, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state magnitude_check(
+        text: &[u8],
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        negative: bool,
+        magnitude: u64,
+        saw_digit: bool,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        let maximum: u64 = max_value_for(element_size, is_signed);
+        transition saw_digit {
+            true -> bound(magnitude, negative, is_signed, maximum, is_big_endian, element_size, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state bound(
+        magnitude: u64,
+        negative: bool,
+        is_signed: bool,
+        maximum: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        // Signed negatives may be one past the signed max (i8 min = -128);
+        // is_signed keeps the maximum+1 computation away from the unsigned
+        // u64 edge where maximum is already u64::MAX.
+        transition is_signed && negative {
+            true -> within_negative(magnitude, maximum, is_big_endian, element_size, out, out_position)
+            false -> within_other(magnitude, maximum, is_big_endian, element_size, out, out_position)
+        }
+    }
+    state within_negative(
+        magnitude: u64,
+        maximum: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition magnitude <= (((maximum as u64 in Wrapping) + (1 as u64 in Wrapping))) {
+            true -> negate(magnitude, true, is_big_endian, element_size, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state within_other(
+        magnitude: u64,
+        maximum: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        transition magnitude <= maximum {
+            true -> negate(magnitude, false, is_big_endian, element_size, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    // Two's-complement the magnitude for negatives, then emit width bytes.
+    state negate(
+        magnitude: u64,
+        negative: bool,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64
+    ) -> DeanonymizeResult {
+        let negated: u64 = ((0 as u64 in Wrapping) - (magnitude as u64 in Wrapping));
+        transition negative {
+            true -> emit_bytes(negated, is_big_endian, element_size, out, out_position, 0)
+            false -> emit_bytes(magnitude, is_big_endian, element_size, out, out_position, 0)
+        }
+    }
+    // LE: out[i] = byte i of the value (low first); BE: out[i] = byte
+    // size-1-i (high first) — to_le_bytes / to_be_bytes of the parsed value.
+    state emit_bytes(
+        value: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64,
+        index: u64
+    ) -> DeanonymizeResult {
+        transition index < element_size && (((out_position as u64 in Wrapping) + (index as u64 in Wrapping))) < out.len {
+            true -> emit_byte(value, is_big_endian, element_size, out, out_position, index)
+            false -> emit_done(index, element_size)
+        }
+    }
+    state emit_byte(
+        value: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64,
+        index: u64
+    ) -> DeanonymizeResult {
+        let be_slot: u64 = (((element_size as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64 in Wrapping) - (index as u64 in Wrapping);
+        let be_shift: u64 = ((be_slot as u64 in Wrapping) * (8 as u64 in Wrapping));
+        let le_shift: u64 = ((index as u64 in Wrapping) * (8 as u64 in Wrapping));
+        transition is_big_endian {
+            true -> emit_be_check(value, be_shift, is_big_endian, element_size, out, out_position, index)
+            false -> emit_le_check(value, le_shift, is_big_endian, element_size, out, out_position, index)
+        }
+    }
+    state emit_be_check(
+        value: u64,
+        shift: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64,
+        index: u64
+    ) -> DeanonymizeResult {
+        let target: u64 = ((out_position as u64 in Wrapping) + (index as u64 in Wrapping));
+        transition target < out.len {
+            true -> emit_byte_at(value, shift, is_big_endian, element_size, out, out_position, index, target)
+            false -> emit_done(index, element_size)
+        }
+    }
+    state emit_le_check(
+        value: u64,
+        shift: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64,
+        index: u64
+    ) -> DeanonymizeResult {
+        let target: u64 = ((out_position as u64 in Wrapping) + (index as u64 in Wrapping));
+        transition target < out.len {
+            true -> emit_byte_le(value, shift, is_big_endian, element_size, out, out_position, index, target)
+            false -> emit_done(index, element_size)
+        }
+    }
+    state emit_byte_le(
+        value: u64,
+        shift: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64,
+        index: u64,
+        target: u64
+    ) -> DeanonymizeResult {
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping))) % 256;
+        out[target] = (byte as u8);
+        transition {
+            _ -> emit_bytes(value, is_big_endian, element_size, out, out_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+    state emit_byte_at(
+        value: u64,
+        shift: u64,
+        is_big_endian: bool,
+        element_size: u64,
+        out: &mut [u8],
+        out_position: u64,
+        index: u64,
+        target: u64
+    ) -> DeanonymizeResult {
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping))) % 256;
+        out[target] = (byte as u8);
+        transition {
+            _ -> emit_bytes(value, is_big_endian, element_size, out, out_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)))
+        }
+    }
+    state emit_done(index: u64, element_size: u64) -> DeanonymizeResult {
+        transition index == element_size {
+            true -> (DeanonymizeResult::Bytes { count: element_size })
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+}
+
+// Read one element of `element_size` bytes at `offset` as an integer (the
+// upstream T::as_bits bit view; float elements load their bit pattern the
+// same way). LE reads low byte first, BE high byte first.
+machine load_element(value_bytes: &[u8], offset: u64, element_size: u64, is_big_endian: bool) -> u64 {
+    transition {
+        _ -> accumulate(value_bytes, offset, element_size, is_big_endian, 0, 0)
+    }
+    state accumulate(
+        value_bytes: &[u8],
+        offset: u64,
+        element_size: u64,
+        is_big_endian: bool,
+        index: u64,
+        value: u64
+    ) -> u64 {
+        let target: u64 = ((offset as u64 in Wrapping) + (index as u64 in Wrapping));
+        transition index < element_size && target < value_bytes.len {
+            true -> load_byte(value_bytes, offset, element_size, is_big_endian, index, value, target)
+            false -> (value)
+        }
+    }
+    state load_byte(
+        value_bytes: &[u8],
+        offset: u64,
+        element_size: u64,
+        is_big_endian: bool,
+        index: u64,
+        value: u64,
+        target: u64
+    ) -> u64 {
+        let byte: u8 = value_bytes[target];
+        let index_bits: u64 = (((index as u64 in Wrapping) * (8 as u64 in Wrapping)));
+        let place: u64 = (((1 as u64 in Wrapping) << (index_bits as u64 in Wrapping)));
+        let shifted_byte: u64 = (((byte as u64 in Wrapping) * (place as u64 in Wrapping)));
+        let be_sum: u64 = ((((value as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64 in Wrapping) + (byte as u64 in Wrapping));
+        let le_sum: u64 = (((value as u64 in Wrapping) + (shifted_byte as u64 in Wrapping)));
+        transition is_big_endian {
+            true -> accumulate(
+                value_bytes,
+                offset,
+                element_size,
+                is_big_endian,
+                ((index as u64 in Wrapping) + (1 as u64 in Wrapping)),
+                be_sum
+            )
+            false -> accumulate(
+                value_bytes,
+                offset,
+                element_size,
+                is_big_endian,
+                ((index as u64 in Wrapping) + (1 as u64 in Wrapping)),
+                le_sum
+            )
+        }
+    }
+}
+
+// Upstream anonymize<T>: chunk value_bytes into element_size elements
+// (chunks_exact — a trailing partial chunk is dropped, upstream semantics),
+// format each by the requested format — Binary is the unpadded {:b}, Address
+// and Hexadecimal the uppercase {:X}, and every other format the decimal
+// value.to_string() which re-interprets signed elements (an i8 of 0xFF
+// prints "-1") — join with ", ", and wrap in an AnonymousValueString whose
+// container is ArrayFixed(count) when more than one element was emitted.
+pub machine PrimitiveDataTypeNumeric::anonymize(
+    &self,
+    value_bytes: &[u8],
+    element_size: u64,
+    is_signed: bool,
+    is_big_endian: bool,
+    anonymous_value_string_format: AnonymousValueStringFormat,
+    out_text: &mut [u8]
+) -> AnonymizeResult {
+    transition element_size >= 1 && element_size <= 8 {
+        true -> chunk(value_bytes, element_size, is_signed, is_big_endian, anonymous_value_string_format, out_text, 0, 0, 0)
+        false -> (AnonymizeResult::Error {
+            error: DataTypeError::InvalidByteCount { expected: element_size, actual: 0 }
+        })
+    }
+    state chunk(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64
+    ) -> AnonymizeResult {
+        transition ((offset as u64 in Wrapping) + (element_size as u64 in Wrapping)) <= value_bytes.len {
+            true -> separator(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count)
+            false -> finish(out_text, position, format, count)
+        }
+    }
+    // The ", " joiner precedes every element after the first.
+    state separator(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64
+    ) -> AnonymizeResult {
+        transition count > 0 {
+            true -> write_separator(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count)
+            false -> element(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count)
+        }
+    }
+    state write_separator(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64
+    ) -> AnonymizeResult {
+        let second: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping));
+        let after_separator: u64 = ((second as u64 in Wrapping) + (1 as u64 in Wrapping));
+        transition position < out_text.len && second < out_text.len && after_separator <= out_text.len {
+            true -> store_separator(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, second, count)
+            false -> (AnonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state store_separator(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        second: u64,
+        count: u64
+    ) -> AnonymizeResult {
+        out_text[position] = 44;
+        out_text[second] = 32;
+        let after_separator: u64 = ((second as u64 in Wrapping) + (1 as u64 in Wrapping));
+        transition {
+            _ -> element(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, after_separator, count)
+        }
+    }
+    state element(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64
+    ) -> AnonymizeResult {
+        let value: u64 = load_element(value_bytes, offset, element_size, is_big_endian);
+        transition format {
+            AnonymousValueStringFormat::Binary -> emit_element(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count, value, 2, false)
+            AnonymousValueStringFormat::Address -> emit_element(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count, value, 16, true)
+            AnonymousValueStringFormat::Hexadecimal -> emit_element(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count, value, 16, true)
+            _ -> sign_of(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count, value)
+        }
+    }
+    // Upstream's `_` arm: value.to_string() — signed elements re-interpret
+    // the width's top bit and print "-magnitude"; unsigned print as-is.
+    state sign_of(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64,
+        value: u64
+    ) -> AnonymizeResult {
+        let bit_index: u64 = ((((element_size as u64 in Wrapping) * (8 as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping));
+        let sign_bit: u64 = (((value as u64 in Wrapping) >> (bit_index as u64 in Wrapping))) % 2;
+        transition is_signed && sign_bit == 1 {
+            true -> minus(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count, value)
+            false -> emit_element(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count, value, 10, false)
+        }
+    }
+    state minus(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64,
+        value: u64
+    ) -> AnonymizeResult {
+        transition position < out_text.len {
+            true -> store_minus(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, position, count, value)
+            false -> (AnonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state store_minus(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64,
+        value: u64
+    ) -> AnonymizeResult {
+        out_text[position] = 45;
+        // Width-bounded two's complement: (0 - value) truncated to the
+        // element's width is the printed magnitude.
+        let width_max: u64 = unsigned_max(element_size);
+        let magnitude: u64 = ((((0 as u64 in Wrapping) - (value as u64 in Wrapping)) as u64 in Wrapping) & (width_max as u64 in Wrapping));
+        transition {
+            _ -> emit_element(value_bytes, element_size, is_signed, is_big_endian, format, out_text, offset, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)), count, magnitude, 10, false)
+        }
+    }
+    state emit_element(
+        value_bytes: &[u8],
+        element_size: u64,
+        is_signed: bool,
+        is_big_endian: bool,
+        format: AnonymousValueStringFormat,
+        out_text: &mut [u8],
+        offset: u64,
+        position: u64,
+        count: u64,
+        value: u64,
+        base: u64,
+        uppercase: bool
+    ) -> AnonymizeResult {
+        let written: u64 = BaseSystemConversions::emit_radix(value, base, uppercase, out_text, position);
+        transition written > 0 {
+            true -> chunk(value_bytes, element_size, is_signed, is_big_endian, format, out_text, ((offset as u64 in Wrapping) + (element_size as u64 in Wrapping)), ((position as u64 in Wrapping) + (written as u64 in Wrapping)), ((count as u64 in Wrapping) + (1 as u64 in Wrapping)))
+            false -> (AnonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    // ContainerType::None for a single element, ArrayFixed otherwise — the
+    // upstream `result_strings.len() > 1` rule.
+    state finish(
+        out_text: &mut [u8],
+        position: u64,
+        format: AnonymousValueStringFormat,
+        count: u64
+    ) -> AnonymizeResult {
+        transition count > 1 {
+            true -> finish_fixed(out_text, position, format, count)
+            false -> finish_single(out_text, position, format)
+        }
+    }
+    state finish_fixed(out_text: &mut [u8], position: u64, format: AnonymousValueStringFormat, count: u64) -> AnonymizeResult {
+        transition position < out_text.len {
+            true -> build_fixed(out_text, position, format, count)
+            false -> finish_fixed_full(out_text, position, format, count)
+        }
+    }
+    state finish_fixed_full(out_text: &mut [u8], position: u64, format: AnonymousValueStringFormat, count: u64) -> AnonymizeResult {
+        transition position == out_text.len {
+            true -> build_fixed_full(out_text, format, count)
+            false -> (AnonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    // position == out_text.len: the whole buffer is the value text.
+    state build_fixed_full(out_text: &mut [u8], format: AnonymousValueStringFormat, count: u64) -> AnonymizeResult {
+        let built: AnonymousValueString = AnonymousValueString::new(&out_text, format, ContainerType::ArrayFixed { length: count });
+        (AnonymizeResult::Text { value: built })
+    }
+    state finish_single(out_text: &mut [u8], position: u64, format: AnonymousValueStringFormat) -> AnonymizeResult {
+        transition position < out_text.len {
+            true -> build_single(out_text, position, format)
+            false -> finish_single_full(out_text, position, format)
+        }
+    }
+    state finish_single_full(out_text: &mut [u8], position: u64, format: AnonymousValueStringFormat) -> AnonymizeResult {
+        transition position == out_text.len {
+            true -> build_single_full(out_text, format)
+            false -> (AnonymizeResult::Error { error: DataTypeError::ParseError })
+        }
+    }
+    state build_single_full(out_text: &mut [u8], format: AnonymousValueStringFormat) -> AnonymizeResult {
+        let built: AnonymousValueString = AnonymousValueString::new(&out_text, format, ContainerType::None);
+        (AnonymizeResult::Text { value: built })
+    }
+    state build_fixed(
+        out_text: &mut [u8],
+        position: u64 [0..=out_text.len],
+        format: AnonymousValueStringFormat,
+        count: u64
+    ) -> AnonymizeResult {
+        let built: AnonymousValueString = AnonymousValueString::new(&out_text[0..position], format, ContainerType::ArrayFixed { length: count });
+        (AnonymizeResult::Text { value: built })
+    }
+    state build_single(out_text: &mut [u8], position: u64 [0..=out_text.len], format: AnonymousValueStringFormat) -> AnonymizeResult {
+        let built: AnonymousValueString = AnonymousValueString::new(&out_text[0..position], format, ContainerType::None);
+        (AnonymizeResult::Text { value: built })
+    }
+}
