@@ -3,6 +3,7 @@ module src::structures::scanning::filters::snapshot_region_filter_collection;
 use src::structures::data_types::data_type_ref::DataTypeRef;
 use src::structures::memory::memory_alignment::MemoryAlignment;
 use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::structures::snapshots::deleted_scan_result_index_set::DeletedScanResultIndexSet;
 
 // Port of structures/scanning/filters/snapshot_region_filter_collection.rs:
 // the filters (scan results) one data type owns inside a snapshot region.
@@ -414,4 +415,278 @@ crashes Abort
             false -> scan(((filter_index as u64 in Wrapping) + 1) as u64, remaining - elements)
         }
     }
+}
+
+// Flat result index of an element within a filter — the sum of the element
+// counts of the filters before it plus the element's own index. Upstream's
+// `collection_result_indices` seek target and `remove_results_at_indices`
+// indexing both work in this flat space.
+pub machine SnapshotRegionFilterCollection::flat_result_index(
+    &self,
+    filter_index: u64,
+    element_index: u64
+) -> u64
+crashes Abort
+{
+    transition { _ -> total(0, element_index, filter_index) }
+    state total(&self, position: u64, count: u64, filter_index: u64) -> u64 {
+        transition position < filter_index && position < self.filter_count && position < 64 {
+            true -> add(position, count, filter_index)
+            false -> (count)
+        }
+    }
+    state add(&self, position: u64, count: u64, filter_index: u64) -> u64 {
+        let elements: u64 = self.snapshot_region_filters[position].get_element_count(
+            self.result_value_size_in_bytes, self.memory_alignment);
+        transition { _ -> total(((position as u64 in Wrapping) + 1) as u64,
+            ((count as u64 in Saturating) + (elements as u64 in Saturating)) as u64,
+            filter_index) }
+    }
+}
+
+// Upstream `remove_results_at_indices`: rebuilds the collection with the
+// deleted flat result indices excised — each kept span becomes a new
+// filter (upstream `push_filter_segments_after_deletions` /
+// `create_filter_segment`), so surviving results stay address ranges, not
+// per-result objects. Deleted indices arrive sorted and unique — the set
+// type guarantees both upstream properties (`sort_unstable` + `dedup`).
+pub machine SnapshotRegionFilterCollection::remove_results_at_indices(
+    &self,
+    deleted_result_indices: &DeletedScanResultIndexSet
+) -> SnapshotRegionFilterCollection
+crashes Abort
+{
+    transition deleted_result_indices.count == 0 {
+        true -> (SnapshotRegionFilterCollection::clone(self))
+        false -> begin(deleted_result_indices)
+    }
+    state begin(&self, deleted_result_indices: &DeletedScanResultIndexSet) -> SnapshotRegionFilterCollection {
+        let mut rebuilt: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(
+            DataTypeRef::clone(&self.data_type_ref),
+            self.memory_alignment,
+            self.result_value_size_in_bytes);
+        transition { _ -> each_filter(&mut rebuilt, deleted_result_indices, 0, 0) }
+    }
+    // filter_index walks the filters; flat_base is the current filter's
+    // first flat result index across the collection.
+    state each_filter(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64
+    ) -> SnapshotRegionFilterCollection {
+        transition filter_index < self.filter_count && filter_index < 64 {
+            true -> within(rebuilt, deleted_result_indices, filter_index, flat_base)
+            false -> (SnapshotRegionFilterCollection::clone(rebuilt))
+        }
+    }
+    state within(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64
+    ) -> SnapshotRegionFilterCollection {
+        let filter_results: u64 = self.snapshot_region_filters[filter_index].get_element_count(
+            self.result_value_size_in_bytes, self.memory_alignment);
+        transition { _ -> segment(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results, 0, 0) }
+    }
+    // Walks the deleted set once per filter: members before the filter's
+    // flat window are skipped; the first member past it ends the walk;
+    // inside it, kept spans emit as new filters. `kept_start` is the local
+    // (filter-relative) result index the next kept segment begins at.
+    state segment(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        deleted_position: u64,
+        kept_start: u64
+    ) -> SnapshotRegionFilterCollection {
+        transition deleted_position < deleted_result_indices.count && deleted_position < 64 {
+            true -> inspect(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results, deleted_position, kept_start)
+            false -> tail(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results, kept_start)
+        }
+    }
+    state inspect(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        deleted_position: u64 [0..64],
+        kept_start: u64
+    ) -> SnapshotRegionFilterCollection {
+        let deleted_flat: u64 = deleted_result_indices.indices[deleted_position];
+        transition deleted_flat < flat_base {
+            true -> segment(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results,
+                deleted_position + 1, kept_start)
+            false -> upper(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results,
+                deleted_position, kept_start, deleted_flat)
+        }
+    }
+    state upper(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        deleted_position: u64 [0..64],
+        kept_start: u64,
+        deleted_flat: u64
+    ) -> SnapshotRegionFilterCollection {
+        let filter_flat_end: u64 = ((flat_base as u64 in Saturating) + (filter_results as u64 in Saturating)) as u64;
+        transition deleted_flat >= filter_flat_end {
+            true -> tail(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results, kept_start)
+            false -> excise(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results,
+                deleted_position, kept_start, deleted_flat)
+        }
+    }
+    state excise(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        deleted_position: u64 [0..64],
+        kept_start: u64,
+        deleted_flat: u64
+    ) -> SnapshotRegionFilterCollection {
+        let deleted_local: u64 = ((deleted_flat as u64 in Saturating) - (flat_base as u64 in Saturating)) as u64;
+        transition deleted_local > kept_start {
+            true -> emit(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results,
+                deleted_position, kept_start, deleted_local)
+            false -> excised(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results,
+                deleted_position, deleted_local)
+        }
+    }
+    state emit(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        deleted_position: u64 [0..64],
+        kept_start: u64,
+        deleted_local: u64
+    ) -> SnapshotRegionFilterCollection {
+        let segment: SnapshotRegionFilter = self.create_filter_segment(
+            filter_index, kept_start,
+            ((deleted_local as u64 in Saturating) - (kept_start as u64 in Saturating)) as u64);
+        let pushed: bool = rebuilt.push_filter(&segment);
+        transition { _ -> excised(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results,
+            deleted_position, deleted_local) }
+    }
+    state excised(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        deleted_position: u64,
+        deleted_local: u64
+    ) -> SnapshotRegionFilterCollection {
+        transition { _ -> segment(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results,
+            deleted_position + 1,
+            ((deleted_local as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+    // No more deletions inside this filter — emit the trailing kept span
+    // (or the whole filter untouched when nothing was excised).
+    state tail(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        kept_start: u64
+    ) -> SnapshotRegionFilterCollection {
+        transition kept_start < filter_results {
+            true -> emit_tail(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results, kept_start)
+            false -> advance(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results)
+        }
+    }
+    state emit_tail(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        kept_start: u64
+    ) -> SnapshotRegionFilterCollection {
+        transition kept_start == 0 {
+            true -> keep_whole(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results)
+            false -> push_tail(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results, kept_start)
+        }
+    }
+    state keep_whole(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64
+    ) -> SnapshotRegionFilterCollection {
+        let filter: SnapshotRegionFilter = self.get_filter(filter_index);
+        let pushed: bool = rebuilt.push_filter(&filter);
+        transition { _ -> advance(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results) }
+    }
+    state push_tail(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64,
+        kept_start: u64
+    ) -> SnapshotRegionFilterCollection {
+        let segment: SnapshotRegionFilter = self.create_filter_segment(
+            filter_index, kept_start,
+            ((filter_results as u64 in Saturating) - (kept_start as u64 in Saturating)) as u64);
+        let pushed: bool = rebuilt.push_filter(&segment);
+        transition { _ -> advance(rebuilt, deleted_result_indices, filter_index, flat_base, filter_results) }
+    }
+    state advance(
+        &self,
+        rebuilt: &mut SnapshotRegionFilterCollection,
+        deleted_result_indices: &DeletedScanResultIndexSet,
+        filter_index: u64,
+        flat_base: u64,
+        filter_results: u64
+    ) -> SnapshotRegionFilterCollection {
+        transition { _ -> each_filter(rebuilt, deleted_result_indices,
+            ((filter_index as u64 in Wrapping) + 1) as u64,
+            ((flat_base as u64 in Saturating) + (filter_results as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `create_filter_segment`: the filter covering `segment_result_count`
+// consecutive results starting `segment_start_result_index` elements into the
+// source filter — base advances by index*alignment, size is
+// value_size + (count-1)*alignment (the inverse of `get_element_count`).
+machine SnapshotRegionFilterCollection::create_filter_segment(
+    &self,
+    filter_index: u64,
+    segment_start_result_index: u64,
+    segment_result_count: u64
+) -> SnapshotRegionFilter
+crashes Abort
+{
+    let filter: SnapshotRegionFilter = self.get_filter(filter_index);
+    let alignment_bytes: u64 [1..=8] = self.memory_alignment.get_size_in_bytes();
+    let segment_base: u64 = ((filter.get_base_address() as u64 in Saturating)
+        + ((segment_start_result_index as u64 in Saturating) * (alignment_bytes as u64 in Saturating))) as u64;
+    let segment_size: u64 = ((self.result_value_size_in_bytes as u64 in Saturating)
+        + (((segment_result_count as u64 in Saturating) - (1 as u64 in Saturating))
+            * (alignment_bytes as u64 in Saturating))) as u64;
+    SnapshotRegionFilter::new(segment_base, segment_size)
 }
