@@ -1,26 +1,42 @@
 module src::structures::snapshots::snapshot;
 
 use src::structures::memory::normalized_region;
+use src::structures::results::snapshot_region_scan_results::DataTypeResultCounts;
+use src::structures::results::snapshot_region_scan_results::ScanResultAddresses;
+use src::structures::scan_results::scan_result_valued::ScanResultValued;
+use src::structures::results::snapshot_region_scan_results::ScanResultValuedList;
+use src::structures::results::snapshot_region_scan_results::ScanResultsPage;
 use src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
+use src::structures::results::snapshot_region_scan_results::StructuralResult;
+use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use src::structures::snapshots::deleted_scan_result_index_set::DeletedScanResultIndexSet;
 use src::structures::snapshots::element_window::ElementWindow;
 use src::structures::snapshots::snapshot_region::DataTypeRefSet;
 use src::structures::snapshots::snapshot_region::SnapshotRegion;
+use src::structures::data_types::data_type_ref::DataTypeRef;
 use src::structures::memory::memory_alignment::MemoryAlignment;
 
 // Port of structures/snapshots/snapshot.rs: the ordered set of regions a
-// scan operates over. Upstream holds `Vec<SnapshotRegion>` plus a
-// `deleted_scan_result_indices` set; the port bounds regions at 1 — the
-// supplied-snapshot leg needs one and the native backend caps
-// structural types at 64KiB (one region is already ~23KiB) — named
-// deviation, see tools/native_probe_resume.md. The deleted-index set ships
-// with the delete command leg; until then results stay append-only.
+// scan operates over, plus the tombstone set of manually deleted global
+// scan-result indices. Upstream holds `Vec<SnapshotRegion>` plus a
+// `BTreeSet<u64>`; the port bounds regions at 1 — the supplied-snapshot
+// leg needs one and the native backend caps structural types at 64KiB
+// (one region is already ~23KiB) — named deviation, see
+// tools/native_probe_resume.md. The tombstone set is the bounded
+// `DeletedScanResultIndexSet` (64 entries — the CLI delete surface's row
+// selection bound; same named deviation family as PageElementList).
 pub data Snapshot {
     regions: [SnapshotRegion; 1];
     region_count: u64;
+    deleted_indices: DeletedScanResultIndexSet;
 }
 
 pub machine Snapshot::new() -> Snapshot {
-    Snapshot { region_count: 0 }
+    Snapshot {
+        region_count: 0,
+        deleted_indices: DeletedScanResultIndexSet::empty(),
+    }
 }
 
 pub machine Snapshot::get_region_count(&self) -> u64 {
@@ -209,6 +225,7 @@ pub machine Snapshot::clone(source: &Snapshot) -> Snapshot {
 
 pub machine Snapshot::clone_from(&mut self, source: &Snapshot) {
     self.region_count = source.region_count;
+    self.deleted_indices.clone_from(&source.deleted_indices);
     transition { _ -> copy(source, 0) }
     state copy(&mut self, source: &Snapshot, position: u64) {
         transition position < source.region_count && position < 1 {
@@ -240,5 +257,439 @@ pub machine Snapshot::get_collected_byte_count(&self) -> u64 {
         let next_total: u64 = ((total as u64 in Saturating)
             + (self.regions[position].get_collected_byte_count() as u64 in Saturating)) as u64;
         transition { _ -> each(position + 1, next_total) }
+    }
+}
+
+// ————— Scan-results materialization + tombstones —————
+// Upstream `Snapshot`'s result surface: the deleted-index tombstone set,
+// the visibility-adjusted counts, the address-ascending global page merge,
+// and the delete/commit lifecycle that rewrites filters so tombstones
+// become structural.
+
+// Upstream `get_scan_result`: the result at a global merged-order index —
+// tombstoned and out-of-range indices both answer Missing (upstream's
+// Option is the `StructuralResult` union).
+pub machine Snapshot::get_scan_result(
+    &self,
+    global_scan_result_index: u64
+) -> StructuralResult
+crashes Abort
+{
+    transition self.deleted_indices.contains(global_scan_result_index) {
+        true -> (StructuralResult::Missing)
+        false -> seek(0, global_scan_result_index, global_scan_result_index)
+    }
+    state seek(&self, position: u64, global_index: u64, local_index: u64) -> StructuralResult {
+        transition position < self.region_count && position < 1 {
+            true -> within(position, global_index, local_index)
+            false -> (StructuralResult::Missing)
+        }
+    }
+    state within(&self, position: u64 [0..1], global_index: u64, local_index: u64) -> StructuralResult {
+        let results: SnapshotRegionScanResults = self.regions[position].get_scan_results();
+        let region_results: u64 = results.get_number_of_results();
+        transition local_index < region_results {
+            true -> found(position, global_index, local_index)
+            false -> seek(position + 1, global_index,
+                ((local_index as u64 in Saturating) - (region_results as u64 in Saturating)) as u64)
+        }
+    }
+    state found(&self, position: u64 [0..1], global_index: u64, local_index: u64) -> StructuralResult {
+        let region: SnapshotRegion = SnapshotRegion::clone(&self.regions[position]);
+        let results: SnapshotRegionScanResults = region.get_scan_results();
+        results.get_structural_scan_result(&region, global_index, local_index)
+    }
+}
+
+// Upstream `delete_scan_results`: mark the provided global indices as
+// tombstones; indices outside the structural result space are skipped and
+// already-deleted indices do not recount.
+pub machine Snapshot::delete_scan_results(
+    &mut self,
+    deleted_scan_result_indices: &DeletedScanResultIndexSet
+) -> u64
+crashes Abort
+{
+    let structural_total: u64 = self.get_structural_number_of_results();
+    transition { _ -> each(deleted_scan_result_indices, structural_total, 0, 0) }
+    state each(&mut self, indices: &DeletedScanResultIndexSet, structural_total: u64, position: u64, deleted: u64) -> u64 {
+        transition position < indices.count && position < 64 {
+            true -> inspect(indices, structural_total, position, deleted)
+            false -> (deleted)
+        }
+    }
+    state inspect(&mut self, indices: &DeletedScanResultIndexSet, structural_total: u64, position: u64 [0..64], deleted: u64) -> u64 {
+        let member: u64 = indices.indices[position];
+        transition member < structural_total {
+            true -> mark(indices, structural_total, position, deleted, member)
+            false -> each(indices, structural_total, position + 1, deleted)
+        }
+    }
+    state mark(&mut self, indices: &DeletedScanResultIndexSet, structural_total: u64, position: u64 [0..64], deleted: u64, member: u64) -> u64 {
+        let fresh: bool = self.deleted_indices.insert(member);
+        transition fresh {
+            true -> each(indices, structural_total, position + 1,
+                ((deleted as u64 in Saturating) + (1 as u64 in Saturating)) as u64)
+            false -> each(indices, structural_total, position + 1, deleted)
+        }
+    }
+}
+
+// Upstream's per-row delete loop callsite — a single-index tombstone.
+pub machine Snapshot::delete_scan_result(&mut self, global_scan_result_index: u64) -> bool
+crashes Abort
+{
+    transition global_scan_result_index < self.get_structural_number_of_results() {
+        true -> (self.deleted_indices.insert(global_scan_result_index))
+        false -> (false)
+    }
+}
+
+// Upstream `clear_deleted_scan_result_indices`.
+pub machine Snapshot::clear_deleted_scan_result_indices(&mut self) {
+    self.deleted_indices.clear();
+}
+
+// Upstream `get_deleted_scan_result_index_count`.
+pub machine Snapshot::get_deleted_scan_result_index_count(&self) -> u64 {
+    self.deleted_indices.get_count()
+}
+
+// Upstream `commit_deleted_scan_result_indices`: rebuild every region's
+// filters so the tombstones become the structural layout, then clear the
+// set. Upstream takes `symbol_registry` — the port's collections carry the
+// resolved `result_value_size_in_bytes`, so no registry is threaded
+// (deviation recorded in the results file).
+pub machine Snapshot::commit_deleted_scan_result_indices(&mut self) -> u64
+crashes Abort
+{
+    transition self.deleted_indices.count == 0 {
+        true -> (0)
+        false -> commit()
+    }
+    state commit(&mut self) -> u64 {
+        let deleted: DeletedScanResultIndexSet = DeletedScanResultIndexSet::clone(&self.deleted_indices);
+        transition { _ -> each(&deleted, 0, 0, 0) }
+    }
+    state each(&mut self, deleted: &DeletedScanResultIndexSet, removed: u64, position: u64, region_base: u64) -> u64 {
+        transition position < self.region_count && position < 1 {
+            true -> excise(deleted, removed, position, region_base)
+            false -> finish(removed)
+        }
+    }
+    state excise(&mut self, deleted: &DeletedScanResultIndexSet, removed: u64, position: u64 [0..1], region_base: u64) -> u64 {
+        let region_results: u64 = self.regions[position].get_scan_results().get_number_of_results();
+        let region_removed: u64 = self.regions[position].remove_scan_results_by_global_indices(region_base, deleted);
+        transition { _ -> each(deleted,
+            ((removed as u64 in Saturating) + (region_removed as u64 in Saturating)) as u64,
+            position + 1,
+            ((region_base as u64 in Saturating) + (region_results as u64 in Saturating)) as u64) }
+    }
+    state finish(&mut self, removed: u64) -> u64 {
+        self.deleted_indices.clear();
+        transition { _ -> (removed) }
+    }
+}
+
+// Upstream `get_structural_number_of_results` — the count before tombstones.
+pub machine Snapshot::get_structural_number_of_results(&self) -> u64
+crashes Abort
+{
+    transition { _ -> each(0, 0) }
+    state each(&self, position: u64, total: u64) -> u64 {
+        transition position < self.region_count && position < 1 {
+            true -> tally(position, total)
+            false -> (total)
+        }
+    }
+    state tally(&self, position: u64 [0..1], total: u64) -> u64 {
+        let region_results: u64 = self.regions[position].get_scan_results().get_number_of_results();
+        transition { _ -> each(position + 1,
+            ((total as u64 in Saturating) + (region_results as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_number_of_results` — the visible count (structural minus
+// tombstones inside each region's global window).
+pub machine Snapshot::get_number_of_results(&self) -> u64
+crashes Abort
+{
+    transition { _ -> each(0, 0, 0) }
+    state each(&self, position: u64, total: u64, region_base: u64) -> u64 {
+        transition position < self.region_count && position < 1 {
+            true -> tally(position, total, region_base)
+            false -> (total)
+        }
+    }
+    state tally(&self, position: u64 [0..1], total: u64, region_base: u64) -> u64 {
+        let results: SnapshotRegionScanResults = self.regions[position].get_scan_results();
+        let structural: u64 = results.get_number_of_results();
+        let visible: u64 = results.get_visible_result_count(region_base, &self.deleted_indices);
+        transition { _ -> each(position + 1,
+            ((total as u64 in Saturating) + (visible as u64 in Saturating)) as u64,
+            ((region_base as u64 in Saturating) + (structural as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_number_of_results_for_data_types` — visible count over the
+// selected data types only.
+pub machine Snapshot::get_number_of_results_for_data_types(
+    &self,
+    filtered_data_types: &DataTypeRefSet
+) -> u64
+crashes Abort
+{
+    transition { _ -> each(0, 0, 0, filtered_data_types) }
+    state each(&self, position: u64, total: u64, region_base: u64, filtered_data_types: &DataTypeRefSet) -> u64 {
+        transition position < self.region_count && position < 1 {
+            true -> tally(position, total, region_base, filtered_data_types)
+            false -> (total)
+        }
+    }
+    state tally(&self, position: u64 [0..1], total: u64, region_base: u64, filtered_data_types: &DataTypeRefSet) -> u64 {
+        let results: SnapshotRegionScanResults = self.regions[position].get_scan_results();
+        let structural: u64 = results.get_number_of_results();
+        let visible: u64 = results.get_visible_result_count_for_data_types(
+            filtered_data_types, region_base, &self.deleted_indices);
+        transition { _ -> each(position + 1,
+            ((total as u64 in Saturating) + (visible as u64 in Saturating)) as u64,
+            ((region_base as u64 in Saturating) + (structural as u64 in Saturating)) as u64,
+            filtered_data_types) }
+    }
+}
+
+// Upstream `get_result_counts_by_data_type` — visible counts merged across
+// regions (same-type entries fold into one tally).
+pub machine Snapshot::get_result_counts_by_data_type(&self) -> DataTypeResultCounts
+crashes Abort
+{
+    let mut merged: DataTypeResultCounts = DataTypeResultCounts::empty();
+    transition { _ -> each(&mut merged, 0, 0) }
+    state each(&self, merged: &mut DataTypeResultCounts, position: u64, region_base: u64) -> DataTypeResultCounts {
+        transition position < self.region_count && position < 1 {
+            true -> fold(merged, position, region_base)
+            false -> (DataTypeResultCounts::clone(merged))
+        }
+    }
+    state fold(&self, merged: &mut DataTypeResultCounts, position: u64 [0..1], region_base: u64) -> DataTypeResultCounts {
+        let results: SnapshotRegionScanResults = self.regions[position].get_scan_results();
+        let structural: u64 = results.get_number_of_results();
+        let region_counts: DataTypeResultCounts = results.get_visible_result_counts_by_data_type(
+            region_base, &self.deleted_indices);
+        merged.merge_from(&region_counts);
+        transition { _ -> each(merged, position + 1,
+            ((region_base as u64 in Saturating) + (structural as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `get_scan_results_page`: one address-ascending page of results
+// across the whole snapshot — page_index clamps to the last real page,
+// skip/capacity walk each region's visible window in order.
+pub machine Snapshot::get_scan_results_page(
+    &self,
+    filtered_data_types: &DataTypeRefSet,
+    page_index: u64,
+    page_size: u64
+) -> ScanResultsPage
+crashes Abort
+{
+    let total_filtered: u64 = self.get_number_of_results_for_data_types(filtered_data_types);
+    transition { _ -> begin(filtered_data_types, page_index, page_size, total_filtered) }
+    state begin(&self, filtered_data_types: &DataTypeRefSet, page_index: u64, page_size: u64, total_filtered: u64) -> ScanResultsPage {
+        let stride: u64 = max(page_size, 1);
+        transition total_filtered == 0 {
+            true -> (ScanResultsPage {
+                effective_page_index: 0,
+                results: ScanResultValuedList::empty(),
+            })
+            false -> clamp(filtered_data_types, page_index, stride, total_filtered)
+        }
+    }
+    state clamp(&self, filtered_data_types: &DataTypeRefSet, page_index: u64, stride: u64, total_filtered: u64) -> ScanResultsPage {
+        let last_page: u64 = ((total_filtered as u64 in Saturating) - (1 as u64 in Saturating)) as u64 / stride;
+        let effective: u64 = min(page_index, last_page);
+        let skip: u64 = ((effective as u64 in Saturating) * (stride as u64 in Saturating)) as u64;
+        let mut out: ScanResultValuedList = ScanResultValuedList::empty();
+        let page: ScanResultsPage = self.walk_regions(
+            filtered_data_types, effective, skip, stride, &mut out, 0, 0);
+        page
+    }
+    state walk_regions(
+        &self,
+        filtered_data_types: &DataTypeRefSet,
+        effective: u64,
+        skip: u64,
+        capacity: u64,
+        out: &mut ScanResultValuedList,
+        position: u64,
+        region_base: u64
+    ) -> ScanResultsPage {
+        transition position < self.region_count && position < 1 && capacity > 0 {
+            true -> inspect(filtered_data_types, effective, skip, capacity, out, position, region_base)
+            false -> (ScanResultsPage { effective_page_index: effective, results: ScanResultValuedList::clone(out) })
+        }
+    }
+    state inspect(
+        &self,
+        filtered_data_types: &DataTypeRefSet,
+        effective: u64,
+        skip: u64,
+        capacity: u64,
+        out: &mut ScanResultValuedList,
+        position: u64 [0..1],
+        region_base: u64
+    ) -> ScanResultsPage {
+        let results: SnapshotRegionScanResults = self.regions[position].get_scan_results();
+        let structural: u64 = results.get_number_of_results();
+        let region_visible: u64 = results.get_visible_result_count_for_data_types(
+            filtered_data_types, region_base, &self.deleted_indices);
+        transition skip >= region_visible {
+            true -> pass(filtered_data_types, effective, skip, capacity, out, position, region_base, structural, region_visible)
+            false -> take(filtered_data_types, effective, skip, capacity, out, position, region_base, structural)
+        }
+    }
+    state pass(
+        &self,
+        filtered_data_types: &DataTypeRefSet,
+        effective: u64,
+        skip: u64,
+        capacity: u64,
+        out: &mut ScanResultValuedList,
+        position: u64 [0..1],
+        region_base: u64,
+        structural: u64,
+        region_visible: u64
+    ) -> ScanResultsPage {
+        transition { _ -> walk_regions(filtered_data_types, effective,
+            ((skip as u64 in Saturating) - (region_visible as u64 in Saturating)) as u64,
+            capacity, out, position + 1,
+            ((region_base as u64 in Saturating) + (structural as u64 in Saturating)) as u64) }
+    }
+    state take(
+        &self,
+        filtered_data_types: &DataTypeRefSet,
+        effective: u64,
+        skip: u64,
+        capacity: u64,
+        out: &mut ScanResultValuedList,
+        position: u64 [0..1],
+        region_base: u64,
+        structural: u64
+    ) -> ScanResultsPage {
+        let region: SnapshotRegion = SnapshotRegion::clone(&self.regions[position]);
+        let results: SnapshotRegionScanResults = region.get_scan_results();
+        let region_page: ScanResultValuedList = results.get_scan_results_page(
+            &region, filtered_data_types, region_base, skip, capacity, &self.deleted_indices);
+        let emitted: u64 = region_page.get_result_count();
+        let mut merged: ScanResultValuedList = region_page;
+        transition { _ -> append(filtered_data_types, effective, capacity, out, position, region_base, structural, emitted, &mut merged, 0) }
+    }
+    state append(
+        &self,
+        filtered_data_types: &DataTypeRefSet,
+        effective: u64,
+        capacity: u64,
+        out: &mut ScanResultValuedList,
+        position: u64 [0..1],
+        region_base: u64,
+        structural: u64,
+        emitted: u64,
+        merged: &mut ScanResultValuedList,
+        element_position: u64
+    ) -> ScanResultsPage {
+        transition element_position < merged.result_count && element_position < 64 {
+            true -> append_one(filtered_data_types, effective, capacity, out, position, region_base, structural, emitted, merged, element_position)
+            false -> advance(filtered_data_types, effective, capacity, out, position, region_base, structural, emitted)
+        }
+    }
+    state append_one(
+        &self,
+        filtered_data_types: &DataTypeRefSet,
+        effective: u64,
+        capacity: u64,
+        out: &mut ScanResultValuedList,
+        position: u64 [0..1],
+        region_base: u64,
+        structural: u64,
+        emitted: u64,
+        merged: &mut ScanResultValuedList,
+        element_position: u64 [0..64]
+    ) -> ScanResultsPage {
+        let valued: ScanResultValued = merged.get(element_position);
+        let pushed: bool = out.push(&valued);
+        transition { _ -> append(filtered_data_types, effective, capacity, out, position, region_base, structural, emitted, merged, element_position + 1) }
+    }
+    state advance(
+        &self,
+        filtered_data_types: &DataTypeRefSet,
+        effective: u64,
+        capacity: u64,
+        out: &mut ScanResultValuedList,
+        position: u64 [0..1],
+        region_base: u64,
+        structural: u64,
+        emitted: u64
+    ) -> ScanResultsPage {
+        transition { _ -> walk_regions(filtered_data_types, effective, 0,
+            ((capacity as u64 in Saturating) - (emitted as u64 in Saturating)) as u64,
+            out, position + 1,
+            ((region_base as u64 in Saturating) + (structural as u64 in Saturating)) as u64) }
+    }
+}
+
+// Upstream `collect_scan_result_addresses_for_data_type`: every surviving
+// result address of one data type, region order then merged order.
+pub machine Snapshot::collect_scan_result_addresses_for_data_type(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> ScanResultAddresses
+crashes Abort
+{
+    let mut out: ScanResultAddresses = ScanResultAddresses::empty();
+    transition { _ -> each(&mut out, data_type_ref, 0) }
+    state each(&self, out: &mut ScanResultAddresses, data_type_ref: &DataTypeRef, position: u64) -> ScanResultAddresses {
+        transition position < self.region_count && position < 1 {
+            true -> within(out, data_type_ref, position)
+            false -> (ScanResultAddresses::clone(out))
+        }
+    }
+    state within(&self, out: &mut ScanResultAddresses, data_type_ref: &DataTypeRef, position: u64 [0..1]) -> ScanResultAddresses {
+        let region: SnapshotRegion = SnapshotRegion::clone(&self.regions[position]);
+        let results: SnapshotRegionScanResults = region.get_scan_results();
+        let collection_index: u64 = results.get_scan_results_by_data_type(data_type_ref);
+        transition collection_index < results.get_collection_count() && collection_index < 4 {
+            true -> collect(out, data_type_ref, position, region, results, collection_index)
+            false -> each(out, data_type_ref, position + 1)
+        }
+    }
+    state collect(&self, out: &mut ScanResultAddresses, data_type_ref: &DataTypeRef, position: u64 [0..1], region: SnapshotRegion, results: SnapshotRegionScanResults, collection_index: u64 [0..4]) -> ScanResultAddresses {
+        let collection: SnapshotRegionFilterCollection = results.get_filter_collection(collection_index);
+        let alignment: u64 = max(collection.get_memory_alignment().get_size_in_bytes(), 1);
+        transition { _ -> each_filter(out, data_type_ref, position, results, collection_index, &collection, alignment, 0) }
+    }
+    state each_filter(&self, out: &mut ScanResultAddresses, data_type_ref: &DataTypeRef, position: u64 [0..1], results: SnapshotRegionScanResults, collection_index: u64 [0..4], collection: &SnapshotRegionFilterCollection, alignment: u64, filter_index: u64) -> ScanResultAddresses {
+        transition filter_index < collection.filter_count && filter_index < 64 {
+            true -> collect_filter(out, data_type_ref, position, results, collection_index, collection, alignment, filter_index)
+            false -> each(out, data_type_ref, position + 1)
+        }
+    }
+    state collect_filter(&self, out: &mut ScanResultAddresses, data_type_ref: &DataTypeRef, position: u64 [0..1], results: SnapshotRegionScanResults, collection_index: u64 [0..4], collection: &SnapshotRegionFilterCollection, alignment: u64, filter_index: u64 [0..64]) -> ScanResultAddresses {
+        let filter: SnapshotRegionFilter = collection.get_filter(filter_index);
+        let filter_base: u64 = filter.get_base_address();
+        let filter_results: u64 = filter.get_element_count(
+            collection.get_result_value_size_in_bytes(), collection.get_memory_alignment());
+        transition { _ -> each_result(out, data_type_ref, position, results, collection_index, collection, alignment, filter_index, filter_base, filter_results, 0) }
+    }
+    state each_result(&self, out: &mut ScanResultAddresses, data_type_ref: &DataTypeRef, position: u64 [0..1], results: SnapshotRegionScanResults, collection_index: u64 [0..4], collection: &SnapshotRegionFilterCollection, alignment: u64, filter_index: u64 [0..64], filter_base: u64, filter_results: u64, result_index: u64) -> ScanResultAddresses {
+        transition result_index < filter_results {
+            true -> push_result(out, data_type_ref, position, results, collection_index, collection, alignment, filter_index, filter_base, filter_results, result_index)
+            false -> each_filter(out, data_type_ref, position, results, collection_index, collection, alignment, filter_index + 1)
+        }
+    }
+    state push_result(&self, out: &mut ScanResultAddresses, data_type_ref: &DataTypeRef, position: u64 [0..1], results: SnapshotRegionScanResults, collection_index: u64 [0..4], collection: &SnapshotRegionFilterCollection, alignment: u64, filter_index: u64 [0..64], filter_base: u64, filter_results: u64, result_index: u64) -> ScanResultAddresses {
+        let address: u64 = ((filter_base as u64 in Saturating)
+            + ((result_index as u64 in Saturating) * (alignment as u64 in Saturating))) as u64;
+        let pushed: bool = out.push(address);
+        transition { _ -> each_result(out, data_type_ref, position, results, collection_index, collection, alignment, filter_index, filter_base, filter_results, result_index + 1) }
     }
 }

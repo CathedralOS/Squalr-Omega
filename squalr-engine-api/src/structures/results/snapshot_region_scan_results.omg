@@ -4,8 +4,14 @@ use src::structures::data_types::data_type_ref::DataTypeRef;
 use src::structures::memory::memory_alignment::MemoryAlignment;
 use src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
 use src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
+use src::structures::scan_results::scan_result_base::ScanResultBase;
 use src::structures::scan_results::scan_result_data_type_count::ScanResultDataTypeCount;
+use src::structures::scan_results::scan_result_ref::ScanResultRef;
+use src::structures::scan_results::scan_result_valued::ScanResultValued;
+use src::structures::snapshots::deleted_scan_result_index_set::DeletedScanResultIndexSet;
 use src::structures::snapshots::snapshot_region::DataTypeRefSet;
+use src::structures::snapshots::snapshot_region::FilterBounds;
+use src::structures::snapshots::snapshot_region::SnapshotRegion;
 
 // Port of structures/results/snapshot_region_scan_results.rs: the per-type
 // filter collections a snapshot region owns. Upstream holds
@@ -254,14 +260,21 @@ pub data ResultCursor {
     collection_index: u64;
     filter_index: u64;
     element_index: u64;
+    // Upstream `ScanResultsPageCursor::is_selected` — set when the cursor's
+    // collection survives the page's data-type filter. `enumerate_page`
+    // only seeds selected cursors; `enumerate_page_deleted` seeds every
+    // non-empty collection and reads this flag per merged element, exactly
+    // as upstream's deleted-aware merge does.
+    selected: bool;
 }
 
-pub machine ResultCursor::active(collection_index: u64) -> ResultCursor {
+pub machine ResultCursor::active(collection_index: u64, selected: bool) -> ResultCursor {
     ResultCursor {
         finished: false,
         collection_index: collection_index,
         filter_index: 0,
         element_index: 0,
+        selected: selected,
     }
 }
 
@@ -271,6 +284,7 @@ pub machine ResultCursor::finished(collection_index: u64) -> ResultCursor {
         collection_index: collection_index,
         filter_index: 0,
         element_index: 0,
+        selected: false,
     }
 }
 
@@ -280,6 +294,7 @@ pub machine ResultCursor::clone(source: &ResultCursor) -> ResultCursor {
         collection_index: source.collection_index,
         filter_index: source.filter_index,
         element_index: source.element_index,
+        selected: source.selected,
     }
 }
 
@@ -288,6 +303,7 @@ pub machine ResultCursor::clone_from(&mut self, source: &ResultCursor) {
     self.collection_index = source.collection_index;
     self.filter_index = source.filter_index;
     self.element_index = source.element_index;
+    self.selected = source.selected;
 }
 
 // Bounded cursor set — one entry per collection slot (MAX_COLLECTIONS = 4).
@@ -305,7 +321,7 @@ pub machine MergeCursors::unfinished() -> MergeCursors {
     }
     state store(out: MergeCursors, position: u64 [0..4]) -> MergeCursors {
         let mut carried: MergeCursors = out;
-        carried.cursors[position] = ResultCursor::active(position);
+        carried.cursors[position] = ResultCursor::active(position, false);
         transition { _ -> fill(carried, position + 1) }
     }
 }
@@ -660,20 +676,21 @@ crashes Abort
         let selected: bool = SnapshotRegionScanResults::is_data_type_in_set(
             &collection.data_type_ref, filtered_data_types);
         transition selected && collection.filter_count > 0 {
-            true -> activate(position, cursors, filtered_data_types, skip, take, page)
+            true -> activate(position, selected, cursors, filtered_data_types, skip, take, page)
             false -> seed(position + 1, cursors, filtered_data_types, skip, take, page)
         }
     }
     state activate(
         &self,
         position: u64 [0..4],
+        selected: bool,
         cursors: &mut MergeCursors,
         filtered_data_types: &DataTypeRefSet,
         skip: u64,
         take: u64,
         page: &mut PageElementList
     ) -> PageElementList {
-        let cursor: ResultCursor = ResultCursor::active(position);
+        let cursor: ResultCursor = ResultCursor::active(position, selected);
         cursors.set_cursor(position, &cursor);
         transition { _ -> seed(position + 1, cursors, filtered_data_types, skip, take, page) }
     }
@@ -900,4 +917,987 @@ pub machine DataTypeResultCounts::merge_from(&mut self, source: &DataTypeResultC
 
 pub machine DataTypeResultCounts::empty() -> DataTypeResultCounts {
     DataTypeResultCounts { count: 0 }
+}
+
+// ————— Tombstone-aware layer — upstream's deleted-index visibility —————
+// Upstream `Snapshot` keeps a `BTreeSet<u64>` of deleted global result
+// indices; every count/page API below subtracts or skips the tombstones
+// inside this region's global window [base, base + structural count).
+
+// Upstream `get_scan_results_by_data_type` — the Option<&collection> is
+// folded to an index sentinel: the collection's own index, or
+// `collection_count` when no collection owns the data type.
+pub machine SnapshotRegionScanResults::get_scan_results_by_data_type(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> u64 {
+    transition { _ -> seek(0, data_type_ref) }
+    state seek(&self, position: u64, data_type_ref: &DataTypeRef) -> u64 {
+        transition position < self.collection_count && position < 4 {
+            true -> compare(position, data_type_ref)
+            false -> (self.collection_count)
+        }
+    }
+    state compare(&self, position: u64 [0..4], data_type_ref: &DataTypeRef) -> u64 {
+        transition self.snapshot_region_filter_collections[position].data_type_ref.equals(data_type_ref) {
+            true -> (position)
+            false -> seek(position + 1, data_type_ref)
+        }
+    }
+}
+
+pub machine SnapshotRegionScanResults::has_scan_results_for_data_type(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> bool {
+    self.get_scan_results_by_data_type(data_type_ref) < self.collection_count
+}
+
+// Upstream `get_filter_bounds`: the (lowest, highest) filter addresses
+// across every non-empty collection — `resize_to_filters`'s own probe
+// (`SnapshotRegion::compute_filter_bounds`) reads the same union.
+pub machine SnapshotRegionScanResults::get_filter_bounds(&self) -> FilterBounds
+crashes Abort
+{
+    transition { _ -> seek(0, false, 0, 0) }
+    state seek(&self, collection_index: u64, has_filters: bool, min_address: u64, max_address: u64) -> FilterBounds {
+        transition collection_index < self.collection_count && collection_index < 4 {
+            true -> merge(collection_index, has_filters, min_address, max_address)
+            false -> (FilterBounds { has_filters: has_filters, min_address: min_address, max_address: max_address })
+        }
+    }
+    state merge(&self, collection_index: u64 [0..4], has_filters: bool, min_address: u64, max_address: u64) -> FilterBounds {
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[collection_index]);
+        transition collection.get_number_of_results() > 0 {
+            true -> include(collection_index, has_filters, min_address, max_address, &collection)
+            false -> seek(collection_index + 1, has_filters, min_address, max_address)
+        }
+    }
+    state include(&self, collection_index: u64 [0..4], has_filters: bool, min_address: u64, max_address: u64, collection: &SnapshotRegionFilterCollection) -> FilterBounds {
+        let lo: u64 = collection.get_filter_minimum_address();
+        let hi: u64 = collection.get_filter_maximum_address();
+        transition has_filters {
+            true -> fold(collection_index, min_address, max_address, lo, hi)
+            false -> first(collection_index, lo, hi)
+        }
+    }
+    state first(&self, collection_index: u64 [0..4], lo: u64, hi: u64) -> FilterBounds {
+        transition { _ -> seek(collection_index + 1, true, lo, hi) }
+    }
+    state fold(&self, collection_index: u64 [0..4], min_address: u64, max_address: u64, lo: u64, hi: u64) -> FilterBounds {
+        let next_min: u64 = min(min_address, lo);
+        let next_max: u64 = max(max_address, hi);
+        transition { _ -> seek(collection_index + 1, true, next_min, next_max) }
+    }
+}
+
+// Upstream `get_visible_result_count`.
+pub machine SnapshotRegionScanResults::get_visible_result_count(
+    &self,
+    region_global_scan_result_index_base: u64,
+    deleted_scan_result_indices: &DeletedScanResultIndexSet
+) -> u64
+crashes Abort
+{
+    transition deleted_scan_result_indices.count == 0 {
+        true -> (self.get_number_of_results())
+        false -> visible(region_global_scan_result_index_base, deleted_scan_result_indices)
+    }
+    state visible(&self, region_global_scan_result_index_base: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> u64 {
+        let total: u64 = self.get_number_of_results();
+        let range_end: u64 = ((region_global_scan_result_index_base as u64 in Saturating)
+            + (total as u64 in Saturating)) as u64;
+        let tombstones: u64 = deleted_scan_result_indices.count_in_range(
+            region_global_scan_result_index_base, range_end);
+        ((total as u64 in Saturating) - (tombstones as u64 in Saturating)) as u64
+    }
+}
+
+// `get_number_of_results_for_data_types` over the bounded Set carrier —
+// same loop as the slice-taking sibling (empty set selects everything).
+pub machine SnapshotRegionScanResults::get_number_of_results_for_set(
+    &self,
+    filtered_data_types: &DataTypeRefSet
+) -> u64
+crashes Abort
+{
+    transition { _ -> total(0, 0, filtered_data_types) }
+    state total(&self, position: u64, count: u64, filtered_data_types: &DataTypeRefSet) -> u64 {
+        transition position < self.collection_count && position < 4 {
+            true -> add(position, count, filtered_data_types)
+            false -> (count)
+        }
+    }
+    state add(&self, position: u64 [0..4], count: u64, filtered_data_types: &DataTypeRefSet) -> u64 {
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[position]);
+        let selected: bool = SnapshotRegionScanResults::is_data_type_in_set(
+            &collection.data_type_ref, filtered_data_types);
+        transition selected {
+            true -> total(position + 1,
+                ((count as u64 in Saturating) + (collection.get_number_of_results() as u64 in Saturating)) as u64,
+                filtered_data_types)
+            false -> total(position + 1, count, filtered_data_types)
+        }
+    }
+}
+
+// Upstream `get_visible_result_count_for_data_types`.
+pub machine SnapshotRegionScanResults::get_visible_result_count_for_data_types(
+    &self,
+    filtered_data_types: &DataTypeRefSet,
+    region_global_scan_result_index_base: u64,
+    deleted_scan_result_indices: &DeletedScanResultIndexSet
+) -> u64
+crashes Abort
+{
+    transition deleted_scan_result_indices.count == 0 {
+        true -> (self.get_number_of_results_for_set(filtered_data_types))
+        false -> visible(filtered_data_types, region_global_scan_result_index_base, deleted_scan_result_indices)
+    }
+    state visible(&self, filtered_data_types: &DataTypeRefSet, region_global_scan_result_index_base: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> u64 {
+        let structural: u64 = self.get_number_of_results_for_set(filtered_data_types);
+        let tombstoned: u64 = self.get_deleted_result_count_for_data_types(
+            filtered_data_types, region_global_scan_result_index_base, deleted_scan_result_indices);
+        ((structural as u64 in Saturating) - (tombstoned as u64 in Saturating)) as u64
+    }
+}
+
+// Upstream `get_deleted_result_count_for_data_types`: for each tombstone in
+// this region's global window, the merged-order seek resolves its data
+// type; it counts against the total when that type is selected.
+pub machine SnapshotRegionScanResults::get_deleted_result_count_for_data_types(
+    &self,
+    filtered_data_types: &DataTypeRefSet,
+    region_global_scan_result_index_base: u64,
+    deleted_scan_result_indices: &DeletedScanResultIndexSet
+) -> u64
+crashes Abort
+{
+    transition deleted_scan_result_indices.count == 0 {
+        true -> (0)
+        false -> begin(filtered_data_types, region_global_scan_result_index_base, deleted_scan_result_indices)
+    }
+    state begin(&self, filtered_data_types: &DataTypeRefSet, region_global_scan_result_index_base: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> u64 {
+        let range_end: u64 = ((region_global_scan_result_index_base as u64 in Saturating)
+            + (self.get_number_of_results() as u64 in Saturating)) as u64;
+        transition { _ -> walk(0, 0, filtered_data_types, region_global_scan_result_index_base, range_end, deleted_scan_result_indices) }
+    }
+    state walk(&self, position: u64, found: u64, filtered_data_types: &DataTypeRefSet, region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> u64 {
+        transition position < deleted_scan_result_indices.count && position < 64 {
+            true -> inspect(position, found, filtered_data_types, region_base, range_end, deleted_scan_result_indices)
+            false -> (found)
+        }
+    }
+    state inspect(&self, position: u64 [0..64], found: u64, filtered_data_types: &DataTypeRefSet, region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> u64 {
+        let member: u64 = deleted_scan_result_indices.indices[position];
+        transition member >= range_end {
+            true -> (found)
+            false -> inside(position, found, filtered_data_types, region_base, range_end, deleted_scan_result_indices, member)
+        }
+    }
+    state inside(&self, position: u64 [0..64], found: u64, filtered_data_types: &DataTypeRefSet, region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet, member: u64) -> u64 {
+        transition member >= region_base {
+            true -> locate(position, found, filtered_data_types, region_base, range_end, deleted_scan_result_indices, member)
+            false -> walk(position + 1, found, filtered_data_types, region_base, range_end, deleted_scan_result_indices)
+        }
+    }
+    state locate(&self, position: u64 [0..64], found: u64, filtered_data_types: &DataTypeRefSet, region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet, member: u64) -> u64 {
+        let local_index: u64 = ((member as u64 in Saturating) - (region_base as u64 in Saturating)) as u64;
+        let probe: SoughtElement = self.seek_by_local_index(local_index);
+        transition probe {
+            SoughtElement::Found { element } -> tally(position, found, filtered_data_types, region_base, range_end, deleted_scan_result_indices, element)
+            _ -> (found)
+        }
+    }
+    state tally(&self, position: u64 [0..64], found: u64, filtered_data_types: &DataTypeRefSet, region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet, element: PageElement) -> u64 {
+        let selected: bool = SnapshotRegionScanResults::is_data_type_in_set(&element.data_type_ref, filtered_data_types);
+        transition selected {
+            true -> walk(position + 1,
+                ((found as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                filtered_data_types, region_base, range_end, deleted_scan_result_indices)
+            false -> walk(position + 1, found, filtered_data_types, region_base, range_end, deleted_scan_result_indices)
+        }
+    }
+}
+
+// Upstream `get_visible_result_counts_by_data_type`: the structural
+// per-type counts minus each tombstone's resolved type; zeroed entries
+// drop like upstream's `retain`.
+pub machine SnapshotRegionScanResults::get_visible_result_counts_by_data_type(
+    &self,
+    region_global_scan_result_index_base: u64,
+    deleted_scan_result_indices: &DeletedScanResultIndexSet
+) -> DataTypeResultCounts
+crashes Abort
+{
+    let mut counts: DataTypeResultCounts = self.get_result_counts_by_data_type();
+    transition deleted_scan_result_indices.count == 0 {
+        true -> (counts)
+        false -> walk(&mut counts, region_global_scan_result_index_base, deleted_scan_result_indices)
+    }
+    state walk(&self, counts: &mut DataTypeResultCounts, region_base: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> DataTypeResultCounts {
+        let range_end: u64 = ((region_base as u64 in Saturating)
+            + (self.get_number_of_results() as u64 in Saturating)) as u64;
+        transition { _ -> each(counts, 0, region_base, range_end, deleted_scan_result_indices) }
+    }
+    state each(&self, counts: &mut DataTypeResultCounts, position: u64, region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> DataTypeResultCounts {
+        transition position < deleted_scan_result_indices.count && position < 64 {
+            true -> inspect(counts, position, region_base, range_end, deleted_scan_result_indices)
+            false -> finish(counts)
+        }
+    }
+    state inspect(&self, counts: &mut DataTypeResultCounts, position: u64 [0..64], region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> DataTypeResultCounts {
+        let member: u64 = deleted_scan_result_indices.indices[position];
+        transition member >= range_end {
+            true -> finish(counts)
+            false -> inside(counts, position, region_base, range_end, deleted_scan_result_indices, member)
+        }
+    }
+    state inside(&self, counts: &mut DataTypeResultCounts, position: u64 [0..64], region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet, member: u64) -> DataTypeResultCounts {
+        transition member >= region_base {
+            true -> locate(counts, position, region_base, range_end, deleted_scan_result_indices, member)
+            false -> each(counts, position + 1, region_base, range_end, deleted_scan_result_indices)
+        }
+    }
+    state locate(&self, counts: &mut DataTypeResultCounts, position: u64 [0..64], region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet, member: u64) -> DataTypeResultCounts {
+        let local_index: u64 = ((member as u64 in Saturating) - (region_base as u64 in Saturating)) as u64;
+        let probe: SoughtElement = self.seek_by_local_index(local_index);
+        transition probe {
+            SoughtElement::Found { element } -> drop(counts, position, region_base, range_end, deleted_scan_result_indices, element)
+            _ -> (DataTypeResultCounts::clone(counts))
+        }
+    }
+    state drop(&self, counts: &mut DataTypeResultCounts, position: u64 [0..64], region_base: u64, range_end: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet, element: PageElement) -> DataTypeResultCounts {
+        counts.decrement_for(&element.data_type_ref);
+        transition { _ -> each(counts, position + 1, region_base, range_end, deleted_scan_result_indices) }
+    }
+    state finish(&self, counts: &mut DataTypeResultCounts) -> DataTypeResultCounts {
+        counts.retain_positive();
+        transition { _ -> (DataTypeResultCounts::clone(counts)) }
+    }
+}
+
+// Seek probe — upstream's Option<(address, data_type)> / Option<(collection,
+// result index)> folded to a case union; Found carries the located element.
+pub data SoughtElement {
+    case Found(element: PageElement);
+    case Missing;
+}
+
+// Resolves a merged-order local result index to its element — the
+// address-ascending merge with every collection selected, skipped by the
+// local index. Upstream walks `ScanResultsPageCursor`s with batched
+// alignment advances; the port enumerates to the same ordering
+// element-wise.
+machine SnapshotRegionScanResults::seek_by_local_index(
+    &self,
+    local_scan_result_index: u64
+) -> SoughtElement
+crashes Abort
+{
+    let all_types: DataTypeRefSet = DataTypeRefSet::empty();
+    let page: PageElementList = self.enumerate_page(local_scan_result_index, 1, &all_types);
+    transition page.element_count > 0 {
+        true -> (SoughtElement::Found { element: page.get_page_element(0) })
+        false -> (SoughtElement::Missing)
+    }
+}
+
+// Structural lookup result — upstream's Option<ScanResultValued>.
+pub data StructuralResult {
+    case Found(valued_result: ScanResultValued);
+    case Missing;
+}
+
+// Bounded valued-result carrier for the materialization paths — same 64-slot
+// bound as PageElementList (named deviation; the CLI page surface is 22).
+pub data ScanResultValuedList {
+    valued_results: [ScanResultValued; 64];
+    result_count: u64;
+}
+
+pub machine ScanResultValuedList::empty() -> ScanResultValuedList {
+    ScanResultValuedList { result_count: 0 }
+}
+
+pub machine ScanResultValuedList::get_result_count(&self) -> u64 {
+    self.result_count
+}
+
+pub machine ScanResultValuedList::push(&mut self, valued_result: &ScanResultValued) -> bool {
+    transition self.result_count < 64 {
+        true -> store(valued_result)
+        false -> (false)
+    }
+    state store(&mut self, valued_result: &ScanResultValued) -> bool {
+        self.valued_results[self.result_count].clone_from(valued_result);
+        self.result_count = self.result_count + 1;
+        true
+    }
+}
+
+pub machine ScanResultValuedList::get(&self, position: u64) -> ScanResultValued {
+    transition position < self.result_count && position < 64 {
+        true -> clone_at(position)
+        false -> (ScanResultValued::default())
+    }
+    state clone_at(&self, position: u64 [0..64]) -> ScanResultValued {
+        ScanResultValued::clone(&self.valued_results[position])
+    }
+}
+
+pub machine ScanResultValuedList::clone(source: &ScanResultValuedList) -> ScanResultValuedList {
+    let mut copy: ScanResultValuedList = ScanResultValuedList::empty();
+    copy.copy_from(source);
+    copy
+}
+
+machine ScanResultValuedList::copy_from(&mut self, source: &ScanResultValuedList) {
+    self.result_count = source.result_count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &ScanResultValuedList, position: u64) {
+        transition position < source.result_count && position < 64 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &ScanResultValuedList, position: u64 [0..64]) {
+        self.valued_results[position].clone_from(&source.valued_results[position]);
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.result_count = self.result_count;
+    }
+}
+
+// One materialized scan result — upstream `ScanResultsPageCursor::
+// build_scan_result`. Values come from the region's element windows at
+// (address - base) / 8 — the port's u64-element value model (a named
+// deviation from upstream's byte arrays; sub-8-byte offsets inside one
+// window element share the slot).
+machine SnapshotRegionScanResults::build_scan_result(
+    &self,
+    snapshot_region: &SnapshotRegion,
+    global_scan_result_index: u64,
+    element: &PageElement
+) -> ScanResultValued
+{
+    let region_base: u64 = snapshot_region.get_base_address();
+    let byte_offset: u64 = ((element.address as u64 in Saturating)
+        - (region_base as u64 in Saturating)) as u64;
+    let window_index: u64 = byte_offset / 8;
+    let has_current: bool = snapshot_region.has_current_values()
+        && window_index < snapshot_region.get_current_element_count();
+    let has_previous: bool = window_index < snapshot_region.get_previous_element_count();
+    transition { _ -> value(has_current, window_index, has_previous, snapshot_region, global_scan_result_index, element) }
+    state value(&self, has_current: bool, window_index: u64, has_previous: bool, snapshot_region: &SnapshotRegion, global_scan_result_index: u64, element: &PageElement) -> ScanResultValued {
+        transition has_current {
+            true -> current(window_index, has_previous, snapshot_region, global_scan_result_index, element)
+            false -> absent_current(window_index, has_previous, snapshot_region, global_scan_result_index, element)
+        }
+    }
+    state current(&self, window_index: u64, has_previous: bool, snapshot_region: &SnapshotRegion, global_scan_result_index: u64, element: &PageElement) -> ScanResultValued {
+        let current_value: u64 = snapshot_region.get_current_element(window_index);
+        transition { _ -> previous(true, current_value, window_index, has_previous, snapshot_region, global_scan_result_index, element) }
+    }
+    state absent_current(&self, window_index: u64, has_previous: bool, snapshot_region: &SnapshotRegion, global_scan_result_index: u64, element: &PageElement) -> ScanResultValued {
+        transition { _ -> previous(false, 0, window_index, has_previous, snapshot_region, global_scan_result_index, element) }
+    }
+    state previous(&self, has_current: bool, current_value: u64, window_index: u64, has_previous: bool, snapshot_region: &SnapshotRegion, global_scan_result_index: u64, element: &PageElement) -> ScanResultValued {
+        transition has_previous {
+            true -> prior(has_current, current_value, window_index, snapshot_region, global_scan_result_index, element)
+            false -> finish(has_current, current_value, false, 0, global_scan_result_index, element)
+        }
+    }
+    state prior(&self, has_current: bool, current_value: u64, window_index: u64, snapshot_region: &SnapshotRegion, global_scan_result_index: u64, element: &PageElement) -> ScanResultValued {
+        let previous_value: u64 = snapshot_region.get_previous_element(window_index);
+        transition { _ -> finish(has_current, current_value, true, previous_value, global_scan_result_index, element) }
+    }
+    state finish(&self, has_current: bool, current_value: u64, has_previous: bool, previous_value: u64, global_scan_result_index: u64, element: &PageElement) -> ScanResultValued {
+        let base: ScanResultBase = ScanResultBase::new(
+            element.address,
+            DataTypeRef::clone(&element.data_type_ref),
+            ScanResultRef::new(global_scan_result_index, false));
+        ScanResultValued::new(base, has_current, current_value, has_previous, previous_value)
+    }
+}
+
+// Upstream `get_structural_scan_result` — the single element at a local
+// merged-order index, materialized against the region's values.
+pub machine SnapshotRegionScanResults::get_structural_scan_result(
+    &self,
+    snapshot_region: &SnapshotRegion,
+    global_scan_result_index: u64,
+    local_scan_result_index: u64
+) -> StructuralResult
+crashes Abort
+{
+    let probe: SoughtElement = self.seek_by_local_index(local_scan_result_index);
+    transition probe {
+        SoughtElement::Found { element } -> found(global_scan_result_index, element, snapshot_region)
+        _ -> (StructuralResult::Missing)
+    }
+    state found(&self, global_scan_result_index: u64, element: PageElement, snapshot_region: &SnapshotRegion) -> StructuralResult {
+        StructuralResult::Found { valued_result: self.build_scan_result(snapshot_region, global_scan_result_index, &element) }
+    }
+}
+
+// Upstream `get_scan_results_page` — BOTH upstream branches share this
+// merge: every non-empty collection seeds a flagged cursor, each merged
+// element consumes one global result index regardless of selection, and
+// only selected+untombstoned elements emit. With an empty tombstone set
+// this reduces to upstream's structural path verbatim.
+pub machine SnapshotRegionScanResults::get_scan_results_page(
+    &self,
+    snapshot_region: &SnapshotRegion,
+    filtered_data_types: &DataTypeRefSet,
+    region_global_scan_result_index_base: u64,
+    filtered_scan_result_index_offset: u64,
+    page_size: u64,
+    deleted_scan_result_indices: &DeletedScanResultIndexSet
+) -> ScanResultValuedList
+crashes Abort
+{
+    let mut out: ScanResultValuedList = ScanResultValuedList::empty();
+    let mut cursors: MergeCursors = MergeCursors::unfinished();
+    transition page_size > 0 {
+        true -> seed(0, &mut cursors, snapshot_region, filtered_data_types, region_global_scan_result_index_base, filtered_scan_result_index_offset, page_size, deleted_scan_result_indices, &mut out)
+        false -> (ScanResultValuedList::empty())
+    }
+    state seed(
+        &self,
+        position: u64,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        transition position < self.collection_count && position < 4 {
+            true -> seed_one(position, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+            false -> step(cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+        }
+    }
+    state seed_one(
+        &self,
+        position: u64 [0..4],
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[position]);
+        let selected: bool = SnapshotRegionScanResults::is_data_type_in_set(
+            &collection.data_type_ref, filtered_data_types);
+        transition collection.filter_count > 0 {
+            true -> plant(position, selected, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+            false -> seed(position + 1, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+        }
+    }
+    state plant(
+        &self,
+        position: u64 [0..4],
+        selected: bool,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        let cursor: ResultCursor = ResultCursor::active(position, selected);
+        cursors.set_cursor(position, &cursor);
+        transition { _ -> seed(position + 1, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out) }
+    }
+    state step(
+        &self,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        transition take > 0 {
+            true -> probe(cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+            false -> (ScanResultValuedList::clone(out))
+        }
+    }
+    state probe(
+        &self,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        let c0: ResultCursor = cursors.get_cursor(0);
+        let c1: ResultCursor = cursors.get_cursor(1);
+        let c2: ResultCursor = cursors.get_cursor(2);
+        let c3: ResultCursor = cursors.get_cursor(3);
+        let p0: CursorProbe = self.probe_cursor(&c0);
+        let p1: CursorProbe = self.probe_cursor(&c1);
+        let p2: CursorProbe = self.probe_cursor(&c2);
+        let p3: CursorProbe = self.probe_cursor(&c3);
+        let m01: CursorProbe = CursorProbe::smaller(&p0, &p1);
+        let m23: CursorProbe = CursorProbe::smaller(&p2, &p3);
+        let best: CursorProbe = CursorProbe::smaller(&m01, &m23);
+        transition best.active {
+            true -> merged(best, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+            false -> (ScanResultValuedList::clone(out))
+        }
+    }
+    state merged(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        let cursor: ResultCursor = cursors.get_cursor(best.owner);
+        transition cursor.selected {
+            true -> selected(best, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+            false -> pass(best, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+        }
+    }
+    // Unselected collections still consume global result-index space —
+    // upstream advances them by the consecutive batch; the port steps one
+    // element at a time to the same merged order.
+    state pass(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        self.advance_cursor(cursors, best.owner);
+        transition { _ -> step(cursors, snapshot_region, filtered_data_types,
+            ((next_global as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            skip, take, deleted_scan_result_indices, out) }
+    }
+    state selected(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        let tombstoned: bool = deleted_scan_result_indices.contains(next_global);
+        transition tombstoned {
+            true -> skip_tombstoned(best, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+            false -> visible(best, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+        }
+    }
+    state skip_tombstoned(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        self.advance_cursor(cursors, best.owner);
+        transition { _ -> step(cursors, snapshot_region, filtered_data_types,
+            ((next_global as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            skip, take, deleted_scan_result_indices, out) }
+    }
+    state visible(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        transition skip > 0 {
+            true -> skip_visible(best, cursors, snapshot_region, filtered_data_types, next_global, skip, take, deleted_scan_result_indices, out)
+            false -> emit(best, cursors, snapshot_region, filtered_data_types, next_global, take, deleted_scan_result_indices, out)
+        }
+    }
+    state skip_visible(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        skip: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        self.advance_cursor(cursors, best.owner);
+        transition { _ -> step(cursors, snapshot_region, filtered_data_types,
+            ((next_global as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            ((skip as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64,
+            take, deleted_scan_result_indices, out) }
+    }
+    state emit(
+        &self,
+        best: CursorProbe,
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        transition best.owner < self.collection_count && best.owner < 4 {
+            true -> emit_element(best, best.owner, cursors, snapshot_region, filtered_data_types, next_global, take, deleted_scan_result_indices, out)
+            false -> step(cursors, snapshot_region, filtered_data_types, next_global, 0, take, deleted_scan_result_indices, out)
+        }
+    }
+    state emit_element(
+        &self,
+        best: CursorProbe,
+        owner: u64 [0..4],
+        cursors: &mut MergeCursors,
+        snapshot_region: &SnapshotRegion,
+        filtered_data_types: &DataTypeRefSet,
+        next_global: u64,
+        take: u64,
+        deleted_scan_result_indices: &DeletedScanResultIndexSet,
+        out: &mut ScanResultValuedList
+    ) -> ScanResultValuedList {
+        let collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::clone(
+            &self.snapshot_region_filter_collections[owner]);
+        let cursor: ResultCursor = cursors.get_cursor(owner);
+        let element: PageElement = PageElement::of(
+            best.address,
+            owner,
+            cursor.filter_index,
+            cursor.element_index,
+            DataTypeRef::clone(&collection.data_type_ref));
+        let valued: ScanResultValued = self.build_scan_result(snapshot_region, next_global, &element);
+        let pushed: bool = out.push(&valued);
+        self.advance_cursor(cursors, owner);
+        transition pushed {
+            true -> step(cursors, snapshot_region, filtered_data_types,
+                ((next_global as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                0,
+                ((take as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64,
+                deleted_scan_result_indices, out)
+            false -> (ScanResultValuedList::clone(out))
+            _ -> (ScanResultValuedList::clone(out))
+        }
+    }
+}
+
+// Per-collection deleted flat indices — upstream's
+// `vec![Vec<u64>; collections.len()]` folded to the 4-collection bound.
+pub data CollectionDeletions {
+    sets: [DeletedScanResultIndexSet; 4];
+}
+
+pub machine CollectionDeletions::empty() -> CollectionDeletions {
+    CollectionDeletions {}
+}
+
+pub machine CollectionDeletions::insert(&mut self, collection_index: u64, flat_result_index: u64) -> bool {
+    transition collection_index == 0 {
+        true -> (self.sets[0].insert(flat_result_index))
+        false -> one(collection_index, flat_result_index)
+    }
+    state one(&mut self, collection_index: u64, flat_result_index: u64) -> bool {
+        transition collection_index == 1 {
+            true -> (self.sets[1].insert(flat_result_index))
+            false -> two(collection_index, flat_result_index)
+        }
+    }
+    state two(&mut self, collection_index: u64, flat_result_index: u64) -> bool {
+        transition collection_index == 2 {
+            true -> (self.sets[2].insert(flat_result_index))
+            false -> three(collection_index, flat_result_index)
+        }
+    }
+    state three(&mut self, collection_index: u64, flat_result_index: u64) -> bool {
+        transition collection_index == 3 {
+            true -> (self.sets[3].insert(flat_result_index))
+            false -> (false)
+        }
+    }
+}
+
+pub machine CollectionDeletions::get(&self, collection_index: u64) -> DeletedScanResultIndexSet {
+    transition collection_index < 4 {
+        true -> clone_at(collection_index)
+        false -> (DeletedScanResultIndexSet::empty())
+    }
+    state clone_at(&self, collection_index: u64 [0..4]) -> DeletedScanResultIndexSet {
+        DeletedScanResultIndexSet::clone(&self.sets[collection_index])
+    }
+}
+
+// Upstream `remove_scan_results_by_global_indices`: tombstones inside this
+// region's global window resolve through the merged-order seek to flat
+// collection result indices, then each collection rebuilds its filters
+// minus those indices.
+pub machine SnapshotRegionScanResults::remove_scan_results_by_global_indices(
+    &mut self,
+    region_global_scan_result_index_base: u64,
+    deleted_scan_result_indices: &DeletedScanResultIndexSet
+) -> u64
+crashes Abort
+{
+    transition deleted_scan_result_indices.count == 0 {
+        true -> (0)
+        false -> begin(region_global_scan_result_index_base, deleted_scan_result_indices)
+    }
+    state begin(&mut self, region_base: u64, deleted_scan_result_indices: &DeletedScanResultIndexSet) -> u64 {
+        let range_end: u64 = ((region_base as u64 in Saturating)
+            + (self.get_number_of_results() as u64 in Saturating)) as u64;
+        let mut deletions: CollectionDeletions = CollectionDeletions::empty();
+        transition { _ -> walk(deleted_scan_result_indices, &mut deletions, 0, 0, region_base, range_end) }
+    }
+    state walk(&mut self, deleted_scan_result_indices: &DeletedScanResultIndexSet, deletions: &mut CollectionDeletions, position: u64, removed: u64, region_base: u64, range_end: u64) -> u64 {
+        transition position < deleted_scan_result_indices.count && position < 64 {
+            true -> inspect(deleted_scan_result_indices, deletions, position, removed, region_base, range_end)
+            false -> rebuild(deletions, removed, 0)
+        }
+    }
+    state inspect(&mut self, deleted_scan_result_indices: &DeletedScanResultIndexSet, deletions: &mut CollectionDeletions, position: u64 [0..64], removed: u64, region_base: u64, range_end: u64) -> u64 {
+        let member: u64 = deleted_scan_result_indices.indices[position];
+        transition member >= range_end {
+            true -> rebuild(deletions, removed, 0)
+            false -> inside(deleted_scan_result_indices, deletions, position, removed, region_base, range_end, member)
+        }
+    }
+    state inside(&mut self, deleted_scan_result_indices: &DeletedScanResultIndexSet, deletions: &mut CollectionDeletions, position: u64 [0..64], removed: u64, region_base: u64, range_end: u64, member: u64) -> u64 {
+        transition member >= region_base {
+            true -> locate(deleted_scan_result_indices, deletions, position, removed, region_base, range_end, member)
+            false -> walk(deleted_scan_result_indices, deletions, position + 1, removed, region_base, range_end)
+        }
+    }
+    state locate(&mut self, deleted_scan_result_indices: &DeletedScanResultIndexSet, deletions: &mut CollectionDeletions, position: u64 [0..64], removed: u64, region_base: u64, range_end: u64, member: u64) -> u64 {
+        let local_index: u64 = ((member as u64 in Saturating) - (region_base as u64 in Saturating)) as u64;
+        let probe: SoughtElement = self.seek_by_local_index(local_index);
+        transition probe {
+            SoughtElement::Found { element } -> record(deleted_scan_result_indices, deletions, position, removed, region_base, range_end, element)
+            _ -> rebuild(deletions, removed, 0)
+        }
+    }
+    state record(&mut self, deleted_scan_result_indices: &DeletedScanResultIndexSet, deletions: &mut CollectionDeletions, position: u64 [0..64], removed: u64, region_base: u64, range_end: u64, element: PageElement) -> u64 {
+        transition element.collection_index < self.collection_count && element.collection_index < 4 {
+            true -> flat(deleted_scan_result_indices, deletions, position, removed, region_base, range_end, element.collection_index, element)
+            false -> walk(deleted_scan_result_indices, deletions, position + 1, removed, region_base, range_end)
+        }
+    }
+    state flat(&mut self, deleted_scan_result_indices: &DeletedScanResultIndexSet, deletions: &mut CollectionDeletions, position: u64 [0..64], removed: u64, region_base: u64, range_end: u64, collection_index: u64 [0..4], element: PageElement) -> u64 {
+        let flat_index: u64 = self.snapshot_region_filter_collections[collection_index].flat_result_index(
+            element.filter_index, element.element_index);
+        let recorded: bool = deletions.sets[collection_index].insert(flat_index);
+        transition { _ -> walk(deleted_scan_result_indices, deletions, position + 1,
+            ((removed as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            region_base, range_end) }
+    }
+    state rebuild(&mut self, deletions: &mut CollectionDeletions, removed: u64, collection_index: u64) -> u64 {
+        transition collection_index < self.collection_count && collection_index < 4 {
+            true -> rebuild_one(deletions, removed, collection_index)
+            false -> (removed)
+        }
+    }
+    state rebuild_one(&mut self, deletions: &mut CollectionDeletions, removed: u64, collection_index: u64 [0..4]) -> u64 {
+        transition deletions.sets[collection_index].count > 0 {
+            true -> apply(deletions, removed, collection_index)
+            false -> rebuild(deletions, removed, collection_index + 1)
+        }
+    }
+    state apply(&mut self, deletions: &mut CollectionDeletions, removed: u64, collection_index: u64 [0..4]) -> u64 {
+        let rebuilt: SnapshotRegionFilterCollection =
+            self.snapshot_region_filter_collections[collection_index].remove_results_at_indices(
+                &deletions.sets[collection_index]);
+        self.snapshot_region_filter_collections[collection_index].clone_from(&rebuilt);
+        transition { _ -> rebuild(deletions, removed, collection_index + 1) }
+    }
+}
+
+// `get_visible_result_counts_by_data_type` support: drop one surviving
+// count for the tombstone's resolved type; drop emptied entries like
+// upstream's `retain(count > 0)`.
+machine DataTypeResultCounts::decrement_for(&mut self, data_type_ref: &DataTypeRef) {
+    transition { _ -> seek(data_type_ref, 0) }
+    state seek(&mut self, data_type_ref: &DataTypeRef, position: u64) {
+        transition position < self.count && position < 4 {
+            true -> compare(data_type_ref, position)
+            false -> done()
+        }
+    }
+    state compare(&mut self, data_type_ref: &DataTypeRef, position: u64 [0..4]) {
+        transition self.counts[position].data_type_ref.equals(data_type_ref) {
+            true -> drop(position)
+            false -> seek(data_type_ref, position + 1)
+        }
+    }
+    state drop(&mut self, position: u64 [0..4]) {
+        self.counts[position].count = ((self.counts[position].count as u64 in Saturating)
+            - (1 as u64 in Saturating)) as u64;
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
+        self.count = self.count;
+    }
+}
+
+// Upstream's `retain(result_count > 0)` — in-place compaction.
+machine DataTypeResultCounts::retain_positive(&mut self) {
+    transition { _ -> compact(0, 0) }
+    state compact(&mut self, read_position: u64, write_position: u64) {
+        transition read_position < self.count && read_position < 4 && write_position < 4 {
+            true -> inspect(read_position, write_position)
+            false -> finish(write_position)
+        }
+    }
+    state inspect(&mut self, read_position: u64 [0..4], write_position: u64 [0..4]) {
+        transition self.counts[read_position].count > 0 {
+            true -> keep(read_position, write_position)
+            false -> compact(read_position + 1, write_position)
+        }
+    }
+    state keep(&mut self, read_position: u64 [0..4], write_position: u64 [0..4]) {
+        let held: ScanResultDataTypeCount = ScanResultDataTypeCount::clone(&self.counts[read_position]);
+        self.counts[write_position].clone_from(&held);
+        transition { _ -> compact(read_position + 1, write_position + 1) }
+    }
+    state finish(&mut self, write_position: u64) {
+        self.count = write_position;
+    }
+}
+
+// A filtered page of scan results — upstream `Snapshot::get_scan_results_page`
+// returns `(effective_page_index, Vec<ScanResultValued>)`; the port returns
+// them on one record.
+pub data ScanResultsPage {
+    effective_page_index: u64;
+    results: ScanResultValuedList;
+}
+
+pub machine ScanResultsPage::empty() -> ScanResultsPage {
+    ScanResultsPage {
+        effective_page_index: 0,
+        results: ScanResultValuedList::empty(),
+    }
+}
+
+// Upstream `collect_scan_result_addresses_for_data_type`'s Vec<u64> — the
+// bounded carrier (64, same family as the page bound).
+pub data ScanResultAddresses {
+    addresses: [u64; 64];
+    address_count: u64;
+}
+
+pub machine ScanResultAddresses::empty() -> ScanResultAddresses {
+    ScanResultAddresses { address_count: 0 }
+}
+
+pub machine ScanResultAddresses::get_address_count(&self) -> u64 {
+    self.address_count
+}
+
+pub machine ScanResultAddresses::get(&self, position: u64) -> u64 {
+    transition position < self.address_count && position < 64 {
+        true -> (self.addresses[position])
+        false -> (0)
+    }
+}
+
+pub machine ScanResultAddresses::push(&mut self, address: u64) -> bool {
+    transition self.address_count < 64 {
+        true -> store(address)
+        false -> (false)
+    }
+    state store(&mut self, address: u64) -> bool {
+        self.addresses[self.address_count] = address;
+        self.address_count = self.address_count + 1;
+        true
+    }
+}
+
+pub machine ScanResultAddresses::clone(source: &ScanResultAddresses) -> ScanResultAddresses {
+    let mut copy: ScanResultAddresses = ScanResultAddresses::empty();
+    copy.clone_from(source);
+    copy
+}
+
+pub machine ScanResultAddresses::clone_from(&mut self, source: &ScanResultAddresses) {
+    self.address_count = source.address_count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &ScanResultAddresses, position: u64) {
+        transition position < source.address_count && position < 64 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &ScanResultAddresses, position: u64 [0..64]) {
+        self.addresses[position] = source.addresses[position];
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.address_count = self.address_count;
+    }
+}
+
+// Deep copy parity — used when a computed tally is returned from a state.
+pub machine DataTypeResultCounts::clone(source: &DataTypeResultCounts) -> DataTypeResultCounts {
+    let mut copy: DataTypeResultCounts = DataTypeResultCounts::empty();
+    copy.clone_from(source);
+    copy
+}
+
+pub machine DataTypeResultCounts::clone_from(&mut self, source: &DataTypeResultCounts) {
+    self.count = source.count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &DataTypeResultCounts, position: u64) {
+        transition position < source.count && position < 4 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &DataTypeResultCounts, position: u64 [0..4]) {
+        self.counts[position].clone_from(&source.counts[position]);
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.count = self.count;
+    }
 }
