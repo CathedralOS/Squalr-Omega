@@ -4,13 +4,19 @@ use squalr_engine_api::src::structures::snapshots::element_window::ElementWindow
 use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
 use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
 use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::ReadWindowResult;
 use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
 
-// Port of `SnapshotValueCollector::collect_values`: per region, rotate the
-// current window into previous and install the freshly read window. The
-// collected values live under `snapshot.collect_region_values` in the api
-// package — `&mut`-receiver calls with borrowed arguments cannot cross the
-// package boundary, so the per-region write goes through that entry.
+// Port of `SnapshotValueCollector::collect_values` + its per-region
+// `read_snapshot_region_values`. Per region: clear tombstones, zero-size
+// regions tombstone their base, then rotate current→previous and read —
+// a single read when no page boundaries exist, otherwise a fast-path
+// whole-region read falling back to per-page-range reads whose failures
+// are tombstoned at their range-start addresses. The collected values live
+// under `snapshot.collect_region_values` in the api package —
+// `&mut`-receiver calls with borrowed arguments cannot cross the package
+// boundary, so the per-region writes go through the api-side entries
+// (`collect_region_values`, `clear_region_tombstones`, `push_region_tombstone`).
 // Empty receiver carrying the collector's machines — mirrors upstream's
 // `impl` namespace.
 pub data SnapshotValueCollector {}
@@ -26,17 +32,289 @@ pub machine SnapshotValueCollector::collect_all_regions(
             false -> done()
         }
     }
+    state done() {
+    }
+
+    // Upstream `read_snapshot_region_values` head: clear tombstones, then
+    // gate on region size before any window rotation.
     state region(engine_privileged_state: &mut EnginePrivilegedState, position: u64) {
         let region: SnapshotRegion = engine_privileged_state.borrow_snapshot().get_region(position);
-        let source: &SuppliedMemorySource = engine_privileged_state.get_supplied_memory_source();
+        engine_privileged_state.borrow_snapshot_mut().clear_region_tombstones(position);
         let region_base: u64 = region.get_base_address();
         let region_size: u64 = region.get_region_size();
-        let window: ElementWindow = source.read_window(region_base, region_size);
+        transition region_size == 0 {
+            true -> zero(engine_privileged_state, position, region_base)
+            false -> gate(engine_privileged_state, position, region, region_base, region_size)
+            _ -> gate(engine_privileged_state, position, region, region_base, region_size)
+        }
+    }
+
+    // Upstream: `if region_size == 0 { tombstones.insert(base); return; }`.
+    state zero(engine_privileged_state: &mut EnginePrivilegedState, position: u64, region_base: u64) {
+        let pushed: bool = engine_privileged_state
+            .borrow_snapshot_mut()
+            .push_region_tombstone(position, region_base);
+        transition { _ -> each(engine_privileged_state, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state gate(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64
+    ) {
+        transition region.get_page_boundary_count() == 0 {
+            true -> single(engine_privileged_state, position, region, region_base, region_size)
+            false -> fast(engine_privileged_state, position, region, region_base, region_size)
+            _ -> fast(engine_privileged_state, position, region, region_base, region_size)
+        }
+    }
+
+    // Upstream `if snapshot_region.page_boundaries.is_empty()`: one
+    // all-or-nothing read over the region; failure tombstones the base.
+    state single(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64
+    ) {
+        let result: ReadWindowResult = engine_privileged_state
+            .get_supplied_memory_source()
+            .try_read_window(region_base, region_size);
+        transition result.succeeded {
+            true -> install(engine_privileged_state, position, result.window)
+            false -> fail_single(engine_privileged_state, position, region, region_base, region_size)
+            _ -> fail_single(engine_privileged_state, position, region, region_base, region_size)
+        }
+    }
+
+    state fail_single(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64
+    ) {
+        let pushed: bool = engine_privileged_state
+            .borrow_snapshot_mut()
+            .push_region_tombstone(position, region_base);
+        let baseline: ElementWindow = SnapshotValueCollector::baseline_window(&region, region_size);
+        engine_privileged_state
+            .borrow_snapshot_mut()
+            .collect_region_values(position, baseline);
+        transition { _ -> each(engine_privileged_state, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // Upstream's fast path: `if read_bytes(base, &mut current_values) {
+    // return; }` — most merged regions remain fully readable.
+    state fast(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64
+    ) {
+        let result: ReadWindowResult = engine_privileged_state
+            .get_supplied_memory_source()
+            .try_read_window(region_base, region_size);
+        transition result.succeeded {
+            true -> install(engine_privileged_state, position, result.window)
+            false -> ranges_begin(engine_privileged_state, position, region, region_base, region_size)
+            _ -> ranges_begin(engine_privileged_state, position, region, region_base, region_size)
+        }
+    }
+
+    // Upstream's fallback: build the page-split read ranges
+    // ([base, b0), [b0, b1), ..., [b_last, end)) and read each; failures
+    // extend `page_boundary_tombstones`. The composed window starts from
+    // the baseline (previous values or zeros) — upstream keeps the
+    // swapped-in buffer content on failed ranges and only overwrites the
+    // ranges that succeed.
+    state ranges_begin(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64
+    ) {
+        let baseline: ElementWindow = SnapshotValueCollector::baseline_window(&region, region_size);
+        transition { _ -> range_each(engine_privileged_state, position, region, region_base, region_size, baseline, 0) }
+    }
+
+    // Range index walks 0..=boundary_count — the bounded ranges plus the
+    // trailing [last_boundary, end) range.
+    state range_each(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64,
+        window: ElementWindow,
+        range_index: u64
+    ) {
+        transition range_index <= region.get_page_boundary_count() {
+            true -> range_read(engine_privileged_state, position, region, region_base, region_size, window, range_index)
+            false -> install(engine_privileged_state, position, window)
+            _ -> install(engine_privileged_state, position, window)
+        }
+    }
+
+    state range_read(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64,
+        window: ElementWindow,
+        range_index: u64
+    ) {
+        let range_start: u64 = SnapshotValueCollector::range_start_of(&region, region_base, range_index);
+        let range_end: u64 = SnapshotValueCollector::range_end_of(&region, region_base, region_size, range_index);
+        let range_size: u64 = ((range_end as u64 in Saturating) - (range_start as u64 in Saturating)) as u64;
+        let result: ReadWindowResult = engine_privileged_state
+            .get_supplied_memory_source()
+            .try_read_window(range_start, range_size);
+        transition result.succeeded {
+            true -> copy_range(engine_privileged_state, position, region, region_base, region_size, window, range_index, range_start, result)
+            false -> fail_range(engine_privileged_state, position, region, region_base, region_size, window, range_index, range_start)
+            _ -> fail_range(engine_privileged_state, position, region, region_base, region_size, window, range_index, range_start)
+        }
+    }
+
+    // Upstream `if !range_slice.is_empty() { read_ranges.push(...) }` — a
+    // failed range read tombstones its start address; the window keeps the
+    // baseline content under that span.
+    state fail_range(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64,
+        window: ElementWindow,
+        range_index: u64,
+        range_start: u64
+    ) {
+        let pushed: bool = engine_privileged_state
+            .borrow_snapshot_mut()
+            .push_region_tombstone(position, range_start);
+        transition { _ -> range_each(
+            engine_privileged_state, position, region, region_base, region_size, window,
+            ((range_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state copy_range(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64,
+        window: ElementWindow,
+        range_index: u64,
+        range_start: u64,
+        result: ReadWindowResult
+    ) {
+        let element_offset: u64 = (((range_start as u64 in Saturating)
+            - (region_base as u64 in Saturating)) as u64) / 8;
+        transition { _ -> copy_at(
+            engine_privileged_state, position, region, region_base, region_size, window,
+            range_index, result, element_offset, 0) }
+    }
+
+    state copy_at(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64,
+        window: ElementWindow,
+        range_index: u64,
+        result: ReadWindowResult,
+        element_offset: u64,
+        element_index: u64
+    ) {
+        transition element_index < result.window.get_element_count() {
+            true -> set_element(engine_privileged_state, position, region, region_base, region_size, window, range_index, result, element_offset, element_index)
+            false -> range_each(engine_privileged_state, position, region, region_base, region_size, window, ((range_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> range_each(engine_privileged_state, position, region, region_base, region_size, window, ((range_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state set_element(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        region: SnapshotRegion,
+        region_base: u64,
+        region_size: u64,
+        window: ElementWindow,
+        range_index: u64,
+        result: ReadWindowResult,
+        element_offset: u64,
+        element_index: u64
+    ) {
+        let mut written: ElementWindow = window;
+        let value: u64 = result.window.get_element(element_index);
+        written.set_element(
+            ((element_offset as u64 in Saturating) + (element_index as u64 in Saturating)) as u64,
+            value);
+        transition { _ -> copy_at(
+            engine_privileged_state, position, region, region_base, region_size, written,
+            range_index, result, element_offset,
+            ((element_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state install(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        position: u64,
+        window: ElementWindow
+    ) {
         engine_privileged_state
             .borrow_snapshot_mut()
             .collect_region_values(position, window);
         transition { _ -> each(engine_privileged_state, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
-    state done() {
+}
+
+// Upstream's post-swap buffer semantics: `current_values` becomes the old
+// `previous_values` — or a zeroed `region_size` buffer when nothing was
+// collected before. Element-domain analogue over the region's windows.
+machine SnapshotValueCollector::baseline_window(
+    region: &SnapshotRegion,
+    region_size: u64
+) -> ElementWindow {
+    transition region.get_previous_element_count() == 0 {
+        true -> (ElementWindow::of_length(region_size / 8))
+        false -> (region.clone_previous_values())
+        _ -> (region.clone_previous_values())
+    }
+}
+
+// The k-th read range's start: the region base for k = 0, otherwise the
+// previous page boundary — upstream's `next_range_start_address` walk.
+machine SnapshotValueCollector::range_start_of(
+    region: &SnapshotRegion,
+    region_base: u64,
+    range_index: u64
+) -> u64 {
+    transition range_index == 0 {
+        true -> (region_base)
+        false -> (region.get_page_boundary(((range_index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64))
+        _ -> (region.get_page_boundary(((range_index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64))
+    }
+}
+
+// The k-th read range's end: the k-th page boundary while one remains,
+// otherwise the region end — upstream's tail `current_slice` case.
+machine SnapshotValueCollector::range_end_of(
+    region: &SnapshotRegion,
+    region_base: u64,
+    region_size: u64,
+    range_index: u64
+) -> u64 {
+    transition range_index < region.get_page_boundary_count() {
+        true -> (region.get_page_boundary(range_index))
+        false -> (((region_base as u64 in Saturating) + (region_size as u64 in Saturating)) as u64)
+        _ -> (((region_base as u64 in Saturating) + (region_size as u64 in Saturating)) as u64)
     }
 }

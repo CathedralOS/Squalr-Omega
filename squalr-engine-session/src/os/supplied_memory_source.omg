@@ -15,6 +15,10 @@ pub data SuppliedRegion {
     base_address: u64;
     elements: ElementWindow;
     element_stride_bytes: u64;
+    // Upstream unreadable-page analog: the page is still declared in
+    // `get_page_bounds` (it is mapped), but every read over it fails —
+    // `read_bytes` returning false on a deallocated or guarded page.
+    is_readable: bool;
 }
 
 pub data SuppliedMemorySource {
@@ -35,7 +39,15 @@ pub machine SuppliedRegion::new(
         base_address: base_address,
         elements: ElementWindow::clone(elements),
         element_stride_bytes: element_stride_bytes,
+        is_readable: true,
     }
+}
+
+// Fault-injection surface for the partial-read leg: mark a region unreadable
+// so `try_read_window` fails over it while `get_page_bounds` keeps reporting
+// its page (upstream: mapped but unreadable).
+pub machine SuppliedRegion::set_readable(&mut self, readable: bool) {
+    self.is_readable = readable;
 }
 
 pub machine SuppliedRegion::get_base_address(&self) -> u64 {
@@ -53,6 +65,7 @@ pub machine SuppliedRegion::of_window(
         base_address: base_address,
         elements: elements,
         element_stride_bytes: element_stride_bytes,
+        is_readable: true,
     }
 }
 
@@ -77,9 +90,9 @@ pub machine SuppliedMemorySource::of_region(region: SuppliedRegion) -> SuppliedM
     SuppliedMemorySource {
         regions: [
             region,
-            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
-            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 },
-            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0 }
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0, is_readable: true },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0, is_readable: true },
+            SuppliedRegion { base_address: 0, elements: ElementWindow::empty(), element_stride_bytes: 0, is_readable: true }
         ],
         region_count: 1,
     }
@@ -89,15 +102,18 @@ pub machine SuppliedMemorySource::get_region_count(&self) -> u64 {
     self.region_count
 }
 
-pub machine SuppliedMemorySource::push_region(&mut self, region: &SuppliedRegion) -> bool {
-    transition self.region_count < 4 {
-        true -> store(region)
-        false -> (false)
+// Fixture-side readability toggle — see `SuppliedRegion::set_readable`.
+pub machine SuppliedMemorySource::set_region_readable(&mut self, position: u64, readable: bool) {
+    transition position < self.region_count && position < 4 {
+        true -> store(position, readable)
+        false -> done()
+        _ -> done()
     }
-    state store(&mut self, region: &SuppliedRegion) -> bool {
-        self.regions[self.region_count].clone_from(region);
-        self.region_count = self.region_count + 1;
-        true
+    state store(&mut self, position: u64, readable: bool) {
+        self.regions[position].is_readable = readable;
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
     }
 }
 
@@ -105,6 +121,7 @@ pub machine SuppliedRegion::clone_from(&mut self, source: &SuppliedRegion) {
     self.base_address = source.base_address;
     self.elements.clone_from(&source.elements);
     self.element_stride_bytes = source.element_stride_bytes;
+    self.is_readable = source.is_readable;
 }
 
 pub machine SuppliedRegion::clone(source: &SuppliedRegion) -> SuppliedRegion {
@@ -112,6 +129,7 @@ pub machine SuppliedRegion::clone(source: &SuppliedRegion) -> SuppliedRegion {
         base_address: source.base_address,
         elements: ElementWindow::clone(&source.elements),
         element_stride_bytes: source.element_stride_bytes,
+        is_readable: source.is_readable,
     }
 }
 
@@ -155,7 +173,7 @@ pub machine SuppliedMemorySource::read_window(
             + (self.regions[position].get_region_size() as u64 in Saturating)) as u64;
         let read_end: u64 = ((base_address as u64 in Saturating)
             + (size_in_bytes as u64 in Saturating)) as u64;
-        transition region_base < read_end && region_end > base_address {
+        transition region_base < read_end && region_end > base_address && self.regions[position].is_readable {
             true -> append(window, base_address, size_in_bytes, position)
             false -> each(window, base_address, size_in_bytes, position + 1)
         }
@@ -180,6 +198,75 @@ pub machine SuppliedMemorySource::read_window(
     }
 }
 
+// Upstream `read_bytes(process_info, address, values) -> bool` surface:
+// `succeeded` iff the OS call could fill the whole buffer — the adapter's
+// analogue is full coverage of `[base, base+size)` by READABLE supplied
+// regions. `window` carries the overlapping elements on success only.
+pub data ReadWindowResult {
+    succeeded: bool;
+    window: ElementWindow;
+}
+
+// Upstream `read_process_memory` returning `bytes_read == len` — an
+// all-or-nothing read: partial coverage is a failure, not a short read
+// (the per-page fallback in the collector is what tolerates short spans).
+pub machine SuppliedMemorySource::try_read_window(
+    &self,
+    base_address: u64,
+    size_in_bytes: u64
+) -> ReadWindowResult {
+    let limit: u64 = ((base_address as u64 in Saturating)
+        + (size_in_bytes as u64 in Saturating)) as u64;
+    let covered: bool = self.covers_readable(base_address, limit, 0);
+    transition covered {
+        true -> fill(base_address, size_in_bytes)
+        false -> (ReadWindowResult { succeeded: false, window: ElementWindow::empty() })
+        _ -> (ReadWindowResult { succeeded: false, window: ElementWindow::empty() })
+    }
+    state fill(&self, base_address: u64, size_in_bytes: u64) -> ReadWindowResult {
+        let window: ElementWindow = self.read_window(base_address, size_in_bytes);
+        ReadWindowResult { succeeded: true, window: window }
+    }
+}
+
+// Coverage walk for `try_read_window`: advance a cursor across the readable
+// regions covering it — every gap or unreadable span fails the check,
+// mirroring `process_vm_readv` failing on any unmapped page in the range.
+// At most one hop per region.
+machine SuppliedMemorySource::covers_readable(&self, cursor: u64, limit: u64, iteration: u64) -> bool {
+    transition cursor >= limit || iteration >= 4 {
+        true -> (cursor >= limit)
+        false -> seek(cursor, limit, iteration, 0)
+        _ -> seek(cursor, limit, iteration, 0)
+    }
+    state seek(&self, cursor: u64, limit: u64, iteration: u64, position: u64) -> bool {
+        transition position < self.region_count && position < 4 {
+            true -> probe(cursor, limit, iteration, position)
+            false -> (false)
+        }
+    }
+    state probe(&self, cursor: u64, limit: u64, iteration: u64, position: u64 [0..4]) -> bool {
+        let region_base: u64 = self.regions[position].get_base_address();
+        let region_end: u64 = ((region_base as u64 in Saturating)
+            + (self.regions[position].get_region_size() as u64 in Saturating)) as u64;
+        let readable: bool = self.regions[position].is_readable;
+        transition readable && region_base <= cursor && cursor < region_end {
+            true -> advance(cursor, limit, iteration, region_end)
+            false -> seek(cursor, limit, iteration, position + 1)
+            _ -> seek(cursor, limit, iteration, position + 1)
+        }
+    }
+    // Recursion must be tail-only here (measured-recursion rule): the next
+    // hop re-enters `seek` through a transition, not a nested value call.
+    state advance(&self, cursor: u64, limit: u64, iteration: u64, region_end: u64) -> bool {
+        transition region_end >= limit {
+            true -> (true)
+            false -> seek(region_end, limit, ((iteration as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, 0)
+            _ -> seek(region_end, limit, ((iteration as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, 0)
+        }
+    }
+}
+
 // Best-effort live read for `scan-results list` display — the value at the
 // element offset under `address`, or 0 when the address misses every
 // supplied region (upstream logs the read failure and shows the default).
@@ -196,7 +283,7 @@ pub machine SuppliedMemorySource::read_u64(&self, address: u64) -> u64 {
         let size: u64 = self.regions[position].get_region_size();
         let stride: u64 = self.regions[position].element_stride_bytes;
         let limit: u64 = ((base as u64 in Saturating) + (size as u64 in Saturating)) as u64;
-        transition address >= base && address < limit && stride > 0 {
+        transition address >= base && address < limit && stride > 0 && self.regions[position].is_readable {
             true -> at(address, position, base, stride)
             false -> each(address, position + 1)
         }
