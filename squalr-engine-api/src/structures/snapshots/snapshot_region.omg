@@ -138,6 +138,105 @@ pub machine SnapshotRegion::get_previous_element(&self, position: u64) -> u64 {
     self.previous_values.get_element(position)
 }
 
+// Upstream `has_previous_values`: the prior collection window is populated.
+pub machine SnapshotRegion::has_previous_values(&self) -> bool {
+    !self.previous_values.is_empty()
+}
+
+// `read_current_elements`/`read_previous_elements` are the owned-model
+// equivalent of upstream's `get_current_values_filter_pointer`: the scanner
+// asks for the elements a filter's range covers. Upstream hands out raw
+// byte pointers; this port copies the covered window elements into `dst`
+// and returns the count written. Element indexing presumes the window's
+// capture stride equals the scan's unit size — the same binding the
+// collector's window model carries. The alignment parameter rides the
+// signature for the alignment-strided reads the vector legs will need;
+// scalar reads are element-indexed.
+pub machine SnapshotRegion::read_current_elements(
+    &self,
+    snapshot_region_filter: &SnapshotRegionFilter,
+    unit_size_in_bytes: u64,
+    memory_alignment: MemoryAlignment,
+    dst: &mut [u64]
+) -> u64
+crashes Abort
+{
+    let alignment: u64 = memory_alignment.get_size_in_bytes();
+    let base_delta: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+        - (self.normalized_region.get_base_address() as u64 in Saturating)) as u64;
+    // Upstream's candidate count at the filter's scan stride — trailing
+    // payload bytes are not candidate starts (`get_element_count` carries
+    // the aligned-base crash parity).
+    let covered: u64 = snapshot_region_filter.get_element_count(
+        unit_size_in_bytes,
+        memory_alignment);
+    transition { _ -> each(dst, base_delta, alignment, covered, unit_size_in_bytes, 0) }
+    state each(&self, dst: &mut [u64], base_delta: u64, stride: u64, count: u64, unit: u64, position: u64) -> u64 {
+        let window_count: u64 = self.current_values.get_element_count();
+        transition position < count && position < dst.len {
+            true -> probe(dst, base_delta, stride, count, unit, position, window_count)
+            false -> (position)
+        }
+    }
+    state probe(&self, dst: &mut [u64], base_delta: u64, stride: u64, count: u64, unit: u64, position: u64, window_count: u64) -> u64 {
+        // Candidate `position` sits `position * stride` bytes past the
+        // filter base; the window stores unit-strided elements, so the
+        // element index divides by the unit. Scalar-leg invariants keep
+        // stride == unit and the filter base unit-aligned.
+        let element_index: u64 = (((base_delta as u64 in Saturating)
+            + ((position as u64 in Saturating) * (stride as u64 in Saturating))) as u64)
+            / unit;
+        transition element_index < window_count {
+            true -> copy(dst, base_delta, stride, count, unit, position, element_index)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+    state copy(&self, dst: &mut [u64], base_delta: u64, stride: u64, count: u64, unit: u64, position: u64, element_index: u64) -> u64 {
+        dst[position] = self.current_values.get_element(element_index);
+        transition { _ -> each(dst, base_delta, stride, count, unit, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+pub machine SnapshotRegion::read_previous_elements(
+    &self,
+    snapshot_region_filter: &SnapshotRegionFilter,
+    unit_size_in_bytes: u64,
+    memory_alignment: MemoryAlignment,
+    dst: &mut [u64]
+) -> u64
+crashes Abort
+{
+    let alignment: u64 = memory_alignment.get_size_in_bytes();
+    let base_delta: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+        - (self.normalized_region.get_base_address() as u64 in Saturating)) as u64;
+    let covered: u64 = snapshot_region_filter.get_element_count(
+        unit_size_in_bytes,
+        memory_alignment);
+    transition { _ -> each(dst, base_delta, alignment, covered, unit_size_in_bytes, 0) }
+    state each(&self, dst: &mut [u64], base_delta: u64, stride: u64, count: u64, unit: u64, position: u64) -> u64 {
+        let window_count: u64 = self.previous_values.get_element_count();
+        transition position < count && position < dst.len {
+            true -> probe(dst, base_delta, stride, count, unit, position, window_count)
+            false -> (position)
+        }
+    }
+    state probe(&self, dst: &mut [u64], base_delta: u64, stride: u64, count: u64, unit: u64, position: u64, window_count: u64) -> u64 {
+        let element_index: u64 = (((base_delta as u64 in Saturating)
+            + ((position as u64 in Saturating) * (stride as u64 in Saturating))) as u64)
+            / unit;
+        transition element_index < window_count {
+            true -> copy(dst, base_delta, stride, count, unit, position, element_index)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+    state copy(&self, dst: &mut [u64], base_delta: u64, stride: u64, count: u64, unit: u64, position: u64, element_index: u64) -> u64 {
+        dst[position] = self.previous_values.get_element(element_index);
+        transition { _ -> each(dst, base_delta, stride, count, unit, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
 // Upstream `set_current_values`: installs a freshly collected window.
 pub machine SnapshotRegion::set_current_values(&mut self, values: &ElementWindow) {
     self.current_values.clone_from(values);
@@ -210,6 +309,33 @@ pub machine DataTypeRefSet::get(&self, position: u64) -> DataTypeRef {
     }
     state clone_at(&self, position: u64) -> DataTypeRef {
         DataTypeRef::clone(&self.data_type_refs[position])
+    }
+}
+
+// The set copy — upstream hands `&[DataTypeRef]` around and callers clone it
+// when an owned span is needed (`self.data_type_refs.clone()`); the bounded
+// set clone is the same operation.
+pub machine DataTypeRefSet::clone(source: &DataTypeRefSet) -> DataTypeRefSet {
+    let mut built: DataTypeRefSet = DataTypeRefSet::empty();
+    built.clone_from(source);
+    (built)
+}
+
+pub machine DataTypeRefSet::clone_from(&mut self, source: &DataTypeRefSet) {
+    self.count = 0;
+    transition { _ -> each(source, 0) }
+    state each(&mut self, source: &DataTypeRefSet, position: u64) {
+        transition position < source.get_count() {
+            true -> copy(source, position)
+            false -> done()
+        }
+    }
+    state copy(&mut self, source: &DataTypeRefSet, position: u64) {
+        let data_type_ref: DataTypeRef = source.get(position);
+        let pushed: bool = self.push(&data_type_ref);
+        transition { _ -> each(source, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done(&mut self) {
     }
 }
 
@@ -379,6 +505,15 @@ pub machine SnapshotRegion::get_current_values_slice(&self, start: u64, count: u
 
 pub machine SnapshotRegion::get_previous_values_slice(&self, start: u64, count: u64) -> &[u64] {
     self.previous_values.slice(start, count)
+}
+
+// Upstream `scan_results.collections.push(collection)` — the scan installs
+// its dispatch output one collection at a time.
+pub machine SnapshotRegion::push_scan_result_collection(
+    &mut self,
+    collection: SnapshotRegionFilterCollection
+) -> bool {
+    self.scan_results.push_collection(&collection)
 }
 
 // Upstream `set_scan_results`: replaces the region's result collections with
