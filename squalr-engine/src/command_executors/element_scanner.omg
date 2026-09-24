@@ -8,6 +8,7 @@ use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filte
 use squalr_engine_api::src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
 use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use squalr_engine_scanning::src::scanners::scan_control::ScanControl;
 use src::command_executors::element_scan_dispatcher::ElementScanChainDispatcher;
 
 // Port of `ElementScanner::scan_snapshot` (single-threaded leg). Per region:
@@ -18,16 +19,23 @@ use src::command_executors::element_scan_dispatcher::ElementScanChainDispatcher;
 // Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
 pub data ElementScannerDriver {}
 
+// Upstream `scan_snapshot(snapshot, symbol_registry, plan, scan_control,
+// with_logging, refresh)`: the owned-model port carries `scan_control` by
+// `&mut` since cancellation and the reported progress write onto the
+// control object (upstream reads a shared atomic + invokes a closure).
 pub machine ElementScannerDriver::scan_snapshot(
     snapshot: &mut Snapshot,
-    element_scan_plan: &ElementScanPlan
+    element_scan_plan: &ElementScanPlan,
+    scan_control: &mut ScanControl
 ) -> ScanResultsMetadata
 crashes Abort
 {
+    let total_region_count: u64 = snapshot.get_region_count();
     snapshot.initialize_all_scan_results(
         element_scan_plan.clone_data_type_refs(),
         element_scan_plan.get_memory_alignment());
-    ElementScannerDriver::scan_regions(snapshot, element_scan_plan, 0);
+    ElementScannerDriver::scan_regions(
+        snapshot, element_scan_plan, scan_control, 0, 0, total_region_count);
     snapshot.discard_empty_regions();
     ElementScannerDriver::collect_metadata(snapshot, 0, 0)
 }
@@ -38,25 +46,99 @@ crashes Abort
 pub machine ElementScannerDriver::scan_regions(
     snapshot: &mut Snapshot,
     element_scan_plan: &ElementScanPlan,
-    region_index: u64
+    scan_control: &mut ScanControl,
+    region_index: u64,
+    processed_region_count: u64,
+    total_region_count: u64
 ) 
 crashes Abort
 {
-    transition region_index < snapshot.get_region_count() {
-        true -> scan_one(snapshot, element_scan_plan, region_index)
+    transition region_index < total_region_count && region_index < snapshot.get_region_count() {
+        true -> cancel_gate(
+            snapshot, element_scan_plan, scan_control,
+            region_index, processed_region_count, total_region_count)
         false -> done()
         _ -> done()
+    }
+
+    // Upstream's per-region `if scan_control.should_cancel() { return; }` —
+    // the cancelled region (and every one after) contributes neither scanned
+    // results nor a processed count, exactly as upstream's early return.
+    state cancel_gate(
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
+        region_index: u64,
+        processed_region_count: u64,
+        total_region_count: u64
+    ) {
+        let cancelled: bool = scan_control.should_cancel();
+        transition cancelled == false {
+            true -> scan_one(
+                snapshot, element_scan_plan, scan_control,
+                region_index, processed_region_count, total_region_count)
+            false -> done()
+            _ -> done()
+        }
     }
 
     state scan_one(
         snapshot: &mut Snapshot,
         element_scan_plan: &ElementScanPlan,
-        region_index: u64
+        scan_control: &mut ScanControl,
+        region_index: u64,
+        processed_region_count: u64,
+        total_region_count: u64
     ) {
         let results: SnapshotRegionScanResults = ElementScannerDriver::dispatch_region(
             snapshot, element_scan_plan, region_index);
         snapshot.apply_region_scan_results(region_index, results);
-        transition { _ -> scan_regions(snapshot, element_scan_plan, ((region_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+        // `fetch_add(1)` returns the pre-increment index — report on it.
+        transition { _ -> progress(
+            snapshot, element_scan_plan, scan_control,
+            region_index, processed_region_count, total_region_count) }
+    }
+
+    // Upstream's `processed_region_index % 32 == 0 && total_region_count > 0`.
+    state progress(
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
+        region_index: u64,
+        processed_index: u64,
+        total_region_count: u64
+    ) {
+        let next_region: u64 = ((region_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let next_processed: u64 = ((processed_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let phase: u64 = processed_index % 32;
+        transition phase == 0 && total_region_count > 0 {
+            true -> report(
+                snapshot, element_scan_plan, scan_control,
+                next_region, next_processed, total_region_count, processed_index)
+            false -> scan_regions(
+                snapshot, element_scan_plan, scan_control,
+                next_region, next_processed, total_region_count)
+            _ -> scan_regions(
+                snapshot, element_scan_plan, scan_control,
+                next_region, next_processed, total_region_count)
+        }
+    }
+
+    state report(
+        snapshot: &mut Snapshot,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
+        next_region: u64,
+        next_processed: u64,
+        total_region_count: u64,
+        processed_index: u64
+    ) {
+        let progress: f32 =
+            ((processed_index as f32) / (total_region_count as f32)) * 100.0;
+        scan_control.report_progress(progress);
+        transition { _ -> scan_regions(
+            snapshot, element_scan_plan, scan_control,
+            next_region, next_processed, total_region_count) }
     }
 
     state done() {
