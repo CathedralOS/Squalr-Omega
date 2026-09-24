@@ -1,0 +1,76 @@
+module src::command_executors::scan_results_delete_request_executor;
+
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultRefList;
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultsDeleteRequest;
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_response::ScanResultsDeleteResponse;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
+use squalr_engine_api::src::structures::snapshots::deleted_scan_result_index_set::DeletedScanResultIndexSet;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+
+// Port of command_executors/scan_results/delete/
+// scan_results_delete_request_executor.rs: mark each requested global
+// result index as deleted on the snapshot tombstone set and report how
+// many fresh marks landed. Upstream's write-lock failure arm folds into
+// the `has_opened_process` gate here (the port's snapshot is owned, not
+// RwLock'd); upstream's ScanResultsUpdatedEvent has no event surface in
+// the port yet — a named deviation.
+pub data ScanResultsDeleteRequestExecutor {}
+
+pub machine ScanResultsDeleteRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    scan_results_delete_request: &ScanResultsDeleteRequest
+) -> ScanResultsDeleteResponse
+crashes Abort
+{
+    let requested_result_count: u64 = scan_results_delete_request.scan_result_refs.get_count();
+    transition engine_privileged_state.has_opened_process() {
+        true -> collect(engine_privileged_state, &scan_results_delete_request.scan_result_refs, requested_result_count)
+        false -> (ScanResultsDeleteResponse::of(requested_result_count, 0))
+        _ -> (ScanResultsDeleteResponse::of(requested_result_count, 0))
+    }
+
+    state collect(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_result_refs: &ScanResultRefList,
+        requested_result_count: u64
+    ) -> ScanResultsDeleteResponse {
+        let mut deleted_scan_result_indices: DeletedScanResultIndexSet = DeletedScanResultIndexSet::empty();
+        transition { _ -> each(engine_privileged_state, scan_result_refs, requested_result_count, &mut deleted_scan_result_indices, 0) }
+    }
+
+    state each(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_result_refs: &ScanResultRefList,
+        requested_result_count: u64,
+        deleted_scan_result_indices: &mut DeletedScanResultIndexSet,
+        position: u64
+    ) -> ScanResultsDeleteResponse {
+        transition position < scan_result_refs.get_count() && position < 64 {
+            true -> plant(engine_privileged_state, scan_result_refs, requested_result_count, deleted_scan_result_indices, position)
+            false -> apply(engine_privileged_state, requested_result_count, deleted_scan_result_indices)
+        }
+    }
+
+    state plant(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_result_refs: &ScanResultRefList,
+        requested_result_count: u64,
+        deleted_scan_result_indices: &mut DeletedScanResultIndexSet,
+        position: u64
+    ) -> ScanResultsDeleteResponse {
+        let scan_result_ref: ScanResultRef = scan_result_refs.get(position);
+        _ = deleted_scan_result_indices.insert(scan_result_ref.get_scan_result_index());
+        transition { _ -> each(engine_privileged_state, scan_result_refs, requested_result_count, deleted_scan_result_indices, position + 1) }
+    }
+
+    state apply(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        requested_result_count: u64,
+        deleted_scan_result_indices: &mut DeletedScanResultIndexSet
+    ) -> ScanResultsDeleteResponse {
+        let snapshot: &mut Snapshot = engine_privileged_state.borrow_snapshot_mut();
+        let deleted_result_count: u64 = snapshot.delete_scan_results(deleted_scan_result_indices);
+        transition { _ -> (ScanResultsDeleteResponse::of(requested_result_count, deleted_result_count)) }
+    }
+}
