@@ -32,7 +32,8 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   declared package graph. Acceptance: native command sequence creates a scan,
   filters it again and pages exact results through the production engine.
 - **TARGETS-AND-THROUGHPUT.** Then port native reads using a controlled child
-  process, partial-read handling, cancellations, SIMD and parallel execution.
+  process, partial-read handling, SIMD and parallel execution. (ScanControl
+  cancellation/progress surface is ported — `leaf/scan-cancellation-progress`.)
   Reuse scalar fixtures to check optimized results; measure total allocation
   and throughput including result publication. GUI/TUI/installer are excluded.
   Live-snapshot chain status: attach/enumerate/region/memory-io providers are
