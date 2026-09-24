@@ -1,0 +1,189 @@
+module src::structures::snapshots::deleted_scan_result_index_set;
+
+// Port of upstream `BTreeSet<u64>` deleted_scan_result_indices: the
+// tombstone set of manually deleted global scan-result indices. Bounded at
+// 64 — the CLI delete surface carries a row selection, matching the
+// PageElementList bound (named deviation from unbounded BTreeSet growth;
+// deletions past the bound are declined by `insert` returning false).
+// Members stay sorted and unique, so range counting is a linear scan that
+// stops at the first index past the end.
+pub data DeletedScanResultIndexSet {
+    indices: [u64; 64];
+    count: u64;
+}
+
+pub machine DeletedScanResultIndexSet::empty() -> DeletedScanResultIndexSet {
+    DeletedScanResultIndexSet { count: 0 }
+}
+
+pub machine DeletedScanResultIndexSet::is_empty(&self) -> bool {
+    self.count == 0
+}
+
+pub machine DeletedScanResultIndexSet::get_count(&self) -> u64 {
+    self.count
+}
+
+// Upstream `BTreeSet::insert`: absent and within the bound stores sorted —
+// returns true; already-present or full returns false (upstream's `false`
+// for duplicates; the bound is the named deviation).
+pub machine DeletedScanResultIndexSet::insert(&mut self, index: u64) -> bool {
+    transition { _ -> seek(0, index) }
+    state seek(&mut self, position: u64, index: u64) -> bool {
+        transition position < self.count && position < 64 {
+            true -> compare(position, index)
+            false -> append(position, index)
+        }
+    }
+    state compare(&mut self, position: u64 [0..64], index: u64) -> bool {
+        transition self.indices[position] == index {
+            true -> (false)
+            false -> order(position, index)
+        }
+    }
+    state order(&mut self, position: u64 [0..64], index: u64) -> bool {
+        transition self.indices[position] < index {
+            true -> seek(position + 1, index)
+            false -> shift(position, index)
+        }
+    }
+    state shift(&mut self, position: u64 [0..64], index: u64) -> bool {
+        transition self.count < 64 {
+            true -> move_tail(position, index, self.count)
+            false -> (false)
+        }
+    }
+    // Walk `tail` down from `count`, copying indices[prev] into indices[tail],
+    // until the insertion slot at `position` is open. Both index operands
+    // arrive bounded — the guard `tail > position` also proves tail >= 1 so
+    // `tail - 1` stays in range.
+    state move_tail(&mut self, position: u64 [0..64], index: u64, tail: u64 [0..64]) -> bool {
+        transition tail > position {
+            true -> step(position, index, tail,
+                ((tail as u64 in Saturating) - (1 as u64 in Saturating)) as u64)
+            false -> plant(position, index)
+        }
+    }
+    // `previous` arrived unbounded (a computed argument carries no static
+    // range) — the guard narrows it before `write` takes it as a bounded
+    // index.
+    state step(&mut self, position: u64 [0..64], index: u64, tail: u64 [0..64], previous: u64) -> bool {
+        transition previous < 64 {
+            true -> write(position, index, tail, previous)
+            false -> plant(position, index)
+        }
+    }
+    state write(&mut self, position: u64 [0..64], index: u64, tail: u64 [0..64], previous: u64 [0..64]) -> bool {
+        self.indices[tail] = self.indices[previous];
+        transition { _ -> move_tail(position, index, previous) }
+    }
+    state plant(&mut self, position: u64 [0..64], index: u64) -> bool {
+        self.indices[position] = index;
+        self.count = ((self.count as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        true
+    }
+    state append(&mut self, position: u64, index: u64) -> bool {
+        transition self.count < 64 {
+            true -> store(index, self.count)
+            false -> (false)
+        }
+    }
+    state store(&mut self, index: u64, at: u64 [0..64]) -> bool {
+        self.indices[at] = index;
+        self.count = ((self.count as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        true
+    }
+}
+
+// Upstream `BTreeSet::contains`.
+pub machine DeletedScanResultIndexSet::contains(&self, index: u64) -> bool {
+    transition { _ -> seek(0, index) }
+    state seek(&self, position: u64, index: u64) -> bool {
+        transition position < self.count && position < 64 {
+            true -> compare(position, index)
+            false -> (false)
+        }
+    }
+    state compare(&self, position: u64 [0..64], index: u64) -> bool {
+        transition self.indices[position] == index {
+            true -> (true)
+            false -> skip(position, index)
+        }
+    }
+    state skip(&self, position: u64 [0..64], index: u64) -> bool {
+        transition self.indices[position] < index {
+            true -> seek(position + 1, index)
+            false -> (false)
+        }
+    }
+}
+
+pub machine DeletedScanResultIndexSet::clear(&mut self) {
+    self.count = 0;
+}
+
+// In-order read of the sorted members — the `range(base..end)` walks below
+// iterate positions [0, count) and filter by bounds.
+pub machine DeletedScanResultIndexSet::get(&self, position: u64) -> u64 {
+    transition position < self.count && position < 64 {
+        true -> (self.indices[position])
+        false -> (0)
+    }
+}
+
+// Upstream `deleted_scan_result_indices.range(base..base+count).count()`:
+// sorted members let the scan stop once it passes the end bound.
+pub machine DeletedScanResultIndexSet::count_in_range(
+    &self,
+    range_base: u64,
+    range_end: u64
+) -> u64 {
+    transition { _ -> seek(0, 0, range_base, range_end) }
+    state seek(&self, position: u64, found: u64, range_base: u64, range_end: u64) -> u64 {
+        transition position < self.count && position < 64 {
+            true -> inspect(position, found, range_base, range_end)
+            false -> (found)
+        }
+    }
+    state inspect(&self, position: u64 [0..64], found: u64, range_base: u64, range_end: u64) -> u64 {
+        transition self.indices[position] >= range_end {
+            true -> (found)
+            false -> bound(position, found, range_base, range_end)
+        }
+    }
+    state bound(&self, position: u64 [0..64], found: u64, range_base: u64, range_end: u64) -> u64 {
+        transition self.indices[position] >= range_base {
+            true -> tally(position, found, range_base, range_end)
+            false -> seek(position + 1, found, range_base, range_end)
+        }
+    }
+    state tally(&self, position: u64 [0..64], found: u64, range_base: u64, range_end: u64) -> u64 {
+        transition { _ -> seek(position + 1,
+            ((found as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            range_base, range_end) }
+    }
+}
+
+pub machine DeletedScanResultIndexSet::clone(source: &DeletedScanResultIndexSet) -> DeletedScanResultIndexSet {
+    let mut copy: DeletedScanResultIndexSet = DeletedScanResultIndexSet::empty();
+    copy.clone_from(source);
+    copy
+}
+
+pub machine DeletedScanResultIndexSet::clone_from(&mut self, source: &DeletedScanResultIndexSet) {
+    self.count = source.count;
+    transition { _ -> copy(source, 0) }
+    state copy(&mut self, source: &DeletedScanResultIndexSet, position: u64) {
+        transition position < source.count && position < 64 {
+            true -> store(source, position)
+            false -> done()
+        }
+    }
+    state store(&mut self, source: &DeletedScanResultIndexSet, position: u64 [0..64]) {
+        self.indices[position] = source.indices[position];
+        transition { _ -> copy(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.count = self.count;
+    }
+}
