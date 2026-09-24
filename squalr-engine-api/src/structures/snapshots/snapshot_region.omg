@@ -24,9 +24,18 @@ use src::structures::snapshots::element_window::ElementWindow;
 //
 // No Vec in this pin: scan results and windows are bounded; overflow is a
 // named deviation recorded at the bounded carriers.
+//
+// Flat mirrors of the nested scalars (`base_address`/`region_size`/
+// `current_element_count`): native runtime observation admits exactly one
+// field leaf after an array index, so `regions[0].normalized_region.X`
+// reads cannot realize natively. Entry-side verification reads these
+// mirrors; every writer below keeps them in step with the nested fields.
 pub data SnapshotRegion {
     normalized_region: NormalizedRegion;
+    base_address: u64;
+    region_size: u64;
     current_values: ElementWindow;
+    current_element_count: u64;
     previous_values: ElementWindow;
     page_boundaries: [u64; 64];
     page_boundary_count: u64;
@@ -39,7 +48,10 @@ pub machine SnapshotRegion::new(base_address: u64, region_size: u64) -> Snapshot
             base_address: base_address,
             region_size: region_size,
         },
+        base_address: base_address,
+        region_size: region_size,
         current_values: ElementWindow::empty(),
+        current_element_count: 0,
         previous_values: ElementWindow::empty(),
         page_boundary_count: 0,
         scan_results: SnapshotRegionScanResults::empty(),
@@ -72,7 +84,10 @@ pub machine SnapshotRegion::clone(source: &SnapshotRegion) -> SnapshotRegion {
 
 pub machine SnapshotRegion::clone_from(&mut self, source: &SnapshotRegion) {
     self.normalized_region.clone_from(&source.normalized_region);
+    self.base_address = source.base_address;
+    self.region_size = source.region_size;
     self.current_values.clone_from(&source.current_values);
+    self.current_element_count = source.current_element_count;
     self.previous_values.clone_from(&source.previous_values);
     self.scan_results.clone_from(&source.scan_results);
     self.page_boundary_count = source.page_boundary_count;
@@ -99,6 +114,7 @@ pub machine SnapshotRegion::get_base_address(&self) -> u64 {
 
 pub machine SnapshotRegion::set_base_address(&mut self, base_address: u64) {
     self.normalized_region.set_base_address(base_address);
+    self.base_address = base_address;
 }
 
 pub machine SnapshotRegion::get_end_address(&self) -> u64 {
@@ -111,6 +127,7 @@ pub machine SnapshotRegion::get_region_size(&self) -> u64 {
 
 pub machine SnapshotRegion::set_region_size(&mut self, region_size: u64) {
     self.normalized_region.set_region_size(region_size);
+    self.region_size = region_size;
 }
 
 // The region's normalized span, for callers building filters over it.
@@ -124,6 +141,14 @@ pub machine SnapshotRegion::has_current_values(&self) -> bool {
 
 pub machine SnapshotRegion::get_current_element_count(&self) -> u64 {
     self.current_values.get_element_count()
+}
+
+// Fixture-side counterpart — entry closures cannot descend below an
+// array element into a nested record (`carrier path` wall), so seeds
+// reach the element window through a flat setter.
+pub machine SnapshotRegion::set_current_element_count(&mut self, element_count: u64) {
+    self.current_values.element_count = element_count;
+    self.current_element_count = element_count;
 }
 
 pub machine SnapshotRegion::get_current_element(&self, position: u64) -> u64 {
@@ -141,6 +166,7 @@ pub machine SnapshotRegion::get_previous_element(&self, position: u64) -> u64 {
 // Upstream `set_current_values`: installs a freshly collected window.
 pub machine SnapshotRegion::set_current_values(&mut self, values: &ElementWindow) {
     self.current_values.clone_from(values);
+    self.current_element_count = self.current_values.element_count;
 }
 
 // Upstream's collect swap: current becomes previous before the next read.
@@ -274,6 +300,8 @@ machine SnapshotRegion::resize_to_filters(&mut self) {
         self.previous_values.truncate_front(lead);
         self.normalized_region.set_base_address(bounds.min_address);
         self.normalized_region.set_region_size(((bounds.max_address as u64 in Saturating) - (bounds.min_address as u64 in Saturating)) as u64);
+        self.base_address = self.normalized_region.base_address;
+        self.region_size = self.normalized_region.region_size;
         transition { _ -> clip() }
     }
     // Windows may extend past the surviving union — clamp the element counts
@@ -282,12 +310,15 @@ machine SnapshotRegion::resize_to_filters(&mut self) {
         let elements: u64 = self.normalized_region.get_region_size() / 8;
         self.current_values.truncate_back(elements);
         self.previous_values.truncate_back(elements);
+        self.current_element_count = self.current_values.element_count;
         self.page_boundary_count = self.page_boundary_count;
     }
     state empty_self(&mut self) {
         self.normalized_region.set_region_size(0);
+        self.region_size = 0;
         self.current_values.clear();
         self.previous_values.clear();
+        self.current_element_count = 0;
     }
 }
 
