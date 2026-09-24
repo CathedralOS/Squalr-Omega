@@ -22,14 +22,20 @@ use src::structures::snapshots::element_window::ElementWindow;
 // value collection must not read across them (upstream keeps the boundary
 // addresses at merge time for exactly this). Bounded at 64 boundaries.
 //
-// No Vec in this pin: scan results and windows are bounded; overflow is a
-// named deviation recorded at the bounded carriers.
+// `page_boundary_tombstones` mirrors upstream's `HashSet<u64>` of failed
+// range-start addresses: when a page-split read fails, its start address is
+// tombstoned and excluded from `get_collected_byte_count`. Bounded at 64.
+//
+// No Vec/HashSet in this pin: scan results, windows and tombstones are
+// bounded; overflow is a named deviation recorded at the bounded carriers.
 pub data SnapshotRegion {
     normalized_region: NormalizedRegion;
     current_values: ElementWindow;
     previous_values: ElementWindow;
     page_boundaries: [u64; 64];
     page_boundary_count: u64;
+    page_boundary_tombstones: [u64; 64];
+    page_boundary_tombstone_count: u64;
     scan_results: SnapshotRegionScanResults;
 }
 
@@ -42,6 +48,7 @@ pub machine SnapshotRegion::new(base_address: u64, region_size: u64) -> Snapshot
         current_values: ElementWindow::empty(),
         previous_values: ElementWindow::empty(),
         page_boundary_count: 0,
+        page_boundary_tombstone_count: 0,
         scan_results: SnapshotRegionScanResults::empty(),
     }
 }
@@ -76,7 +83,68 @@ pub machine SnapshotRegion::clone_from(&mut self, source: &SnapshotRegion) {
     self.previous_values.clone_from(&source.previous_values);
     self.scan_results.clone_from(&source.scan_results);
     self.page_boundary_count = source.page_boundary_count;
+    self.page_boundary_tombstone_count = source.page_boundary_tombstone_count;
     self.copy_boundaries(source, 0);
+    self.copy_tombstones(source, 0);
+}
+
+machine SnapshotRegion::copy_tombstones(&mut self, source: &SnapshotRegion, position: u64) {
+    transition position < source.page_boundary_tombstone_count && position < 64 {
+        true -> copy(source, position)
+        false -> done()
+    }
+    state copy(&mut self, source: &SnapshotRegion, position: u64) {
+        self.page_boundary_tombstones[position] = source.page_boundary_tombstones[position];
+        transition { _ -> copy_tombstones(source, position + 1) }
+    }
+    state done(&mut self) {
+        self.page_boundary_tombstone_count = self.page_boundary_tombstone_count;
+    }
+}
+
+// Upstream `page_boundary_tombstones.clear()` at the head of every
+// `read_snapshot_region_values` — stale read failures from a previous
+// collection do not carry into the next.
+pub machine SnapshotRegion::clear_page_boundary_tombstones(&mut self) {
+    self.page_boundary_tombstone_count = 0;
+}
+
+// Upstream `page_boundary_tombstones.insert(address)`: mark the read range
+// beginning at `address` as failed. Bounded at 64 — overflow drops the
+// tombstone (carrier deviation; upstream's set is unbounded).
+pub machine SnapshotRegion::push_page_boundary_tombstone(&mut self, address: u64) -> bool {
+    transition self.page_boundary_tombstone_count < 64 {
+        true -> push(address)
+        false -> (false)
+    }
+    state push(&mut self, address: u64) -> bool {
+        self.page_boundary_tombstones[self.page_boundary_tombstone_count] = address;
+        self.page_boundary_tombstone_count = self.page_boundary_tombstone_count + 1;
+        true
+    }
+}
+
+// Upstream `page_boundary_tombstones.contains(&address)` — the per-range
+// exclusion check `get_collected_byte_count` performs.
+pub machine SnapshotRegion::has_page_boundary_tombstone(&self, address: u64) -> bool {
+    transition { _ -> seek(0, address) }
+    state seek(&self, position: u64, address: u64) -> bool {
+        transition position < self.page_boundary_tombstone_count && position < 64 {
+            true -> probe(position, address)
+            false -> (false)
+        }
+    }
+    state probe(&self, position: u64, address: u64) -> bool {
+        transition self.page_boundary_tombstones[position] == address {
+            true -> (true)
+            false -> seek(position + 1, address)
+            _ -> seek(position + 1, address)
+        }
+    }
+}
+
+pub machine SnapshotRegion::get_page_boundary_tombstone_count(&self) -> u64 {
+    self.page_boundary_tombstone_count
 }
 
 machine SnapshotRegion::copy_boundaries(&mut self, source: &SnapshotRegion, position: u64) {
@@ -136,6 +204,13 @@ pub machine SnapshotRegion::get_previous_element_count(&self) -> u64 {
 
 pub machine SnapshotRegion::get_previous_element(&self, position: u64) -> u64 {
     self.previous_values.get_element(position)
+}
+
+// The whole prior window — upstream reads `previous_values` directly (the
+// field is `pub` upstream); value collectors need it as the baseline a
+// failed read leaves in `current_values`.
+pub machine SnapshotRegion::clone_previous_values(&self) -> ElementWindow {
+    ElementWindow::clone(&self.previous_values)
 }
 
 // Upstream `set_current_values`: installs a freshly collected window.
@@ -291,33 +366,92 @@ machine SnapshotRegion::resize_to_filters(&mut self) {
     }
 }
 
-// Upstream `get_collected_byte_count`: the byte coverage the surviving
-// filters claim, clamped by the collected window's coverage.
+// Upstream `get_collected_byte_count`: bytes successfully collected for
+// `current_values`, i.e. `current_values.len().min(region_size)` minus every
+// tombstoned page range. Element-domain analogue: the window's covered
+// bytes stand for the collected byte vector's length.
 pub machine SnapshotRegion::get_collected_byte_count(&self) -> u64 {
-    let window_bytes: u64 = self.current_values.get_covered_byte_count(8);
-    let filtered: u64 = self.covered_by_filters(self.normalized_region.get_base_address());
-    transition filtered < window_bytes {
-        true -> (filtered)
-        false -> (window_bytes)
+    transition self.current_values.is_empty() {
+        true -> (0)
+        false -> sized()
+        _ -> sized()
+    }
+
+    state sized(&self) -> u64 {
+        let window_bytes: u64 = self.current_values.get_covered_byte_count(8);
+        let region_size: u64 = self.normalized_region.get_region_size();
+        let value_size: u64 = SnapshotRegion::pick_min_u64(window_bytes, region_size);
+        transition self.page_boundary_tombstone_count == 0 {
+            true -> (value_size)
+            false -> gated(value_size)
+            _ -> gated(value_size)
+        }
+    }
+
+    state gated(&self, value_size: u64) -> u64 {
+        transition self.page_boundary_count == 0 {
+            true -> lone(value_size)
+            false -> walk(value_size, 0, self.normalized_region.get_base_address(), 0)
+            _ -> walk(value_size, 0, self.normalized_region.get_base_address(), 0)
+        }
+    }
+
+    // Single-read region: the whole span is one range — tombstoned means
+    // nothing was collected.
+    state lone(&self, value_size: u64) -> u64 {
+        let base: u64 = self.normalized_region.get_base_address();
+        let tombstoned: bool = self.has_page_boundary_tombstone(base);
+        transition tombstoned {
+            true -> (0)
+            false -> (value_size)
+            _ -> (value_size)
+        }
+    }
+
+    // Walk the page-split ranges [base, b0), [b0, b1), ..., summing only
+    // non-tombstoned range sizes — upstream's boundary loop.
+    state walk(&self, value_size: u64, boundary_index: u64, range_start: u64, collected: u64) -> u64 {
+        transition boundary_index < self.page_boundary_count && boundary_index < 64 {
+            true -> step(value_size, boundary_index, range_start, collected)
+            false -> tail(value_size, range_start, collected)
+            _ -> tail(value_size, range_start, collected)
+        }
+    }
+
+    state step(&self, value_size: u64, boundary_index: u64, range_start: u64, collected: u64) -> u64 {
+        let next_boundary: u64 = self.page_boundaries[boundary_index];
+        let tombstoned: bool = self.has_page_boundary_tombstone(range_start);
+        transition tombstoned {
+            true -> walk(value_size, boundary_index + 1, next_boundary, collected)
+            false -> keep(value_size, boundary_index, next_boundary, collected, range_start)
+            _ -> keep(value_size, boundary_index, next_boundary, collected, range_start)
+        }
+    }
+
+    state keep(&self, value_size: u64, boundary_index: u64, next_boundary: u64, collected: u64, range_start: u64) -> u64 {
+        let added: u64 = ((next_boundary as u64 in Saturating) - (range_start as u64 in Saturating)) as u64;
+        let next_collected: u64 = ((collected as u64 in Saturating) + (added as u64 in Saturating)) as u64;
+        transition { _ -> walk(value_size, boundary_index + 1, next_boundary, next_collected) }
+    }
+
+    state tail(&self, value_size: u64, range_start: u64, collected: u64) -> u64 {
+        let end: u64 = self.normalized_region.get_end_address();
+        let tombstoned: bool = self.has_page_boundary_tombstone(range_start);
+        let added: u64 = ((end as u64 in Saturating) - (range_start as u64 in Saturating)) as u64;
+        let tail_collected: u64 = ((collected as u64 in Saturating) + (added as u64 in Saturating)) as u64;
+        transition tombstoned {
+            true -> (SnapshotRegion::pick_min_u64(collected, value_size))
+            false -> (SnapshotRegion::pick_min_u64(tail_collected, value_size))
+            _ -> (SnapshotRegion::pick_min_u64(tail_collected, value_size))
+        }
     }
 }
 
-// Sum of filter coverage restricted to [window_base, window_base +
-// window_bytes) — upstream's per-filter clamp loop.
-machine SnapshotRegion::covered_by_filters(&self, window_base: u64) -> u64 {
-    let window_end: u64 = ((window_base as u64 in Saturating) + (self.current_values.get_covered_byte_count(8) as u64 in Saturating)) as u64;
-    transition { _ -> total(0, 0, window_base, window_end) }
-    state total(&self, collection_index: u64, covered: u64, window_base: u64, window_end: u64) -> u64 {
-        transition collection_index < self.scan_results.get_collection_count() && collection_index < 4 {
-            true -> per_collection(collection_index, covered, window_base, window_end)
-            false -> (covered)
-        }
-    }
-    state per_collection(&self, collection_index: u64, covered: u64, window_base: u64, window_end: u64) -> u64 {
-        let collection: SnapshotRegionFilterCollection =
-            self.scan_results.get_filter_collection(collection_index);
-        let added: u64 = collection.covered_in_range(window_base, window_end);
-        transition { _ -> total(((collection_index as u64 in Wrapping) + 1) as u64, ((covered as u64 in Saturating) + (added as u64 in Saturating)) as u64, window_base, window_end) }
+machine SnapshotRegion::pick_min_u64(first: u64, second: u64) -> u64 {
+    transition first <= second {
+        true -> (first)
+        false -> (second)
+        _ -> (second)
     }
 }
 
