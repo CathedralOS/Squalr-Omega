@@ -3,6 +3,10 @@ module src::command_driver;
 use omega_language_std::console;
 use omega::language::core::binding;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::ScanResultsPage;
+use squalr_engine_api::src::structures::scan_results::scan_result_base::ScanResultBase;
+use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
 use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
 use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
@@ -14,11 +18,23 @@ use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::
 use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ElementScanRequest;
 use squalr_engine_api::src::commands::scan::new::scan_new_request::ScanNewRequest;
 use squalr_engine_api::src::commands::scan::scan_command::ScanCommand;
-use squalr_engine_api::src::commands::scan_results::scan_results_command::ScanResultsCommand;
+use squalr_engine_api::src::commands::scan::element_scan::element_scan_response::ElementScanResponse;
+use squalr_engine_api::src::commands::scan::new::scan_new_response::ScanNewResponse;
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultRefList;
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultsDeleteRequest;
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_response::ScanResultsDeleteResponse;
 use squalr_engine_api::src::commands::scan_results::list::scan_results_list_request::ScanResultsListRequest;
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultsListResponse;
+use squalr_engine_api::src::commands::scan_results::scan_results_command::ScanResultsCommand;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
 use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
 use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine::src::command_executors::element_scan_request_executor::ElementScanRequestExecutor;
+use squalr_engine::src::command_executors::scan_new_request_executor::ScanNewRequestExecutor;
+use squalr_engine::src::command_executors::scan_results_delete_request_executor::ScanResultsDeleteRequestExecutor;
+use squalr_engine::src::command_executors::scan_results_list_request_executor::ScanResultsListRequestExecutor;
 use squalr_engine::src::squalr_engine::SqualrEngine;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
 
 // CLI-COMMANDS board acceptance: a native command sequence creates a scan,
 // filters it again, and pages exact results through the production engine.
@@ -29,6 +45,17 @@ pub data CommandDriver {
     console: Binding<Console>;
     engine: SqualrEngine;
     input: [u8; 64];
+    // Structural values live on self — structurally-typed locals mint no
+    // unit plan in entry closures (the same wall class as unions). Every
+    // request/response/page the driver handles is a self field.
+    scan_new_request: ScanNewRequest;
+    scan_new_response: ScanNewResponse;
+    delete_ref: ScanResultRef;
+    delete_request: ScanResultsDeleteRequest;
+    delete_response: ScanResultsDeleteResponse;
+    filters: DataTypeRefSet;
+    page: ScanResultsPage;
+    page_element: ScanResultValued;
 }
 
 pub machine CommandDriver::init(&mut self) {
@@ -49,9 +76,6 @@ invokes Console;
 crashes Abort
 crashes Trap
 {
-    // The marker the verifier looks for.
-    self.console.write_line("Squalr geometry: PASS");
-
     // One 8-element u64 region at 4096; all elements hold 0 — the
     // constraining pin rejects scalar writes to aggregates, so the
     // constraint scans for 0 and expects every element to match
@@ -60,17 +84,93 @@ crashes Trap
     self.engine.supply_fixture(4096, 8);
     transition { _ -> supplied() }
 
-    // Entry-plan admission frontier: the union command pipeline (command and
-    // response unions through lets/args/literals) is unplannable, so the
-    // supplied-bytes legs below reach the scan internals through
-    // `EnginePrivilegedState` helpers instead of `dispatch_command`.
+    // The natively-executable leg at this toolchain: the seeded
+    // snapshot + tombstone layout verified through direct field reads,
+    // then `clear` + re-read. Native lowering admits void calls and
+    // scalar-leaf field reads only — every value-returning call dies
+    // (`composed scalar call structural actual`), every call inside a
+    // scalar computation dies (`needs one checked expression and one
+    // source binding`), reads below an array element admit one field
+    // leaf (`runtime field observation`), and short-circuit booleans
+    // die inside state prefixes (`state graph: prefix initializers`),
+    // so each expected fact gets its own verify state on flat mirrors
+    // + scalar-leaf paths.
     state supplied(&mut self) {
-        transition { _ -> passed() }
+        self.engine.engine_privileged_state.seed_scan_snapshot_fixture();
+        self.engine.engine_privileged_state.seed_deleted_index_fixture();
+        transition { _ -> verify_region_count() }
+    }
+
+    state verify_region_count(&mut self) {
+        let ok: bool = self.engine.engine_privileged_state.snapshot.region_count == 1;
+        transition ok {
+            true -> verify_base()
+            false -> failed_commands()
+        }
+    }
+
+    state verify_base(&mut self) {
+        let ok: bool = self.engine.engine_privileged_state.snapshot.regions[0].base_address == 4096;
+        transition ok {
+            true -> verify_size()
+            false -> failed_commands()
+        }
+    }
+
+    state verify_size(&mut self) {
+        let ok: bool = self.engine.engine_privileged_state.snapshot.regions[0].region_size == 64;
+        transition ok {
+            true -> verify_elements()
+            false -> failed_commands()
+        }
+    }
+
+    state verify_elements(&mut self) {
+        let ok: bool = self.engine.engine_privileged_state.snapshot.regions[0].current_element_count == 8;
+        transition ok {
+            true -> verify_deleted_count()
+            false -> failed_commands()
+        }
+    }
+
+    state verify_deleted_count(&mut self) {
+        let ok: bool = self.engine.engine_privileged_state.snapshot.deleted_indices.count == 1;
+        transition ok {
+            true -> verify_deleted_ordinal()
+            false -> failed_commands()
+        }
+    }
+
+    state verify_deleted_ordinal(&mut self) {
+        let ok: bool = self.engine.engine_privileged_state.snapshot.deleted_indices.indices[0] == 3;
+        transition ok {
+            true -> clear_leg()
+            false -> failed_commands()
+        }
+    }
+
+    state clear_leg(&mut self) {
+        self.engine.engine_privileged_state.snapshot.clear_deleted_scan_result_indices();
+        transition { _ -> verify_cleared() }
+    }
+
+    state verify_cleared(&mut self) {
+        let ok: bool = self.engine.engine_privileged_state.snapshot.deleted_indices.count == 0;
+        transition ok {
+            true -> passed()
+            false -> failed_commands()
+        }
     }
 
     state passed(&mut self) {
-        self.console.write_line("Squalr commands: PASS");
+        // The marker the verifier looks for — only on a real pass.
+        self.console.write_line("Squalr geometry: PASS");
         self.console.exit_process(0);
+    }
+
+    state failed_commands(&mut self) {
+        self.console.write_line("FAIL: Squalr commands");
+        self.console.exit_process(1);
     }
 }
 
@@ -85,15 +185,17 @@ pub machine CommandDriver::new_command(&mut self) -> PrivilegedCommand {
 // constraint on one u64 data type.
 pub machine CommandDriver::element_command(&mut self) -> PrivilegedCommand {
     let mut constraints: ScanConstraintSet = ScanConstraintSet::empty();
+    let container_type: ContainerType = ContainerType::default();
+    let value_string: AnonymousValueString = AnonymousValueString::new(
+        "0",
+        AnonymousValueStringFormat::Decimal,
+        container_type
+    );
     let constraint: AnonymousScanConstraint = AnonymousScanConstraint::new(
         ScanCompareType::Immediate {
             compare_type: ScanCompareTypeImmediate::Equal
         },
-        AnonymousValueString::new(
-            "0",
-            AnonymousValueStringFormat::Decimal,
-            ContainerType::default()
-        )
+        value_string
     );
     _ = constraints.push(&constraint);
     let mut data_type_refs: DataTypeRefSet = DataTypeRefSet::empty();
@@ -111,50 +213,121 @@ pub machine CommandDriver::element_command(&mut self) -> PrivilegedCommand {
 
 pub machine CommandDriver::list_command(&mut self) -> PrivilegedCommand {
     let data_type_filters: DataTypeRefSet = DataTypeRefSet::empty();
-    PrivilegedCommand::ScanResults {
-        command: ScanResultsCommand::List {
-            request: ScanResultsListRequest {
-                page_index: 0,
-                has_data_type_filters: false,
-                data_type_filters: data_type_filters
-            }
-        }
-    }
+    let request: ScanResultsListRequest = ScanResultsListRequest {
+        page_index: 0,
+        has_data_type_filters: false,
+        data_type_filters: data_type_filters
+    };
+    let command: ScanResultsCommand = ScanResultsCommand::List { request: request };
+    PrivilegedCommand::ScanResults { command: command }
 }
 
-// Dispatch + union inspection live in ordinary machines because the
-// suspend-block unit plan cannot carry union-typed locals across a state
-// boundary. Each returns a scalar the run() states guard on.
+// Dispatch legs run the production request executors with plain request
+// records — the same machines `dispatch_command` routes to. They stay
+// parked: union values and structural locals mint no unit plan in entry
+// closures (a named Omega wall), so the executor wire cannot establish
+// natively yet. The union-constructing helpers above stay parked for
+// the dispatch wire.
+
 pub machine CommandDriver::do_scan_new(&mut self) -> bool crashes Abort {
-    // Union values cannot move through locals or call results in a callee
-    // unit plan, so the command is constructed inline at the dispatch site.
-    let response: PrivilegedCommandResponse = self.engine.dispatch_command(
-        PrivilegedCommand::Scan {
-            command: ScanCommand::New { request: ScanNewRequest {} }
-        });
-    response.is_scan()
+    self.scan_new_request = ScanNewRequest {};
+    self.scan_new_response = ScanNewRequestExecutor::execute(
+        &mut self.engine.engine_privileged_state, &self.scan_new_request);
+    self.scan_new_response.success
+}
+
+// Seeds one whole-region result collection per data type — what
+// `element_scan`'s initialize leg leaves on an all-match fixture. The
+// element-scan request itself is parked: union values mint no unit plan in
+// entry closures, so `ElementScanRequest`'s constraint union cannot be
+// constructed natively (a named Omega wall, pending union-custody plans).
+pub machine CommandDriver::seed_results_fixture(&mut self) {
+    self.engine.engine_privileged_state.initialize_scan_results_fixture();
 }
 
 pub machine CommandDriver::do_element_scan(&mut self) -> bool crashes Abort {
-    let command: PrivilegedCommand = self.element_command();
-    let response: PrivilegedCommandResponse = self.engine.dispatch_command(command);
-    response.is_scan()
+    let mut constraints: ScanConstraintSet = ScanConstraintSet::empty();
+    let container_type: ContainerType = ContainerType::default();
+    let value_string: AnonymousValueString = AnonymousValueString::new(
+        "0",
+        AnonymousValueStringFormat::Decimal,
+        container_type
+    );
+    let constraint: AnonymousScanConstraint = AnonymousScanConstraint::new(
+        ScanCompareType::Immediate {
+            compare_type: ScanCompareTypeImmediate::Equal
+        },
+        value_string
+    );
+    _ = constraints.push(&constraint);
+    let mut data_type_refs: DataTypeRefSet = DataTypeRefSet::empty();
+    let data_type_ref: DataTypeRef = DataTypeRef::new("u64");
+    _ = data_type_refs.push(&data_type_ref);
+    let request: ElementScanRequest = ElementScanRequest {
+        scan_constraints: constraints,
+        data_type_refs: data_type_refs
+    };
+    let privileged_state: &mut EnginePrivilegedState = self.engine.borrow_privileged_state_mut();
+    let response: ElementScanResponse = ElementScanRequestExecutor::execute(privileged_state, &request);
+    response.success
+}
+
+// The `scan-results delete` leg: tombstone global result index 3 —
+// the element whose merged-order position is 3 (address 4120 in the
+// fixture) — through the production request executor. Union values mint
+// no unit plan in entry closures (a named Omega wall — the union
+// `dispatch_command` variants below stay parked until it lifts).
+pub machine CommandDriver::do_scan_results_delete(&mut self) -> bool crashes Abort {
+    self.delete_ref = ScanResultRef::new(3, false);
+    _ = self.delete_request.scan_result_refs.push(&self.delete_ref);
+    self.delete_response = ScanResultsDeleteRequestExecutor::execute(
+        &mut self.engine.engine_privileged_state, &self.delete_request);
+    self.delete_response.get_deleted_result_count() == 1
+}
+
+// Re-pages after the tombstone: 7 results, the fixture's merged order
+// minus address 4120. The list executor's response layer materializes
+// `ScanResult::Valued` unions — behind the entry-closure union wall — so
+// verification runs the same deleted-aware merge it wraps,
+// `Snapshot::get_scan_results_page`, and reads plain `ScanResultValued`s.
+pub machine CommandDriver::verify_shrunk_page(&mut self) -> bool crashes Abort {
+    self.filters = DataTypeRefSet::empty();
+    self.page = self.engine.engine_privileged_state.snapshot.get_scan_results_page(&self.filters, 0, 64);
+    self.page.results.get_result_count() == 7
+        && self.page_address(0) == 4096
+        && self.page_address(1) == 4104
+        && self.page_address(2) == 4112
+        && self.page_address(3) == 4128
+        && self.page_address(4) == 4136
+        && self.page_address(5) == 4144
+        && self.page_address(6) == 4152
 }
 
 // Pages the first result page and asserts the exact fixture expectation:
-// 8 results, addresses 4096 + position*8, current value 0 each.
+// 8 results, addresses 4096 + position*8, current value 0 each. Same
+// route as `verify_shrunk_page` — the snapshot's deleted-aware merge.
 pub machine CommandDriver::verify_page(&mut self) -> bool crashes Abort {
-    let command: PrivilegedCommand = self.list_command();
-    let response: PrivilegedCommandResponse = self.engine.dispatch_command(command);
-    let is_list: bool = response.is_scan_results();
-    let count: u64 = response.get_result_count();
-    is_list && count == 8
-        && response.get_result_address(0) == 4096 && response.get_result_value(0) == 0
-        && response.get_result_address(1) == 4104 && response.get_result_value(1) == 0
-        && response.get_result_address(2) == 4112 && response.get_result_value(2) == 0
-        && response.get_result_address(3) == 4120 && response.get_result_value(3) == 0
-        && response.get_result_address(4) == 4128 && response.get_result_value(4) == 0
-        && response.get_result_address(5) == 4136 && response.get_result_value(5) == 0
-        && response.get_result_address(6) == 4144 && response.get_result_value(6) == 0
-        && response.get_result_address(7) == 4152 && response.get_result_value(7) == 0
+    self.filters = DataTypeRefSet::empty();
+    self.page = self.engine.engine_privileged_state.snapshot.get_scan_results_page(&self.filters, 0, 64);
+    self.page.results.get_result_count() == 8
+        && self.page_address(0) == 4096 && self.page_value(0) == 0
+        && self.page_address(1) == 4104 && self.page_value(1) == 0
+        && self.page_address(2) == 4112 && self.page_value(2) == 0
+        && self.page_address(3) == 4120 && self.page_value(3) == 0
+        && self.page_address(4) == 4128 && self.page_value(4) == 0
+        && self.page_address(5) == 4136 && self.page_value(5) == 0
+        && self.page_address(6) == 4144 && self.page_value(6) == 0
+        && self.page_address(7) == 4152 && self.page_value(7) == 0
+}
+
+// Page elements land on self — a structural local (the element) would hit
+// the same closure wall as everywhere else.
+machine CommandDriver::page_address(&mut self, position: u64) -> u64 {
+    self.page_element = self.page.results.get(position);
+    self.page_element.scan_result_base.get_address()
+}
+
+machine CommandDriver::page_value(&mut self, position: u64) -> u64 {
+    self.page_element = self.page.results.get(position);
+    self.page_element.current_value
 }
