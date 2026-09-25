@@ -1,0 +1,875 @@
+module src::scanners::vector::scanner_vector_aligned;
+
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_vector::PlannedScanTypeVector;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_vectorization_size::PlannedScanVectorizationSize;
+use src::scanners::snapshot_scanner::Scanner;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::SnapshotRegionFilterRunLengthEncoder;
+
+// Port of ScannerVectorAligned over a typed u64 element window — and the
+// shared driver for the whole vector family. Upstream loads N-byte vectors
+// of raw memory, evaluates a Simd compare per element lane, and folds the
+// result mask into the run-length encoder. On the element model the caller
+// supplies the decoded element views, so the "vector" is a group of
+// `elements_per_vector` candidate elements (stride = memory alignment); the
+// SIMD mask/rotate mechanics collapse to per-element compares, which is
+// exactly what upstream's masks produce once every window lane is already a
+// candidate start (aligned/sparse: stride == or < the dtype spacing;
+// overlapping: `element_wise_mask` keeps alignment-many lanes per dtype
+// chunk — in element terms, one candidate each).
+//
+// Coverage is upstream's, not an approximation: a full group of
+// `elements_per_vector` hits/misses folds to one `encode_range(N)` /
+// `finalize(N)` just like the vector loop, a partial group (the
+// `valid_bytes % stride != 0` or leftover-element tail) walks lanes one
+// stride each like upstream's remainder pass, and Overlapping's misses
+// carry `finalize_current_encode_with_padding` — upstream's
+// data_type_size_padding on every candidate miss.
+//
+// `lane_results` holds the per-lane compare mask between the compare pass
+// and the encode pass, the same role upstream's `compare_result` Simd mask
+// plays between the load+mask phase and `encode_results`. Lanes never
+// exceed 64 (largest N at stride 1), the same bound the Simd width sets
+// upstream.
+//
+// Upstream debug_asserts on construction (`data_type == alignment` for
+// aligned, `<` for sparse, `>` for overlapping) are selection-time
+// invariants enforced by RuleMapScanType, so they ride as comments rather
+// than runtime checks.
+pub data VectorElementScan {
+    encoder: SnapshotRegionFilterRunLengthEncoder;
+    element_index: u64;
+    element_count: u64;
+    elements_per_vector: u64;
+    vector_size_in_bytes: u64;
+    stride_bytes: u64;
+    data_type_size_bytes: u64;
+    length_padding: u64;
+    vector_kind: PlannedScanTypeVector;
+    compare_type: ScanCompareType;
+    operand_value: u64;
+    has_scan_function: bool;
+    scan_function: ScanFunctionScalar;
+    finalized_tail: bool;
+    lane_results: [u8; 64];
+}
+
+// Shared constructor — `vector_kind` is one of Aligned/Sparse/Overlapping
+// (the dispatcher maps the bytewise plan kinds onto Overlapping exactly as
+// upstream's commented-out arms do), `vectorization_size` selects the vector
+// width N. Geometry mirrors `VectorGenerics::plan_vector_scan::<N>`:
+// element_count = (region - sat(unit - stride)) / stride = the filter's
+// element window count, elements_per_vector = N / stride.
+pub machine VectorElementScan::new(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    plan: &SnapshotFilterElementScanPlan,
+    vector_kind: PlannedScanTypeVector,
+    vectorization_size: PlannedScanVectorizationSize
+) -> VectorElementScan
+crashes Abort
+{
+    transition vectorization_size {
+        PlannedScanVectorizationSize::Vector16 -> build(
+            snapshot_region_filter, plan, vector_kind, 16)
+        PlannedScanVectorizationSize::Vector32 -> build(
+            snapshot_region_filter, plan, vector_kind, 32)
+        PlannedScanVectorizationSize::Vector64 -> build(
+            snapshot_region_filter, plan, vector_kind, 64)
+    }
+
+    state build(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        vector_kind: PlannedScanTypeVector,
+        vector_size_in_bytes: u64
+    ) -> VectorElementScan {
+        let memory_alignment: MemoryAlignment = plan.get_memory_alignment();
+        let memory_alignment_size: u64 = memory_alignment.get_size_in_bytes();
+        let data_type_size: u64 = plan.get_unit_size_in_bytes();
+        let stride: u64 = max(memory_alignment_size, 1);
+        let elements_per_vec: u64 = vector_size_in_bytes / stride;
+        let window_element_count: u64 = snapshot_region_filter.get_element_count(
+            data_type_size,
+            memory_alignment
+        );
+        // Upstream's `debug_assert!(vectorizable_iterations > 0)`: the
+        // rule's `is_valid` pick guarantees at least one full group, so a
+        // driver built for a sub-vector window is a caller bug.
+        transition elements_per_vec > 0 && window_element_count >= elements_per_vec {
+            true -> ready(
+                snapshot_region_filter,
+                plan,
+                vector_kind,
+                vector_size_in_bytes,
+                stride,
+                data_type_size,
+                elements_per_vec,
+                window_element_count)
+            false -> (VectorElementScan::unsupported(snapshot_region_filter))
+            _ -> (VectorElementScan::unsupported(snapshot_region_filter))
+        }
+    }
+
+    state ready(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        vector_kind: PlannedScanTypeVector,
+        vector_size_in_bytes: u64,
+        stride: u64,
+        data_type_size: u64,
+        elements_per_vec: u64,
+        window_element_count: u64
+    ) -> VectorElementScan {
+        VectorElementScan {
+            encoder: SnapshotRegionFilterRunLengthEncoder::new(
+                snapshot_region_filter.get_base_address()
+            ),
+            element_index: 0,
+            element_count: window_element_count,
+            elements_per_vector: elements_per_vec,
+            vector_size_in_bytes: vector_size_in_bytes,
+            stride_bytes: stride,
+            data_type_size_bytes: data_type_size,
+            length_padding: ((data_type_size as u64 in Saturating)
+                - (stride as u64 in Saturating)) as u64,
+            vector_kind: vector_kind,
+            compare_type: plan.get_scan_compare_type(),
+            operand_value: plan.get_operand_value(),
+            has_scan_function: plan.has_scan_function_scalar(),
+            scan_function: plan.get_scan_function_scalar(),
+            finalized_tail: false,
+        }
+    }
+}
+
+// The empty-result shape upstream's unsupported vector arms produce, also
+// the union's dead-driver payload for non-vector selections.
+pub machine VectorElementScan::dead() -> VectorElementScan {
+    VectorElementScan {
+        encoder: SnapshotRegionFilterRunLengthEncoder::new(0),
+        element_index: 0,
+        element_count: 0,
+        elements_per_vector: 0,
+        vector_size_in_bytes: 16,
+        stride_bytes: 1,
+        data_type_size_bytes: 0,
+        length_padding: 0,
+        vector_kind: PlannedScanTypeVector::Aligned,
+        compare_type: ScanCompareType::Immediate {
+            compare_type:
+                squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate::Equal
+        },
+        operand_value: 0,
+        has_scan_function: false,
+        scan_function: ScanFunctionScalar::Immediate,
+        finalized_tail: false,
+    }
+}
+
+// Same dead shape anchored on the caller's filter for unsupported
+// construction (upstream returns `vec![]`; the pull driver just yields
+// EmittedRegion::Empty — elements_per_vector 0 stalls the group walk so
+// `next` finalizes immediately).
+pub machine VectorElementScan::unsupported(
+    snapshot_region_filter: &SnapshotRegionFilter
+) -> VectorElementScan {
+    VectorElementScan {
+        encoder: SnapshotRegionFilterRunLengthEncoder::new(
+            snapshot_region_filter.get_base_address()
+        ),
+        element_index: 0,
+        element_count: 0,
+        elements_per_vector: 0,
+        vector_size_in_bytes: 16,
+        stride_bytes: 1,
+        data_type_size_bytes: 0,
+        length_padding: 0,
+        vector_kind: PlannedScanTypeVector::Aligned,
+        compare_type: ScanCompareType::Immediate {
+            compare_type:
+                squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate::Equal
+        },
+        operand_value: 0,
+        has_scan_function: false,
+        scan_function: ScanFunctionScalar::Immediate,
+        finalized_tail: false,
+    }
+}
+
+// Pulls the next emitted region. Two passes per group, upstream's
+// compare-then-encode shape: `compare_lane` evaluates every lane of the
+// current group into `lane_results` (counting hits), `decide` picks the
+// upstream fold — a full group of hits collapses to `encode_range(N)`, a
+// full group of misses to one `finalize(N)` (padded for Overlapping), and
+// anything else (mixed group or a partial tail group) walks lanes one at a
+// time encoding `stride_bytes` per lane — the same per-element steps
+// upstream's remainder pass and per-lane encode_results take.
+pub machine VectorElementScan::next(
+    &mut self,
+    current_values: &[u64],
+    previous_values: &[u64]
+) -> EmittedRegion satisfies Scanner::next {
+    transition self.finalized_tail {
+        true -> (EmittedRegion::Empty)
+        false -> pump(current_values, previous_values)
+        _ -> pump(current_values, previous_values)
+    }
+
+    state pump(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64]
+    ) -> EmittedRegion {
+        transition self.element_index < self.element_count {
+            true -> group(current_values, previous_values)
+            false -> finish()
+        }
+    }
+
+    // Group bounds: lanes = min(elements_per_vector, remaining elements).
+    state group(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64]
+    ) -> EmittedRegion {
+        let remaining: u64 = ((self.element_count as u64 in Saturating)
+            - (self.element_index as u64 in Saturating)) as u64;
+        let lane_count: u64 = min(remaining, self.elements_per_vector);
+        compare_lane(current_values, previous_values, lane_count, 0, 0)
+    }
+
+    state compare_lane(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_index < lane_count {
+            true -> lane_bounds(current_values, previous_values, lane_count, lane_index, hit_count)
+            false -> decide(current_values, previous_values, lane_count, hit_count)
+        }
+    }
+
+    state lane_bounds(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        let element_at: u64 = ((self.element_index as u64 in Saturating)
+            + (lane_index as u64 in Saturating)) as u64;
+        transition element_at < current_values.len {
+            true -> lane_by_kind(
+                current_values, previous_values, lane_count, lane_index, hit_count, element_at)
+            // Unreachable in practice (the caller sizes the window to
+            // element_count); out-of-window lanes compare false, matching
+            // the scalar driver's same-bounds behavior.
+            false -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_by_kind(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        element_at: u64
+    ) -> EmittedRegion {
+        transition self.has_scan_function {
+            true -> lane_eval_kind(
+                current_values, previous_values, lane_count, lane_index, hit_count, element_at)
+            false -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_eval_kind(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        element_at: u64
+    ) -> EmittedRegion {
+        transition self.scan_function {
+            ScanFunctionScalar::Immediate -> lane_immediate_gate(
+                current_values, previous_values, lane_count, lane_index, hit_count, element_at)
+            ScanFunctionScalar::RelativeOrDelta -> lane_relative_gate(
+                current_values, previous_values, lane_count, lane_index, hit_count, element_at)
+        }
+    }
+
+    state lane_immediate_gate(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        element_at: u64
+    ) -> EmittedRegion {
+        transition element_at < current_values.len {
+            true -> lane_eval_immediate(
+                current_values, previous_values, lane_count, lane_index, hit_count, element_at)
+            _ -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_relative_gate(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        element_at: u64
+    ) -> EmittedRegion {
+        transition element_at < previous_values.len {
+            true -> lane_eval_relative(
+                current_values, previous_values, lane_count, lane_index, hit_count, element_at)
+            false -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_eval_immediate(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        element_at: u64 [0..current_values.len]
+    ) -> EmittedRegion {
+        let matched: bool =
+            self.compare_type.compare(current_values[element_at], 0, self.operand_value);
+        lane_mark(
+            current_values, previous_values, lane_count, lane_index, hit_count, matched)
+    }
+
+    state lane_eval_relative(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        element_at: u64 [0..previous_values.len]
+    ) -> EmittedRegion {
+        // element_at's bound on the CURRENT window was established upstream
+        // of the lane chain (lane_bounds); previous window carries the same
+        // indexing.
+        let previous_element: u64 = previous_values[element_at];
+        transition element_at < current_values.len {
+            true -> lane_eval_relative_current(
+                current_values, previous_values, lane_count, lane_index, hit_count, element_at, previous_element)
+            _ -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_eval_relative_current(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        element_at: u64 [0..current_values.len],
+        previous_element: u64
+    ) -> EmittedRegion {
+        let matched: bool = self.compare_type.compare(
+            current_values[element_at],
+            previous_element,
+            self.operand_value
+        );
+        lane_mark(
+            current_values, previous_values, lane_count, lane_index, hit_count, matched)
+    }
+
+    // Stores the lane verdict in `lane_results` — upstream's compare_result
+    // mask bit — then advances the compare pass.
+    state lane_mark(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        matched: bool
+    ) -> EmittedRegion {
+        transition matched && lane_index < 64 {
+            true -> lane_hit_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+            false -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_hit_mark(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_index < 64 {
+            true -> lane_hit_write(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> lane_miss_mark(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_hit_write(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64 [0..64],
+        hit_count: u64
+    ) -> EmittedRegion {
+        self.lane_results[lane_index] = 1;
+        let next_lane: u64 = sat_inc(lane_index);
+        let next_hits: u64 = sat_inc(hit_count);
+        compare_lane(current_values, previous_values, lane_count, next_lane, next_hits)
+    }
+
+    state lane_miss_mark(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_index < 64 {
+            true -> lane_miss_write(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> compare_lane(current_values, previous_values, lane_count, sat_inc(lane_index), hit_count)
+        }
+    }
+
+    state lane_miss_write(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64 [0..64],
+        hit_count: u64
+    ) -> EmittedRegion {
+        self.lane_results[lane_index] = 0;
+        let next_lane: u64 = sat_inc(lane_index);
+        compare_lane(current_values, previous_values, lane_count, next_lane, hit_count)
+    }
+
+    // Upstream's all-true / all-false fast paths apply only to FULL vector
+    // groups; a partial tail group encodes per lane exactly like upstream's
+    // remainder pass.
+    state decide(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_count == self.elements_per_vector && hit_count == lane_count {
+            true -> encode_all(current_values, previous_values, lane_count)
+            false -> decide_miss(current_values, previous_values, lane_count, hit_count)
+            _ -> decide_miss(current_values, previous_values, lane_count, hit_count)
+        }
+    }
+
+    state decide_miss(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_count == self.elements_per_vector && hit_count == 0 {
+            true -> encode_none(current_values, previous_values, lane_count)
+            false -> encode_lane(current_values, previous_values, lane_count, 0)
+            _ -> encode_lane(current_values, previous_values, lane_count, 0)
+        }
+    }
+
+    // Upstream all-true: `encode_range(vector_size_in_bytes)` — N bytes =
+    // lane_count * stride for a full group.
+    state encode_all(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        self.encoder.encode_range(self.vector_size_in_bytes);
+        self.element_index = ((self.element_index as u64 in Saturating)
+            + (lane_count as u64 in Saturating)) as u64;
+        pump(current_values, previous_values)
+    }
+
+    // Upstream all-false: Aligned/Sparse finalize `N` bytes; Overlapping
+    // carries the data-type padding (upstream's per-lane finalize padding
+    // folded into the group finalize — the encoder never opened a run).
+    state encode_none(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        transition self.vector_kind {
+            PlannedScanTypeVector::Overlapping -> none_padded(
+                current_values, previous_values, lane_count)
+            _ -> none_plain(current_values, previous_values, lane_count)
+        }
+    }
+
+    state none_padded(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode_with_padding(self.vector_size_in_bytes, self.length_padding);
+        self.element_index = ((self.element_index as u64 in Saturating)
+            + (lane_count as u64 in Saturating)) as u64;
+        emit_or_pump(current_values, previous_values, emitted)
+    }
+
+    state none_plain(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode(self.vector_size_in_bytes);
+        self.element_index = ((self.element_index as u64 in Saturating)
+            + (lane_count as u64 in Saturating)) as u64;
+        emit_or_pump(current_values, previous_values, emitted)
+    }
+
+    // Per-lane encode (mixed group or partial tail): each lane covers
+    // stride_bytes — upstream's `encode_range(memory_alignment)` /
+    // `finalize_current_encode*(alignment)` walk over the result mask.
+    state encode_lane(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        transition lane_index < lane_count {
+            true -> encode_lane_read(current_values, previous_values, lane_count, lane_index)
+            false -> group_done(current_values, previous_values, lane_count)
+        }
+    }
+
+    state encode_lane_read(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        transition lane_index < 64 {
+            true -> encode_lane_take(current_values, previous_values, lane_count, lane_index)
+            _ -> encode_lane_miss(current_values, previous_values, lane_count, lane_index)
+        }
+    }
+
+    state encode_lane_take(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64 [0..64]
+    ) -> EmittedRegion {
+        let lane_result: u8 = self.lane_results[lane_index];
+        transition lane_result == 1 {
+            true -> encode_lane_hit(current_values, previous_values, lane_count, lane_index)
+            false -> encode_lane_miss(current_values, previous_values, lane_count, lane_index)
+            _ -> encode_lane_miss(current_values, previous_values, lane_count, lane_index)
+        }
+    }
+
+    state encode_lane_hit(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        self.encoder.encode_range(self.stride_bytes);
+        let next_lane: u64 = sat_inc(lane_index);
+        encode_lane(current_values, previous_values, lane_count, next_lane)
+    }
+
+    state encode_lane_miss(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        transition self.vector_kind {
+            PlannedScanTypeVector::Overlapping -> encode_lane_miss_padded(
+                current_values, previous_values, lane_count, lane_index)
+            _ -> encode_lane_miss_plain(
+                current_values, previous_values, lane_count, lane_index)
+        }
+    }
+
+    state encode_lane_miss_padded(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode_with_padding(self.stride_bytes, self.length_padding);
+        transition emitted {
+            EmittedRegion::Region { region } -> emit_advance(
+                current_values, previous_values, lane_count, lane_index, region)
+            EmittedRegion::Empty -> encode_lane(
+                current_values, previous_values, lane_count, sat_inc(lane_index))
+            _ -> encode_lane(current_values, previous_values, lane_count, sat_inc(lane_index))
+        }
+    }
+
+    state encode_lane_miss_plain(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode(self.stride_bytes);
+        transition emitted {
+            EmittedRegion::Region { region } -> emit_advance(
+                current_values, previous_values, lane_count, lane_index, region)
+            EmittedRegion::Empty -> encode_lane(
+                current_values, previous_values, lane_count, sat_inc(lane_index))
+            _ -> encode_lane(current_values, previous_values, lane_count, sat_inc(lane_index))
+        }
+    }
+
+    // An emitted region mid-group: the emitted lane was consumed, so the
+    // group cursor advances past it before the region leaves `next`.
+    state emit_advance(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        region: SnapshotRegionFilter
+    ) -> EmittedRegion {
+        self.element_index = ((self.element_index as u64 in Saturating)
+            + (lane_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition sat_inc(lane_index) < lane_count {
+            true -> resume_encode(current_values, previous_values, lane_count, lane_index, region)
+            false -> emit_done(current_values, previous_values, lane_count, region)
+            _ -> emit_done(current_values, previous_values, lane_count, region)
+        }
+    }
+
+    // Remaining lanes of this group are folded into the NEXT pull — the
+    // pull-driver contract yields one region per `next` call; upstream's
+    // eager loop encodes them immediately but the emitted sequence is
+    // identical.
+    state resume_encode(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        region: SnapshotRegionFilter
+    ) -> EmittedRegion {
+        // The tail of the group still has compare results staged; rewind to
+        // a fresh group start on the remaining lanes. element_index now
+        // points at the first unencoded lane, so `group` recomputes
+        // lane_count over the leftover lanes — identical coverage, just a
+        // finer group boundary than upstream's (the compare pass re-runs on
+        // the leftover lanes; compares are pure so results are identical).
+        (EmittedRegion::Region { region: region })
+    }
+
+    state emit_done(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        region: SnapshotRegionFilter
+    ) -> EmittedRegion {
+        (EmittedRegion::Region { region: region })
+    }
+
+    state group_done(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        self.element_index = ((self.element_index as u64 in Saturating)
+            + (lane_count as u64 in Saturating)) as u64;
+        pump(current_values, previous_values)
+    }
+
+    state emit_or_pump(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        emitted: EmittedRegion
+    ) -> EmittedRegion {
+        transition emitted {
+            EmittedRegion::Region { region } -> (EmittedRegion::Region { region: region })
+            EmittedRegion::Empty -> pump(current_values, previous_values)
+            _ -> pump(current_values, previous_values)
+        }
+    }
+
+    state finish(&mut self) -> EmittedRegion {
+        transition self.finalized_tail {
+            true -> (EmittedRegion::Empty)
+            false -> tail_finalize()
+            _ -> tail_finalize()
+        }
+    }
+
+    // One-shot tail emission, upstream's post-loop finalize: Overlapping
+    // closes with padding, Aligned/Sparse plain — the same per-kind fold the
+    // miss path uses.
+    state tail_finalize(&mut self) -> EmittedRegion {
+        self.finalized_tail = true;
+        transition self.vector_kind {
+            PlannedScanTypeVector::Overlapping -> tail_padded()
+            _ -> tail_plain()
+        }
+    }
+
+    state tail_padded(&mut self) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode_with_padding(0, self.length_padding);
+        transition emitted {
+            EmittedRegion::Region { region } -> (EmittedRegion::Region { region: region })
+            EmittedRegion::Empty -> (EmittedRegion::Empty)
+            _ -> (EmittedRegion::Empty)
+        }
+    }
+
+    state tail_plain(&mut self) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode(0);
+        transition emitted {
+            EmittedRegion::Region { region } -> (EmittedRegion::Region { region: region })
+            EmittedRegion::Empty -> (EmittedRegion::Empty)
+            _ -> (EmittedRegion::Empty)
+        }
+    }
+}
+
+// Upstream `get_scanner_name` is per-scanner ("Vector (Aligned)" etc.); the
+// shared driver answers for whichever kind it carries — dispatch in
+// `get_scanner_name_byte` picks the literal, `get_scanner_name_len` the
+// matching bound.
+pub machine VectorElementScan::get_scanner_name_len(&self) -> u64
+satisfies Scanner::get_scanner_name_len
+{
+    transition self.vector_kind {
+        PlannedScanTypeVector::Aligned -> (16)
+        PlannedScanTypeVector::Sparse -> (13)
+        _ -> (18)
+    }
+}
+
+pub machine VectorElementScan::get_scanner_name_byte(
+    &self,
+    position: u64
+) -> u8
+satisfies Scanner::get_scanner_name_byte
+{
+    transition self.vector_kind {
+        PlannedScanTypeVector::Aligned -> aligned(position)
+        PlannedScanTypeVector::Sparse -> sparse(position)
+        _ -> overlapping(position)
+    }
+
+    state aligned(&self, position: u64) -> u8 {
+        transition position < 16 {
+            true -> aligned_take(position)
+            _ -> (0)
+        }
+    }
+
+    state aligned_take(&self, position: u64 [0..16]) -> u8 {
+        "Vector (Aligned)"[position]
+    }
+
+    state sparse(&self, position: u64) -> u8 {
+        transition position < 13 {
+            true -> sparse_take(position)
+            _ -> (0)
+        }
+    }
+
+    state sparse_take(&self, position: u64 [0..13]) -> u8 {
+        "Vector Sparse"[position]
+    }
+
+    state overlapping(&self, position: u64) -> u8 {
+        transition position < 18 {
+            true -> overlapping_take(position)
+            _ -> (0)
+        }
+    }
+
+    state overlapping_take(&self, position: u64 [0..18]) -> u8 {
+        "Vector Overlapping"[position]
+    }
+}
+
+// Unit receiver carrying the upstream `ScannerVectorAligned::<N>` namespace
+// — the concrete scanner wrapper for `data_type == alignment` plans
+// (upstream's `debug_assert!(data_type_size == memory_alignment)` arm).
+pub data ScannerVectorAligned {}
+
+pub machine ScannerVectorAligned::new(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+    vectorization_size: PlannedScanVectorizationSize
+) -> VectorElementScan
+crashes Abort
+{
+    VectorElementScan::new(
+        snapshot_region_filter,
+        snapshot_filter_element_scan_plan,
+        PlannedScanTypeVector::Aligned,
+        vectorization_size
+    )
+}
+
+// Saturating single-step for unbounded u64 counters (lane/pattern indexes):
+// the compare/encode loops only ever reach their caller-bounded lane count,
+// but the param types carry no proof — upstream's plain `+1` would trip the
+// exact-arithmetic overflow check.
+machine sat_inc(value: u64) -> u64 {
+    ((value as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+}
