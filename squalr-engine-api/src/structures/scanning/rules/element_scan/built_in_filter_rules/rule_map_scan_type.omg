@@ -5,21 +5,21 @@ use src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
 use src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
 use src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use src::structures::scanning::plans::plan_types::planned_scan_type_byte_array::PlannedScanTypeByteArray;
 use src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
 
 pub data RuleMapScanType {}
 
 // Port of built_in_filter_rules/filter_rule_map_scan_type.rs, scalar leg:
 // picks the planned scanner family for one snapshot region filter.
-// Upstream decides among byte-array, vector, and scalar families; only the
-// scalar family is ported this leg, so every arm that would select a
-// byte-array or vector plan instead lands on upstream's universal fallback
-// — PlannedScanType::Scalar(ScalarIterative), the same arm upstream reaches
+// Upstream decides among byte-array, vector, and scalar families; the
+// byte-array arm now selects for real (`ByteArray` BooyerMoore, or
+// BooyerMooreMasked by has_mask — upstream's `should_use_byte_array_scan`
+// exactly), while vector arms still land on upstream's universal fallback
+// PlannedScanType::Scalar(ScalarIterative) — the same arm upstream reaches
 // when `has_supported_vector_scan` is false. The validity gate and the
 // region_size < 16 early-out are ported unchanged; the vector-plan walk
-// still computes the upstream vectorization size (used by the SIMD leg's
-// dispatch when it lands), but the final support check always resolves to
-// the scalar fallback until vector scan functions exist.
+// still resolves to the scalar fallback until vector scan functions exist.
 pub machine RuleMapScanType::map_parameters(
     scan_compare_type: ScanCompareType,
     has_current_values: bool,
@@ -52,14 +52,42 @@ pub machine RuleMapScanType::map_parameters(
         plan: &mut SnapshotFilterElementScanPlan
     ) {
         transition is_immediate_equal(scan_compare_type) && !is_floating_point && !prefer_type_scanner {
-            // Upstream selects ByteArray (BooyerMoore | BooyerMooreMasked by
-            // has_mask). Byte-array scanners are a separate leg; the scalar
-            // fallback covers the same elements and produces identical
-            // filters (named deviation).
-            true -> set_scalar(plan)
+            true -> select_byte_array(has_mask, plan)
             false -> small_region(region_size, data_type_size_bytes, memory_alignment_size, periodicity, prefer_type_scanner, plan)
             _ -> small_region(region_size, data_type_size_bytes, memory_alignment_size, periodicity, prefer_type_scanner, plan)
         }
+    }
+
+    // Upstream `should_use_byte_array_scan`: Immediate(Equal) on a
+    // non-float, non-type-preferred constraint picks the byte-array family —
+    // the masked variant when the constraint carries a mask.
+    state select_byte_array(
+        has_mask: bool,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        transition has_mask {
+            true -> set_byte_array_masked(plan)
+            false -> set_byte_array(plan)
+            _ -> set_byte_array(plan)
+        }
+    }
+
+    state set_byte_array(plan: &mut SnapshotFilterElementScanPlan) {
+        plan.set_planned_scan_type(
+            PlannedScanType::ByteArray {
+                scan_type: PlannedScanTypeByteArray::ByteArrayBooyerMoore
+            }
+        );
+        transition { _ -> done() }
+    }
+
+    state set_byte_array_masked(plan: &mut SnapshotFilterElementScanPlan) {
+        plan.set_planned_scan_type(
+            PlannedScanType::ByteArray {
+                scan_type: PlannedScanTypeByteArray::ByteArrayBooyerMooreMasked
+            }
+        );
+        transition { _ -> done() }
     }
 
     state small_region(
