@@ -9,6 +9,8 @@ use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_byte_array::PlannedScanTypeByteArray;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_vector::PlannedScanTypeVector;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_vectorization_size::PlannedScanVectorizationSize;
 use squalr_engine_api::src::registries::scan_rules::element_scan_rule_registry::ElementScanRuleRegistry;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
@@ -24,22 +26,29 @@ use src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
 use src::scanners::scalar::scanner_scalar_single_element::ScannerScalarSingleElement;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::SnapshotRegionFilterRunLengthEncoder;
+use src::scanners::vector::scanner_vector_aligned::ScannerVectorAligned;
+use src::scanners::vector::scanner_vector_aligned::VectorElementScan;
+use src::scanners::vector::scanner_vector_overlapping::ScannerVectorOverlapping;
+use src::scanners::vector::scanner_vector_sparse::ScannerVectorSparse;
 
-// Port of ElementScanDispatcher's scanner selection, scalar leg. Upstream's
+// Port of ElementScanDispatcher's scanner selection. Upstream's
 // acquire_scanner_instance returns a &dyn Scanner covering vector, byte-array
-// and scalar families; the scalar + byte-array families are ported
-// (vectorization is a separate board item), so selection returns Optional:
-// a Vector plan selects nothing rather than silently degrading, and Invalid
-// yields the null scanner upstream binds for it.
+// and scalar families; all three are now ported — vector plans acquire the
+// element-window vector driver at the plan's kind/width (the bytewise
+// staggered/periodic plan kinds route to the overlapping scanner exactly as
+// upstream's commented-out dispatch arms route them), and Invalid yields the
+// null scanner upstream binds for it.
 //
-// The scanners differ in shape (iterative pulls, byte-array pull driver,
-// single-shot, null), so dispatch yields a driver drained uniformly via
-// `next`. `kind` selects which field is live — a tag rather than a payload
-// case so `next` can mutate the active scanner in place through `self`.
+// The scanners differ in shape (iterative pulls, vector/byte-array pull
+// drivers, single-shot, null), so dispatch yields a driver drained uniformly
+// via `next`. `kind` selects which field is live — a tag rather than a
+// payload case so `next` can mutate the active scanner in place through
+// `self`.
 pub data ScalarRegionScanKind [copy] {
     case Iterative;
     case SingleElement;
     case ByteArray;
+    case Vector;
     case Null;
 }
 
@@ -59,6 +68,7 @@ pub data ScalarRegionScan {
     kind: ScalarRegionScanKind;
     iterative_scan: ScalarIterativeScan;
     byte_array_scan: ScalarByteArrayScan;
+    vector_scan: VectorElementScan;
     has_single_pending: bool;
     pending_region: SnapshotRegionFilter;
 }
@@ -106,7 +116,12 @@ crashes Abort
             single_previous_value
         )
         PlannedScanType::Invalid -> null_driver()
-        PlannedScanType::Vector { scan_type, vectorization_size } -> (ScalarScanSelection::None)
+        PlannedScanType::Vector { scan_type, vectorization_size } -> vector_kind(
+            scan_type,
+            vectorization_size,
+            snapshot_region_filter,
+            snapshot_filter_element_scan_plan
+        )
         PlannedScanType::ByteArray { scan_type } -> byte_array_kind(
             scan_type,
             snapshot_region_filter,
@@ -123,6 +138,7 @@ crashes Abort
                 kind: ScalarRegionScanKind::Null,
                 iterative_scan: dead_iterative(),
                 byte_array_scan: dead_byte_array(),
+                vector_scan: dead_vector(),
                 has_single_pending: false,
                 pending_region: SnapshotRegionFilter::new(0, 0),
             }
@@ -182,6 +198,7 @@ crashes Abort
                 kind: ScalarRegionScanKind::ByteArray,
                 iterative_scan: dead_iterative(),
                 byte_array_scan: byte_array_scan,
+                vector_scan: dead_vector(),
                 has_single_pending: false,
                 pending_region: SnapshotRegionFilter::new(0, 0),
             }
@@ -205,6 +222,7 @@ crashes Abort
                             snapshot_filter_element_scan_plan
                         ),
                         byte_array_scan: dead_byte_array(),
+                        vector_scan: dead_vector(),
                         has_single_pending: false,
                         pending_region: SnapshotRegionFilter::new(0, 0),
                     }
@@ -248,6 +266,7 @@ crashes Abort
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
                 byte_array_scan: dead_byte_array(),
+                vector_scan: dead_vector(),
                 has_single_pending: true,
                 pending_region: region,
             }
@@ -260,6 +279,101 @@ crashes Abort
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
                 byte_array_scan: dead_byte_array(),
+                vector_scan: dead_vector(),
+                has_single_pending: false,
+                pending_region: SnapshotRegionFilter::new(0, 0),
+            }
+        }
+    }
+
+    // Upstream's `aquire_scanner_instance` vector arms: the bytewise
+    // staggered/periodic plan kinds upstream comments out resolve to the
+    // plain overlapping scanner (`&ScannerVectorOverlapping::<N>`); the
+    // other kinds acquire the element-window driver at the plan's kind and
+    // vectorization width.
+    state vector_kind(
+        scan_type: PlannedScanTypeVector,
+        vectorization_size: PlannedScanVectorizationSize,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan
+    ) -> ScalarScanSelection {
+        transition scan_type {
+            PlannedScanTypeVector::Overlapping -> acquire_vector_overlapping(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan,
+                vectorization_size
+            )
+            PlannedScanTypeVector::Aligned -> acquire_vector_aligned(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan,
+                vectorization_size
+            )
+            PlannedScanTypeVector::Sparse -> acquire_vector_sparse(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan,
+                vectorization_size
+            )
+            // Upstream comments out the dedicated scanners and binds
+            // ScannerVectorOverlapping::<N> for both bytewise arms.
+            PlannedScanTypeVector::OverlappingBytewiseStaggered -> acquire_vector_overlapping(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan,
+                vectorization_size
+            )
+            PlannedScanTypeVector::OverlappingBytewisePeriodic -> acquire_vector_overlapping(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan,
+                vectorization_size
+            )
+        }
+    }
+
+    state acquire_vector_aligned(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+        vectorization_size: PlannedScanVectorizationSize
+    ) -> ScalarScanSelection {
+        let driver: VectorElementScan = ScannerVectorAligned::new(
+            snapshot_region_filter,
+            snapshot_filter_element_scan_plan,
+            vectorization_size
+        );
+        vector_scanner(driver)
+    }
+
+    state acquire_vector_sparse(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+        vectorization_size: PlannedScanVectorizationSize
+    ) -> ScalarScanSelection {
+        let driver: VectorElementScan = ScannerVectorSparse::new(
+            snapshot_region_filter,
+            snapshot_filter_element_scan_plan,
+            vectorization_size
+        );
+        vector_scanner(driver)
+    }
+
+    state acquire_vector_overlapping(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+        vectorization_size: PlannedScanVectorizationSize
+    ) -> ScalarScanSelection {
+        let driver: VectorElementScan = ScannerVectorOverlapping::new(
+            snapshot_region_filter,
+            snapshot_filter_element_scan_plan,
+            vectorization_size
+        );
+        vector_scanner(driver)
+    }
+
+    state vector_scanner(vector_scan: VectorElementScan) -> ScalarScanSelection {
+        ScalarScanSelection::Some {
+            driver: ScalarRegionScan {
+                kind: ScalarRegionScanKind::Vector,
+                iterative_scan: dead_iterative(),
+                byte_array_scan: dead_byte_array(),
+                vector_scan: vector_scan,
                 has_single_pending: false,
                 pending_region: SnapshotRegionFilter::new(0, 0),
             }
@@ -293,6 +407,10 @@ crashes Abort
     state dead_byte_array() -> ScalarByteArrayScan {
         ScalarByteArrayScan::dead()
     }
+
+    state dead_vector() -> VectorElementScan {
+        VectorElementScan::dead()
+    }
 }
 
 // Drains whichever scalar scanner the plan selected; Iterative walks the
@@ -306,6 +424,7 @@ pub machine ScalarRegionScan::next(
         ScalarRegionScanKind::Iterative -> pull(current_values, previous_values)
         ScalarRegionScanKind::SingleElement -> take_pending()
         ScalarRegionScanKind::ByteArray -> pull_bytes(current_values, previous_values)
+        ScalarRegionScanKind::Vector -> pull_vector(current_values, previous_values)
         ScalarRegionScanKind::Null -> (EmittedRegion::Empty)
         _ -> (EmittedRegion::Empty)
     }
@@ -327,6 +446,17 @@ pub machine ScalarRegionScan::next(
         previous_values: &[u64]
     ) -> EmittedRegion {
         self.byte_array_scan.next(current_values, previous_values)
+    }
+
+    // Vector plans filled `current_values`/`previous_values` as element
+    // windows exactly like the iterative arm (see apply_constraint) — the
+    // driver consumes the same slices.
+    state pull_vector(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64]
+    ) -> EmittedRegion {
+        self.vector_scan.next(current_values, previous_values)
     }
 
     state take_pending(&mut self) -> EmittedRegion {
