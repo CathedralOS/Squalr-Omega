@@ -1,11 +1,9 @@
 use omega_language_std::console;
 use omega_language_std::filesystem_host;
 use omega_language_std::time_host;
-use omega::language::core::service;
-use squalr_engine_api::src::plugins::memory_view::page_retrieval_mode::PageRetrievalMode;
+use omega::language::core::binding;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
 use squalr_engine_api::src::structures::memory::normalized_region::NormalizedRegion;
-use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
 use squalr_engine_api::src::structures::processes::process_info::ProcessInfo;
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
 use squalr_engine_api::src::structures::snapshots::element_window::ElementWindow;
@@ -38,7 +36,9 @@ use squalr_engine_session::src::os::engine_os_provider::EngineOsProviders;
 use squalr_engine_targets::src::target_providers::MemoryBoundsOpen;
 use squalr_engine_targets::src::target_providers::MemoryBoundsStep;
 use squalr_engine_targets::src::target_providers::MemoryReadResult;
+use squalr_engine_targets::src::target_providers::AddressWritable;
 use squalr_engine_targets::src::target_providers::OpenedProcessResult;
+use squalr_engine_targets::src::target_providers::ProcessAliveResult;
 use squalr_engine_targets::src::target_providers::ProcessQueryOutcome;
 
 // squalr-tests native probe for TARGETS-AND-THROUGHPUT. Default run keeps the
@@ -49,13 +49,14 @@ use squalr_engine_targets::src::target_providers::ProcessQueryOutcome;
 // is file-based.
 pub data Main {
     driver: CommandDriver;
-    console: Service<Console>;
-    raw_fs: Service<FilesystemHost>;
-    time: Service<TimeHost>;
+    console: Binding<Console>;
+    raw_fs: Binding<FilesystemHost>;
+    time: Binding<TimeHost>;
     providers: EngineOsProviders;
 
     // Control file parse registers.
     control_fd: i32;
+    close_rc: i32;
     control: [u8; 64];
     control_len: i64;
     pos: u64;
@@ -66,17 +67,13 @@ pub data Main {
     // Probe registers.
     proc_info: ProcessInfo;
     open_result: OpenedProcessResult;
-    opened: OpenedProcessInfo;
-    bounds_open: MemoryBoundsOpen;
-    step_result: MemoryBoundsStep;
-    read_result: MemoryReadResult;
-    close_result: ProcessQueryOutcome;
+    open_ok: bool;
     region: NormalizedRegion;
     region_count: u64;
+    region_hit: bool;
+    guard_hit: bool;
     found_page: bool;
     found_guard: bool;
-    writable_page: bool;
-    writable_guard: bool;
     magic_buf: [u8; 16];
     part_buf: [u8; 32];
     read_buf: [u8; 4096];
@@ -102,17 +99,24 @@ crashes Abort
 crashes Trap
 {
     // Gate: no control file -> the ordinary geometry canary.
-    self.control_fd = self.raw_fs.open("/tmp/squalr-native-probe.control", 0);
-    transition self.control_fd >= 0 {
-        true -> probe_control()
-        false -> geometry()
+    transition { _ -> gate() }
+
+    state gate(&mut self) {
+        let _control_fd_r: i32 = self.raw_fs.open("/tmp/squalr-native-probe.control", 0);
+        self.control_fd = _control_fd_r;
+        transition _control_fd_r >= 0 {
+            true -> probe_control()
+            _ -> geometry()
+        }
     }
 
     // ---------- native-read probe ----------
 
     state probe_control(&mut self) {
-        self.control_len = self.raw_fs.read(self.control_fd, &mut self.control, 64);
-        self.cancelled = self.raw_fs.close(self.control_fd) != 0;
+        let controlfd: i32 = self.control_fd;
+        self.control_len = self.raw_fs.read(controlfd, &mut self.control, 64);
+        self.close_rc = self.raw_fs.close(self.control_fd);
+        self.cancelled = self.close_rc != 0;
         self.pid_u64 = 0;
         self.page_addr = 0;
         self.guard_addr = 0;
@@ -177,7 +181,8 @@ crashes Trap
     }
 
     state hex_page_val(&mut self) {
-        self.digit_len = self.hex_value(self.control[self.pos]);
+        let dv: u64 = hex_value(self.control[self.pos]);
+        self.digit_len = dv;
         transition self.digit_len < 16 {
             true -> hex_page_step()
             false -> parse_addr2()
@@ -210,7 +215,8 @@ crashes Trap
     }
 
     state hex_guard_val(&mut self) {
-        self.digit_len = self.hex_value(self.control[self.pos]);
+        let dv: u64 = hex_value(self.control[self.pos]);
+        self.digit_len = dv;
         transition self.digit_len < 16 {
             true -> hex_guard_step()
             false -> open_target()
@@ -225,17 +231,18 @@ crashes Trap
 
     // open_process: pid handle + bitness read of /proc/<pid>/exe.
     state open_target(&mut self) {
-        self.proc_info = ProcessInfo::new_named((self.pid_u64 as u32 in Trapping) as u32, "squalr-child", false);
+        self.proc_info = ProcessInfo::new_named((self.pid_u64 as u32 in Trapping) as u32, "squalr-child", 12, false);
         self.open_result = self.providers.open_process(&self.proc_info);
-        transition self.open_result {
-            OpenedProcessResult::Opened { info } -> have_open(info)
-            OpenedProcessResult::Failed { error } -> probe_fail_open()
+        let _open_ok_r: bool = self.open_result.succeeded();
+        self.open_ok = _open_ok_r;
+        transition _open_ok_r {
+            true -> have_open()
+            false -> probe_fail_open()
         }
     }
 
-    state have_open(&mut self, info: OpenedProcessInfo) {
-        self.opened = info;
-        transition self.opened.get_pointer_width() == 8 {
+    state have_open(&mut self) {
+        transition self.open_result.info.get_pointer_width() == 8 {
             true -> enum_open()
             false -> probe_fail_bitness()
         }
@@ -247,28 +254,31 @@ crashes Trap
     // what must not appear is any read of it. Containment is recorded, not
     // required).
     state enum_open(&mut self) {
-        self.bounds_open = self.providers.open_page_bounds(&self.opened, PageRetrievalMode::FromUserMode);
+        self.region = NormalizedRegion::new(0, 0);
         self.region_count = 0;
         self.found_page = false;
         self.found_guard = false;
-        transition self.bounds_open {
+        let bounds: MemoryBoundsOpen = self.providers.open_page_bounds(&self.open_result.info, 0);
+        transition bounds {
             MemoryBoundsOpen::Opened -> enum_step()
-            MemoryBoundsOpen::Failed -> probe_fail_enum()
+            _ -> probe_fail_enum()
         }
     }
 
     state enum_step(&mut self) {
-        self.step_result = self.providers.next_page_bounds_region(&mut self.region);
-        transition self.step_result {
+        let step: MemoryBoundsStep = self.providers.next_page_bounds_region(&mut self.region);
+        transition step {
             MemoryBoundsStep::Region -> enum_record()
             MemoryBoundsStep::Finished -> enum_done()
-            MemoryBoundsStep::Failed -> probe_fail_enum()
+            _ -> probe_fail_enum()
         }
     }
 
     state enum_record(&mut self) {
         self.region_count = ((self.region_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition self.region.contains_address(self.page_addr) {
+        let _region_hit_r: bool = self.region.contains_address(self.page_addr);
+        self.region_hit = _region_hit_r;
+        transition _region_hit_r {
             true -> mark_page()
             false -> check_guard()
         }
@@ -280,7 +290,9 @@ crashes Trap
     }
 
     state check_guard(&mut self) {
-        transition self.region.contains_address(self.guard_addr) {
+        let _guard_hit_r: bool = self.region.contains_address(self.guard_addr);
+        self.guard_hit = _guard_hit_r;
+        transition _guard_hit_r {
             true -> mark_guard()
             false -> enum_step()
         }
@@ -299,21 +311,30 @@ crashes Trap
     }
 
     state writable_checks(&mut self) {
-        self.writable_page = self.providers.is_address_writable(&self.opened, self.page_addr);
-        self.writable_guard = self.providers.is_address_writable(&self.opened, self.guard_addr);
-        transition self.writable_page && !self.writable_guard {
-            true -> read_magic()
-            false -> probe_fail_writable()
+        let w_addr: u64 = self.page_addr;
+        let w: AddressWritable = self.providers.is_address_writable(&self.open_result.info, w_addr);
+        transition w {
+            AddressWritable::Writable -> writable_guard()
+            _ -> probe_fail_writable()
+        }
+    }
+
+    state writable_guard(&mut self) {
+        let g_addr: u64 = self.guard_addr;
+        let g: AddressWritable = self.providers.is_address_writable(&self.open_result.info, g_addr);
+        transition g {
+            AddressWritable::Writable -> probe_fail_writable()
+            _ -> read_magic()
         }
     }
 
     // Full read of the magic at page start.
     state read_magic(&mut self) {
-        self.read_result = self.providers.read_bytes(&self.opened, self.page_addr, &mut self.magic_buf);
-        transition self.read_result {
+        let addr: u64 = self.page_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.magic_buf);
+        transition read {
             MemoryReadResult::Complete { count } -> check_magic(count)
-            MemoryReadResult::Partial { count } -> probe_fail_read()
-            MemoryReadResult::Failed -> probe_fail_read()
+            _ -> probe_fail_read()
         }
     }
 
@@ -328,11 +349,12 @@ crashes Trap
     // Partial read straddling the PROT_NONE guard: 32 requested at
     // page_addr+4080 => 16 come back.
     state read_partial(&mut self) {
-        self.read_result = self.providers.read_bytes(&self.opened, ((self.page_addr as u64 in Wrapping) + (4080 as u64 in Wrapping)) as u64, &mut self.part_buf);
-        transition self.read_result {
+        let addr: u64 = ((self.page_addr as u64 in Wrapping) + (4080 as u64 in Wrapping)) as u64;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.part_buf);
+        transition read {
             MemoryReadResult::Partial { count } -> check_partial(count)
             MemoryReadResult::Complete { count } -> check_partial(count)
-            MemoryReadResult::Failed -> probe_fail_partial()
+            _ -> probe_fail_partial()
         }
     }
 
@@ -347,11 +369,12 @@ crashes Trap
     // Disappearing/unreadable page: reading the PROT_NONE guard fails (EIO),
     // and no bytes are invented.
     state read_guard(&mut self) {
-        self.read_result = self.providers.read_bytes(&self.opened, self.guard_addr, &mut self.magic_buf);
-        transition self.read_result {
-            MemoryReadResult::Failed -> cancel_probe()
+        let gaddr: u64 = self.guard_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, gaddr, &mut self.magic_buf);
+        transition read {
             MemoryReadResult::Complete { count } -> check_guard_count(count)
             MemoryReadResult::Partial { count } -> check_guard_count(count)
+            _ -> cancel_probe()
         }
     }
 
@@ -380,8 +403,9 @@ crashes Trap
     }
 
     state cancel_read(&mut self) {
-        self.read_result = self.providers.read_bytes(&self.opened, self.page_addr, &mut self.read_buf);
         self.chunk_i = ((self.chunk_i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let addr: u64 = self.page_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.read_buf);
         transition { _ -> cancel_tick() }
     }
 
@@ -419,8 +443,9 @@ crashes Trap
     }
 
     state throughput_read(&mut self) {
-        self.read_result = self.providers.read_bytes(&self.opened, self.page_addr, &mut self.read_buf);
         self.iter_i = ((self.iter_i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let addr: u64 = self.page_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.read_buf);
         transition { _ -> throughput_step() }
     }
 
@@ -437,19 +462,22 @@ crashes Trap
     }
 
     state close_target(&mut self) {
-        let handle: u64 = self.opened.get_handle();
-        self.close_result = self.providers.close_process(handle);
-        transition self.close_result {
-            ProcessQueryOutcome::Succeeded -> alive_check()
-            ProcessQueryOutcome::Failed { error } -> probe_fail_close()
+        let handle: u64 = self.open_result.info.get_handle();
+        let closed: ProcessQueryOutcome = self.providers.close_process(handle);
+        let closed_ok: bool = closed.succeeded();
+        transition closed_ok {
+            true -> alive_check()
+            false -> probe_fail_close()
         }
     }
 
     // The child is still alive (driver owns it) — liveness via /proc probe.
     state alive_check(&mut self) {
-        transition self.providers.is_process_alive((self.pid_u64 as u32 in Trapping) as u32) {
-            true -> probe_pass()
-            false -> probe_fail_alive()
+        let pid: u32 = (self.pid_u64 as u32 in Trapping) as u32;
+        let alive: ProcessAliveResult = self.providers.is_process_alive(pid);
+        transition alive {
+            ProcessAliveResult::Alive -> probe_pass()
+            ProcessAliveResult::Dead -> probe_fail_alive()
         }
     }
 
@@ -691,8 +719,14 @@ reaches Console
         }
     }
     state take_digit(&mut self, value: u64) {
-        self.digit_buf[self.digit_len] = ((48 as u64 in Wrapping) + ((value % 10) as u64 as u64 in Wrapping)) as u64 as u8;
-        self.digit_len = ((self.digit_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition self.digit_len < 24 {
+            true -> store_digit(value, self.digit_len)
+            false -> reverse_start()
+        }
+    }
+    state store_digit(&mut self, value: u64, len: u64 [0..24]) {
+        self.digit_buf[len] = ((48 as u64 in Wrapping) + ((value % 10) as u64 as u64 in Wrapping)) as u64 as u8;
+        self.digit_len = ((len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> emit_step(value / 10) }
     }
     state reverse_start(&mut self) {
@@ -713,59 +747,76 @@ reaches Console
     }
     state swap_bound(&mut self) {
         self.swap_index = ((((self.digit_len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64 as u64 in Wrapping) - (self.digit_pos as u64 in Wrapping)) as u64;
-        transition self.swap_index < 24 {
-            true -> swap_move()
+        transition self.swap_index < 24 && self.digit_pos < 24 {
+            true -> swap_move(self.digit_pos, self.swap_index)
             false -> print_bound()
         }
     }
-    state swap_move(&mut self) {
-        let left: u8 = self.digit_buf[self.digit_pos];
-        self.digit_buf[self.digit_pos] = self.digit_buf[self.swap_index];
-        self.digit_buf[self.swap_index] = left;
-        self.digit_pos = ((self.digit_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    state swap_move(&mut self, pos: u64 [0..24], idx: u64 [0..24]) {
+        let left: u8 = self.digit_buf[pos];
+        self.digit_buf[pos] = self.digit_buf[idx];
+        self.digit_buf[idx] = left;
+        self.digit_pos = ((pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> reverse_step() }
     }
     state print_bound(&mut self) {
         transition self.digit_len <= 24 {
-            true -> print_line()
+            true -> print_at(0, self.digit_len)
             false -> emit_done()
         }
     }
-    state print_line(&mut self) {
-        self.console.write_line(self.digit_buf[0..self.digit_len]);
+    state print_at(&mut self, i: u64, len: u64 [0..=24]) {
+        transition i < len {
+            true -> print_byte(i, len)
+            false -> print_nl()
+        }
+    }
+    state print_byte(&mut self, i: u64, len: u64 [0..=24]) {
+        transition i < 24 {
+            true -> write_digit(i, len)
+            false -> print_nl()
+        }
+    }
+    state write_digit(&mut self, i: u64 [0..24], len: u64 [0..=24]) {
+        let b: i32 = self.digit_buf[i] as i32;
+        self.console.write_byte(b);
+        transition { _ -> print_at(((i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, len) }
+    }
+    state print_nl(&mut self) {
+        self.console.write_byte(10);
         transition { _ -> emit_done() }
     }
     state emit_done(&mut self) {
     }
 }
 
-machine Main::hex_value(&self, byte: u8) -> u64 {
+machine hex_value(byte: u8) -> u64 {
     transition byte >= 48 && byte <= 57 {
         true -> dec(byte)
         false -> alpha(byte)
     }
-    state dec(&self, byte: u8) -> u64 {
+    state dec(byte: u8) -> u64 {
         (((byte as u64) as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64
     }
-    state alpha(&self, byte: u8) -> u64 {
+    state alpha(byte: u8) -> u64 {
         transition byte >= 97 && byte <= 102 {
             true -> lower(byte)
             false -> upper(byte)
         }
     }
-    state lower(&self, byte: u8) -> u64 {
+    state lower(byte: u8) -> u64 {
         (((byte as u64) as u64 in Wrapping) - (87 as u64 in Wrapping)) as u64
     }
-    state upper(&self, byte: u8) -> u64 {
+    state upper(byte: u8) -> u64 {
         transition byte >= 65 && byte <= 70 {
             true -> up(byte)
             false -> invalid(byte)
         }
     }
-    state up(&self, byte: u8) -> u64 {
+    state up(byte: u8) -> u64 {
         (((byte as u64) as u64 in Wrapping) - (55 as u64 in Wrapping)) as u64
     }
-    state invalid(&self, byte: u8) -> u64 {
+    state invalid(byte: u8) -> u64 {
         16
     }
 }

@@ -1,0 +1,109 @@
+use omega_language_std::console;
+use omega_language_std::filesystem_host;
+use omega::language::core::binding;
+
+// Minimal repro: a whole record-typed state parameter cannot be stored
+// into a structural field — the unit-plan store vocabulary has no
+// "record field type" lane. `unrestricted_sum` (the only admitted
+// non-scalar field store) requires a payloadless-enum field type, so
+// `self.opened = info;` where both sides are `Info` records declines
+// with the misleading omission label `case field type`.
+//
+// Diagnostic:
+//   selected ProgramEntry establishment rejoins 0 Terminal attachment
+//   identities; expected one; the machine's unit plan was omitted at
+//   local construction at `structural field store: case field type`
+//   (state 1, statement 0)
+//
+// Admitted equivalents demonstrated elsewhere:
+//   - scalar field stores (`scalar field type`)
+//   - payloadless-enum field stores via `unrestricted_sum`
+//     (e.g. `self.bitness = Bitness::SixtyFour` — same-type whole param)
+//   - record values flowing as state parameters through transitions
+//     (`-> have(info)`), including [copy] records copied out of a
+//     stored enum field's case payload
+//   - affine (non-[copy]) record call results stored into fields
+//     (e.g. `self.proc_info = ProcessInfo::new_named(...)` — the
+//     StructuralCall result custody is consumed by the field write)
+//
+// Non-routes confirmed in this repro:
+//   - `self.opened = Providers::identity(info)` (a call returning the
+//     same record) fails `state graph: result custody accounting` —
+//     the [copy] call result needs a transfer/disposal row the field
+//     store does not provide.
+//   - With `Info` non-[copy], the case-payload transfer
+//     `Opened { info } -> have(info)` itself rejects: `cannot transfer a
+//     non-copy value out of borrowed storage` — so the record cannot
+//     arrive affine either.
+//
+// Consequence: any record kept across machine states must be threaded
+// as a state parameter through every intermediate state (as the probe
+// harness does for `opened: OpenedProcessInfo`), or the payload must
+// live inside the stored enum and be re-selected per consumer state.
+
+pub data Bitness [copy] {
+    case ThirtyTwo;
+    case SixtyFour;
+}
+
+pub data Info [copy] {
+    id: u32;
+    bitness: Bitness;
+}
+
+pub data Outcome {
+    case Got(info: Info);
+    case None;
+}
+
+pub data Providers {
+    x: u64;
+}
+
+pub machine Providers::produce(&mut self) -> Outcome {
+    Outcome::Got { info: Info { id: 1, bitness: Bitness::SixtyFour } }
+}
+
+pub machine Providers::use_ref(&mut self, info: &Info) -> bool {
+    true
+}
+
+pub machine Providers::use_val(info: Info) -> bool {
+    true
+}
+
+pub data Main {
+    console: Binding<Console>;
+    raw_fs: Binding<FilesystemHost>;
+    providers: Providers;
+    fd: i32;
+    closed: bool;
+    result: Outcome;
+    opened: Info;
+}
+
+pub linux_x86_64 machine Main::main(&mut self)
+reaches Console + FilesystemHost
+invokes Console;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    self.fd = self.raw_fs.open("/tmp/record-field-store-repro.control", 0);
+    self.result = self.providers.produce();
+    transition self.result {
+        Outcome::Got { info } -> have(info)
+        _ -> s()
+    }
+
+    state have(&mut self, info: Info) {
+        self.closed = Providers::use_val(info);
+        transition { _ -> s() }
+    }
+
+    state s(&mut self) {
+        self.fd = self.raw_fs.close(self.fd);
+        self.closed = self.fd != 0;
+        self.console.exit_process(0);
+    }
+}

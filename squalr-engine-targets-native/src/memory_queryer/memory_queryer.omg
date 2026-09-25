@@ -1,20 +1,17 @@
 module src::memory_queryer::memory_queryer;
 
 use omega_language_std::filesystem_host;
-use omega::language::core::service;
-use squalr_engine_api::src::plugins::memory_view::page_retrieval_mode::PageRetrievalMode;
+use omega::language::core::binding;
 use squalr_engine_api::src::structures::memory::normalized_region;
 use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_targets::src::target_providers::AddressWritable;
 use squalr_engine_targets::src::target_providers::MemoryBoundsOpen;
 use squalr_engine_targets::src::target_providers::MemoryBoundsStep;
 use src::memory_queryer::linux::linux_memory_queryer::LinuxMemoryQueryer;
-use src::memory_queryer::memory_protection_enum::MemoryProtectionEnum;
-use src::memory_queryer::memory_type_enum::MemoryTypeEnum;
 use src::memory_queryer::normalized_module::AddressModuleResult;
 use src::memory_queryer::normalized_module::ModuleStreamStep;
 use src::memory_queryer::normalized_module::NormalizedModule;
 use src::memory_queryer::normalized_module::ResolvedModuleAddress;
-use src::memory_queryer::region_bounds_handling::RegionBoundsHandling;
 
 // Port of memory_queryer/memory_queryer.rs — the MemoryQueryer facade whose
 // upstream statics route to the OnceLock'd MemoryQueryerImpl. The impl is a
@@ -51,58 +48,70 @@ pub data MemoryQueryer {
 pub linux_x86_64 machine MemoryQueryer::open_memory_page_bounds(
     &mut self,
     process_info: &OpenedProcessInfo,
-    mode: PageRetrievalMode
+    mode_tag: u8
 ) -> MemoryBoundsOpen
 reaches FilesystemHost
 invokes FilesystemHost;
 {
-    transition mode {
-        PageRetrievalMode::FromUserMode -> usermode(process_info)
-        PageRetrievalMode::FromSettings -> settings(process_info)
-        PageRetrievalMode::FromModules -> modules(process_info)
-        PageRetrievalMode::FromNonModules -> non_modules(process_info)
-        PageRetrievalMode::FromVirtualModules -> empty_stream()
+    transition { _ -> dispatch(mode_tag, process_info) }
+
+    state dispatch(&mut self, mode_tag: u8, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        transition mode_tag == 0 {
+            true -> usermode(process_info)
+            false -> dispatch_1(mode_tag, process_info)
+        }
+    }
+
+    state dispatch_1(&mut self, mode_tag: u8, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        transition mode_tag == 1 {
+            true -> settings(process_info)
+            false -> dispatch_2(mode_tag, process_info)
+        }
+    }
+
+    state dispatch_2(&mut self, mode_tag: u8, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        transition mode_tag == 2 {
+            true -> modules(process_info)
+            false -> dispatch_3(mode_tag, process_info)
+        }
+    }
+
+    state dispatch_3(&mut self, mode_tag: u8, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
+        transition mode_tag == 3 {
+            true -> non_modules(process_info)
+            false -> empty_stream()
+        }
     }
 
     state usermode(&mut self, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
-        let required: MemoryProtectionEnum = MemoryProtectionEnum::empty();
-        let excluded: MemoryProtectionEnum = MemoryProtectionEnum::none();
-        let type_none: MemoryTypeEnum = MemoryTypeEnum::none();
-        let type_private: MemoryTypeEnum = MemoryTypeEnum::private();
-        let type_image: MemoryTypeEnum = MemoryTypeEnum::image();
-        let allowed_partial: MemoryTypeEnum = type_none.union(type_private);
-        let allowed: MemoryTypeEnum = allowed_partial.union(type_image);
+        let required_bits: u32 = 0;
+        let excluded_bits: u32 = 0;
+        let allowed_bits: u32 = 7;
         let maximum: u64 = self.linux.get_max_usermode_address(process_info);
         self.linux.open_virtual_pages(
             process_info,
-            required,
-            excluded,
-            allowed,
+            required_bits,
+            excluded_bits,
+            allowed_bits,
             0,
             maximum,
-            RegionBoundsHandling::Exclude
+            0
         )
     }
 
     state settings(&mut self, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
-        let required: MemoryProtectionEnum = MemoryProtectionEnum::write();
-        let excluded: MemoryProtectionEnum = MemoryProtectionEnum::none();
-        let type_none: MemoryTypeEnum = MemoryTypeEnum::none();
-        let type_private: MemoryTypeEnum = MemoryTypeEnum::private();
-        let type_image: MemoryTypeEnum = MemoryTypeEnum::image();
-        let type_mapped: MemoryTypeEnum = MemoryTypeEnum::mapped();
-        let allowed_np: MemoryTypeEnum = type_none.union(type_private);
-        let allowed_npi: MemoryTypeEnum = allowed_np.union(type_image);
-        let allowed: MemoryTypeEnum = allowed_npi.union(type_mapped);
+        let required_bits: u32 = 2;
+        let excluded_bits: u32 = 0;
+        let allowed_bits: u32 = 15;
         let maximum: u64 = self.linux.get_max_usermode_address(process_info);
         self.linux.open_virtual_pages(
             process_info,
-            required,
-            excluded,
-            allowed,
+            required_bits,
+            excluded_bits,
+            allowed_bits,
             0,
             maximum,
-            RegionBoundsHandling::Exclude
+            0
         )
     }
 
@@ -127,7 +136,7 @@ pub linux_x86_64 machine MemoryQueryer::next_memory_page_bounds(
 reaches FilesystemHost
 invokes FilesystemHost;
 {
-    self.linux.next_virtual_page(region)
+    self.linux.next_virtual_page(&mut region)
 }
 
 pub linux_x86_64 machine MemoryQueryer::close_memory_page_bounds(
@@ -143,7 +152,7 @@ pub linux_x86_64 machine MemoryQueryer::is_address_writable(
     &mut self,
     process_info: &OpenedProcessInfo,
     address: u64
-) -> bool
+) -> AddressWritable
 reaches FilesystemHost
 invokes FilesystemHost;
 {
@@ -169,7 +178,7 @@ pub linux_x86_64 machine MemoryQueryer::next_module(
     module: &mut NormalizedModule
 ) -> ModuleStreamStep
 {
-    self.linux.next_module(module)
+    self.linux.next_module(&mut module)
 }
 
 pub linux_x86_64 machine MemoryQueryer::resolve_module(
@@ -204,5 +213,5 @@ pub linux_x86_64 machine MemoryQueryer::address_to_module(
 reaches FilesystemHost
 invokes FilesystemHost;
 {
-    self.linux.address_to_module(process_info, address, module)
+    self.linux.address_to_module(process_info, address, &mut module)
 }
