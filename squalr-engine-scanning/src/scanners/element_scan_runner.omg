@@ -6,8 +6,12 @@ use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filte
 use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_byte_array::PlannedScanTypeByteArray;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use src::scanners::scalar::scanner_scalar_byte_array_booyer_moore::ScalarByteArrayScan;
+use src::scanners::scalar::scanner_scalar_byte_array_booyer_moore::ScannerScalarByteArrayBooyerMoore;
+use src::scanners::scalar::scanner_scalar_byte_array_booyer_moore_masked::ScannerScalarByteArrayBooyerMooreMasked;
 use src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
 use src::scanners::scalar::scanner_scalar_single_element::ScannerScalarSingleElement;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
@@ -49,8 +53,53 @@ crashes Abort
             scan_type, snapshot_region, snapshot_region_filter, plan, result)
         PlannedScanType::Invalid -> (result)
         PlannedScanType::Vector { scan_type, vectorization_size } -> (result)
-        PlannedScanType::ByteArray { scan_type } -> (result)
+        PlannedScanType::ByteArray { scan_type } -> byte_array(
+            scan_type, snapshot_region, snapshot_region_filter, plan, result)
         _ -> (result)
+    }
+
+    // Byte-array plans scan the filter's raw byte window — the same window
+    // the dispatcher fills at unit 1 / alignment 1 (upstream's
+    // get_current_values_filter_pointer view). `previous_values` is unused by
+    // the byte-array scan; `current_values` stands in for the unused param.
+    state byte_array(
+        scan_type: PlannedScanTypeByteArray,
+        snapshot_region: &SnapshotRegion,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        result: SnapshotRegionFilterCollection
+    ) -> SnapshotRegionFilterCollection
+    {
+        let base_difference: u64 = ((snapshot_region_filter.get_base_address() as u64 in Saturating)
+            - (snapshot_region.get_base_address() as u64 in Saturating)) as u64;
+        let count: u64 = snapshot_region_filter.get_element_count(
+            1,
+            MemoryAlignment::Alignment1);
+        let current_values: &[u64] = snapshot_region.get_current_values_slice(
+            base_difference, count);
+        transition scan_type {
+            PlannedScanTypeByteArray::ByteArrayBooyerMoore -> drain(
+                snapshot_region, snapshot_region_filter, plan, current_values, result, false)
+            PlannedScanTypeByteArray::ByteArrayBooyerMooreMasked -> drain(
+                snapshot_region, snapshot_region_filter, plan, current_values, result, true)
+        }
+    }
+
+    state drain(
+        snapshot_region: &SnapshotRegion,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        current_values: &[u64],
+        result: SnapshotRegionFilterCollection,
+        has_mask: bool
+    ) -> SnapshotRegionFilterCollection
+    {
+        let mut scan: ScalarByteArrayScan = ScalarByteArrayScan::new(
+            snapshot_region_filter, plan, has_mask);
+        let mut collected: SnapshotRegionFilterCollection = result;
+        ElementScanRunner::drain_byte_array(
+            &mut scan, current_values, &mut collected);
+        (collected)
     }
 
     state scalar(
@@ -197,6 +246,49 @@ pub machine ElementScanRunner::drain_iterative(
         let pushed: bool = collected.push_filter(&region);
         transition pushed {
             true -> pump(scan, current_values, previous_values, collected)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state done() {
+    }
+}
+
+// Upstream's byte-array scanner drain (`take_result_regions` at end of
+// scan_region): pull `next` until `Empty`, appending each emitted region.
+// The byte-array scan ignores previous values; `current_values` fills both
+// slots — the dispatcher's same-convention arm documents the window itself.
+pub machine ElementScanRunner::drain_byte_array(
+    scan: &mut ScalarByteArrayScan,
+    current_values: &[u64],
+    collected: &mut SnapshotRegionFilterCollection
+) {
+    transition { _ -> pump(scan, current_values, collected) }
+
+    state pump(
+        scan: &mut ScalarByteArrayScan,
+        current_values: &[u64],
+        collected: &mut SnapshotRegionFilterCollection
+    ) {
+        let emitted: EmittedRegion = scan.next(current_values, current_values);
+        transition emitted {
+            EmittedRegion::Region { region } -> collect(
+                scan, current_values, collected, region)
+            EmittedRegion::Empty -> done()
+            _ -> done()
+        }
+    }
+
+    state collect(
+        scan: &mut ScalarByteArrayScan,
+        current_values: &[u64],
+        collected: &mut SnapshotRegionFilterCollection,
+        region: SnapshotRegionFilter
+    ) {
+        let pushed: bool = collected.push_filter(&region);
+        transition pushed {
+            true -> pump(scan, current_values, collected)
             false -> done()
             _ -> done()
         }
