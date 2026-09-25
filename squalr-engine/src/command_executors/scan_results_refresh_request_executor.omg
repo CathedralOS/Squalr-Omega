@@ -1,0 +1,117 @@
+module src::command_executors::scan_results_refresh_request_executor;
+
+use squalr_engine_api::src::commands::scan_results::refresh::scan_results_refresh_request::ScanResultsRefreshRequest;
+use squalr_engine_api::src::commands::scan_results::refresh::scan_results_refresh_response::ScanResultsRefreshResponse;
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultPage;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::StructuralResult;
+use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
+use squalr_engine_api::src::structures::scan_results::scan_result_base::ScanResultBase;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
+use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::ReadWindowResult;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
+
+// Port of command_executors/scan_results/refresh/scan_results_refresh_request_executor.rs:
+// refresh the given scan result refs — resolve each global index through the
+// snapshot (upstream `get_scan_result`, StructuralResult::Missing skips) and
+// re-read the current value through the memory source. The snapshot read is
+// unconditional like upstream; the lock collapse matches the query executor.
+// Best-effort read failure leaves has_current_value = false (upstream
+// recently_read_value = None).
+pub data ScanResultsRefreshRequestExecutor {}
+
+pub machine ScanResultsRefreshRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    scan_results_refresh_request: &ScanResultsRefreshRequest
+) -> ScanResultsRefreshResponse
+crashes Abort
+{
+    transition { _ -> each(engine_privileged_state, scan_results_refresh_request, ScanResultPage::empty(), 0) }
+
+    state each(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_refresh_request: &ScanResultsRefreshRequest,
+        scan_results: ScanResultPage,
+        position: u64
+    ) -> ScanResultsRefreshResponse {
+        transition position < scan_results_refresh_request.scan_result_refs.get_count() {
+            true -> resolve(
+                engine_privileged_state,
+                scan_results_refresh_request,
+                scan_results,
+                position)
+            false -> finish(scan_results)
+            _ -> finish(scan_results)
+        }
+    }
+    state resolve(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_refresh_request: &ScanResultsRefreshRequest,
+        scan_results: ScanResultPage,
+        position: u64
+    ) -> ScanResultsRefreshResponse {
+        let scan_result_ref: ScanResultRef = scan_results_refresh_request.scan_result_refs.get(position);
+        let global_index: u64 = scan_result_ref.get_scan_result_index();
+        let snapshot: &Snapshot = engine_privileged_state.borrow_snapshot();
+        let structural_result: StructuralResult = snapshot.get_scan_result(global_index);
+        transition structural_result {
+            StructuralResult::Found { valued_result } -> refresh(
+                engine_privileged_state,
+                scan_results_refresh_request,
+                valued_result,
+                scan_results,
+                position)
+            _ -> next(
+                engine_privileged_state,
+                scan_results_refresh_request,
+                scan_results,
+                position)
+        }
+    }
+    state refresh(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_refresh_request: &ScanResultsRefreshRequest,
+        valued_result: ScanResultValued,
+        scan_results: ScanResultPage,
+        position: u64
+    ) -> ScanResultsRefreshResponse {
+        let base: ScanResultBase = valued_result.get_base_result();
+        let address: u64 = base.get_address();
+        let source: &SuppliedMemorySource = engine_privileged_state.get_supplied_memory_source();
+        let read: ReadWindowResult = source.try_read_window(address, 8);
+        let has_current: bool = read.succeeded;
+        let current_value: u64 = read.window.get_element(0);
+        let has_previous: bool = valued_result.has_previous_value;
+        let previous_value: u64 = valued_result.get_previous_value();
+        let refreshed: ScanResultValued = ScanResultValued::new(
+            base, has_current, current_value, has_previous, previous_value);
+        let mut carried: ScanResultPage = scan_results;
+        let pushed: bool = carried.push(&ScanResult::Valued { valued_result: refreshed });
+        transition { _ -> each(
+            engine_privileged_state,
+            scan_results_refresh_request,
+            carried,
+            ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state next(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_refresh_request: &ScanResultsRefreshRequest,
+        scan_results: ScanResultPage,
+        position: u64
+    ) -> ScanResultsRefreshResponse {
+        transition { _ -> each(
+            engine_privileged_state,
+            scan_results_refresh_request,
+            scan_results,
+            ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state finish(
+        scan_results: ScanResultPage
+    ) -> ScanResultsRefreshResponse {
+        ScanResultsRefreshResponse {
+            scan_results: scan_results,
+        }
+    }
+}
