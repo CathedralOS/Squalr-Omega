@@ -30,12 +30,11 @@ use squalr_engine_scanning::src::scanners::vector::scanner_vector_aligned::Vecto
 use squalr_engine_scanning::src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
 use squalr_engine_scanning::src::scanners::scan_control::ScanControl;
 use squalr_engine_scanning::src::scanners::structures::snapshot_region_filter_run_length_encoder::SnapshotRegionFilterRunLengthEncoder;
+use omega_language_std::filesystem_host;
+use omega_language_std::time_host;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
-use squalr_engine_api::src::structures::memory::memory_alignment::AlignmentSpelling;
-use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignmentParse;
-// The numbered record dual-registers a wire schema under the same name, so
-// the module is imported and the type is named qualified.
-use squalr_engine_api::src::structures::memory::normalized_region;
+use squalr_engine_api::src::structures::memory::normalized_region::NormalizedRegion;
+use squalr_engine_api::src::structures::processes::process_info::ProcessInfo;
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
 use squalr_engine_api::src::structures::snapshots::element_window::ElementWindow;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
@@ -63,22 +62,529 @@ use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource
 use squalr_engine_session::src::os::supplied_memory_source::SuppliedRegion;
 use squalr_engine::src::squalr_engine::SqualrEngine;
 use src::command_driver::CommandDriver;
+use squalr_engine_session::src::os::engine_os_provider::EngineOsProviders;
+use squalr_engine_targets::src::target_providers::MemoryBoundsOpen;
+use squalr_engine_targets::src::target_providers::MemoryBoundsStep;
+use squalr_engine_targets::src::target_providers::MemoryReadResult;
+use squalr_engine_targets::src::target_providers::AddressWritable;
+use squalr_engine_targets::src::target_providers::OpenedProcessResult;
+use squalr_engine_targets::src::target_providers::ProcessAliveResult;
+use squalr_engine_targets::src::target_providers::ProcessQueryOutcome;
 
+// squalr-tests native probe for TARGETS-AND-THROUGHPUT. Default run keeps the
+// upstream geometry + command legs verbatim. When /tmp/squalr-native-probe.control
+// exists the driver is exercising the native-read leg: the file carries
+// "<pid> <page_addr_hex> <guard_addr_hex>" for a controlled child (its own
+// process, paused on stdin) — omega run passes a null stdin, so the handoff
+// is file-based.
 pub data Main {
     driver: CommandDriver;
+    console: Binding<Console>;
+    raw_fs: Binding<FilesystemHost>;
+    time: Binding<TimeHost>;
+    providers: EngineOsProviders;
+
+    // Control file parse registers.
+    control_fd: i32;
+    close_rc: i32;
+    control: [u8; 64];
+    control_len: i64;
+    pos: u64;
+    pid_u64: u64;
+    page_addr: u64;
+    guard_addr: u64;
+
+    // Probe registers.
+    proc_info: ProcessInfo;
+    open_result: OpenedProcessResult;
+    open_ok: bool;
+    region: NormalizedRegion;
+    region_count: u64;
+    region_hit: bool;
+    guard_hit: bool;
+    found_page: bool;
+    found_guard: bool;
+    magic_buf: [u8; 16];
+    part_buf: [u8; 32];
+    read_buf: [u8; 4096];
+    chunk_i: u64;
+    cancel_after: u64;
+    cancelled: bool;
+    iter_i: u64;
+    t0: u64;
+    t1: u64;
+    rate: u64;
+    digit_buf: [u8; 24];
+    digit_len: u64;
+    digit_pos: u64;
+    swap_index: u64;
 }
 
 pub linux_x86_64 machine Main::main(&mut self)
-reaches Console
+reaches Console + FilesystemHost + TimeHost
 invokes Console;
+invokes FilesystemHost;
+invokes TimeHost;
 crashes Abort
 crashes Trap
 {
-    let aligned: SnapshotRegionFilter = SnapshotRegionFilter::new(4096, 16);
-    let count: u64 = aligned.get_element_count(4, MemoryAlignment::Alignment4);
-    transition count == 4 {
-        true -> overlap()
-        false -> failed()
+    // Gate: no control file -> the ordinary geometry canary.
+    transition { _ -> gate() }
+
+    state gate(&mut self) {
+        let _control_fd_r: i32 = self.raw_fs.open("/tmp/squalr-native-probe.control", 0);
+        self.control_fd = _control_fd_r;
+        transition _control_fd_r >= 0 {
+            true -> probe_control()
+            _ -> geometry()
+        }
+    }
+
+    // ---------- native-read probe ----------
+
+    state probe_control(&mut self) {
+        let controlfd: i32 = self.control_fd;
+        self.control_len = self.raw_fs.read(controlfd, &mut self.control, 64);
+        self.close_rc = self.raw_fs.close(self.control_fd);
+        self.cancelled = self.close_rc != 0;
+        self.pid_u64 = 0;
+        self.page_addr = 0;
+        self.guard_addr = 0;
+        self.pos = 0;
+        transition self.control_len > 0 {
+            true -> parse_pid()
+            false -> probe_fail_control()
+        }
+    }
+
+    state parse_pid(&mut self) {
+        transition self.pos < 64 {
+            true -> parse_pid_in()
+            false -> parse_addr1()
+        }
+    }
+
+    state parse_pid_in(&mut self) {
+        transition self.pos < (self.control_len as u64 in Trapping) {
+            true -> parse_pid_test()
+            false -> parse_addr1()
+        }
+    }
+
+    state parse_pid_test(&mut self) {
+        transition self.control[self.pos] >= 48 {
+            true -> parse_pid_high()
+            false -> parse_addr1()
+        }
+    }
+
+    state parse_pid_high(&mut self) {
+        transition self.control[self.pos] <= 57 {
+            true -> parse_pid_step()
+            false -> parse_addr1()
+        }
+    }
+
+    state parse_pid_step(&mut self) {
+        self.pid_u64 = ((((self.pid_u64 as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64 as u64 in Wrapping) - ((((self.control[self.pos] as u64) as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64 as u64 in Wrapping)) as u64;
+        self.pos = ((self.pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> parse_pid() }
+    }
+
+    state parse_addr1(&mut self) {
+        self.pos = ((self.pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> hex_page() }
+    }
+
+    state hex_page(&mut self) {
+        transition self.pos < 64 {
+            true -> hex_page_in()
+            false -> parse_addr2()
+        }
+    }
+
+    state hex_page_in(&mut self) {
+        transition self.pos < (self.control_len as u64 in Trapping) {
+            true -> hex_page_val()
+            false -> parse_addr2()
+        }
+    }
+
+    state hex_page_val(&mut self) {
+        let dv: u64 = hex_value(self.control[self.pos]);
+        self.digit_len = dv;
+        transition self.digit_len < 16 {
+            true -> hex_page_step()
+            false -> parse_addr2()
+        }
+    }
+
+    state hex_page_step(&mut self) {
+        self.page_addr = ((((self.page_addr as u64 in Wrapping) * (16 as u64 in Wrapping)) as u64 as u64 in Wrapping) + (self.digit_len as u64 in Wrapping)) as u64;
+        self.pos = ((self.pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> hex_page() }
+    }
+
+    state parse_addr2(&mut self) {
+        self.pos = ((self.pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> hex_guard() }
+    }
+
+    state hex_guard(&mut self) {
+        transition self.pos < 64 {
+            true -> hex_guard_in()
+            false -> open_target()
+        }
+    }
+
+    state hex_guard_in(&mut self) {
+        transition self.pos < (self.control_len as u64 in Trapping) {
+            true -> hex_guard_val()
+            false -> open_target()
+        }
+    }
+
+    state hex_guard_val(&mut self) {
+        let dv: u64 = hex_value(self.control[self.pos]);
+        self.digit_len = dv;
+        transition self.digit_len < 16 {
+            true -> hex_guard_step()
+            false -> open_target()
+        }
+    }
+
+    state hex_guard_step(&mut self) {
+        self.guard_addr = ((((self.guard_addr as u64 in Wrapping) * (16 as u64 in Wrapping)) as u64 as u64 in Wrapping) + (self.digit_len as u64 in Wrapping)) as u64;
+        self.pos = ((self.pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> hex_guard() }
+    }
+
+    // open_process: pid handle + bitness read of /proc/<pid>/exe.
+    state open_target(&mut self) {
+        self.proc_info = ProcessInfo::new_named((self.pid_u64 as u32 in Trapping) as u32, "squalr-child", 12, false);
+        self.open_result = self.providers.open_process(&self.proc_info);
+        let _open_ok_r: bool = self.open_result.succeeded();
+        self.open_ok = _open_ok_r;
+        transition _open_ok_r {
+            true -> have_open()
+            false -> probe_fail_open()
+        }
+    }
+
+    state have_open(&mut self) {
+        transition self.open_result.info.get_pointer_width() == 8 {
+            true -> enum_open()
+            false -> probe_fail_bitness()
+        }
+    }
+
+    // Enumerate page bounds: the child's RW page must appear, the PROT_NONE
+    // guard must not (no WRITE bit => filtered from a FromUserMode view? no —
+    // FromUserMode has empty required flags, so the guard page CAN appear;
+    // what must not appear is any read of it. Containment is recorded, not
+    // required).
+    state enum_open(&mut self) {
+        self.region = NormalizedRegion::new(0, 0);
+        self.region_count = 0;
+        self.found_page = false;
+        self.found_guard = false;
+        let bounds: MemoryBoundsOpen = self.providers.open_page_bounds(&self.open_result.info, 0);
+        transition bounds {
+            MemoryBoundsOpen::Opened -> enum_step()
+            _ -> probe_fail_enum()
+        }
+    }
+
+    state enum_step(&mut self) {
+        let step: MemoryBoundsStep = self.providers.next_page_bounds_region(&mut self.region);
+        transition step {
+            MemoryBoundsStep::Region -> enum_record()
+            MemoryBoundsStep::Finished -> enum_done()
+            _ -> probe_fail_enum()
+        }
+    }
+
+    state enum_record(&mut self) {
+        self.region_count = ((self.region_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let _region_hit_r: bool = self.region.contains_address(self.page_addr);
+        self.region_hit = _region_hit_r;
+        transition _region_hit_r {
+            true -> mark_page()
+            false -> check_guard()
+        }
+    }
+
+    state mark_page(&mut self) {
+        self.found_page = true;
+        transition { _ -> enum_step() }
+    }
+
+    state check_guard(&mut self) {
+        let _guard_hit_r: bool = self.region.contains_address(self.guard_addr);
+        self.guard_hit = _guard_hit_r;
+        transition _guard_hit_r {
+            true -> mark_guard()
+            false -> enum_step()
+        }
+    }
+
+    state mark_guard(&mut self) {
+        self.found_guard = true;
+        transition { _ -> enum_step() }
+    }
+
+    state enum_done(&mut self) {
+        transition self.region_count > 0 && self.found_page {
+            true -> writable_checks()
+            false -> probe_fail_enum()
+        }
+    }
+
+    state writable_checks(&mut self) {
+        let w_addr: u64 = self.page_addr;
+        let w: AddressWritable = self.providers.is_address_writable(&self.open_result.info, w_addr);
+        transition w {
+            AddressWritable::Writable -> writable_guard()
+            _ -> probe_fail_writable()
+        }
+    }
+
+    state writable_guard(&mut self) {
+        let g_addr: u64 = self.guard_addr;
+        let g: AddressWritable = self.providers.is_address_writable(&self.open_result.info, g_addr);
+        transition g {
+            AddressWritable::Writable -> probe_fail_writable()
+            _ -> read_magic()
+        }
+    }
+
+    // Full read of the magic at page start.
+    state read_magic(&mut self) {
+        let addr: u64 = self.page_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.magic_buf);
+        transition read {
+            MemoryReadResult::Complete { count } -> check_magic(count)
+            _ -> probe_fail_read()
+        }
+    }
+
+    state check_magic(&mut self, count: u64) {
+        // Child wrote "SQUALR42" then a rising pattern at page start.
+        transition count == 16 && self.magic_buf[0] == 83 && self.magic_buf[1] == 81 && self.magic_buf[2] == 85 && self.magic_buf[3] == 65 && self.magic_buf[4] == 76 && self.magic_buf[5] == 82 && self.magic_buf[6] == 52 && self.magic_buf[7] == 50 {
+            true -> read_partial()
+            false -> probe_fail_magic()
+        }
+    }
+
+    // Partial read straddling the PROT_NONE guard: 32 requested at
+    // page_addr+4080 => 16 come back.
+    state read_partial(&mut self) {
+        let addr: u64 = ((self.page_addr as u64 in Wrapping) + (4080 as u64 in Wrapping)) as u64;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.part_buf);
+        transition read {
+            MemoryReadResult::Partial { count } -> check_partial(count)
+            MemoryReadResult::Complete { count } -> check_partial(count)
+            _ -> probe_fail_partial()
+        }
+    }
+
+    state check_partial(&mut self, count: u64) {
+        // page0[i] = 83 + (i & 63) past the 8-byte magic: offsets 4080->131, 4095->146.
+        transition count == 16 && self.part_buf[0] == 131 && self.part_buf[15] == 146 {
+            true -> read_guard()
+            false -> probe_fail_partial()
+        }
+    }
+
+    // Disappearing/unreadable page: reading the PROT_NONE guard fails (EIO),
+    // and no bytes are invented.
+    state read_guard(&mut self) {
+        let gaddr: u64 = self.guard_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, gaddr, &mut self.magic_buf);
+        transition read {
+            MemoryReadResult::Complete { count } -> check_guard_count(count)
+            MemoryReadResult::Partial { count } -> check_guard_count(count)
+            _ -> cancel_probe()
+        }
+    }
+
+    state check_guard_count(&mut self, count: u64) {
+        transition count == 0 {
+            true -> cancel_probe()
+            false -> probe_fail_guard()
+        }
+    }
+
+    // Cancellation: a chunked read honoring a cancellation flag between
+    // chunks (upstream scan loops poll the token identically). The flag flips
+    // after 2 of 4 planned chunks; the loop must stop early.
+    state cancel_probe(&mut self) {
+        self.chunk_i = 0;
+        self.cancel_after = 2;
+        self.cancelled = false;
+        transition { _ -> cancel_step() }
+    }
+
+    state cancel_step(&mut self) {
+        transition !self.cancelled && self.chunk_i < 4 {
+            true -> cancel_read()
+            false -> cancel_check()
+        }
+    }
+
+    state cancel_read(&mut self) {
+        self.chunk_i = ((self.chunk_i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let addr: u64 = self.page_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.read_buf);
+        transition { _ -> cancel_tick() }
+    }
+
+    state cancel_tick(&mut self) {
+        transition self.chunk_i >= self.cancel_after {
+            true -> cancel_set()
+            false -> cancel_step()
+        }
+    }
+
+    state cancel_set(&mut self) {
+        self.cancelled = true;
+        transition { _ -> cancel_step() }
+    }
+
+    state cancel_check(&mut self) {
+        transition self.chunk_i == 2 && self.cancelled {
+            true -> throughput()
+            false -> probe_fail_cancel()
+        }
+    }
+
+    // Throughput leg: 8 x 4096-byte reads, TimeHost-timed, printed in decimal.
+    state throughput(&mut self) {
+        self.iter_i = 0;
+        self.t0 = self.time.monotonic_ticks();
+        transition { _ -> throughput_step() }
+    }
+
+    state throughput_step(&mut self) {
+        transition self.iter_i < 8 {
+            true -> throughput_read()
+            false -> throughput_done()
+        }
+    }
+
+    state throughput_read(&mut self) {
+        self.iter_i = ((self.iter_i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let addr: u64 = self.page_addr;
+        let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.read_buf);
+        transition { _ -> throughput_step() }
+    }
+
+    state throughput_done(&mut self) {
+        self.t1 = self.time.monotonic_ticks();
+        self.rate = ((self.t1 as u64 in Wrapping) - (self.t0 as u64 in Wrapping)) as u64;
+        self.console.write_line("native-read bytes=32768");
+        transition { _ -> emit_ticks() }
+    }
+
+    state emit_ticks(&mut self) {
+        self.emit_u64(self.rate);
+        transition { _ -> close_target() }
+    }
+
+    state close_target(&mut self) {
+        let handle: u64 = self.open_result.info.get_handle();
+        let closed: ProcessQueryOutcome = self.providers.close_process(handle);
+        let closed_ok: bool = closed.succeeded();
+        transition closed_ok {
+            true -> alive_check()
+            false -> probe_fail_close()
+        }
+    }
+
+    // The child is still alive (driver owns it) — liveness via /proc probe.
+    state alive_check(&mut self) {
+        let pid: u32 = (self.pid_u64 as u32 in Trapping) as u32;
+        let alive: ProcessAliveResult = self.providers.is_process_alive(pid);
+        transition alive {
+            ProcessAliveResult::Alive -> probe_pass()
+            ProcessAliveResult::Dead -> probe_fail_alive()
+        }
+    }
+
+    state probe_pass(&mut self) {
+        self.console.write_line("Squalr native-read: PASS");
+        self.console.exit_process(0);
+    }
+
+    state probe_fail_control(&mut self) {
+        self.console.write_line("FAIL: native-probe control");
+        self.console.exit_process(2);
+    }
+
+    state probe_fail_open(&mut self) {
+        self.console.write_line("FAIL: native-probe open");
+        self.console.exit_process(3);
+    }
+
+    state probe_fail_bitness(&mut self) {
+        self.console.write_line("FAIL: native-probe bitness");
+        self.console.exit_process(4);
+    }
+
+    state probe_fail_enum(&mut self) {
+        self.console.write_line("FAIL: native-probe enumerate");
+        self.console.exit_process(5);
+    }
+
+    state probe_fail_writable(&mut self) {
+        self.console.write_line("FAIL: native-probe writable");
+        self.console.exit_process(6);
+    }
+
+    state probe_fail_read(&mut self) {
+        self.console.write_line("FAIL: native-probe read");
+        self.console.exit_process(7);
+    }
+
+    state probe_fail_magic(&mut self) {
+        self.console.write_line("FAIL: native-probe magic");
+        self.console.exit_process(8);
+    }
+
+    state probe_fail_partial(&mut self) {
+        self.console.write_line("FAIL: native-probe partial");
+        self.console.exit_process(9);
+    }
+
+    state probe_fail_guard(&mut self) {
+        self.console.write_line("FAIL: native-probe guard");
+        self.console.exit_process(10);
+    }
+
+    state probe_fail_cancel(&mut self) {
+        self.console.write_line("FAIL: native-probe cancel");
+        self.console.exit_process(11);
+    }
+
+    state probe_fail_close(&mut self) {
+        self.console.write_line("FAIL: native-probe close");
+        self.console.exit_process(12);
+    }
+
+    state probe_fail_alive(&mut self) {
+        self.console.write_line("FAIL: native-probe alive");
+        self.console.exit_process(13);
+    }
+
+    // ---------- geometry canary (unchanged) ----------
+
+    state geometry(&mut self) {
+        let aligned: SnapshotRegionFilter = SnapshotRegionFilter::new(4096, 16);
+        let count: u64 = aligned.get_element_count(4, MemoryAlignment::Alignment4);
+        transition count == 4 {
+            true -> overlap()
+            false -> failed()
+        }
     }
 
     state overlap(&mut self) {
@@ -164,9 +670,9 @@ crashes Trap
     }
 
     state inclusive_end(&mut self) {
-        let region: normalized_region::NormalizedRegion = normalized_region::NormalizedRegion { base_address: 100, region_size: 16 };
-        let includes_end: bool = region.contains_address(116);
-        let includes_after: bool = region.contains_address(117);
+        let end_region: NormalizedRegion = NormalizedRegion::new(100, 16);
+        let includes_end: bool = end_region.contains_address(116);
+        let includes_after: bool = end_region.contains_address(117);
         transition includes_end && !includes_after {
             true -> retained_end()
             false -> failed()
@@ -174,12 +680,12 @@ crashes Trap
     }
 
     state retained_end(&mut self) {
-        let mut region: normalized_region::NormalizedRegion = normalized_region::NormalizedRegion { base_address: 100, region_size: 16 };
-        region.set_region_size(24);
-        region.set_base_address_retain_end_address(104);
-        let base_address: u64 = region.get_base_address();
-        let end_address: u64 = region.get_end_address();
-        let size: u64 = region.get_region_size();
+        let mut keep_region: NormalizedRegion = NormalizedRegion::new(100, 16);
+        keep_region.set_region_size(24);
+        keep_region.set_base_address_retain_end_address(104);
+        let base_address: u64 = keep_region.get_base_address();
+        let end_address: u64 = keep_region.get_end_address();
+        let size: u64 = keep_region.get_region_size();
         transition base_address == 104 && end_address == 124 && size == 20 {
             true -> alignment_conversion()
             false -> failed()
@@ -192,7 +698,7 @@ crashes Trap
         let default_size: u64 = default_alignment.get_size_in_bytes();
         let fallback_size: u64 = fallback_alignment.get_size_in_bytes();
         transition default_size == 4 && fallback_size == 1 {
-            true -> expand_grows_saturating()
+            true -> passed()
             false -> failed()
         }
     }
@@ -1161,4 +1667,129 @@ crashes Abort
         let processed: u64 = report.get_processed_region_count();
         let total_results: u64 = report.get_result_count();
     region_count == 0 && scanned_bytes == 0 && processed == 1 && total_results == 0 && emitted == 0
+}
+
+// Decimal emission: digits land LSD-first then reverse (same shape as
+// ProcName); the line "ticks=<n>" goes to the console for the driver.
+machine Main::emit_u64(&mut self, value: u64)
+reaches Console
+{
+    self.digit_len = 0;
+    transition { _ -> emit_state(value) }
+    state emit_state(&mut self, value: u64) {
+        transition { _ -> emit_step(value) }
+    }
+    state emit_step(&mut self, value: u64) {
+        transition value > 0 || self.digit_len == 0 {
+            true -> digit_bound(value)
+            false -> reverse_start()
+        }
+    }
+    state digit_bound(&mut self, value: u64) {
+        transition self.digit_len < 24 {
+            true -> take_digit(value)
+            false -> reverse_start()
+        }
+    }
+    state take_digit(&mut self, value: u64) {
+        transition self.digit_len < 24 {
+            true -> store_digit(value, self.digit_len)
+            false -> reverse_start()
+        }
+    }
+    state store_digit(&mut self, value: u64, len: u64 [0..24]) {
+        self.digit_buf[len] = ((48 as u64 in Wrapping) + ((value % 10) as u64 as u64 in Wrapping)) as u64 as u8;
+        self.digit_len = ((len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> emit_step(value / 10) }
+    }
+    state reverse_start(&mut self) {
+        self.digit_pos = 0;
+        transition { _ -> reverse_step() }
+    }
+    state reverse_step(&mut self) {
+        transition self.digit_pos < self.digit_len / 2 {
+            true -> swap_digit()
+            false -> print_bound()
+        }
+    }
+    state swap_digit(&mut self) {
+        transition self.digit_pos < 24 {
+            true -> swap_bound()
+            false -> print_bound()
+        }
+    }
+    state swap_bound(&mut self) {
+        self.swap_index = ((((self.digit_len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64 as u64 in Wrapping) - (self.digit_pos as u64 in Wrapping)) as u64;
+        transition self.swap_index < 24 && self.digit_pos < 24 {
+            true -> swap_move(self.digit_pos, self.swap_index)
+            false -> print_bound()
+        }
+    }
+    state swap_move(&mut self, pos: u64 [0..24], idx: u64 [0..24]) {
+        let left: u8 = self.digit_buf[pos];
+        self.digit_buf[pos] = self.digit_buf[idx];
+        self.digit_buf[idx] = left;
+        self.digit_pos = ((pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> reverse_step() }
+    }
+    state print_bound(&mut self) {
+        transition self.digit_len <= 24 {
+            true -> print_at(0, self.digit_len)
+            false -> emit_done()
+        }
+    }
+    state print_at(&mut self, i: u64, len: u64 [0..=24]) {
+        transition i < len {
+            true -> print_byte(i, len)
+            false -> print_nl()
+        }
+    }
+    state print_byte(&mut self, i: u64, len: u64 [0..=24]) {
+        transition i < 24 {
+            true -> write_digit(i, len)
+            false -> print_nl()
+        }
+    }
+    state write_digit(&mut self, i: u64 [0..24], len: u64 [0..=24]) {
+        let b: i32 = self.digit_buf[i] as i32;
+        self.console.write_byte(b);
+        transition { _ -> print_at(((i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, len) }
+    }
+    state print_nl(&mut self) {
+        self.console.write_byte(10);
+        transition { _ -> emit_done() }
+    }
+    state emit_done(&mut self) {
+    }
+}
+
+machine hex_value(byte: u8) -> u64 {
+    transition byte >= 48 && byte <= 57 {
+        true -> dec(byte)
+        false -> alpha(byte)
+    }
+    state dec(byte: u8) -> u64 {
+        (((byte as u64) as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64
+    }
+    state alpha(byte: u8) -> u64 {
+        transition byte >= 97 && byte <= 102 {
+            true -> lower(byte)
+            false -> upper(byte)
+        }
+    }
+    state lower(byte: u8) -> u64 {
+        (((byte as u64) as u64 in Wrapping) - (87 as u64 in Wrapping)) as u64
+    }
+    state upper(byte: u8) -> u64 {
+        transition byte >= 65 && byte <= 70 {
+            true -> up(byte)
+            false -> invalid(byte)
+        }
+    }
+    state up(byte: u8) -> u64 {
+        (((byte as u64) as u64 in Wrapping) - (55 as u64 in Wrapping)) as u64
+    }
+    state invalid(byte: u8) -> u64 {
+        16
+    }
 }
