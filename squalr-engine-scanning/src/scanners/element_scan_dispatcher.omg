@@ -7,6 +7,7 @@ use squalr_engine_api::src::structures::scanning::comparisons::scan_function_sca
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_byte_array::PlannedScanTypeByteArray;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
 use squalr_engine_api::src::registries::scan_rules::element_scan_rule_registry::ElementScanRuleRegistry;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
@@ -16,6 +17,9 @@ use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filte
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
+use src::scanners::scalar::scanner_scalar_byte_array_booyer_moore::ScalarByteArrayScan;
+use src::scanners::scalar::scanner_scalar_byte_array_booyer_moore::ScannerScalarByteArrayBooyerMoore;
+use src::scanners::scalar::scanner_scalar_byte_array_booyer_moore_masked::ScannerScalarByteArrayBooyerMooreMasked;
 use src::scanners::scalar::scanner_scalar_iterative::ScalarIterativeScan;
 use src::scanners::scalar::scanner_scalar_single_element::ScannerScalarSingleElement;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
@@ -23,17 +27,20 @@ use src::scanners::structures::snapshot_region_filter_run_length_encoder::Snapsh
 
 // Port of ElementScanDispatcher's scanner selection, scalar leg. Upstream's
 // acquire_scanner_instance returns a &dyn Scanner covering vector, byte-array
-// and scalar families; only the scalar family is ported (vectorization and
-// Boyer-Moore legs are separate board work), so selection returns Optional:
-// a non-scalar or Invalid plan selects nothing rather than silently degrading.
+// and scalar families; the scalar + byte-array families are ported
+// (vectorization is a separate board item), so selection returns Optional:
+// a Vector plan selects nothing rather than silently degrading, and Invalid
+// yields the null scanner upstream binds for it.
 //
-// The scalar scanners differ in shape (iterative pulls vs single-shot), so
-// dispatch yields a driver drained uniformly via `next`. `kind` selects which
-// field is live — a tag rather than a payload case so `next` can mutate the
-// active scanner in place through `self`.
+// The scanners differ in shape (iterative pulls, byte-array pull driver,
+// single-shot, null), so dispatch yields a driver drained uniformly via
+// `next`. `kind` selects which field is live — a tag rather than a payload
+// case so `next` can mutate the active scanner in place through `self`.
 pub data ScalarRegionScanKind [copy] {
     case Iterative;
     case SingleElement;
+    case ByteArray;
+    case Null;
 }
 
 // Matchable selection carrier — this pin can construct `Optional` but not
@@ -51,6 +58,7 @@ pub data ElementScanDispatcher {}
 pub data ScalarRegionScan {
     kind: ScalarRegionScanKind;
     iterative_scan: ScalarIterativeScan;
+    byte_array_scan: ScalarByteArrayScan;
     has_single_pending: bool;
     pending_region: SnapshotRegionFilter;
 }
@@ -97,10 +105,87 @@ crashes Abort
             single_current_value,
             single_previous_value
         )
-        PlannedScanType::Invalid -> (ScalarScanSelection::None)
+        PlannedScanType::Invalid -> null_driver()
         PlannedScanType::Vector { scan_type, vectorization_size } -> (ScalarScanSelection::None)
-        PlannedScanType::ByteArray { scan_type } -> (ScalarScanSelection::None)
+        PlannedScanType::ByteArray { scan_type } -> byte_array_kind(
+            scan_type,
+            snapshot_region_filter,
+            snapshot_filter_element_scan_plan
+        )
         _ -> (ScalarScanSelection::None)
+    }
+
+    // Upstream binds `&ScannerNull` for `PlannedScanType::Invalid` — a driver
+    // that yields an empty result stream rather than selecting nothing.
+    state null_driver() -> ScalarScanSelection {
+        ScalarScanSelection::Some {
+            driver: ScalarRegionScan {
+                kind: ScalarRegionScanKind::Null,
+                iterative_scan: dead_iterative(),
+                byte_array_scan: dead_byte_array(),
+                has_single_pending: false,
+                pending_region: SnapshotRegionFilter::new(0, 0),
+            }
+        }
+    }
+
+    // Upstream acquires `&ScannerScalarByteArrayBooyerMoore` (or its masked
+    // sibling) per the plan's byte-array kind — the unit constructors carry
+    // the has_mask bit into the shared driver.
+    state byte_array_kind(
+        scan_type: PlannedScanTypeByteArray,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan
+    ) -> ScalarScanSelection {
+        transition scan_type {
+            PlannedScanTypeByteArray::ByteArrayBooyerMoore -> acquire_byte_array(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan
+            )
+            PlannedScanTypeByteArray::ByteArrayBooyerMooreMasked -> acquire_byte_array_masked(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan
+            )
+        }
+    }
+
+    state acquire_byte_array(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan
+    ) -> ScalarScanSelection {
+        let driver: ScalarByteArrayScan =
+            ScannerScalarByteArrayBooyerMoore::new(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan
+            );
+        byte_array_scanner(snapshot_region_filter, driver)
+    }
+
+    state acquire_byte_array_masked(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan
+    ) -> ScalarScanSelection {
+        let driver: ScalarByteArrayScan =
+            ScannerScalarByteArrayBooyerMooreMasked::new(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan
+            );
+        byte_array_scanner(snapshot_region_filter, driver)
+    }
+
+    state byte_array_scanner(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        byte_array_scan: ScalarByteArrayScan
+    ) -> ScalarScanSelection {
+        ScalarScanSelection::Some {
+            driver: ScalarRegionScan {
+                kind: ScalarRegionScanKind::ByteArray,
+                iterative_scan: dead_iterative(),
+                byte_array_scan: byte_array_scan,
+                has_single_pending: false,
+                pending_region: SnapshotRegionFilter::new(0, 0),
+            }
+        }
     }
 
     state scalar_kind(
@@ -119,6 +204,7 @@ crashes Abort
                             snapshot_region_filter,
                             snapshot_filter_element_scan_plan
                         ),
+                        byte_array_scan: dead_byte_array(),
                         has_single_pending: false,
                         pending_region: SnapshotRegionFilter::new(0, 0),
                     }
@@ -161,6 +247,7 @@ crashes Abort
             driver: ScalarRegionScan {
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
+                byte_array_scan: dead_byte_array(),
                 has_single_pending: true,
                 pending_region: region,
             }
@@ -172,6 +259,7 @@ crashes Abort
             driver: ScalarRegionScan {
                 kind: ScalarRegionScanKind::SingleElement,
                 iterative_scan: dead_iterative(),
+                byte_array_scan: dead_byte_array(),
                 has_single_pending: false,
                 pending_region: SnapshotRegionFilter::new(0, 0),
             }
@@ -197,6 +285,14 @@ crashes Abort
             finalized_tail: true,
         }
     }
+
+    // A never-pulled byte-array driver for the non-byte-array selections;
+    // data declarations have no partial initialization, so the dead fields
+    // are the `unsupported` shape (upstream constructs no scanner state at
+    // all for those arms).
+    state dead_byte_array() -> ScalarByteArrayScan {
+        ScalarByteArrayScan::dead()
+    }
 }
 
 // Drains whichever scalar scanner the plan selected; Iterative walks the
@@ -209,6 +305,8 @@ pub machine ScalarRegionScan::next(
     transition self.kind {
         ScalarRegionScanKind::Iterative -> pull(current_values, previous_values)
         ScalarRegionScanKind::SingleElement -> take_pending()
+        ScalarRegionScanKind::ByteArray -> pull_bytes(current_values, previous_values)
+        ScalarRegionScanKind::Null -> (EmittedRegion::Empty)
         _ -> (EmittedRegion::Empty)
     }
 
@@ -218,6 +316,17 @@ pub machine ScalarRegionScan::next(
         previous_values: &[u64]
     ) -> EmittedRegion {
         self.iterative_scan.next(current_values, previous_values)
+    }
+
+    // Byte-array plans filled `current_values` as a byte window (unit 1,
+    // alignment 1 — see apply_constraint); `previous_values` is unused by the
+    // byte-array scan exactly as upstream's pointer is current-only.
+    state pull_bytes(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64]
+    ) -> EmittedRegion {
+        self.byte_array_scan.next(current_values, previous_values)
     }
 
     state take_pending(&mut self) -> EmittedRegion {
@@ -302,28 +411,123 @@ crashes Abort
         has_mask,
         &mut scan_plan
     );
-    let current_count: u64 = snapshot_region.read_current_elements(
-        snapshot_region_filter,
-        unit_size,
-        memory_alignment,
-        current_elements
-    );
-    transition snapshot_region.has_previous_values() {
-        true -> decode_previous(
+    // Upstream's byte-array scanners read the region through the raw byte
+    // pointer (get_current_values_filter_pointer); on the element model the
+    // same window is the decoded-byte view — unit 1, alignment 1. Byte-array
+    // scans are current-values-only upstream, so the previous decode is
+    // skipped entirely for that plan.
+    transition scan_plan.get_planned_scan_type() {
+        PlannedScanType::ByteArray { scan_type } -> fill_bytes(
+            snapshot_region,
+            element_scan_plan,
+            snapshot_region_filter,
+            scan_plan,
+            current_elements,
+            previous_elements,
+            driver_cell,
+            dst,
+            dst_len
+        )
+        _ -> fill_elements(
             snapshot_region,
             element_scan_plan,
             snapshot_region_filter,
             scan_plan,
             unit_size,
             memory_alignment,
-            current_count,
             current_elements,
             previous_elements,
             driver_cell,
             dst,
             dst_len
         )
-        false -> pick_current(
+    }
+
+    state fill_elements(
+        snapshot_region: &SnapshotRegion,
+        element_scan_plan: &ElementScanPlan,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        scan_plan: SnapshotFilterElementScanPlan,
+        unit_size: u64,
+        memory_alignment: MemoryAlignment,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64
+    ) -> u64 {
+        let current_count: u64 = snapshot_region.read_current_elements(
+            snapshot_region_filter,
+            unit_size,
+            memory_alignment,
+            current_elements
+        );
+        transition snapshot_region.has_previous_values() {
+            true -> decode_previous(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                unit_size,
+                memory_alignment,
+                current_count,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len
+            )
+            false -> pick_current(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                0,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len
+            )
+            _ -> pick_current(
+                snapshot_region,
+                element_scan_plan,
+                snapshot_region_filter,
+                scan_plan,
+                current_count,
+                0,
+                current_elements,
+                previous_elements,
+                driver_cell,
+                dst,
+                dst_len
+            )
+        }
+    }
+
+    // The byte window: upstream reads the filter's current bytes
+    // contiguously; the same coverage lands as a unit-1 element fill capped
+    // by the lent scratch (a short scratch scans the covered prefix — see the
+    // scanner file's window note).
+    state fill_bytes(
+        snapshot_region: &SnapshotRegion,
+        element_scan_plan: &ElementScanPlan,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        scan_plan: SnapshotFilterElementScanPlan,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64
+    ) -> u64 {
+        let current_count: u64 = snapshot_region.read_current_elements(
+            snapshot_region_filter,
+            1,
+            MemoryAlignment::Alignment1,
+            current_elements
+        );
+        transition { _ -> pick_current(
             snapshot_region,
             element_scan_plan,
             snapshot_region_filter,
@@ -335,20 +539,7 @@ crashes Abort
             driver_cell,
             dst,
             dst_len
-        )
-        _ -> pick_current(
-            snapshot_region,
-            element_scan_plan,
-            snapshot_region_filter,
-            scan_plan,
-            current_count,
-            0,
-            current_elements,
-            previous_elements,
-            driver_cell,
-            dst,
-            dst_len
-        )
+        ) }
     }
 
     state decode_previous(
