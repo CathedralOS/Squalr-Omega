@@ -1,0 +1,971 @@
+module src::scanners::scalar::scanner_scalar_byte_array_booyer_moore;
+
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
+use src::scanners::snapshot_scanner::Scanner;
+use src::scanners::structures::boyer_moore_table::OptionalIndex;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::SnapshotRegionFilterRunLengthEncoder;
+
+// Port of scalar/scanner_scalar_byte_array_booyer_moore.rs (with the masked
+// sibling's shared shape — see scanner_scalar_byte_array_booyer_moore_masked
+// for the masked constructor): the overlap-preserving Boyer-Moore byte-array
+// scan over a region's captured current bytes.
+//
+// Storage notes (deviations, per AGENTS.md recorded here):
+//  * Upstream's `DataValue` carries the scan pattern as a byte vector; the
+//    plan's operand is a u64 word, so the pattern lands as `scan_pattern:
+//    [u8; 8]` + `pattern_length` (= the data type's unit width, exactly
+//    `scan_pattern.len` upstream). The same holds for the mask word.
+//  * Upstream's `BoyerMooreTable` heap-owns its suffix-shift Vec; the ported
+//    table takes a caller-lent `&mut [u64]` backing which cannot ride inside
+//    this pull-driver record, so the tables live inline on the scan instead
+//    (`mismatch_index_table: [OptionalIndex; 256]` mirrors upstream's
+//    fixed-256 Vec<Option<usize>>; `matching_suffix_shift_table: [u64; 8]`
+//    covers every pattern length the u64 operand can express). The
+//    table-build states below are upstream `BoyerMooreTable::build_table`
+//    (`is_prefix`/`suffix_length`/`round_up_to_alignment` helpers included)
+//    with `self.scan_pattern`/`self.pattern_length` standing in for the
+//    borrowed `scan_pattern`/`scan_pattern.len`.
+//  * Upstream drains the encoder's `take_result_regions()` eagerly; the
+//    pull-model `next` walks until one emission per call, same order and
+//    content, and the post-loop `finalize_current_encode_with_padding(0,
+//    padding)` is the one-shot tail (`finalized_tail`).
+//  * `current_values` is the caller's decoded byte window (unit 1, alignment
+//    1 — the dispatcher fills it via read_current_elements at byte stride,
+//    matching upstream's `get_current_values_filter_pointer` byte view). A
+//    window shorter than the region ends the scan at the covered prefix —
+//    upstream always reads a full window; under the lent-slab model a short
+//    scratch reports the covered prefix and closes (the dispatcher's
+//    abort-on-undersize convention applied read-side).
+//  * Upstream's unsupported-compare-type arms log and return an empty Vec;
+//    here `supported` gates `next` to the same empty result stream.
+pub data ScalarByteArrayScan {
+    encoder: SnapshotRegionFilterRunLengthEncoder;
+    scan_index: u64;
+    region_size: u64;
+    scan_pattern: [u8; 8];
+    pattern_length: u64;
+    scan_mask: [u8; 8];
+    has_mask: bool;
+    memory_alignment_size: u64;
+    data_type_size_padding: u64;
+    mismatch_index_table: [OptionalIndex; 256];
+    matching_suffix_shift_table: [u64; 8];
+    supported: bool;
+    finalized_tail: bool;
+}
+
+// Upstream `acquire_scanner_instance`'s `&ScannerScalarByteArrayBooyerMoore`
+// unit — kept as the constructor namespace; the returned record is the
+// pull driver the caller drains.
+pub data ScannerScalarByteArrayBooyerMoore {}
+
+pub machine ScannerScalarByteArrayBooyerMoore::new(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan
+) -> ScalarByteArrayScan {
+    ScalarByteArrayScan::new(
+        snapshot_region_filter,
+        snapshot_filter_element_scan_plan,
+        false
+    )
+}
+
+// Upstream `get_scanner_name` (`"Byte Array (Booyer-Moore)"`, 25 bytes) —
+// len/byte pair per the borrowed-string convention.
+pub machine ScannerScalarByteArrayBooyerMoore::get_scanner_name_len(&self) -> u64
+satisfies Scanner::get_scanner_name_len
+{
+    25
+}
+
+pub machine ScannerScalarByteArrayBooyerMoore::get_scanner_name_byte(
+    &self,
+    position: u64
+) -> u8
+satisfies Scanner::get_scanner_name_byte
+{
+    transition position < 25 {
+        true -> read(position)
+        _ -> (0)
+    }
+
+    state read(&self, position: u64) -> u8 {
+        transition position < 25 {
+            true -> take(position)
+            _ -> (0)
+        }
+    }
+
+    state take(&self, position: u64 [0..25]) -> u8 {
+        "Byte Array (Booyer-Moore)"[position]
+    }
+}
+
+// Upstream's scan_region prelude: Immediate(Equal) is the only compare type
+// byte-array scans support; anything else is the empty upstream arm.
+pub machine ScalarByteArrayScan::new(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+    has_mask: bool
+) -> ScalarByteArrayScan {
+    transition snapshot_filter_element_scan_plan.get_scan_compare_type() {
+        ScanCompareType::Immediate { compare_type } -> immediate(
+            compare_type,
+            snapshot_region_filter,
+            snapshot_filter_element_scan_plan,
+            has_mask
+        )
+        _ -> (ScalarByteArrayScan::unsupported(snapshot_region_filter))
+    }
+
+    state immediate(
+        compare_type: ScanCompareTypeImmediate,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+        has_mask: bool
+    ) -> ScalarByteArrayScan {
+        transition compare_type {
+            ScanCompareTypeImmediate::Equal -> build(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan,
+                has_mask
+            )
+            _ -> (ScalarByteArrayScan::unsupported(snapshot_region_filter))
+        }
+    }
+
+    state build(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+        has_mask: bool
+    ) -> ScalarByteArrayScan {
+        let align_size: u64 =
+            snapshot_filter_element_scan_plan.get_memory_alignment().get_size_in_bytes();
+        let pat_len: u64 =
+            snapshot_filter_element_scan_plan.get_unit_size_in_bytes();
+        // The u64-carried operand bounds the pattern to 8 bytes; upstream's
+        // `if scan_pattern.len() != scan_mask.len()` and zero-length pattern
+        // collapse into `supported` — both yield upstream's empty result.
+        let is_supported: bool = pat_len >= 1 && pat_len <= 8;
+        let mut scan: ScalarByteArrayScan = ScalarByteArrayScan {
+            encoder: SnapshotRegionFilterRunLengthEncoder::new(
+                snapshot_region_filter.get_base_address()
+            ),
+            scan_index: 0,
+            region_size: snapshot_region_filter.get_region_size(),
+            pattern_length: pat_len,
+            has_mask: has_mask,
+            memory_alignment_size: align_size,
+            data_type_size_padding: ((pat_len as u64 in Saturating)
+                - (align_size as u64 in Saturating)) as u64,
+            supported: is_supported,
+            finalized_tail: false,
+        };
+        transition is_supported {
+            true -> fill(scan, snapshot_filter_element_scan_plan)
+            _ -> (scan)
+        }
+    }
+
+    state fill(
+        scan: ScalarByteArrayScan,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan
+    ) -> ScalarByteArrayScan {
+        let mut filled: ScalarByteArrayScan = scan;
+        filled.fill_bytes(
+            snapshot_filter_element_scan_plan.get_operand_value(),
+            snapshot_filter_element_scan_plan.get_mask_value(),
+            0
+        );
+        // Upstream's masked variant never builds the Boyer-Moore tables — its
+        // shift walk replaces them — so table-build runs only unmasked.
+        transition filled.has_mask {
+            true -> (filled)
+            false -> tables(filled)
+            _ -> (filled)
+        }
+    }
+
+    state tables(scan: ScalarByteArrayScan) -> ScalarByteArrayScan {
+        let mut built: ScalarByteArrayScan = scan;
+        built.build_tables();
+        built
+    }
+}
+
+// The dead byte-array payload carried by `ScalarRegionScan` whenever the
+// selected scanner is not byte-array (and by fixtures declaring the union
+// cell). Array fields default-omit; the scan is never driven.
+pub machine ScalarByteArrayScan::dead() -> ScalarByteArrayScan {
+    ScalarByteArrayScan {
+        encoder: SnapshotRegionFilterRunLengthEncoder::new(0),
+        scan_index: 0,
+        region_size: 0,
+        pattern_length: 0,
+        has_mask: false,
+        memory_alignment_size: 1,
+        data_type_size_padding: 0,
+        supported: false,
+        finalized_tail: false,
+    }
+}
+
+// The empty-result shape upstream's unsupported arms (`vec![]`) produce —
+// also the union's dead-driver payload for non-byte-array selections.
+pub machine ScalarByteArrayScan::unsupported(
+    snapshot_region_filter: &SnapshotRegionFilter
+) -> ScalarByteArrayScan {
+    ScalarByteArrayScan {
+        encoder: SnapshotRegionFilterRunLengthEncoder::new(
+            snapshot_region_filter.get_base_address()
+        ),
+        scan_index: 0,
+        region_size: snapshot_region_filter.get_region_size(),
+        pattern_length: 0,
+        has_mask: false,
+        memory_alignment_size: 1,
+        data_type_size_padding: 0,
+        supported: false,
+        finalized_tail: false,
+    }
+}
+
+// Unpacks the operand (and, for the masked variant, the packed mask word)
+// into the byte arrays — upstream's `data_value.get_value_bytes()` /
+// `get_mask()` element views, little-endian per the operand packing.
+machine ScalarByteArrayScan::fill_bytes(
+    &mut self,
+    operand_value: u64,
+    mask_value: u64,
+    index: u64
+) {
+    transition index < self.pattern_length && index < 8 {
+        true -> store(operand_value, mask_value, index)
+        _ -> done()
+    }
+
+    state store(
+        &mut self,
+        operand_value: u64,
+        mask_value: u64,
+        index: u64
+    ) {
+        transition index < self.pattern_length && index < 8 {
+            true -> write(operand_value, mask_value, index)
+            _ -> done()
+        }
+    }
+
+    state done(&mut self) {
+    }
+
+    state write(
+        &mut self,
+        operand_value: u64,
+        mask_value: u64,
+        index: u64 [0..8]
+    ) {
+        self.scan_pattern[index] =
+            byte_array_operand_byte(operand_value, self.pattern_length, index);
+        self.scan_mask[index] =
+            byte_array_operand_byte(mask_value, self.pattern_length, index);
+        // The byte walk is a state-graph loop (constant stack, bounded by
+        // index < 8) — the same idiom as the table-build passes below.
+        store(operand_value, mask_value,
+            ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+    }
+}
+
+// Upstream `BoyerMooreTable::build_table` on the record's inline pattern and
+// tables — identical passes: bad-character forward fill, suffix table seeded
+// with the aligned whole-pattern shift, prefix-allowed minima, then the
+// suffix-match minima.
+machine ScalarByteArrayScan::build_tables(&mut self) {
+    transition { _ -> mismatch_fill(0) }
+
+    state mismatch_fill(&mut self, index: u64) {
+        transition index < self.pattern_length && index < 8 {
+            true -> mismatch_store(index)
+            false -> shift_init(0)
+            _ -> shift_init(0)
+        }
+    }
+
+    state mismatch_store(&mut self, index: u64) {
+        transition index < self.pattern_length && index < 8 {
+            true -> mismatch_byte(index)
+            _ -> shift_init(0)
+        }
+    }
+
+    state mismatch_byte(&mut self, index: u64 [0..8]) {
+        let byte: u64 = self.scan_pattern[index] as u64;
+        transition byte < 256 {
+            true -> mismatch_commit(index, byte)
+            _ -> shift_init(0)
+        }
+    }
+
+    state mismatch_commit(&mut self, index: u64, byte: u64 [0..256]) {
+        self.mismatch_index_table[byte] = OptionalIndex::Present { index: index };
+        mismatch_fill(
+            ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        )
+    }
+
+    state shift_init(&mut self, index: u64) {
+        let aligned_length: u64 = byte_array_round_up_to_alignment(
+            self.pattern_length,
+            self.memory_alignment_size
+        );
+        transition index < self.pattern_length && index < 8 {
+            true -> shift_store(index, aligned_length)
+            false -> prefix_probe()
+            _ -> prefix_probe()
+        }
+    }
+
+    state shift_store(&mut self, index: u64, aligned_length: u64) {
+        transition index < 8 {
+            true -> shift_write(index, aligned_length)
+            _ -> prefix_probe()
+        }
+    }
+
+    state shift_write(&mut self, index: u64 [0..8], aligned_length: u64) {
+        self.matching_suffix_shift_table[index] = aligned_length;
+        shift_init(
+            ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        )
+    }
+
+    // Upstream `for start_index in (0..pattern_length).rev()`.
+    state prefix_probe(&mut self) {
+        transition self.pattern_length > 0 {
+            true -> prefix_pass(
+                ((self.pattern_length as u64 in Saturating) - (1 as u64 in Saturating)) as u64
+            )
+            _ -> suffix_pass(0)
+        }
+    }
+
+    state prefix_pass(&mut self, start_index: u64) {
+        transition start_index < self.pattern_length && start_index <= self.pattern_length
+            && start_index < 8 {
+            true -> prefix_check(start_index)
+            _ -> suffix_pass(0)
+        }
+    }
+
+    state prefix_check(&mut self, start_index: u64) {
+        transition self.is_prefix(start_index) {
+            true -> prefix_min(start_index)
+            _ -> prefix_next(start_index)
+        }
+    }
+
+    // A suffix that is also a prefix allows shift = pattern_length - start.
+    state prefix_min(&mut self, start_index: u64) {
+        let raw_shift: u64 =
+            ((self.pattern_length as u64 in Saturating) - (start_index as u64 in Saturating)) as u64;
+        let aligned_shift: u64 = byte_array_round_up_to_alignment(
+            raw_shift,
+            self.memory_alignment_size
+        );
+        transition start_index < 8 {
+            true -> prefix_min_write(start_index, aligned_shift)
+            _ -> prefix_next(start_index)
+        }
+    }
+
+    state prefix_min_write(&mut self, start_index: u64, aligned_shift: u64) {
+        transition start_index < 8 {
+            true -> prefix_min_store(start_index, aligned_shift)
+            _ -> prefix_next(start_index)
+        }
+    }
+
+    state prefix_min_store(&mut self, start_index: u64 [0..8], aligned_shift: u64) {
+        let current: u64 = self.matching_suffix_shift_table[start_index];
+        self.matching_suffix_shift_table[start_index] =
+            byte_array_u64_min(current, aligned_shift);
+        prefix_next(start_index)
+    }
+
+    state prefix_next(&mut self, start_index: u64) {
+        transition start_index > 0 {
+            true -> prefix_pass(
+                ((start_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64
+            )
+            _ -> suffix_pass(0)
+        }
+    }
+
+    // Second pass over 0..pattern_length_minus_one: shifts from actual
+    // suffix matches, taking the smaller of the two upstream options.
+    state suffix_pass(&mut self, pattern_index: u64) {
+        let pattern_length_minus_one: u64 =
+            ((self.pattern_length as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition pattern_index < pattern_length_minus_one
+            && pattern_index < self.pattern_length && pattern_index < 8 {
+            true -> suffix_step(pattern_index, pattern_length_minus_one)
+            _ -> done()
+        }
+    }
+
+    state suffix_step(&mut self, pattern_index: u64, pattern_length_minus_one: u64) {
+        let matching_suffix_len: u64 = self.suffix_length(pattern_index);
+        let shift_table_index: u64 =
+            ((pattern_length_minus_one as u64 in Saturating) - (matching_suffix_len as u64 in Saturating)) as u64;
+        let option_a: u64 =
+            ((self.pattern_length as u64 in Saturating) - (matching_suffix_len as u64 in Saturating)) as u64;
+        let option_b_span: u64 =
+            ((pattern_length_minus_one as u64 in Saturating) - (pattern_index as u64 in Saturating)) as u64;
+        let option_b: u64 =
+            ((option_b_span as u64 in Saturating) + (matching_suffix_len as u64 in Saturating)) as u64;
+        let shift: u64 = byte_array_u64_min(option_a, option_b);
+        let aligned_shift: u64 = byte_array_round_up_to_alignment(
+            shift,
+            self.memory_alignment_size
+        );
+        transition shift_table_index < 8 {
+            true -> suffix_min_write(pattern_index, shift_table_index, aligned_shift)
+            _ -> suffix_pass(
+                ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+
+    state suffix_min_write(&mut self, pattern_index: u64, shift_table_index: u64, aligned_shift: u64) {
+        transition shift_table_index < 8 {
+            true -> suffix_min_store(pattern_index, shift_table_index, aligned_shift)
+            _ -> suffix_pass(
+                ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+
+    state suffix_min_store(&mut self, pattern_index: u64, shift_table_index: u64 [0..8], aligned_shift: u64) {
+        let current: u64 = self.matching_suffix_shift_table[shift_table_index];
+        self.matching_suffix_shift_table[shift_table_index] =
+            byte_array_u64_min(current, aligned_shift);
+        suffix_pass(
+            ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+        )
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// Upstream `BoyerMooreTable::is_prefix` on `self.scan_pattern`: whether the
+// suffix starting at suffix_start is also a prefix.
+machine ScalarByteArrayScan::is_prefix(
+    &mut self,
+    suffix_start: u64
+) -> bool
+requires
+    suffix_start <= self.pattern_length
+{
+    transition {
+        _ -> walk(
+            suffix_start,
+            ((self.pattern_length as u64 in Saturating) - (suffix_start as u64 in Saturating)) as u64,
+            0
+        )
+    }
+
+    state walk(&mut self, reverse: u64, suffix_len: u64, forward: u64) -> bool {
+        transition forward < suffix_len && forward < 8 && reverse < 8
+            && forward < self.pattern_length && reverse < self.pattern_length {
+            true -> compare(reverse, suffix_len, forward)
+            _ -> (true)
+        }
+    }
+
+    state compare(&mut self, reverse: u64 [0..8], suffix_len: u64, forward: u64 [0..8]) -> bool {
+        transition self.scan_pattern[forward] != self.scan_pattern[reverse] {
+            true -> (false)
+            false -> walk(
+                ((reverse as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                suffix_len,
+                ((forward as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+            _ -> walk(
+                ((reverse as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                suffix_len,
+                ((forward as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+            )
+        }
+    }
+}
+
+// Upstream `BoyerMooreTable::suffix_length`: length of the suffix match
+// ending at match_pos, comparing backward from the pattern's last byte.
+machine ScalarByteArrayScan::suffix_length(
+    &mut self,
+    match_pos: u64
+) -> u64
+requires
+    match_pos < self.pattern_length
+{
+    transition {
+        _ -> walk(
+            match_pos,
+            ((self.pattern_length as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+            0
+        )
+    }
+
+    state walk(&mut self, suffix_index: u64, pattern_end_index: u64, length: u64) -> u64 {
+        transition suffix_index < self.pattern_length && pattern_end_index < self.pattern_length
+            && suffix_index < 8 && pattern_end_index < 8 {
+            true -> compare(suffix_index, pattern_end_index, length)
+            _ -> (length)
+        }
+    }
+
+    state compare(&mut self, suffix_index: u64 [0..8], pattern_end_index: u64 [0..8], length: u64) -> u64 {
+        transition self.scan_pattern[suffix_index] == self.scan_pattern[pattern_end_index] {
+            true -> step(suffix_index, pattern_end_index, length)
+            _ -> (length)
+        }
+    }
+
+    // Upstream increments before the zero-edge break, then walks both indexes
+    // down while bytes keep matching.
+    state step(&mut self, suffix_index: u64, pattern_end_index: u64, length: u64) -> u64 {
+        let next_length: u64 = ((length as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition suffix_index == 0 || pattern_end_index == 0 {
+            true -> (next_length)
+            _ -> walk(
+                ((suffix_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+                ((pattern_end_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64,
+                next_length
+            )
+        }
+    }
+}
+
+// Upstream `ScannerScalarByteArrayBooyerMooreMasked::get_safe_mismatch_shift`:
+// walk pattern positions before the mismatch downward for a byte that is
+// mask-equal to the mismatching byte; the first gives the smallest safe
+// (alignment-rounded) shift, else mismatch + 1 rounded up. Masked scans only.
+machine ScalarByteArrayScan::masked_safe_mismatch_shift(
+    &mut self,
+    mismatched_byte: u8,
+    mismatch_pattern_index: u64
+) -> u64 {
+    transition mismatch_pattern_index > 0 {
+        true -> walk(mismatched_byte, mismatch_pattern_index,
+            ((mismatch_pattern_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64)
+        _ -> fallback(mismatch_pattern_index)
+    }
+
+    state walk(&mut self, mismatched_byte: u8, mismatch_pattern_index: u64, compatible_pattern_index: u64) -> u64 {
+        transition compatible_pattern_index < mismatch_pattern_index && compatible_pattern_index < 8 {
+            true -> test(mismatched_byte, mismatch_pattern_index, compatible_pattern_index)
+            _ -> fallback(mismatch_pattern_index)
+        }
+    }
+
+    state test(&mut self, mismatched_byte: u8, mismatch_pattern_index: u64, compatible_pattern_index: u64) -> u64 {
+        transition compatible_pattern_index < 8 {
+            true -> bounded(mismatched_byte, mismatch_pattern_index, compatible_pattern_index)
+            _ -> fallback(mismatch_pattern_index)
+        }
+    }
+
+    state bounded(&mut self, mismatched_byte: u8, mismatch_pattern_index: u64, compatible_pattern_index: u64 [0..8]) -> u64 {
+        let pattern_mask: u8 = self.scan_mask[compatible_pattern_index];
+        let masked_pattern_byte: u8 = self.scan_pattern[compatible_pattern_index] & pattern_mask;
+        let masked_mismatched_byte: u8 = mismatched_byte & pattern_mask;
+        transition masked_mismatched_byte == masked_pattern_byte {
+            true -> found(mismatch_pattern_index, compatible_pattern_index)
+            _ -> step(mismatched_byte, mismatch_pattern_index, compatible_pattern_index)
+        }
+    }
+
+    state found(&mut self, mismatch_pattern_index: u64, compatible_pattern_index: u64) -> u64 {
+        let raw_shift: u64 =
+            ((mismatch_pattern_index as u64 in Saturating) - (compatible_pattern_index as u64 in Saturating)) as u64;
+        let capped_shift: u64 = byte_array_u64_max(raw_shift, 1);
+        byte_array_round_up_to_alignment(
+            capped_shift,
+            self.memory_alignment_size
+        )
+    }
+
+    state step(&mut self, mismatched_byte: u8, mismatch_pattern_index: u64, compatible_pattern_index: u64) -> u64 {
+        transition compatible_pattern_index > 0 {
+            true -> walk(
+                mismatched_byte,
+                mismatch_pattern_index,
+                ((compatible_pattern_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64
+            )
+            _ -> fallback(mismatch_pattern_index)
+        }
+    }
+
+    state fallback(&mut self, mismatch_pattern_index: u64) -> u64 {
+        byte_array_round_up_to_alignment(
+            ((mismatch_pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            self.memory_alignment_size
+        )
+    }
+}
+
+// The scan's pull driver: each call walks upstream's `while scan_index <=
+// region_size - pattern_length` loop until the run-length encoder yields a
+// region, then suspends; `Empty` once the tail finalize has run.
+pub machine ScalarByteArrayScan::next(
+    &mut self,
+    current_values: &[u64],
+    previous_values: &[u64]
+) -> EmittedRegion
+satisfies Scanner::next
+{
+    transition self.supported && !self.finalized_tail {
+        true -> pump(current_values)
+        _ -> (EmittedRegion::Empty)
+    }
+
+    state pump(&mut self, current_values: &[u64]) -> EmittedRegion {
+        let window_end: u64 = ((self.region_size as u64 in Saturating)
+            - (self.pattern_length as u64 in Saturating)) as u64;
+        transition self.scan_index <= window_end {
+            true -> probe(current_values)
+            _ -> tail()
+        }
+    }
+
+    // The byte window is shorter than the region only when the caller's
+    // lent scratch undersizes it — scanning the covered prefix and closing
+    // preserves upstream's result ordering over that prefix.
+    state probe(&mut self, current_values: &[u64]) -> EmittedRegion {
+        let last: u64 =
+            ((self.pattern_length as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        compare_gate(current_values, last)
+    }
+
+    state compare_gate(&mut self, current_values: &[u64], inverse_index: u64) -> EmittedRegion {
+        let byte_offset: u64 = ((self.scan_index as u64 in Saturating)
+            + (inverse_index as u64 in Saturating)) as u64;
+        transition byte_offset < current_values.len && inverse_index < 8
+            && inverse_index < self.pattern_length {
+            true -> compare_byte(current_values, inverse_index, byte_offset)
+            _ -> tail()
+        }
+    }
+
+    state compare_byte(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        byte_offset: u64
+    ) -> EmittedRegion {
+        transition byte_offset < current_values.len && inverse_index < 8 {
+            true -> compare_load(current_values, inverse_index, byte_offset)
+            _ -> tail()
+        }
+    }
+
+    state compare_load(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64 [0..8],
+        byte_offset: u64 [0..current_values.len]
+    ) -> EmittedRegion {
+        let byte_word: u64 = current_values[byte_offset];
+        let current_byte: u8 =
+            (((byte_word as u64 in Wrapping) % (256 as u64 in Wrapping)) as u8);
+        transition self.has_mask {
+            true -> compare_masked(current_values, inverse_index, current_byte)
+            _ -> compare_plain(current_values, inverse_index, current_byte)
+        }
+    }
+
+    state compare_plain(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64 [0..8],
+        current_byte: u8
+    ) -> EmittedRegion {
+        transition current_byte == self.scan_pattern[inverse_index] {
+            true -> match_step(current_values, inverse_index)
+            _ -> shift_bad_char(current_values, inverse_index, current_byte)
+        }
+    }
+
+    state compare_masked(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64 [0..8],
+        current_byte: u8
+    ) -> EmittedRegion {
+        let masked_current_byte: u8 = current_byte & self.scan_mask[inverse_index];
+        let masked_pattern_byte: u8 = self.scan_pattern[inverse_index] & self.scan_mask[inverse_index];
+        transition masked_current_byte == masked_pattern_byte {
+            true -> match_step(current_values, inverse_index)
+            _ -> shift_masked(current_values, inverse_index, current_byte)
+        }
+    }
+
+    state match_step(&mut self, current_values: &[u64], inverse_index: u64) -> EmittedRegion {
+        transition inverse_index > 0 {
+            true -> compare_gate(
+                current_values,
+                ((inverse_index as u64 in Saturating) - (1 as u64 in Saturating)) as u64
+            )
+            _ -> match_hit(current_values)
+        }
+    }
+
+    // Upstream: `scan_index += memory_alignment_size` +
+    // `encode_range(memory_alignment_size)` — the candidate stride, not the
+    // pattern width, is what makes overlapping matches reportable.
+    state match_hit(&mut self, current_values: &[u64]) -> EmittedRegion {
+        self.encoder.encode_range(self.memory_alignment_size);
+        self.scan_index = ((self.scan_index as u64 in Saturating)
+            + (self.memory_alignment_size as u64 in Saturating)) as u64;
+        pump(current_values)
+    }
+
+    // Unmasked: upstream `boyer_moore_table.get_safe_mismatch_shift` — the
+    // bad-character rule first, then the good-suffix rule combined under the
+    // same guards upstream's getters apply.
+    state shift_bad_char(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        current_byte: u8
+    ) -> EmittedRegion {
+        transition (current_byte as u64) < 256 {
+            true -> shift_bad_load(
+                current_values,
+                inverse_index,
+                current_byte as u64
+            )
+            _ -> shift_good_suffix(current_values, inverse_index,
+                byte_array_round_up_to_alignment(
+                    byte_array_u64_max(
+                        ((inverse_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                        1
+                    ),
+                    self.memory_alignment_size
+                ))
+        }
+    }
+
+    state shift_bad_load(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        byte_index: u64 [0..256]
+    ) -> EmittedRegion {
+        shift_bad_entry(current_values, inverse_index, self.mismatch_index_table[byte_index])
+    }
+
+    state shift_bad_entry(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        entry: OptionalIndex
+    ) -> EmittedRegion {
+        transition entry {
+            OptionalIndex::Present { index } -> shift_bad_present(
+                current_values,
+                inverse_index,
+                index
+            )
+            _ -> shift_good_suffix(current_values, inverse_index,
+                byte_array_round_up_to_alignment(
+                    byte_array_u64_max(
+                        ((inverse_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+                        1
+                    ),
+                    self.memory_alignment_size
+                ))
+        }
+    }
+
+    state shift_bad_present(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        rightmost: u64
+    ) -> EmittedRegion {
+        transition rightmost < inverse_index {
+            true -> shift_good_suffix(current_values, inverse_index,
+                byte_array_round_up_to_alignment(
+                    byte_array_u64_max(
+                        ((inverse_index as u64 in Saturating) - (rightmost as u64 in Saturating)) as u64,
+                        1
+                    ),
+                    self.memory_alignment_size
+                ))
+            _ -> shift_good_suffix(current_values, inverse_index,
+                byte_array_round_up_to_alignment(1, self.memory_alignment_size))
+        }
+    }
+
+    // Upstream `get_good_suffix_shift(mismatch + 1)`: reads
+    // matching_suffix_shift_table[mismatch + 1] only when
+    // (mismatch + 1) + 1 < pattern_length.
+    state shift_good_suffix(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        bad_char_shift: u64
+    ) -> EmittedRegion {
+        let good_index: u64 =
+            ((inverse_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        let index_after: u64 =
+            ((good_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        transition index_after < self.pattern_length && good_index < 8 {
+            true -> shift_good_read(current_values, inverse_index, bad_char_shift, good_index)
+            _ -> shift_combine(current_values, bad_char_shift, 0)
+        }
+    }
+
+    state shift_good_read(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        bad_char_shift: u64,
+        good_index: u64
+    ) -> EmittedRegion {
+        transition good_index < 8 {
+            true -> shift_good_bounded(current_values, bad_char_shift, good_index)
+            _ -> shift_combine(current_values, bad_char_shift, 0)
+        }
+    }
+
+    state shift_good_bounded(
+        &mut self,
+        current_values: &[u64],
+        bad_char_shift: u64,
+        good_index: u64 [0..8]
+    ) -> EmittedRegion {
+        let good_suffix_shift: u64 = self.matching_suffix_shift_table[good_index];
+        shift_combine(current_values, bad_char_shift, good_suffix_shift)
+    }
+
+    // Upstream: `if good_suffix_shift > 0 { max(min(bad, good), alignment) }
+    // else { max(bad, alignment) }`.
+    state shift_combine(
+        &mut self,
+        current_values: &[u64],
+        bad_char_shift: u64,
+        good_suffix_shift: u64
+    ) -> EmittedRegion {
+        transition good_suffix_shift > 0 {
+            true -> shift_out(
+                current_values,
+                byte_array_u64_max(
+                    byte_array_u64_min(bad_char_shift, good_suffix_shift),
+                    self.memory_alignment_size
+                )
+            )
+            _ -> shift_out(
+                current_values,
+                byte_array_u64_max(bad_char_shift, self.memory_alignment_size)
+            )
+        }
+    }
+
+    state shift_masked(
+        &mut self,
+        current_values: &[u64],
+        inverse_index: u64,
+        current_byte: u8
+    ) -> EmittedRegion {
+        let shift: u64 = self.masked_safe_mismatch_shift(current_byte, inverse_index);
+        shift_out(current_values, shift)
+    }
+
+    // `finalize_current_encode_with_padding(shift, data_type_size_padding)`
+    // then `scan_index += shift` — upstream's mismatch advance.
+    state shift_out(&mut self, current_values: &[u64], shift: u64) -> EmittedRegion {
+        let emitted: EmittedRegion = self.encoder.finalize_current_encode_with_padding(
+            shift,
+            self.data_type_size_padding
+        );
+        self.scan_index =
+            ((self.scan_index as u64 in Wrapping) + (shift as u64 in Wrapping)) as u64;
+        transition emitted {
+            EmittedRegion::Region { region } -> (EmittedRegion::Region { region: region })
+            _ -> pump(current_values)
+        }
+    }
+
+    // Upstream's post-loop `finalize_current_encode_with_padding(0, padding)`
+    // — one-shot tail emission closing an open run at end of window.
+    state tail(&mut self) -> EmittedRegion {
+        self.finalized_tail = true;
+        let emitted: EmittedRegion = self.encoder.finalize_current_encode_with_padding(
+            0,
+            self.data_type_size_padding
+        );
+        transition emitted {
+            EmittedRegion::Region { region } -> (EmittedRegion::Region { region: region })
+            _ -> (EmittedRegion::Empty)
+        }
+    }
+}
+
+// Little-endian byte `byte_index` of a packed u64 word (operand or mask);
+// indexes past `value_size_in_bytes` read as 0 — same convention as
+// ScanConstraintFinalized's operand_byte.
+machine byte_array_operand_byte(
+    value: u64,
+    value_size_in_bytes: u64,
+    byte_index: u64
+) -> u8 {
+    transition byte_index < value_size_in_bytes {
+        true -> shift(value, byte_index)
+        _ -> (0)
+    }
+
+    state shift(value: u64, byte_index: u64) -> u8 {
+        transition byte_index < 8 {
+            true -> bounded(value, byte_index)
+            _ -> (0)
+        }
+    }
+
+    state bounded(value: u64, byte_index: u64) -> u8 {
+        let shift_bits: u64 = ((byte_index as u64 in Saturating) * (8 as u64 in Saturating)) as u64;
+        let shifted: u64 = value >> shift_bits;
+        ((shifted as u64 in Wrapping) % (256 as u64 in Wrapping)) as u8
+    }
+}
+
+// Upstream `round_up_to_alignment`: value + (alignment - remainder) %
+// alignment (requires alignment > 0 — the supported gate guarantees it since
+// memory_alignment_size comes from a MemoryAlignment).
+machine byte_array_round_up_to_alignment(value: u64, alignment: u64) -> u64 {
+    let remainder: u64 = ((value as u64 in Saturating) % (alignment as u64 in Saturating)) as u64;
+    ((value as u64 in Saturating)
+        + (((alignment as u64 in Saturating) - (remainder as u64 in Saturating))
+            % (alignment as u64 in Saturating))) as u64
+}
+
+machine byte_array_u64_min(a: u64, b: u64) -> u64 {
+    transition a < b {
+        true -> a
+        _ -> (b)
+    }
+}
+
+machine byte_array_u64_max(a: u64, b: u64) -> u64 {
+    transition a > b {
+        true -> a
+        _ -> (b)
+    }
+}
