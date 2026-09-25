@@ -1,0 +1,425 @@
+use omega_language_std::console;
+use omega_language_std::filesystem_host;
+use omega::language::core::binding;
+use call_select_dep::src::lib::Rec;
+use call_select_dep::src::lib::Outer;
+use call_select_dep::src::lib::Worker;
+use call_select_dep::src::lib::ProbeResult;
+
+pub data App {
+    console: Binding<Console>;
+    worker: Worker;
+    outer: Outer;
+    control: [u8; 64];
+    ctrl_src: [u8; 64];
+    pos: u64;
+    digit_len: u64;
+    b8: u8;
+    pt: Point;
+    fsw: FsWorker;
+}
+
+pub data FsWorker {
+    fs: Binding<FilesystemHost>;
+    fmem_fd: i32;
+    fproc_fd: i32;
+    fcount: i64;
+    fexpected: u64;
+    fpos: u64;
+    fscratch: i32;
+    control: [u8; 64];
+    name: NameBox;
+    fds: [i32; 8];
+}
+
+pub data NameBox {
+    bytes: [u8; 64];
+    len: u64;
+}
+
+pub machine NameBox::for_process(process_id: u32) -> NameBox {
+    NameBox { len: 3 }
+}
+
+pub linux_x86_64 machine App::main(&mut self)
+reaches Console + FilesystemHost
+invokes Console;
+invokes FilesystemHost;
+suspends; blocks;
+crashes Abort
+crashes Trap
+{
+    state s(&mut self) {
+        self.outer.info = Rec { h: 7 };
+        transition { _ -> u5() }
+    }
+    // u5: 2-seg receiver scalar call into let + affine-result call + ClosedSum
+    state u5(&mut self) {
+        let h: u64 = self.outer.info.get();
+        let p: ProbeResult = self.worker.probe_u(h);
+        let ok: bool = p.succeeded();
+        transition ok {
+            true -> hv()
+            false -> bad()
+        }
+    }
+    state em(&mut self) {
+        self.emit(self.digit_len);
+        transition { _ -> es() }
+    }
+    state es(&mut self) {
+        self.emit_slice(self.digit_len);
+        transition block self.mirror_read(&mut self.control, self.pos) {
+            _ -> es2()
+        }
+    }
+    state es2(&mut self) {
+        self.plain_put(self.pos, 65);
+        self.stmt_bare(&mut self.pt);
+        self.fwd_bump_reborrow(&mut self.pt);
+        self.bump_method(&mut self.pt);
+        self.bump_field(&mut self.pt);
+        self.reuse_arg();
+        self.field_arg();
+        transition block self.fsw.fs_read(&mut self.control, self.pos) {
+            _ -> es3()
+        }
+    }
+    state es3(&mut self) {
+        transition block self.console.read_line(&mut self.control) {
+            _ -> good()
+        }
+    }
+
+    state sf(&mut self) {
+        let p: ProbeResult = self.worker.succ_forward(&mut self.outer.info);
+        let ok: bool = p.succeeded();
+        transition ok {
+            true -> sf()
+            false -> bad()
+        }
+    }
+    state fr(&mut self) {
+        let p: ProbeResult = self.worker.forward_ref(&self.outer.info);
+        let ok: bool = p.succeeded();
+        transition ok {
+            true -> fr()
+            false -> bad()
+        }
+    }
+    state fm(&mut self) {
+        let p: ProbeResult = self.worker.forward_mut(&mut self.outer.info);
+        let ok: bool = p.succeeded();
+        transition ok {
+            true -> hv_in()
+            false -> bad()
+        }
+    }
+    state hv_in(&mut self) {
+        transition self.pos < 64 {
+            true -> hv()
+            false -> bad()
+        }
+    }
+    state hv(&mut self) {
+        let dv: u64 = hex_value(self.b8);
+        self.digit_len = dv;
+        transition self.digit_len < 16 {
+            true -> slg()
+            false -> bad()
+        }
+    }
+    // mirror: std console read_line shape — selfless states, bare &mut forwards, 2 hops
+    state slg(&mut self) {
+        transition { _ -> em() }
+    }
+    // mirror: bound carrier on a self field (owned, non-borrowed)
+    state fw(&mut self, fcount: u64 [0..64]) {
+        self.control[fcount] = self.b8;
+        transition { _ -> em() }
+    }
+    state good(&mut self) {
+        self.console.exit_process(0);
+    }
+    state bad(&mut self) {
+        self.console.exit_process(1);
+    }
+}
+
+machine slice_chain(out: &mut [u8; 64], fcount: u64, byte: u8) -> u64 {
+    transition { _ -> sc(out, fcount, byte) }
+    state sc(out: &mut [u8; 64], fcount: u64, byte: u8) -> u64 {
+        transition fcount < out.len {
+            true -> mid(out, fcount, byte)
+            false -> (1)
+        }
+    }
+    state mid(out: &mut [u8; 64], fcount: u64, byte: u8) -> u64 {
+        transition fcount < out.len {
+            true -> wr(out, fcount, byte)
+            false -> (1)
+        }
+    }
+    state wr(out: &mut [u8; 64], fcount: u64 [0..out.len], byte: u8) -> u64 {
+        out[fcount] = byte;
+        transition { _ -> (0) }
+    }
+}
+
+// runtime &mut slice bound — does [0..out.len] discharge on a &mut [u8]?
+// two-len-conjunct arm -> two bounded params + bool-var arm -> re-guard
+machine two_len_gate(out: &mut [u8; 64], q: u64, j: u64, byte: u8) -> u64 {
+    transition { _ -> g(out, q, j, byte) }
+    state g(out: &mut [u8; 64], q: u64, j: u64, byte: u8) -> u64 {
+        transition q < out.len && j < out.len {
+            true -> acc(out, q, j, byte)
+            false -> (1)
+        }
+    }
+    state acc(out: &mut [u8; 64], q: u64, j: u64 [0..out.len], byte: u8) -> u64 {
+        let cur: u8 = out[j];
+        transition cur < byte {
+            true -> (0)
+            false -> gq(out, q, byte)
+        }
+    }
+    state gq(out: &mut [u8; 64], q: u64, byte: u8) -> u64 {
+        transition q < out.len {
+            true -> sgw(out, q, byte)
+            false -> (1)
+        }
+    }
+    state sgw(out: &mut [u8; 64], q: u64, byte: u8) -> u64 {
+        transition q < out.len {
+            true -> ssw(out, q, byte)
+            false -> (1)
+        }
+    }
+    state ssw(out: &mut [u8; 64], q: u64 [0..out.len], byte: u8) -> u64 {
+        out[q] = byte;
+        transition { _ -> (0) }
+    }
+}
+
+machine mut_slice_write(out: &mut [u8], idx: u64, byte: u8) -> u64 {
+    transition { _ -> mswg(out, idx, byte) }
+    state mswg(out: &mut [u8], idx: u64, byte: u8) -> u64 {
+        transition idx < out.len {
+            true -> msw(out, idx, byte)
+            false -> (1)
+        }
+    }
+    state msw(out: &mut [u8], idx: u64 [0..out.len], byte: u8) -> u64 {
+        out[idx] = byte;
+        transition { _ -> (0) }
+    }
+}
+
+// mirror: copy/store t[p]=s[p] — bound on the & view + literal arm-guard for &mut side
+machine copy_loop(dst: &mut [u8; 64], src: &[u8]) -> u64 {
+    transition { _ -> cp(dst, src, 0) }
+    state cp(dst: &mut [u8; 64], src: &[u8], position: u64) -> u64 {
+        transition position < src.len && position < 64 {
+            true -> st(dst, src, position)
+            false -> (position)
+        }
+    }
+    state st(dst: &mut [u8; 64], src: &[u8], position: u64 [0..src.len]) -> u64 {
+        dst[position] = src[position];
+        transition { _ -> cp(dst, src, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine hex_value(byte: u8) -> u64 {
+    transition byte >= 48 && byte <= 57 {
+        true -> dec(byte)
+        false -> alpha(byte)
+    }
+    state dec(byte: u8) -> u64 {
+        (((byte as u64) as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64
+    }
+    state alpha(byte: u8) -> u64 {
+        transition byte >= 97 && byte <= 102 {
+            true -> lower(byte)
+            false -> upper(byte)
+        }
+    }
+    state lower(byte: u8) -> u64 {
+        (((byte as u64) as u64 in Wrapping) - (87 as u64 in Wrapping)) as u64
+    }
+    state upper(byte: u8) -> u64 {
+        transition byte >= 65 && byte <= 70 {
+            true -> up(byte)
+            false -> invalid(byte)
+        }
+    }
+    state up(byte: u8) -> u64 {
+        (((byte as u64) as u64 in Wrapping) - (55 as u64 in Wrapping)) as u64
+    }
+    state invalid(byte: u8) -> u64 {
+        16
+    }
+}
+
+machine App::emit(&mut self, v: u64)
+reaches Console
+{
+    transition { _ -> e1(v) }
+    state e1(&mut self, v: u64) {
+        self.console.write_line("x");
+        transition { _ -> e2() }
+    }
+    state e2(&mut self) {
+    }
+}
+
+machine App::emit_slice(&mut self, len: u64)
+reaches Console
+{
+    transition { _ -> bound(len) }
+    state bound(&mut self, len: u64) {
+        transition len <= 64 {
+            true -> at(0, len)
+            false -> e2()
+        }
+    }
+    state at(&mut self, i: u64, len: u64 [0..=64]) {
+        transition i < len {
+            true -> pb(i, len)
+            false -> nl()
+        }
+    }
+    state pb(&mut self, i: u64, len: u64 [0..=64]) {
+        transition i < 64 {
+            true -> wb(i, len)
+            false -> nl()
+        }
+    }
+    state wb(&mut self, i: u64 [0..64], len: u64 [0..=64]) {
+        let b: i32 = self.control[i] as i32;
+        self.console.write_byte(b);
+        transition { _ -> at(i + 1, len) }
+    }
+    state nl(&mut self) {
+        self.console.write_byte(10);
+        transition { _ -> e2() }
+    }
+    state e2(&mut self) {
+    }
+}
+
+machine App::mirror_read(&mut self, values: &mut [u8; 64], address: u64) -> u64
+reaches Console
+suspends; blocks;
+{
+    transition { _ -> r(values, address) }
+    state r(&mut self, values: &mut [u8; 64], address: u64) -> u64 {
+        let want: u64 = self.digit_len;
+        let offset: i64 = ((address as i64 in Wrapping) as i64);
+        self.console.write(&self.control[0..64]);
+        transition block self.console.read_line(&mut self.control) {
+            _ -> e2()
+        }
+    }
+    state e2(&mut self) -> u64 {
+        0
+    }
+}
+
+machine FsWorker::fs_read(&mut self, values: &mut [u8], address: u64) -> u64
+reaches FilesystemHost
+invokes FilesystemHost;
+suspends; blocks;
+{
+    transition { _ -> nm(values, address) }
+    state nm(&mut self, values: &mut [u8], address: u64) -> u64 {
+        self.name = NameBox::for_process(7);
+        transition self.name.len <= 48 {
+            true -> op(values, address, self.name.len)
+            false -> op(values, address, 48)
+        }
+    }
+    state op(&mut self, values: &mut [u8], address: u64, name_len: u64) -> u64 {
+        let pfd: i32 = self.fproc_fd;
+        self.fmem_fd = self.fs.open_at(pfd, self.name.bytes[0..name_len], 0);
+        transition { _ -> r(values, address, 0) }
+    }
+    state r(&mut self, values: &mut [u8], address: u64, i: u64 [0..8]) -> u64 {
+        let memfd: i32 = self.fmem_fd;
+        let want: u64 = self.fexpected;
+        let off: i64 = ((address as i64 in Wrapping) as i64);
+        self.fcount = self.fs.read_at(memfd, values, want, off);
+        let cf: i32 = self.fmem_fd;
+        self.fscratch = self.fs.close(cf);
+        self.fscratch = self.fs.close(self.fds[i]);
+        self.fscratch = self.fs.close(self.fds[0]);
+        transition self.fcount < 0 {
+            true -> e2()
+            false -> e2()
+        }
+    }
+    state e2(&mut self) -> u64 {
+        0
+    }
+}
+
+machine App::plain_put(&mut self, position: u64, byte: u8) {
+    transition position < 64 {
+        true -> put(position, byte)
+        false -> skip()
+    }
+    state put(&mut self, position: u64, byte: u8) { self.control[position] = byte; }
+    state skip(&mut self) {
+    }
+}
+
+pub data Point { x: u64; }
+
+machine Point::set_x(&mut self, v: u64) {
+    self.x = v;
+}
+
+machine App::bump_method(&mut self, r: &mut Point) {
+    transition { _ -> call(r) }
+    state call(&mut self, r: &mut Point) {
+        r.set_x(1);
+    }
+}
+
+machine App::bump_field(&mut self, r: &mut Point) {
+    transition { _ -> call(r) }
+    state call(&mut self, r: &mut Point) {
+        r.x = 2;
+    }
+}
+
+machine App::fwd_bump_reborrow(&mut self, r: &mut Point) {
+    self.bump_method(&mut r)
+}
+
+machine App::stmt_bare(&mut self, r: &mut Point) {
+    transition { _ -> s(r) }
+    state s(&mut self, r: &mut Point) {
+        self.bump_method(&mut r);
+    }
+}
+
+machine App::reuse_arg(&mut self)
+reaches Console
+{
+    transition { _ -> s() }
+    state s(&mut self) {
+        let x: i32 = 65;
+        self.console.write_byte(x);
+        self.console.write_byte(x);
+    }
+}
+
+machine App::field_arg(&mut self)
+reaches Console
+{
+    transition { _ -> s() }
+    state s(&mut self) {
+        self.console.write_byte(self.b8 as i32);
+    }
+}

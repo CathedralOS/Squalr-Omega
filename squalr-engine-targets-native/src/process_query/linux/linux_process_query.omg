@@ -1,9 +1,10 @@
 module src::process_query::linux::linux_process_query;
 
 use omega_language_std::filesystem_host;
-use omega::language::core::service;
+use omega::language::core::binding;
 use squalr_engine_api::src::structures::memory::bitness::Bitness;
 use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_api::src::structures::processes::target_architecture::TargetArchitecture;
 use squalr_engine_api::src::structures::processes::process_info::ProcessInfo;
 use squalr_engine_targets::src::process_query::process_query_error::ProcessQueryError;
 use squalr_engine_targets::src::process_query::process_query_options::ProcessNameSearch;
@@ -11,8 +12,13 @@ use squalr_engine_targets::src::process_query::process_query_options::ProcessQue
 use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryOptions;
 use squalr_engine_targets::src::process_query::process_query_options::RequiredProcessId;
 use squalr_engine_targets::src::target_providers::OpenedProcessResult;
+use squalr_engine_targets::src::target_providers::ProcessAliveResult;
 use squalr_engine_targets::src::target_providers::ProcessListOutcome;
 use squalr_engine_targets::src::target_providers::ProcessQueryOutcome;
+use src::memory_queryer::linux::linux_memory_queryer::U64Result;
+use src::memory_queryer::linux::linux_memory_queryer::U8Result;
+use src::memory_queryer::linux::linux_memory_queryer::U32Result;
+use src::memory_queryer::linux::linux_memory_queryer::BoolResult;
 use src::proc_paths::ProcName;
 
 // Port of process_query/linux/linux_process_query.rs.
@@ -30,7 +36,7 @@ use src::proc_paths::ProcName;
 //   first ' ' and the LAST ')' of /proc/<pid>/stat, entries whose stat read
 //   or parse fails are absent) and upstream then filter_maps that snapshot
 //   in this exact order: required_process_id -> name contains-filter (ASCII
-//   case fold unless match_case) -> is_process_windowed (always computed,
+//   case fold unless match_case) -> is_process_windowed(always computed,
 //   then require_windowed drops) -> fetch_icons -> take(limit).
 //   The port is two-phase for the same reason: phase 1 collects numeric
 //   dirents into a bounded pid table (16384 entries; overflow sets
@@ -74,7 +80,11 @@ pub data LinuxProcessQuery {
     count: i64;
     scratch: i32;
     name: ProcName;
-    bitness: Bitness;
+    // Upstream stores `bitness` here. Copy-multiplicity case values cannot
+    // currently be written into fields (unconsumed structural result), so the
+    // two architecture paths carry a scalar tag and `opened_build` selects the
+    // `Bitness`/`TargetArchitecture` pair at the literal.
+    bitness_tag: u8;
 
     // get_processes sweep state.
     dir_buf: [u8; 4096];
@@ -159,12 +169,17 @@ invokes FilesystemHost;
     // read_process_executable_bytes -> ELF EI_CLASS at offset 4 (also the
     // process-existence probe: an unreadable exe means the process is gone or
     // unreadable — upstream falls back to the host architecture either way).
-    let pid: u32 = process_info.get_process_id_raw();
-    self.name = ProcName::for_process(pid, 101, 120, 101, 0, 3);
-    self.proc_fd = self.host.open("/proc", 65536);
-    transition self.proc_fd >= 0 {
-        true -> open_exe(process_info)
-        false -> fallback(process_info)
+    transition { _ -> entry(process_info) }
+
+    state entry(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
+        let pid: u32 = process_info.get_process_id_raw();
+        self.name = ProcName::for_process(pid, 101, 120, 101, 0, 3);
+        let _proc_fd_r: i32 = self.host.open("/proc", 65536);
+        self.proc_fd = _proc_fd_r;
+        transition _proc_fd_r >= 0 {
+            true -> open_exe(process_info)
+            _ -> fallback(process_info)
+        }
     }
 
     state open_exe(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
@@ -182,25 +197,31 @@ invokes FilesystemHost;
     }
 
     state open_exe_do(&mut self, process_info: &ProcessInfo, name_len: u64) -> OpenedProcessResult {
-        self.exe_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 0);
-        transition self.exe_fd >= 0 {
+        let procfd: i32 = self.proc_fd;
+        let _exe_fd_r: i32 = self.host.open_at(procfd, self.name.bytes[0..48], 0);
+        self.exe_fd = _exe_fd_r;
+        transition _exe_fd_r >= 0 {
             true -> read_class(process_info)
             false -> close_fallback(process_info)
         }
     }
 
     state read_class(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
-        self.count = self.host.read_at(self.exe_fd, self.header[0..1], 1, 4);
-        self.scratch = self.host.close(self.exe_fd);
-        self.scratch = self.host.close(self.proc_fd);
-        transition self.count == 1 && self.header[0] == 1 {
+        let exefd: i32 = self.exe_fd;
+        let _count_r: i64 = self.host.read_at(exefd, &mut self.header, 1, 4);
+        self.count = _count_r;
+        let _u1: i32 = self.host.close(self.exe_fd);
+        self.scratch = _u1;
+        let _u2: i32 = self.host.close(self.proc_fd);
+        self.scratch = _u2;
+        transition _count_r == 1 && self.header[0] == 1 {
             true -> arch32(process_info)
             false -> arch64_or_fallback(process_info)
         }
     }
 
     state arch32(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
-        self.bitness = Bitness::Bit32;
+        self.bitness_tag = 1;
         transition { _ -> opened(process_info) }
     }
 
@@ -212,19 +233,20 @@ invokes FilesystemHost;
     }
 
     state arch64(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
-        self.bitness = Bitness::Bit64;
+        self.bitness_tag = 0;
         transition { _ -> opened(process_info) }
     }
 
     // TargetArchitecture::unknown(host_pointer_width, Little): on linux_x86_64
     // the host is Bit64.
     state host_fallback(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
-        self.bitness = Bitness::Bit64;
+        self.bitness_tag = 0;
         transition { _ -> opened(process_info) }
     }
 
     state close_fallback(&mut self, process_info: &ProcessInfo) -> OpenedProcessResult {
-        self.scratch = self.host.close(self.proc_fd);
+        let _u3: i32 = self.host.close(self.proc_fd);
+        self.scratch = _u3;
         transition { _ -> host_fallback(process_info) }
     }
 
@@ -248,14 +270,44 @@ invokes FilesystemHost;
     }
 
     state opened_build(&mut self, process_info: &ProcessInfo, name_len: u64) -> OpenedProcessResult {
+        transition self.bitness_tag == 1 {
+            true -> opened_build32(process_info, name_len)
+            false -> opened_build64(process_info, name_len)
+        }
+    }
+
+    // Result literals are written inline: `OpenedProcessInfo::new` is a call,
+    // and nested calls inside a result literal are not admitted. `name` is the
+    // bounded-256 array carried whole (upstream `set_name` leaves the same
+    // zero-filled tail); `target_architecture` mirrors
+    // `TargetArchitecture::default_for_bitness` — X86 for 32, X64 for 64.
+    state opened_build32(&mut self, process_info: &ProcessInfo, name_len: u64) -> OpenedProcessResult {
         let pid: u32 = process_info.get_process_id_raw();
-        OpenedProcessResult::Opened {
-            info: OpenedProcessInfo::new(
-                pid,
-                process_info.name[0..name_len],
-                pid as u64,
-                self.bitness
-            )
+        OpenedProcessResult {
+            outcome: ProcessQueryOutcome::Succeeded,
+            info: OpenedProcessInfo {
+                process_id: pid,
+                name: process_info.name,
+                name_len: name_len,
+                handle: pid as u64,
+                bitness: Bitness::Bit32,
+                target_architecture: TargetArchitecture::X86
+            }
+        }
+    }
+
+    state opened_build64(&mut self, process_info: &ProcessInfo, name_len: u64) -> OpenedProcessResult {
+        let pid: u32 = process_info.get_process_id_raw();
+        OpenedProcessResult {
+            outcome: ProcessQueryOutcome::Succeeded,
+            info: OpenedProcessInfo {
+                process_id: pid,
+                name: process_info.name,
+                name_len: name_len,
+                handle: pid as u64,
+                bitness: Bitness::Bit64,
+                target_architecture: TargetArchitecture::X64
+            }
         }
     }
 }
@@ -272,53 +324,58 @@ pub linux_x86_64 machine LinuxProcessQuery::close_process(
 pub linux_x86_64 machine LinuxProcessQuery::is_process_alive(
     &mut self,
     process_id: u32
-) -> bool
+) -> ProcessAliveResult
 reaches FilesystemHost
 invokes FilesystemHost;
 {
     // Upstream uses kill(pid, 0) (ESRCH => dead); procfs existence is the same
     // signal for this package's scope: /proc/<pid> present iff the pid lives.
     self.name = ProcName::for_pid(process_id);
-    self.proc_fd = self.host.open("/proc", 65536);
-    transition self.proc_fd >= 0 {
+    let _proc_fd_r: i32 = self.host.open("/proc", 65536);
+    self.proc_fd = _proc_fd_r;
+    transition _proc_fd_r >= 0 {
         true -> probe()
         false -> dead()
     }
 
-    state probe(&mut self) -> bool {
+    state probe(&mut self) -> ProcessAliveResult {
         transition self.name.len <= 48 {
             true -> probe_at(self.name.len)
             false -> probe_at(48)
         }
     }
 
-    state probe_at(&mut self, name_len: u64) -> bool {
+    state probe_at(&mut self, name_len: u64) -> ProcessAliveResult {
         transition name_len <= self.name.bytes.len {
             true -> probe_do(name_len)
             false -> dead()
         }
     }
 
-    state probe_do(&mut self, name_len: u64) -> bool {
-        self.exe_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 65536);
-        self.scratch = self.host.close(self.proc_fd);
-        transition self.exe_fd >= 0 {
+    state probe_do(&mut self, name_len: u64) -> ProcessAliveResult {
+        let procfd: i32 = self.proc_fd;
+        let _exe_fd_r: i32 = self.host.open_at(procfd, self.name.bytes[0..48], 65536);
+        self.exe_fd = _exe_fd_r;
+        let _u5: i32 = self.host.close(self.proc_fd);
+        self.scratch = _u5;
+        transition _exe_fd_r >= 0 {
             true -> alive()
             false -> dead()
         }
     }
 
-    state alive(&mut self) -> bool {
-        self.scratch = self.host.close(self.exe_fd);
+    state alive(&mut self) -> ProcessAliveResult {
+        let _u6: i32 = self.host.close(self.exe_fd);
+        self.scratch = _u6;
         transition { _ -> yes() }
     }
 
-    state yes(&mut self) -> bool {
-        true
+    state yes(&mut self) -> ProcessAliveResult {
+        ProcessAliveResult::Alive
     }
 
-    state dead(&mut self) -> bool {
-        false
+    state dead(&mut self) -> ProcessAliveResult {
+        ProcessAliveResult::Dead
     }
 }
 
@@ -421,7 +478,9 @@ invokes FilesystemHost;
     }
 
     state needle_store_folded(&mut self, options: ProcessQueryOptions, name: [u8; 256], name_len: u64, pos: u64, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.needle_put(pos, self.lowered(name[pos]));
+        let folded_byte: U8Result = self.lowered(name[pos]);
+        let folded_byte_v: u8 = folded_byte.v;
+        self.needle_put(pos, folded_byte_v);
         transition { _ -> needle_copy(options, name, name_len, ((pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, out) }
     }
 
@@ -440,15 +499,17 @@ invokes FilesystemHost;
 
     // The unix-socket snapshot is collected BEFORE the sweep, as upstream.
     state needle_done(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        transition self.collect_socket_snapshot() {
+        let _u7: BoolResult = self.collect_socket_snapshot();
+        transition _u7.v {
             true -> open_proc(options, out)
             false -> failed(options, out)
         }
     }
 
     state open_proc(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.proc_fd = self.host.open("/proc", 65536);
-        transition self.proc_fd >= 0 {
+        let _proc_fd_r: i32 = self.host.open("/proc", 65536);
+        self.proc_fd = _proc_fd_r;
+        transition _proc_fd_r >= 0 {
             true -> dir_fill(options, out)
             false -> listed_empty(options, out)
         }
@@ -462,15 +523,17 @@ invokes FilesystemHost;
 
     // Phase 1: getdents64 walk collecting numeric directory names.
     state dir_fill(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.count = self.host.read_dir(self.proc_fd, &mut self.dir_buf, 4096, &mut self.dir_pos);
-        transition self.count > 0 {
+        let procfd: i32 = self.proc_fd;
+        let _count_r: i64 = self.host.read_dir(procfd, &mut self.dir_buf, 4096, &mut self.dir_pos);
+        self.count = _count_r;
+        transition _count_r > 0 {
             true -> dir_take(options, out)
             false -> dir_nonpositive(options, out)
         }
     }
 
     state dir_take(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.dir_total = self.count as u64;
+        self.dir_total = ((self.count as u64 in Wrapping) as u64);
         self.dir_off = 0;
         transition { _ -> dir_walk(options, out) }
     }
@@ -499,7 +562,9 @@ invokes FilesystemHost;
     }
 
     state dir_reclen(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.reclen = ((((self.dir_at(((self.dir_off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64) as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64) | (self.dir_at(((self.dir_off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64) as u64));
+        let _u8: U8Result = self.dir_at(((self.dir_off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64);
+        let _u9: U8Result = self.dir_at(((self.dir_off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64);
+        self.reclen = ((((_u8.v as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64) | (_u9.v as u64));
         transition self.reclen > 0 && ((self.dir_off as u64 in Wrapping) + (self.reclen as u64 in Wrapping)) as u64 <= self.dir_total {
             true -> dir_dtype(options, out)
             false -> phase_b(options, out)
@@ -510,7 +575,8 @@ invokes FilesystemHost;
     // (DT_UNKNOWN = 0 does not occur there), matching upstream's stat check
     // for every record that matters.
     state dir_dtype(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        transition self.dir_at(((self.dir_off as u64 in Wrapping) + (18 as u64 in Wrapping)) as u64) == 4 {
+        let _u10: U8Result = self.dir_at(((self.dir_off as u64 in Wrapping) + (18 as u64 in Wrapping)) as u64);
+        transition _u10.v == 4 {
             true -> dir_pid_scan(options, out, 19)
             false -> dir_next(options, out)
         }
@@ -533,8 +599,9 @@ invokes FilesystemHost;
     }
 
     state dir_pid_byte(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.ch = self.dir_at(self.i);
-        transition self.ch == 0 {
+        let _ch_r: U8Result = self.dir_at(self.i);
+        self.ch = _ch_r.v;
+        transition _ch_r.v == 0 {
             true -> dir_pid_done(options, out)
             false -> dir_pid_digit(options, out)
         }
@@ -600,7 +667,8 @@ invokes FilesystemHost;
     }
 
     state b_load(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.c_pid = self.pid_at(self.pid_at);
+        let _u11: U32Result = self.pid_at(self.pid_at);
+        self.c_pid = _u11.v;
         self.pid_at = ((self.pid_at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> b_req(options, out) }
     }
@@ -613,14 +681,16 @@ invokes FilesystemHost;
     }
 
     state b_name(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        transition self.read_process_name() {
+        let _u12: BoolResult = self.read_process_name();
+        transition _u12.v {
             true -> b_match(options, out)
             false -> phase_b(options, out)
         }
     }
 
     state b_match(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        transition self.name_matches() {
+        let _u13: BoolResult = self.name_matches();
+        transition _u13.v {
             true -> b_windowed(options, out)
             false -> phase_b(options, out)
         }
@@ -630,7 +700,8 @@ invokes FilesystemHost;
     // require_windowed is false — the field rides out on ProcessInfo either
     // way, exactly as upstream.
     state b_windowed(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.c_windowed = self.is_windowed();
+        let _u14: BoolResult = self.is_windowed();
+        self.c_windowed = _u14.v;
         transition { _ -> b_req_windowed(options, out) }
     }
 
@@ -672,7 +743,7 @@ invokes FilesystemHost;
     }
 
     state b_emit_write(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.emit_into(out, self.emitted, ProcessInfo::new_named(self.c_pid, self.c_name[0..self.c_name_len], self.c_windowed));
+        self.emit_into(out, self.emitted, ProcessInfo::new_named(self.c_pid, &self.c_name, self.c_name_len, self.c_windowed));
         transition { _ -> b_emitted(options, out) }
     }
 
@@ -682,7 +753,8 @@ invokes FilesystemHost;
     }
 
     state sweep_done(&mut self, options: ProcessQueryOptions, out: &mut [ProcessInfo]) -> ProcessListOutcome {
-        self.scratch = self.host.close(self.proc_fd);
+        let _u15: i32 = self.host.close(self.proc_fd);
+        self.scratch = _u15;
         transition { _ -> listed(options, out) }
     }
 
@@ -699,34 +771,37 @@ invokes FilesystemHost;
 // a bounded-table overflow (a named failure — the sets cannot be silently
 // partial, or windowed detection would lie). An unreadable file yields the
 // empty snapshot, exactly as upstream's Err -> default().
-machine LinuxProcessQuery::collect_socket_snapshot(&mut self) -> bool
+machine LinuxProcessQuery::collect_socket_snapshot(&mut self) -> BoolResult
 reaches FilesystemHost
 invokes FilesystemHost;
 {
-    self.io_fd = self.host.open("/proc/net/unix", 0);
-    transition self.io_fd >= 0 {
+    let _io_fd_r: i32 = self.host.open("/proc/net/unix", 0);
+    self.io_fd = _io_fd_r;
+    transition _io_fd_r >= 0 {
         true -> stream()
         false -> empty_ok()
     }
 
-    state stream(&mut self) -> bool {
+    state stream(&mut self) -> BoolResult {
         self.io_delim = 10;
         self.io_len = 0;
         self.io_pos = 0;
         transition { _ -> next_line() }
     }
 
-    state next_line(&mut self) -> bool {
-        self.scratch = self.stream_next();
-        transition self.scratch == 0 {
+    state next_line(&mut self) -> BoolResult {
+        let _scratch_r: U8Result = self.stream_next();
+        self.scratch = _scratch_r.v;
+        transition _scratch_r.v == 0 {
             true -> parse_line()
             false -> ended()
         }
     }
 
-    state parse_line(&mut self) -> bool {
-        self.scratch = self.unix_record();
-        transition self.scratch == 2 {
+    state parse_line(&mut self) -> BoolResult {
+        let _scratch_r: U8Result = self.unix_record();
+        self.scratch = _scratch_r.v;
+        transition _scratch_r.v == 2 {
             true -> overflow()
             false -> next_line()
         }
@@ -734,36 +809,32 @@ invokes FilesystemHost;
 
     // A mid-stream read error mirrors upstream's fs::read_to_string Err:
     // the snapshot reverts to empty.
-    state ended(&mut self) -> bool {
-        self.scratch = self.host.close(self.io_fd);
+    state ended(&mut self) -> BoolResult {
+        let _u16: i32 = self.host.close(self.io_fd);
+        self.scratch = _u16;
         transition self.snap_overflow {
             true -> no()
             false -> yes()
         }
     }
 
-    state overflow(&mut self) -> bool {
-        self.scratch = self.host.close(self.io_fd);
+    state overflow(&mut self) -> BoolResult {
+        let _u17: i32 = self.host.close(self.io_fd);
+        self.scratch = _u17;
         transition { _ -> no() }
     }
 
-    state empty_ok(&mut self) -> bool {
-        true
-    }
+    state empty_ok(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state yes(&mut self) -> bool {
-        true
-    }
+    state yes(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state no(&mut self) -> bool {
-        false
-    }
+    state no(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
 // Parse one /proc/net/unix line from `rec`: whitespace-split columns 4,5,6
 // (and 7 when present) exactly as upstream's parse_proc_net_unix_socket_
 // snapshot. Returns 0 handled, 1 skipped, 2 table overflow.
-machine LinuxProcessQuery::unix_record(&mut self) -> i32 {
+machine LinuxProcessQuery::unix_record(&mut self) -> U8Result {
     self.tok_count = 0;
     self.i = 0;
     self.col4 = 0;
@@ -771,43 +842,45 @@ machine LinuxProcessQuery::unix_record(&mut self) -> i32 {
     self.col6_ok = false;
     transition { _ -> skip_ws() }
 
-    state skip_ws(&mut self) -> i32 {
-        transition self.i < self.rec_len && self.rec_at(self.i) == 32 {
+    state skip_ws(&mut self) -> U8Result {
+        let _u18: U8Result = self.rec_at(self.i);
+        transition self.i < self.rec_len && _u18.v == 32 {
             true -> ws_step()
             false -> tok_begin()
         }
     }
 
-    state ws_step(&mut self) -> i32 {
+    state ws_step(&mut self) -> U8Result {
         self.i = ((self.i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> skip_ws() }
     }
 
-    state tok_begin(&mut self) -> i32 {
+    state tok_begin(&mut self) -> U8Result {
         transition self.i < self.rec_len {
             true -> tok_mark()
             false -> columns_done()
         }
     }
 
-    state tok_mark(&mut self) -> i32 {
+    state tok_mark(&mut self) -> U8Result {
         self.tok_start = self.i;
         transition { _ -> tok_scan() }
     }
 
-    state tok_scan(&mut self) -> i32 {
-        transition self.i < self.rec_len && self.rec_at(self.i) != 32 {
+    state tok_scan(&mut self) -> U8Result {
+        let _u19: U8Result = self.rec_at(self.i);
+        transition self.i < self.rec_len && _u19.v != 32 {
             true -> tok_step()
             false -> tok_done()
         }
     }
 
-    state tok_step(&mut self) -> i32 {
+    state tok_step(&mut self) -> U8Result {
         self.i = ((self.i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> tok_scan() }
     }
 
-    state tok_done(&mut self) -> i32 {
+    state tok_done(&mut self) -> U8Result {
         self.tok_end = self.i;
         transition self.tok_count == 4 {
             true -> take_col4()
@@ -815,81 +888,84 @@ machine LinuxProcessQuery::unix_record(&mut self) -> i32 {
         }
     }
 
-    state col_dispatch(&mut self) -> i32 {
+    state col_dispatch(&mut self) -> U8Result {
         transition self.tok_count == 5 {
             true -> take_col5()
             false -> col_next()
         }
     }
 
-    state col_next(&mut self) -> i32 {
+    state col_next(&mut self) -> U8Result {
         transition self.tok_count == 6 {
             true -> take_col6()
             false -> col_path()
         }
     }
 
-    state col_path(&mut self) -> i32 {
+    state col_path(&mut self) -> U8Result {
         transition self.tok_count == 7 {
             true -> take_col7()
             false -> tok_advance()
         }
     }
 
-    state take_col4(&mut self) -> i32 {
-        transition self.dec_token() {
+    state take_col4(&mut self) -> U8Result {
+        let _u20: BoolResult = self.dec_token();
+        transition _u20.v {
             true -> col4_set()
             false -> tok_advance()
         }
     }
 
-    state col4_set(&mut self) -> i32 {
+    state col4_set(&mut self) -> U8Result {
         self.col4 = self.num;
         transition { _ -> tok_advance() }
     }
 
-    state take_col5(&mut self) -> i32 {
-        transition self.dec_token() {
+    state take_col5(&mut self) -> U8Result {
+        let _u21: BoolResult = self.dec_token();
+        transition _u21.v {
             true -> col5_set()
             false -> tok_advance()
         }
     }
 
-    state col5_set(&mut self) -> i32 {
+    state col5_set(&mut self) -> U8Result {
         self.col5 = self.num;
         transition { _ -> tok_advance() }
     }
 
-    state take_col6(&mut self) -> i32 {
-        transition self.dec_token() {
+    state take_col6(&mut self) -> U8Result {
+        let _u22: BoolResult = self.dec_token();
+        transition _u22.v {
             true -> col6_set()
             false -> bad_line()
         }
     }
 
-    state col6_set(&mut self) -> i32 {
+    state col6_set(&mut self) -> U8Result {
         self.inode = self.num;
         self.col6_ok = true;
         transition { _ -> tok_advance() }
     }
 
-    state take_col7(&mut self) -> i32 {
+    state take_col7(&mut self) -> U8Result {
         self.col7_start = self.tok_start;
         self.col7_end = self.tok_end;
         transition { _ -> tok_advance() }
     }
 
-    state tok_advance(&mut self) -> i32 {
+    state tok_advance(&mut self) -> U8Result {
         self.tok_count = ((self.tok_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> skip_ws() }
     }
 
-    state bad_line(&mut self) -> i32 {
+    state bad_line(&mut self) -> U8Result {
         self.tok_count = 0;
         transition { _ -> skipped() }
     }
 
-    state columns_done(&mut self) -> i32 {
+    state columns_done(&mut self) -> U8Result {
         transition self.tok_count >= 7 && self.col6_ok {
             true -> maybe_insert()
             false -> skipped()
@@ -898,92 +974,92 @@ machine LinuxProcessQuery::unix_record(&mut self) -> i32 {
 
     // Upstream: type=="0001" && st=="03" -> connected set; display path ->
     // display set. Both are optional insertions off the same line.
-    state maybe_insert(&mut self) -> i32 {
+    state maybe_insert(&mut self) -> U8Result {
         transition self.col4 == 1 && self.col5 == 3 {
             true -> insert_conn()
             false -> check_path()
         }
     }
 
-    state insert_conn(&mut self) -> i32 {
-        transition self.inode_in_conn() {
+    state insert_conn(&mut self) -> U8Result {
+        let _u23: BoolResult = self.inode_in_conn();
+        transition _u23.v {
             true -> check_path()
             false -> conn_push()
         }
     }
 
-    state conn_push(&mut self) -> i32 {
+    state conn_push(&mut self) -> U8Result {
         transition self.conn_count < 2048 {
             true -> conn_store()
             false -> over()
         }
     }
 
-    state conn_store(&mut self) -> i32 {
+    state conn_store(&mut self) -> U8Result {
         self.conn_set(self.conn_count, self.inode);
         self.conn_count = ((self.conn_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> check_path() }
     }
 
-    state check_path(&mut self) -> i32 {
+    state check_path(&mut self) -> U8Result {
         transition self.tok_count >= 8 {
             true -> path_wayland()
             false -> handled()
         }
     }
 
-    state path_wayland(&mut self) -> i32 {
-        transition self.token_has("/wayland-", self.col7_start, self.col7_end) {
+    state path_wayland(&mut self) -> U8Result {
+        let _u24: BoolResult = self.token_has("/wayland-", self.col7_start, self.col7_end);
+        transition _u24.v {
             true -> insert_disp()
             false -> path_x11()
         }
     }
 
-    state path_x11(&mut self) -> i32 {
-        transition self.token_has("/tmp/.X11-unix/", self.col7_start, self.col7_end) {
+    state path_x11(&mut self) -> U8Result {
+        let _u25: BoolResult = self.token_has("/tmp/.X11-unix/", self.col7_start, self.col7_end);
+        transition _u25.v {
             true -> insert_disp()
             false -> handled()
         }
     }
 
-    state insert_disp(&mut self) -> i32 {
-        transition self.inode_in_disp() {
+    state insert_disp(&mut self) -> U8Result {
+        let _u26: BoolResult = self.inode_in_disp();
+        transition _u26.v {
             true -> handled()
             false -> disp_push()
         }
     }
 
-    state disp_push(&mut self) -> i32 {
+    state disp_push(&mut self) -> U8Result {
         transition self.disp_count < 256 {
             true -> disp_store()
             false -> over()
         }
     }
 
-    state disp_store(&mut self) -> i32 {
+    state disp_store(&mut self) -> U8Result {
         self.disp_set(self.disp_count, self.inode);
         self.disp_count = ((self.disp_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> handled() }
     }
 
-    state over(&mut self) -> i32 {
+    state over(&mut self) -> U8Result {
         self.snap_overflow = true;
-        2
+        U8Result { v: 2 }
     }
 
-    state handled(&mut self) -> i32 {
-        0
-    }
+    state handled(&mut self) -> U8Result { U8Result { v: 0 } }
 
-    state skipped(&mut self) -> i32 {
-        1
-    }
+    state skipped(&mut self) -> U8Result { U8Result { v: 1 } }
 }
 
 // Shared rolling-buffer record reader: returns 0 with `rec` holding one
 // io_delim-terminated record, 1 at EOF, 2 on read error. Records longer than
 // 255 bytes drain but truncate (rec_skip) — bounded-buffer translation.
-machine LinuxProcessQuery::stream_next(&mut self) -> i32
+machine LinuxProcessQuery::stream_next(&mut self) -> U8Result
 reaches FilesystemHost
 invokes FilesystemHost;
 {
@@ -991,133 +1067,133 @@ invokes FilesystemHost;
     self.rec_skip = false;
     transition { _ -> pump() }
 
-    state pump(&mut self) -> i32 {
+    state pump(&mut self) -> U8Result {
         transition self.io_pos < self.io_len {
             true -> take()
             false -> fill()
         }
     }
 
-    state take(&mut self) -> i32 {
-        self.ch = self.io_at(self.io_pos);
+    state take(&mut self) -> U8Result {
+        let _ch_r: U8Result = self.io_at(self.io_pos);
+        self.ch = _ch_r.v;
         self.io_pos = ((self.io_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition self.ch == self.io_delim {
+        transition _ch_r.v == self.io_delim as u64 {
             true -> have()
             false -> store()
         }
     }
 
-    state store(&mut self) -> i32 {
+    state store(&mut self) -> U8Result {
         transition self.rec_len < 256 {
             true -> put()
             false -> skip_rest()
         }
     }
 
-    state put(&mut self) -> i32 {
+    state put(&mut self) -> U8Result {
         self.rec_set(self.rec_len, self.ch);
         self.rec_len = ((self.rec_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> pump() }
     }
 
-    state skip_rest(&mut self) -> i32 {
+    state skip_rest(&mut self) -> U8Result {
         self.rec_skip = true;
         transition { _ -> pump() }
     }
 
-    state have(&mut self) -> i32 {
-        0
-    }
+    state have(&mut self) -> U8Result { U8Result { v: 0 } }
 
-    state fill(&mut self) -> i32 {
-        self.count = self.host.read(self.io_fd, &mut self.io_buf, 4096);
-        transition self.count > 0 {
+    state fill(&mut self) -> U8Result {
+        let iofd: i32 = self.io_fd;
+        let _count_r: i64 = self.host.read(iofd, &mut self.io_buf, 4096);
+        self.count = _count_r;
+        transition _count_r > 0 {
             true -> filled()
             false -> fill_done()
         }
     }
 
-    state filled(&mut self) -> i32 {
-        self.io_len = self.count as u64;
+    state filled(&mut self) -> U8Result {
+        self.io_len = ((self.count as u64 in Wrapping) as u64);
         self.io_pos = 0;
         transition { _ -> pump() }
     }
 
-    state fill_done(&mut self) -> i32 {
+    state fill_done(&mut self) -> U8Result {
         transition self.count == 0 {
             true -> eof()
             false -> err()
         }
     }
 
-    state eof(&mut self) -> i32 {
+    state eof(&mut self) -> U8Result {
         transition self.rec_len > 0 {
             true -> have()
             false -> at_eof()
         }
     }
 
-    state at_eof(&mut self) -> i32 {
-        1
-    }
+    state at_eof(&mut self) -> U8Result { U8Result { v: 1 } }
 
-    state err(&mut self) -> i32 {
-        2
-    }
+    state err(&mut self) -> U8Result { U8Result { v: 2 } }
 }
 
 // rec[0..prefix.len] == prefix (and rec_len > prefix.len is checked by the
 // caller when a non-empty value is required).
-machine LinuxProcessQuery::rec_has_prefix(&mut self, prefix: &[u8]) -> bool {
+machine LinuxProcessQuery::rec_has_prefix(&mut self, prefix: &[u8]) -> BoolResult {
     self.j = 0;
     transition { _ -> scan(prefix) }
 
-    state scan(&mut self, prefix: &[u8]) -> bool {
+    state scan(&mut self, prefix: &[u8]) -> BoolResult {
         transition self.j < prefix.len && self.j < self.rec_len {
             true -> cmp(prefix)
             false -> verdict(prefix)
         }
     }
 
-    state cmp(&mut self, prefix: &[u8]) -> bool {
-        transition self.rec_at(self.j) == self.byte_at(prefix, self.j) {
+    state cmp(&mut self, prefix: &[u8]) -> BoolResult {
+        let _u27: U8Result = self.rec_at(self.j);
+        let _u28: U8Result = self.byte_at(prefix, self.j);
+        transition _u27.v == _u28.v {
             true -> step(prefix)
             false -> miss()
         }
     }
 
-    state step(&mut self, prefix: &[u8]) -> bool {
+    state step(&mut self, prefix: &[u8]) -> BoolResult {
         self.j = ((self.j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> scan(prefix) }
     }
 
-    state verdict(&mut self, prefix: &[u8]) -> bool {
-        self.j == prefix.len
+    state verdict(&mut self, prefix: &[u8]) -> BoolResult {
+        transition self.j == prefix.len {
+            true -> (BoolResult { v: true })
+            false -> (BoolResult { v: false })
+        }
     }
 
-    state miss(&mut self) -> bool {
-        false
-    }
+    state miss(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
 // rec[start..end] contains `pat` (substring scan for the display paths).
-machine LinuxProcessQuery::token_has(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+machine LinuxProcessQuery::token_has(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
     transition { _ -> entry(pat, start, end) }
 
     // Empty pattern matches immediately (upstream contains("")).
-    state entry(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+    state entry(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
         transition pat.len > 0 {
             true -> begin(pat, start, end)
             false -> hit()
         }
     }
 
-    state begin(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+    state begin(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
         self.i = start;
         transition { _ -> window(pat, start, end) }
     }
 
-    state window(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+    state window(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
         self.k = 0;
         transition self.i < end {
             true -> align(pat, start, end)
@@ -1125,163 +1201,162 @@ machine LinuxProcessQuery::token_has(&mut self, pat: &[u8], start: u64, end: u64
         }
     }
 
-    state align(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+    state align(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
         transition 0 < pat.len {
             true -> align_do(pat, start, end)
             false -> miss()
         }
     }
 
-    state align_do(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
-        transition self.rec_at(self.i) == self.byte_at(pat, 0) {
+    state align_do(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
+        let _u29: U8Result = self.rec_at(self.i);
+        let _u30: U8Result = self.byte_at(pat, 0);
+        transition _u29.v == _u30.v {
             true -> match_scan(pat, start, end)
             false -> advance(pat, start, end)
         }
     }
 
-    state match_scan(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+    state match_scan(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
         transition self.k < pat.len && (((self.i as u64 in Wrapping) + (self.k as u64 in Wrapping)) as u64) < end {
             true -> match_cmp(pat, start, end)
             false -> match_verdict(pat)
         }
     }
 
-    state match_cmp(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
-        transition self.rec_at(((self.i as u64 in Wrapping) + (self.k as u64 in Wrapping)) as u64) == self.byte_at(pat, self.k) {
+    state match_cmp(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
+        let _u31: U8Result = self.rec_at(((self.i as u64 in Wrapping) + (self.k as u64 in Wrapping)) as u64);
+        let _u32: U8Result = self.byte_at(pat, self.k);
+        transition _u31.v == _u32.v {
             true -> match_step(pat, start, end)
             false -> advance(pat, start, end)
         }
     }
 
-    state match_step(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+    state match_step(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
         self.k = ((self.k as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> match_scan(pat, start, end) }
     }
 
-    state match_verdict(&mut self, pat: &[u8]) -> bool {
-        self.k == pat.len
+    state match_verdict(&mut self, pat: &[u8]) -> BoolResult {
+        transition self.k == pat.len {
+            true -> (BoolResult { v: true })
+            false -> (BoolResult { v: false })
+        }
     }
 
-    state advance(&mut self, pat: &[u8], start: u64, end: u64) -> bool {
+    state advance(&mut self, pat: &[u8], start: u64, end: u64) -> BoolResult {
         self.i = ((self.i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> window(pat, start, end) }
     }
 
-    state hit(&mut self) -> bool {
-        true
-    }
+    state hit(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state miss(&mut self) -> bool {
-        false
-    }
+    state miss(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
 // Parse rec[tok_start..tok_end] as decimal (upstream's u64 parse).
-machine LinuxProcessQuery::dec_token(&mut self) -> bool {
+machine LinuxProcessQuery::dec_token(&mut self) -> BoolResult {
     self.num = 0;
     self.found = false;
     self.j = self.tok_start;
     transition { _ -> scan() }
 
-    state scan(&mut self) -> bool {
+    state scan(&mut self) -> BoolResult {
         transition self.j < self.tok_end {
             true -> digit()
             false -> verdict()
         }
     }
 
-    state digit(&mut self) -> bool {
-        self.ch = self.rec_at(self.j);
-        transition self.ch >= 48 && self.ch <= 57 {
+    state digit(&mut self) -> BoolResult {
+        let _ch_r: U8Result = self.rec_at(self.j);
+        self.ch = _ch_r.v;
+        transition _ch_r.v >= 48 && _ch_r.v <= 57 {
             true -> take()
             false -> miss()
         }
     }
 
-    state take(&mut self) -> bool {
+    state take(&mut self) -> BoolResult {
         self.num = ((((self.num as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64 as u64 in Wrapping) + (((self.ch as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64 as u64 in Wrapping)) as u64;
         self.found = true;
         self.j = ((self.j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> scan() }
     }
 
-    state miss(&mut self) -> bool {
-        false
-    }
+    state miss(&mut self) -> BoolResult { BoolResult { v: false } }
 
-    state verdict(&mut self) -> bool {
-        self.found
+    state verdict(&mut self) -> BoolResult {
+        transition self.found {
+            true -> (BoolResult { v: true })
+            false -> (BoolResult { v: false })
+        }
     }
 }
 
-machine LinuxProcessQuery::inode_in_disp(&mut self) -> bool {
+machine LinuxProcessQuery::inode_in_disp(&mut self) -> BoolResult {
     self.i = 0;
     transition { _ -> scan() }
 
-    state scan(&mut self) -> bool {
+    state scan(&mut self) -> BoolResult {
         transition self.i < self.disp_count {
             true -> cmp()
             false -> miss()
         }
     }
 
-    state cmp(&mut self) -> bool {
-        transition self.disp_at(self.i) == self.inode {
+    state cmp(&mut self) -> BoolResult {
+        let _u33: U64Result = self.disp_at(self.i);
+        transition _u33.v == self.inode {
             true -> hit()
             false -> step()
         }
     }
 
-    state step(&mut self) -> bool {
+    state step(&mut self) -> BoolResult {
         self.i = ((self.i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> scan() }
     }
 
-    state hit(&mut self) -> bool {
-        true
-    }
+    state hit(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state miss(&mut self) -> bool {
-        false
-    }
+    state miss(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
-machine LinuxProcessQuery::inode_in_conn(&mut self) -> bool {
+machine LinuxProcessQuery::inode_in_conn(&mut self) -> BoolResult {
     self.i = 0;
     transition { _ -> scan() }
 
-    state scan(&mut self) -> bool {
+    state scan(&mut self) -> BoolResult {
         transition self.i < self.conn_count {
             true -> cmp()
             false -> miss()
         }
     }
 
-    state cmp(&mut self) -> bool {
-        transition self.conn_at(self.i) == self.inode {
+    state cmp(&mut self) -> BoolResult {
+        let _u34: U64Result = self.conn_at(self.i);
+        transition _u34.v == self.inode {
             true -> hit()
             false -> step()
         }
     }
 
-    state step(&mut self) -> bool {
+    state step(&mut self) -> BoolResult {
         self.i = ((self.i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> scan() }
     }
 
-    state hit(&mut self) -> bool {
-        true
-    }
+    state hit(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state miss(&mut self) -> bool {
-        false
-    }
+    state miss(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
 // sysinfo's comm extraction: name sits between the first ' ' and the last
 // ')' of /proc/<pid>/stat (leading '(' stripped). A failed open/read/parse
 // drops the process, exactly as upstream.
-machine LinuxProcessQuery::read_process_name(&mut self) -> bool
+machine LinuxProcessQuery::read_process_name(&mut self) -> BoolResult
 reaches FilesystemHost
 invokes FilesystemHost;
 {
@@ -1291,224 +1366,249 @@ invokes FilesystemHost;
         false -> open_stat(48)
     }
 
-    state open_stat(&mut self, name_len: u64) -> bool {
+    state open_stat(&mut self, name_len: u64) -> BoolResult {
         transition name_len <= self.name.bytes.len {
             true -> open_stat_do(name_len)
             false -> miss()
         }
     }
 
-    state open_stat_do(&mut self, name_len: u64) -> bool {
-        self.probe_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 0);
-        transition self.probe_fd >= 0 {
+    state open_stat_do(&mut self, name_len: u64) -> BoolResult {
+        let procfd: i32 = self.proc_fd;
+        let _probe_fd_r: i32 = self.host.open_at(procfd, self.name.bytes[0..48], 0);
+        self.probe_fd = _probe_fd_r;
+        transition _probe_fd_r >= 0 {
             true -> fill()
             false -> miss()
         }
     }
 
-    state fill(&mut self) -> bool {
-        self.stat_len = self.host.read(self.probe_fd, &mut self.stat_buf, 2048);
-        self.scratch = self.host.close(self.probe_fd);
-        transition self.stat_len > 0 {
+    state fill(&mut self) -> BoolResult {
+        let probefd: i32 = self.probe_fd;
+        let _stat_len_r: i64 = self.host.read(probefd, &mut self.stat_buf, 2048);
+        self.stat_len = _stat_len_r;
+        let _u36: i32 = self.host.close(self.probe_fd);
+        self.scratch = _u36;
+        transition _stat_len_r > 0 {
             true -> find_space()
             false -> miss()
         }
     }
 
-    state find_space(&mut self) -> bool {
+    state find_space(&mut self) -> BoolResult {
         self.i = 0;
         transition { _ -> space_scan() }
     }
 
-    state space_scan(&mut self) -> bool {
+    state space_scan(&mut self) -> BoolResult {
         transition self.i < ((self.stat_len as u64 in Trapping) as u64) && self.i < 2048 {
             true -> space_cmp()
             false -> miss()
         }
     }
 
-    state space_cmp(&mut self) -> bool {
-        transition self.stat_at(self.i) == 32 {
+    state space_cmp(&mut self) -> BoolResult {
+        let _u37: U8Result = self.stat_at(self.i);
+        transition _u37.v == 32 {
             true -> expect_paren()
             false -> space_step()
         }
     }
 
-    state space_step(&mut self) -> bool {
+    state space_step(&mut self) -> BoolResult {
         self.i = ((self.i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> space_scan() }
     }
 
-    state expect_paren(&mut self) -> bool {
+    state expect_paren(&mut self) -> BoolResult {
         self.j = ((self.i as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition self.j < 2048 && self.j < ((self.stat_len as u64 in Trapping) as u64) && self.stat_at(self.j) == 40 {
+        let _u38: U8Result = self.stat_at(self.j);
+        transition self.j < 2048 && self.j < ((self.stat_len as u64 in Trapping) as u64) && _u38.v == 40 {
             true -> find_rparen()
             false -> miss()
         }
     }
 
     // Last ')' in the buffer — comm itself may contain ')' characters.
-    state find_rparen(&mut self) -> bool {
+    state find_rparen(&mut self) -> BoolResult {
         self.k = ((self.i as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64;
         self.tok_end = 0;
         transition { _ -> rparen_scan() }
     }
 
-    state rparen_scan(&mut self) -> bool {
+    state rparen_scan(&mut self) -> BoolResult {
         transition self.k < 2048 && self.k < ((self.stat_len as u64 in Trapping) as u64) {
             true -> rparen_cmp()
             false -> rparen_done()
         }
     }
 
-    state rparen_cmp(&mut self) -> bool {
-        transition self.stat_at(self.k) == 41 {
+    state rparen_cmp(&mut self) -> BoolResult {
+        let _u39: U8Result = self.stat_at(self.k);
+        transition _u39.v == 41 {
             true -> rparen_mark()
             false -> rparen_step()
         }
     }
 
-    state rparen_mark(&mut self) -> bool {
+    state rparen_mark(&mut self) -> BoolResult {
         self.tok_end = self.k;
         transition { _ -> rparen_step() }
     }
 
-    state rparen_step(&mut self) -> bool {
+    state rparen_step(&mut self) -> BoolResult {
         self.k = ((self.k as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> rparen_scan() }
     }
 
-    state rparen_done(&mut self) -> bool {
+    state rparen_done(&mut self) -> BoolResult {
         transition self.tok_end > self.j && ((self.tok_end as u64 in Wrapping) - (self.j as u64 in Wrapping)) as u64 <= 256 {
             true -> copy_name()
             false -> miss()
         }
     }
 
-    state copy_name(&mut self) -> bool {
+    state copy_name(&mut self) -> BoolResult {
         self.k = 0;
         transition { _ -> copy_step() }
     }
 
-    state copy_step(&mut self) -> bool {
+    state copy_step(&mut self) -> BoolResult {
         transition self.k < ((self.tok_end as u64 in Wrapping) - (self.j as u64 in Wrapping)) as u64 {
             true -> copy_byte()
             false -> hit()
         }
     }
 
-    state copy_byte(&mut self) -> bool {
-        self.c_name_set(self.k, self.stat_at(((self.j as u64 in Wrapping) + (self.k as u64 in Wrapping)) as u64));
+    state copy_byte(&mut self) -> BoolResult {
+        let stat_byte: U8Result = self.stat_at(((self.j as u64 in Wrapping) + (self.k as u64 in Wrapping)) as u64);
+        let stat_byte_v: u8 = stat_byte.v;
+        self.c_name_set(self.k, stat_byte_v);
         self.k = ((self.k as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> copy_step() }
     }
 
-    state hit(&mut self) -> bool {
+    state hit(&mut self) -> BoolResult {
         self.c_name_len = ((self.tok_end as u64 in Wrapping) - (self.j as u64 in Wrapping)) as u64;
         transition { _ -> yes() }
     }
 
-    state yes(&mut self) -> bool {
-        true
-    }
+    state yes(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state miss(&mut self) -> bool {
-        false
-    }
+    state miss(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
 // process_name_matches_filter: contains() over the ASCII-lowercased pair
 // unless match_case (the needle was folded once at sweep entry; the
 // candidate folds per byte here).
-machine LinuxProcessQuery::name_matches(&mut self) -> bool {
+machine LinuxProcessQuery::name_matches(&mut self) -> BoolResult {
     transition self.have_search {
         true -> haystack_check()
         false -> yes()
     }
 
-    state haystack_check(&mut self) -> bool {
+    state haystack_check(&mut self) -> BoolResult {
         transition self.needle_len <= self.c_name_len {
             true -> window(0)
             false -> no()
         }
     }
 
-    state window(&mut self, start: u64) -> bool {
+    state window(&mut self, start: u64) -> BoolResult {
         transition ((start as u64 in Wrapping) + (self.needle_len as u64 in Wrapping)) as u64 <= self.c_name_len {
             true -> align(start)
             false -> no()
         }
     }
 
-    state align(&mut self, start: u64) -> bool {
+    state align(&mut self, start: u64) -> BoolResult {
         self.k = 0;
         transition { _ -> cmp(start) }
     }
 
-    state cmp(&mut self, start: u64) -> bool {
+    state cmp(&mut self, start: u64) -> BoolResult {
         transition self.k < self.needle_len {
             true -> byte_cmp(start)
             false -> yes()
         }
     }
 
-    state byte_cmp(&mut self, start: u64) -> bool {
-        self.ch = self.c_name_at(((start as u64 in Wrapping) + (self.k as u64 in Wrapping)) as u64);
+    state byte_cmp(&mut self, start: u64) -> BoolResult {
+        let _u40: U8Result = self.c_name_at(((start as u64 in Wrapping) + (self.k as u64 in Wrapping)) as u64);
+        self.ch = _u40.v;
         transition self.match_case {
             true -> exact_cmp(start)
             false -> fold_cmp(start)
         }
     }
 
-    state exact_cmp(&mut self, start: u64) -> bool {
-        transition self.ch == self.needle_at(self.k) {
+    state exact_cmp(&mut self, start: u64) -> BoolResult {
+        let _u41: U8Result = self.needle_at(self.k);
+        transition self.ch as u64 == _u41.v {
             true -> step(start)
             false -> window_next(start)
         }
     }
 
-    state fold_cmp(&mut self, start: u64) -> bool {
-        transition self.lowered(self.ch) == self.needle_at(self.k) {
+    state fold_cmp(&mut self, start: u64) -> BoolResult {
+        let _u42: U8Result = self.lowered(self.ch);
+        let _u43: U8Result = self.needle_at(self.k);
+        transition _u42.v as u64 == _u43.v {
             true -> step(start)
             false -> window_next(start)
         }
     }
 
-    state step(&mut self, start: u64) -> bool {
+    state step(&mut self, start: u64) -> BoolResult {
         self.k = ((self.k as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> cmp(start) }
     }
 
-    state window_next(&mut self, start: u64) -> bool {
+    state window_next(&mut self, start: u64) -> BoolResult {
         transition { _ -> window(((start as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
 
-    state yes(&mut self) -> bool {
-        true
-    }
+    state yes(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state no(&mut self) -> bool {
-        false
-    }
+    state no(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
-machine LinuxProcessQuery::lowered(&mut self, byte: u8) -> u8 {
+machine LinuxProcessQuery::lowered(&mut self, byte: u8) -> U8Result {
     transition byte >= 65 && byte <= 90 {
         true -> fold(byte)
         false -> same(byte)
     }
 
-    state fold(&mut self, byte: u8) -> u8 {
-        ((byte as u8 in Wrapping) + (32 as u8 in Wrapping)) as u8
+    state fold(&mut self, byte: u8) -> U8Result {
+        U8Result { v: ((byte as u8 in Wrapping) + (32 as u8 in Wrapping)) as u8 }
     }
 
-    state same(&mut self, byte: u8) -> u8 {
-        byte
+    state same(&mut self, byte: u8) -> U8Result {
+        U8Result { v: byte }
+    }
+}
+
+// open_at through a caller-bounded slice — the requires clause couples the
+// slice and the caller-proven length so name[0..name_len] is provably in
+// bounds at the boundary.
+machine LinuxProcessQuery::host_open_at(&mut self, dirfd: i32, name: &[u8], name_len: u64) -> FdResult
+requires
+    name_len <= name.len;
+reaches
+    FilesystemHost
+{
+    transition { _ -> wrap(dirfd, name, name_len) }
+    state wrap(&mut self, dirfd: i32, name: &[u8], name_len: u64) -> FdResult
+    requires
+        name_len <= name.len;
+    {
+        let _fd_r: i32 = self.host.open_at(dirfd, name[0..name_len], 0);
+        FdResult { v: _fd_r }
     }
 }
 
 // is_process_windowed for the candidate in c_pid.
-machine LinuxProcessQuery::is_windowed(&mut self) -> bool
+machine LinuxProcessQuery::is_windowed(&mut self) -> BoolResult
 reaches FilesystemHost
 invokes FilesystemHost;
 {
@@ -1518,12 +1618,13 @@ invokes FilesystemHost;
     }
 
     // process_has_display_environment runs once before the fd walk.
-    state env(&mut self) -> bool {
-        self.c_has_env = self.has_display_env();
+    state env(&mut self) -> BoolResult {
+        let _u44: BoolResult = self.has_display_env();
+        self.c_has_env = _u44.v;
         transition { _ -> open_fd_dir() }
     }
 
-    state open_fd_dir(&mut self) -> bool {
+    state open_fd_dir(&mut self) -> BoolResult {
         self.name = ProcName::for_process(self.c_pid, 102, 100, 0, 0, 2);
         transition self.name.len <= 48 {
             true -> open_fd_at(self.name.len)
@@ -1531,63 +1632,70 @@ invokes FilesystemHost;
         }
     }
 
-    state open_fd_at(&mut self, name_len: u64) -> bool {
+    state open_fd_at(&mut self, name_len: u64) -> BoolResult {
         transition name_len <= self.name.bytes.len {
             true -> open_fd_do(name_len)
             false -> no()
         }
     }
 
-    state open_fd_do(&mut self, name_len: u64) -> bool {
-        self.fd_fd = self.host.open_at(self.proc_fd, self.name.bytes[0..name_len], 65536);
-        transition self.fd_fd >= 0 {
+    state open_fd_do(&mut self, name_len: u64) -> BoolResult {
+        let procfd: i32 = self.proc_fd;
+        let _fd_fd_r: i32 = self.host.open_at(procfd, self.name.bytes[0..48], 65536);
+        self.fd_fd = _fd_fd_r;
+        transition _fd_fd_r >= 0 {
             true -> fd_fill()
             false -> no()
         }
     }
 
-    state fd_fill(&mut self) -> bool {
+    state fd_fill(&mut self) -> BoolResult {
         self.dir_pos = 0;
         self.dir_total = 0;
         self.dir_off = 0;
         transition { _ -> fd_read() }
     }
 
-    state fd_read(&mut self) -> bool {
-        self.count = self.host.read_dir(self.fd_fd, &mut self.dir_buf, 4096, &mut self.dir_pos);
-        transition self.count > 0 {
+    state fd_read(&mut self) -> BoolResult {
+        let fdfd: i32 = self.fd_fd;
+        let _count_r: i64 = self.host.read_dir(fdfd, &mut self.dir_buf, 4096, &mut self.dir_pos);
+        self.count = _count_r;
+        transition _count_r > 0 {
             true -> fd_take()
             false -> fd_done()
         }
     }
 
-    state fd_take(&mut self) -> bool {
-        self.dir_total = self.count as u64;
+    state fd_take(&mut self) -> BoolResult {
+        self.dir_total = ((self.count as u64 in Wrapping) as u64);
         self.dir_off = 0;
         transition { _ -> fd_walk() }
     }
 
-    state fd_done(&mut self) -> bool {
-        self.scratch = self.host.close(self.fd_fd);
+    state fd_done(&mut self) -> BoolResult {
+        let _u46: i32 = self.host.close(self.fd_fd);
+        self.scratch = _u46;
         transition { _ -> no() }
     }
 
-    state fd_walk(&mut self) -> bool {
+    state fd_walk(&mut self) -> BoolResult {
         transition self.dir_off < self.dir_total {
             true -> fd_header()
             false -> fd_read()
         }
     }
 
-    state fd_header(&mut self) -> bool {
+    state fd_header(&mut self) -> BoolResult {
         transition ((self.dir_off as u64 in Wrapping) + (19 as u64 in Wrapping)) as u64 <= self.dir_total {
             true -> fd_reclen()
             false -> fd_done()
         }
     }
 
-    state fd_reclen(&mut self) -> bool {
-        self.reclen = ((((self.dir_at(((self.dir_off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64) as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64) | (self.dir_at(((self.dir_off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64) as u64));
+    state fd_reclen(&mut self) -> BoolResult {
+        let _u47: U8Result = self.dir_at(((self.dir_off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64);
+        let _u48: U8Result = self.dir_at(((self.dir_off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64);
+        self.reclen = ((((_u47.v as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64) | (_u48.v as u64));
         transition self.reclen > 0 && ((self.dir_off as u64 in Wrapping) + (self.reclen as u64 in Wrapping)) as u64 <= self.dir_total {
             true -> fd_name()
             false -> fd_done()
@@ -1595,13 +1703,13 @@ invokes FilesystemHost;
     }
 
     // Copy the entry name to `rec` for the probe open.
-    state fd_name(&mut self) -> bool {
+    state fd_name(&mut self) -> BoolResult {
         self.j = 19;
         self.rec_len = 0;
         transition { _ -> fd_name_step() }
     }
 
-    state fd_name_step(&mut self) -> bool {
+    state fd_name_step(&mut self) -> BoolResult {
         self.i = ((self.dir_off as u64 in Wrapping) + (self.j as u64 in Wrapping)) as u64;
         transition self.j < self.reclen && self.i < self.dir_total {
             true -> fd_name_byte()
@@ -1609,22 +1717,23 @@ invokes FilesystemHost;
         }
     }
 
-    state fd_name_byte(&mut self) -> bool {
-        self.ch = self.dir_at(self.i);
-        transition self.ch == 0 {
+    state fd_name_byte(&mut self) -> BoolResult {
+        let _ch_r: U8Result = self.dir_at(self.i);
+        self.ch = _ch_r.v;
+        transition _ch_r.v == 0 {
             true -> fd_probe()
             false -> fd_name_store()
         }
     }
 
-    state fd_name_store(&mut self) -> bool {
+    state fd_name_store(&mut self) -> BoolResult {
         transition self.rec_len < 255 {
             true -> fd_name_put()
             false -> fd_next()
         }
     }
 
-    state fd_name_put(&mut self) -> bool {
+    state fd_name_put(&mut self) -> BoolResult {
         self.rec_set(self.rec_len, self.ch);
         self.rec_len = ((self.rec_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         self.j = ((self.j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
@@ -1635,34 +1744,37 @@ invokes FilesystemHost;
     // discriminator: opening an fd symlink for a socket fails ENXIO (-6),
     // for every sockfs type; other fds open or fail differently, and any
     // error other than ENXIO skips the entry like upstream's readlink Err.
-    state fd_probe(&mut self) -> bool {
+    state fd_probe(&mut self) -> BoolResult {
         transition self.rec_len > 0 {
             true -> fd_open()
             false -> fd_next()
         }
     }
 
-    state fd_open(&mut self) -> bool {
+    state fd_open(&mut self) -> BoolResult {
         transition self.rec_len <= self.rec.len {
             true -> fd_open_do()
             false -> fd_next()
         }
     }
 
-    state fd_open_do(&mut self) -> bool {
-        self.probe_fd = self.host.open_at(self.fd_fd, self.rec[0..self.rec_len], 0);
-        transition self.probe_fd >= 0 {
+    state fd_open_do(&mut self) -> BoolResult {
+        let fdfd: i32 = self.fd_fd;
+        let _probe_fd_r: FdResult = self.host_open_at(fdfd, &self.rec, self.rec_len);
+        self.probe_fd = _probe_fd_r.v;
+        transition _probe_fd_r.v >= 0 {
             true -> fd_not_socket()
             false -> fd_err()
         }
     }
 
-    state fd_not_socket(&mut self) -> bool {
-        self.scratch = self.host.close(self.probe_fd);
+    state fd_not_socket(&mut self) -> BoolResult {
+        let _u49: i32 = self.host.close(self.probe_fd);
+        self.scratch = _u49;
         transition { _ -> fd_next() }
     }
 
-    state fd_err(&mut self) -> bool {
+    state fd_err(&mut self) -> BoolResult {
         transition self.probe_fd == -6 {
             true -> fdinfo_path()
             false -> fd_next()
@@ -1670,7 +1782,7 @@ invokes FilesystemHost;
     }
 
     // "<pid>/fdinfo/<fdname>" — the fd name is already in rec.
-    state fdinfo_path(&mut self) -> bool {
+    state fdinfo_path(&mut self) -> BoolResult {
         self.path_reset();
         self.path_put_pid();
         self.path_push(47);
@@ -1684,152 +1796,160 @@ invokes FilesystemHost;
         transition { _ -> fdinfo_name() }
     }
 
-    state fdinfo_name(&mut self) -> bool {
+    state fdinfo_name(&mut self) -> BoolResult {
         self.j = 0;
         transition { _ -> fdinfo_name_step() }
     }
 
-    state fdinfo_name_step(&mut self) -> bool {
+    state fdinfo_name_step(&mut self) -> BoolResult {
         transition self.j < self.rec_len {
             true -> fdinfo_name_byte()
             false -> fdinfo_open()
         }
     }
 
-    state fdinfo_name_byte(&mut self) -> bool {
-        self.ch = self.rec_at(self.j);
+    state fdinfo_name_byte(&mut self) -> BoolResult {
+        let _u50: U8Result = self.rec_at(self.j);
+        self.ch = _u50.v;
         self.path_push(self.ch);
         self.j = ((self.j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> fdinfo_name_step() }
     }
 
-    state fdinfo_open(&mut self) -> bool {
+    state fdinfo_open(&mut self) -> BoolResult {
         transition self.path_len <= self.path_buf.len {
             true -> fdinfo_open_do()
             false -> fd_next()
         }
     }
 
-    state fdinfo_open_do(&mut self) -> bool {
-        self.io_fd = self.host.open_at(self.proc_fd, self.path_buf[0..self.path_len], 0);
-        transition self.io_fd >= 0 {
+    state fdinfo_open_do(&mut self) -> BoolResult {
+        let procfd: i32 = self.proc_fd;
+        let _io_fd_r: FdResult = self.host_open_at(procfd, &self.path_buf, self.path_len);
+        self.io_fd = _io_fd_r.v;
+        transition _io_fd_r.v >= 0 {
             true -> fdinfo_stream()
             false -> fd_next()
         }
     }
 
-    state fdinfo_stream(&mut self) -> bool {
+    state fdinfo_stream(&mut self) -> BoolResult {
         self.io_delim = 10;
         self.io_len = 0;
         self.io_pos = 0;
         transition { _ -> fdinfo_line() }
     }
 
-    state fdinfo_line(&mut self) -> bool {
-        self.scratch = self.stream_next();
-        transition self.scratch == 0 {
+    state fdinfo_line(&mut self) -> BoolResult {
+        let _scratch_r: U8Result = self.stream_next();
+        self.scratch = _scratch_r.v;
+        transition _scratch_r.v == 0 {
             true -> fdinfo_check()
             false -> fd_next()
         }
     }
 
     // Parse "ino:\t<decimal>" — the socket inode the readlink target carries.
-    state fdinfo_check(&mut self) -> bool {
-        transition self.rec_has_prefix("ino:") {
+    state fdinfo_check(&mut self) -> BoolResult {
+        let _u51: BoolResult = self.rec_has_prefix("ino:");
+        transition _u51.v {
             true -> fdinfo_parse()
             false -> fdinfo_line()
         }
     }
 
-    state fdinfo_parse(&mut self) -> bool {
+    state fdinfo_parse(&mut self) -> BoolResult {
         self.j = 4;
         self.inode = 0;
         self.found = false;
         transition { _ -> fdinfo_ws() }
     }
 
-    state fdinfo_ws(&mut self) -> bool {
-        transition self.j < self.rec_len && (self.rec_at(self.j) == 9 || self.rec_at(self.j) == 32) {
+    state fdinfo_ws(&mut self) -> BoolResult {
+        let _u52: U8Result = self.rec_at(self.j);
+        let _u53: U8Result = self.rec_at(self.j);
+        transition self.j < self.rec_len && (_u52.v == 9 || _u53.v == 32) {
             true -> fdinfo_ws_step()
             false -> fdinfo_digits()
         }
     }
 
-    state fdinfo_ws_step(&mut self) -> bool {
+    state fdinfo_ws_step(&mut self) -> BoolResult {
         self.j = ((self.j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> fdinfo_ws() }
     }
 
-    state fdinfo_digits(&mut self) -> bool {
+    state fdinfo_digits(&mut self) -> BoolResult {
         transition self.j < self.rec_len {
             true -> fdinfo_digit()
             false -> fdinfo_done()
         }
     }
 
-    state fdinfo_digit(&mut self) -> bool {
-        self.ch = self.rec_at(self.j);
-        transition self.ch >= 48 && self.ch <= 57 {
+    state fdinfo_digit(&mut self) -> BoolResult {
+        let _ch_r: U8Result = self.rec_at(self.j);
+        self.ch = _ch_r.v;
+        transition _ch_r.v >= 48 && _ch_r.v <= 57 {
             true -> fdinfo_take()
             false -> fdinfo_done()
         }
     }
 
-    state fdinfo_take(&mut self) -> bool {
+    state fdinfo_take(&mut self) -> BoolResult {
         self.inode = ((((self.inode as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64 as u64 in Wrapping) + (((self.ch as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64 as u64 in Wrapping)) as u64;
         self.found = true;
         self.j = ((self.j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> fdinfo_digits() }
     }
 
-    state fdinfo_done(&mut self) -> bool {
+    state fdinfo_done(&mut self) -> BoolResult {
         transition { _ -> fdinfo_close() }
     }
 
-    state fdinfo_close(&mut self) -> bool {
-        self.scratch = self.host.close(self.io_fd);
+    state fdinfo_close(&mut self) -> BoolResult {
+        let _u54: i32 = self.host.close(self.io_fd);
+        self.scratch = _u54;
         transition self.found {
             true -> fd_membership()
             false -> fd_next()
         }
     }
 
-    state fd_membership(&mut self) -> bool {
-        transition self.inode_in_disp() {
+    state fd_membership(&mut self) -> BoolResult {
+        let _u55: BoolResult = self.inode_in_disp();
+        transition _u55.v {
             true -> fd_hit()
             false -> fd_conn()
         }
     }
 
-    state fd_conn(&mut self) -> bool {
-        transition self.c_has_env && self.inode_in_conn() {
+    state fd_conn(&mut self) -> BoolResult {
+        let _u56: BoolResult = self.inode_in_conn();
+        transition self.c_has_env && _u56.v {
             true -> fd_hit()
             false -> fd_next()
         }
     }
 
-    state fd_hit(&mut self) -> bool {
-        self.scratch = self.host.close(self.fd_fd);
+    state fd_hit(&mut self) -> BoolResult {
+        let _u57: i32 = self.host.close(self.fd_fd);
+        self.scratch = _u57;
         transition { _ -> yes() }
     }
 
-    state fd_next(&mut self) -> bool {
+    state fd_next(&mut self) -> BoolResult {
         self.dir_off = ((self.dir_off as u64 in Wrapping) + (self.reclen as u64 in Wrapping)) as u64;
         transition { _ -> fd_walk() }
     }
 
-    state yes(&mut self) -> bool {
-        true
-    }
+    state yes(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state no(&mut self) -> bool {
-        false
-    }
+    state no(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
 // process_has_display_environment: NUL-separated environ entries, matching
 // key == "DISPLAY" or "WAYLAND_DISPLAY" with a non-empty value.
-machine LinuxProcessQuery::has_display_env(&mut self) -> bool
+machine LinuxProcessQuery::has_display_env(&mut self) -> BoolResult
 reaches FilesystemHost
 invokes FilesystemHost;
 {
@@ -1845,31 +1965,34 @@ invokes FilesystemHost;
     self.path_push(110);
     transition { _ -> open_env() }
 
-    state open_env(&mut self) -> bool {
+    state open_env(&mut self) -> BoolResult {
         transition self.path_len <= self.path_buf.len {
             true -> open_env_do()
             false -> no()
         }
     }
 
-    state open_env_do(&mut self) -> bool {
-        self.io_fd = self.host.open_at(self.proc_fd, self.path_buf[0..self.path_len], 0);
-        transition self.io_fd >= 0 {
+    state open_env_do(&mut self) -> BoolResult {
+        let procfd: i32 = self.proc_fd;
+        let _io_fd_r: FdResult = self.host_open_at(procfd, &self.path_buf, self.path_len);
+        self.io_fd = _io_fd_r.v;
+        transition _io_fd_r.v >= 0 {
             true -> stream()
             false -> no()
         }
     }
 
-    state stream(&mut self) -> bool {
+    state stream(&mut self) -> BoolResult {
         self.io_delim = 0;
         self.io_len = 0;
         self.io_pos = 0;
         transition { _ -> next_entry() }
     }
 
-    state next_entry(&mut self) -> bool {
-        self.scratch = self.stream_next();
-        transition self.scratch == 0 {
+    state next_entry(&mut self) -> BoolResult {
+        let _scratch_r: U8Result = self.stream_next();
+        self.scratch = _scratch_r.v;
+        transition _scratch_r.v == 0 {
             true -> check_entry()
             false -> close_no()
         }
@@ -1877,37 +2000,37 @@ invokes FilesystemHost;
 
     // Entry matches when key (before the first '=') is exactly DISPLAY or
     // WAYLAND_DISPLAY and a non-empty value follows it.
-    state check_entry(&mut self) -> bool {
-        transition self.rec_len > 8 && self.rec_has_prefix("DISPLAY=") {
+    state check_entry(&mut self) -> BoolResult {
+        let _u58: BoolResult = self.rec_has_prefix("DISPLAY=");
+        transition self.rec_len > 8 && _u58.v {
             true -> close_yes()
             false -> check_wayland()
         }
     }
 
-    state check_wayland(&mut self) -> bool {
-        transition self.rec_len > 16 && self.rec_has_prefix("WAYLAND_DISPLAY=") {
+    state check_wayland(&mut self) -> BoolResult {
+        let _u59: BoolResult = self.rec_has_prefix("WAYLAND_DISPLAY=");
+        transition self.rec_len > 16 && _u59.v {
             true -> close_yes()
             false -> next_entry()
         }
     }
 
-    state close_yes(&mut self) -> bool {
-        self.scratch = self.host.close(self.io_fd);
+    state close_yes(&mut self) -> BoolResult {
+        let _u60: i32 = self.host.close(self.io_fd);
+        self.scratch = _u60;
         transition { _ -> yes() }
     }
 
-    state close_no(&mut self) -> bool {
-        self.scratch = self.host.close(self.io_fd);
+    state close_no(&mut self) -> BoolResult {
+        let _u61: i32 = self.host.close(self.io_fd);
+        self.scratch = _u61;
         transition { _ -> no() }
     }
 
-    state yes(&mut self) -> bool {
-        true
-    }
+    state yes(&mut self) -> BoolResult { BoolResult { v: true } }
 
-    state no(&mut self) -> bool {
-        false
-    }
+    state no(&mut self) -> BoolResult { BoolResult { v: false } }
 }
 
 // "<pid>" decimal into path_buf (ProcName::for_pid's emission, without the
@@ -1936,7 +2059,9 @@ machine LinuxProcessQuery::path_put_pid(&mut self) {
     }
 
     state byte(&mut self) {
-        self.path_set(self.path_len, self.name.bytes[self.j]);
+        let ji: u64 = self.j;
+        let b: u8 = self.name.byte_at(ji);
+        self.path_set(self.path_len, b as u8);
         self.path_len = ((self.path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         self.j = ((self.j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition { _ -> copy() }
@@ -1966,40 +2091,40 @@ machine LinuxProcessQuery::path_push(&mut self, byte: u8) {
 // (computed expressions allowed); the internal guard discharges the index
 // proof, and out-of-range reads yield 0 — a byte that cannot match a live
 // query. Writes out of range are dropped (unreachable by construction).
-machine LinuxProcessQuery::dir_at(&mut self, position: u64) -> u8 {
+machine LinuxProcessQuery::dir_at(&mut self, position: u64) -> U8Result {
     transition position < 4096 {
         true -> hit(position)
         false -> miss()
     }
-    state hit(&mut self, position: u64) -> u8 { self.dir_buf[position] }
-    state miss(&mut self) -> u8 { 0 }
+    state hit(&mut self, position: u64) -> U8Result { U8Result { v: self.dir_buf[position] } }
+    state miss(&mut self) -> U8Result { U8Result { v: 0 } }
 }
 
-machine LinuxProcessQuery::io_at(&mut self, position: u64) -> u8 {
+machine LinuxProcessQuery::io_at(&mut self, position: u64) -> U8Result {
     transition position < 4096 {
         true -> hit(position)
         false -> miss()
     }
-    state hit(&mut self, position: u64) -> u8 { self.io_buf[position] }
-    state miss(&mut self) -> u8 { 0 }
+    state hit(&mut self, position: u64) -> U8Result { U8Result { v: self.io_buf[position] } }
+    state miss(&mut self) -> U8Result { U8Result { v: 0 } }
 }
 
-machine LinuxProcessQuery::stat_at(&mut self, position: u64) -> u8 {
+machine LinuxProcessQuery::stat_at(&mut self, position: u64) -> U8Result {
     transition position < 2048 {
         true -> hit(position)
         false -> miss()
     }
-    state hit(&mut self, position: u64) -> u8 { self.stat_buf[position] }
-    state miss(&mut self) -> u8 { 0 }
+    state hit(&mut self, position: u64) -> U8Result { U8Result { v: self.stat_buf[position] } }
+    state miss(&mut self) -> U8Result { U8Result { v: 0 } }
 }
 
-machine LinuxProcessQuery::rec_at(&mut self, position: u64) -> u8 {
+machine LinuxProcessQuery::rec_at(&mut self, position: u64) -> U8Result {
     transition position < 256 {
         true -> hit(position)
         false -> miss()
     }
-    state hit(&mut self, position: u64) -> u8 { self.rec[position] }
-    state miss(&mut self) -> u8 { 0 }
+    state hit(&mut self, position: u64) -> U8Result { U8Result { v: self.rec[position] } }
+    state miss(&mut self) -> U8Result { U8Result { v: 0 } }
 }
 
 machine LinuxProcessQuery::rec_set(&mut self, position: u64, byte: u8) {
@@ -2012,13 +2137,13 @@ machine LinuxProcessQuery::rec_set(&mut self, position: u64, byte: u8) {
     }
 }
 
-machine LinuxProcessQuery::c_name_at(&mut self, position: u64) -> u8 {
+machine LinuxProcessQuery::c_name_at(&mut self, position: u64) -> U8Result {
     transition position < 256 {
         true -> hit(position)
         false -> miss()
     }
-    state hit(&mut self, position: u64) -> u8 { self.c_name[position] }
-    state miss(&mut self) -> u8 { 0 }
+    state hit(&mut self, position: u64) -> U8Result { U8Result { v: self.c_name[position] } }
+    state miss(&mut self) -> U8Result { U8Result { v: 0 } }
 }
 
 machine LinuxProcessQuery::c_name_set(&mut self, position: u64, byte: u8) {
@@ -2031,13 +2156,13 @@ machine LinuxProcessQuery::c_name_set(&mut self, position: u64, byte: u8) {
     }
 }
 
-machine LinuxProcessQuery::needle_at(&mut self, position: u64) -> u8 {
+machine LinuxProcessQuery::needle_at(&mut self, position: u64) -> U8Result {
     transition position < 256 {
         true -> hit(position)
         false -> miss()
     }
-    state hit(&mut self, position: u64) -> u8 { self.needle[position] }
-    state miss(&mut self) -> u8 { 0 }
+    state hit(&mut self, position: u64) -> U8Result { U8Result { v: self.needle[position] } }
+    state miss(&mut self) -> U8Result { U8Result { v: 0 } }
 }
 
 machine LinuxProcessQuery::needle_put(&mut self, position: u64, byte: u8) {
@@ -2050,13 +2175,13 @@ machine LinuxProcessQuery::needle_put(&mut self, position: u64, byte: u8) {
     }
 }
 
-machine LinuxProcessQuery::path_at(&mut self, position: u64) -> u8 {
+machine LinuxProcessQuery::path_at(&mut self, position: u64) -> U8Result {
     transition position < 64 {
         true -> hit(position)
         false -> miss()
     }
-    state hit(&mut self, position: u64) -> u8 { self.path_buf[position] }
-    state miss(&mut self) -> u8 { 0 }
+    state hit(&mut self, position: u64) -> U8Result { U8Result { v: self.path_buf[position] } }
+    state miss(&mut self) -> U8Result { U8Result { v: 0 } }
 }
 
 machine LinuxProcessQuery::path_set(&mut self, position: u64, byte: u8) {
@@ -2069,13 +2194,13 @@ machine LinuxProcessQuery::path_set(&mut self, position: u64, byte: u8) {
     }
 }
 
-machine LinuxProcessQuery::pid_at(&mut self, index: u64) -> u32 {
+machine LinuxProcessQuery::pid_at(&mut self, index: u64) -> U32Result {
     transition index < 16384 {
         true -> hit(index)
         false -> miss()
     }
-    state hit(&mut self, index: u64) -> u32 { self.pid_tab[index] }
-    state miss(&mut self) -> u32 { 0 }
+    state hit(&mut self, index: u64) -> U32Result { U32Result { v: self.pid_tab[index] } }
+    state miss(&mut self) -> U32Result { U32Result { v: 0 } }
 }
 
 machine LinuxProcessQuery::pid_set(&mut self, index: u64, value: u32) {
@@ -2088,13 +2213,13 @@ machine LinuxProcessQuery::pid_set(&mut self, index: u64, value: u32) {
     }
 }
 
-machine LinuxProcessQuery::disp_at(&mut self, index: u64) -> u64 {
+machine LinuxProcessQuery::disp_at(&mut self, index: u64) -> U64Result {
     transition index < 256 {
         true -> hit(index)
         false -> miss()
     }
-    state hit(&mut self, index: u64) -> u64 { self.disp_inodes[index] }
-    state miss(&mut self) -> u64 { 0 }
+    state hit(&mut self, index: u64) -> U64Result { U64Result { v: self.disp_inodes[index] } }
+    state miss(&mut self) -> U64Result { U64Result { v: 0 } }
 }
 
 machine LinuxProcessQuery::disp_set(&mut self, index: u64, value: u64) {
@@ -2107,13 +2232,13 @@ machine LinuxProcessQuery::disp_set(&mut self, index: u64, value: u64) {
     }
 }
 
-machine LinuxProcessQuery::conn_at(&mut self, index: u64) -> u64 {
+machine LinuxProcessQuery::conn_at(&mut self, index: u64) -> U64Result {
     transition index < 2048 {
         true -> hit(index)
         false -> miss()
     }
-    state hit(&mut self, index: u64) -> u64 { self.conn_inodes[index] }
-    state miss(&mut self) -> u64 { 0 }
+    state hit(&mut self, index: u64) -> U64Result { U64Result { v: self.conn_inodes[index] } }
+    state miss(&mut self) -> U64Result { U64Result { v: 0 } }
 }
 
 machine LinuxProcessQuery::conn_set(&mut self, index: u64, value: u64) {
@@ -2128,11 +2253,11 @@ machine LinuxProcessQuery::conn_set(&mut self, index: u64, value: u64) {
 
 // Element read on a caller-bounded slice param — the requires clause
 // discharges the slice index; the caller proves position < s.len.
-machine LinuxProcessQuery::byte_at(&mut self, s: &[u8], position: u64) -> u8
+machine LinuxProcessQuery::byte_at(&mut self, s: &[u8], position: u64) -> U8Result
 requires
     position < s.len;
 {
-    s[position]
+    s[position] as u64
 }
 
 // Element write on a caller-bounded output slice — the requires clause
@@ -2143,3 +2268,7 @@ requires
 {
     out[index] = info;
 }
+
+// Boundary `i32` results (fd returns carry -1 on failure) cannot ride a
+// numeric domain; the wrapper record keeps them legal as structural results.
+data FdResult { v: i32 }
