@@ -1,0 +1,736 @@
+module src::scanners::vector::scanner_vector_overlapping_bytewise_periodic;
+
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_vectorization_size::PlannedScanVectorizationSize;
+use src::scanners::snapshot_scanner::Scanner;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::SnapshotRegionFilterRunLengthEncoder;
+
+// Port of ScannerVectorOverlappingBytewisePeriodic — unreachable upstream
+// (the dispatcher's dedicated arm is commented out; the plan kind routes to
+// ScannerVectorOverlapping), ported faithfully as a working scanner anyway:
+// upstream still compiles and ships the body.
+//
+// Upstream scans BYTE candidates over the whole `valid_bytes` window: each
+// group covers a full N-byte vector of byte positions, and lane l matches
+// when the window byte at l equals ANY of the first `periodicity` pattern
+// bytes (OR of per-position compares — upstream's `|` fold; NotEqual ORs
+// per-byte not-equals). periodicity ∈ {1,2,4,8}; other values are the
+// error-and-empty arm (upstream logs "Implementation incomplete!" for
+// 2/4/8 but still runs the OR compare — same behavior ported, the log has
+// no Omega analog).
+//
+// Tail coverage is upstream's remainder reload: `remainder_bytes` trailing
+// byte candidates at offset `iterations * N`, encoded per lane —
+// contiguous with the vectorized byte walk. Every miss encodes via
+// `finalize_current_encode_with_minimum_size_filtering(_, data_type_size)`
+// — the minimum-size filter is what lets byte matches beneath the unit
+// width drop, exactly as upstream.
+//
+// On the byte-window element model the caller supplies the filter's raw
+// bytes as one-u64-per-byte elements (the dispatcher's unit-1/alignment-1
+// fill — the same bytes upstream's current-values pointer reads). Group
+// walks advance N bytes (upstream's `index * vector_size_in_bytes` pointer
+// stride); lane_results plays the Simd compare_result mask role between
+// the compare and encode passes.
+pub data VectorBytewisePeriodicScan {
+    encoder: SnapshotRegionFilterRunLengthEncoder;
+    byte_index: u64;
+    candidate_count: u64;
+    vector_size_in_bytes: u64;
+    vectorizable_iterations: u64;
+    data_type_size_bytes: u64;
+    periodicity: u64;
+    check_equal: bool;
+    operand_value: u64;
+    supported: bool;
+    finalized_tail: bool;
+    lane_results: [u8; 64];
+}
+
+pub machine VectorBytewisePeriodicScan::new(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    plan: &SnapshotFilterElementScanPlan,
+    vectorization_size: PlannedScanVectorizationSize
+) -> VectorBytewisePeriodicScan
+crashes Abort
+{
+    transition vectorization_size {
+        PlannedScanVectorizationSize::Vector16 -> compare_gate(
+            snapshot_region_filter, plan, 16)
+        PlannedScanVectorizationSize::Vector32 -> compare_gate(
+            snapshot_region_filter, plan, 32)
+        PlannedScanVectorizationSize::Vector64 -> compare_gate(
+            snapshot_region_filter, plan, 64)
+    }
+
+    // Upstream accepts only Immediate compares; anything else is the
+    // error-and-empty arm.
+    state compare_gate(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        vector_size_in_bytes: u64
+    ) -> VectorBytewisePeriodicScan {
+        transition plan.get_scan_compare_type() {
+            ScanCompareType::Immediate { compare_type } -> equal_gate(
+                compare_type, snapshot_region_filter, plan, vector_size_in_bytes)
+            _ -> (VectorBytewisePeriodicScan::unsupported(snapshot_region_filter))
+        }
+    }
+
+    state equal_gate(
+        compare_type: ScanCompareTypeImmediate,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        vector_size_in_bytes: u64
+    ) -> VectorBytewisePeriodicScan {
+        transition compare_type {
+            ScanCompareTypeImmediate::Equal -> periodicity_gate(
+                snapshot_region_filter, plan, vector_size_in_bytes, true)
+            ScanCompareTypeImmediate::NotEqual -> periodicity_gate(
+                snapshot_region_filter, plan, vector_size_in_bytes, false)
+            _ -> (VectorBytewisePeriodicScan::unsupported(snapshot_region_filter))
+        }
+    }
+
+    // Upstream's `match periodicity { 1|2|4|8 => ..., _ => error+empty }`.
+    state periodicity_gate(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        vector_size_in_bytes: u64,
+        check_equal: bool
+    ) -> VectorBytewisePeriodicScan {
+        let pattern_periodicity: u64 = plan.get_periodicity();
+        transition pattern_periodicity {
+            1 -> build(snapshot_region_filter, plan, vector_size_in_bytes, check_equal, pattern_periodicity)
+            2 -> build(snapshot_region_filter, plan, vector_size_in_bytes, check_equal, pattern_periodicity)
+            4 -> build(snapshot_region_filter, plan, vector_size_in_bytes, check_equal, pattern_periodicity)
+            8 -> build(snapshot_region_filter, plan, vector_size_in_bytes, check_equal, pattern_periodicity)
+            _ -> (VectorBytewisePeriodicScan::unsupported(snapshot_region_filter))
+        }
+    }
+
+    state build(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        vector_size_in_bytes: u64,
+        check_equal: bool,
+        pattern_periodicity: u64
+    ) -> VectorBytewisePeriodicScan {
+        let memory_alignment: MemoryAlignment = plan.get_memory_alignment();
+        let memory_alignment_size: u64 = memory_alignment.get_size_in_bytes();
+        let data_type_size: u64 = plan.get_unit_size_in_bytes();
+        let region_size: u64 = snapshot_region_filter.get_region_size();
+        // `plan_vector_scan` geometry: upstream's vector loop covers
+        // `vectorizable_iterations` full N-byte groups; the remainder lanes
+        // continue to `valid_bytes`, so the candidate byte count is the
+        // whole valid window.
+        let stride: u64 = max(memory_alignment_size, 1);
+        let trailing: u64 = ((data_type_size as u64 in Saturating)
+            - (stride as u64 in Saturating)) as u64;
+        let valid_bytes: u64 = ((region_size as u64 in Saturating)
+            - (trailing as u64 in Saturating)) as u64;
+        let element_count: u64 = valid_bytes / stride;
+        let elements_per_vector: u64 = vector_size_in_bytes / stride;
+        transition elements_per_vector > 0 {
+            true -> iterations(
+                snapshot_region_filter, plan, vector_size_in_bytes, check_equal,
+                pattern_periodicity, stride, data_type_size, valid_bytes, element_count,
+                elements_per_vector)
+            false -> (VectorBytewisePeriodicScan::unsupported(snapshot_region_filter))
+            _ -> (VectorBytewisePeriodicScan::unsupported(snapshot_region_filter))
+        }
+    }
+
+    state iterations(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        vector_size_in_bytes: u64,
+        check_equal: bool,
+        pattern_periodicity: u64,
+        stride: u64,
+        data_type_size: u64,
+        valid_bytes: u64,
+        element_count: u64,
+        elements_per_vector: u64
+    ) -> VectorBytewisePeriodicScan {
+        let vectorized_iterations: u64 = element_count / elements_per_vector;
+        let vectorized_bytes: u64 = ((vectorized_iterations as u64 in Wrapping)
+            * (vector_size_in_bytes as u64 in Wrapping)) as u64;
+        // Candidate byte positions = vectorized bytes + remainder bytes =
+        // upstream's coverage of the valid window.
+        let candidate_byte_count: u64 = ((vectorized_bytes as u64 in Wrapping)
+            + (((valid_bytes as u64 in Wrapping) - (vectorized_bytes as u64 in Wrapping)) as u64 in Wrapping)) as u64;
+        VectorBytewisePeriodicScan {
+            encoder: SnapshotRegionFilterRunLengthEncoder::new(
+                snapshot_region_filter.get_base_address()
+            ),
+            byte_index: 0,
+            candidate_count: candidate_byte_count,
+            vector_size_in_bytes: vector_size_in_bytes,
+            vectorizable_iterations: vectorized_iterations,
+            data_type_size_bytes: data_type_size,
+            periodicity: pattern_periodicity,
+            check_equal: check_equal,
+            operand_value: plan.get_operand_value(),
+            supported: true,
+            finalized_tail: false,
+        }
+    }
+}
+
+// The empty-result shape upstream's error arms (`vec![]`) produce; the pull
+// driver yields EmittedRegion::Empty immediately via `supported = false`
+// and `finalized_tail = true`.
+pub machine VectorBytewisePeriodicScan::unsupported(
+    snapshot_region_filter: &SnapshotRegionFilter
+) -> VectorBytewisePeriodicScan {
+    VectorBytewisePeriodicScan {
+        encoder: SnapshotRegionFilterRunLengthEncoder::new(
+            snapshot_region_filter.get_base_address()
+        ),
+        byte_index: 0,
+        candidate_count: 0,
+        vector_size_in_bytes: 16,
+        vectorizable_iterations: 0,
+        data_type_size_bytes: 0,
+        periodicity: 1,
+        check_equal: true,
+        operand_value: 0,
+        supported: false,
+        finalized_tail: true,
+    }
+}
+
+// Pulls the next emitted region. Full groups of `vector_size_in_bytes`
+// lanes (upstream's N-byte vector loop — `byte_index / N` is the group
+// ordinal) get the all-true/all-false folds; a partial tail group (the
+// remainder reload's lanes) encodes per lane like upstream's
+// encode_remainder_results.
+pub machine VectorBytewisePeriodicScan::next(
+    &mut self,
+    current_values: &[u64],
+    previous_values: &[u64]
+) -> EmittedRegion satisfies Scanner::next {
+    transition self.supported && !self.finalized_tail {
+        true -> pump(current_values, previous_values)
+        false -> (EmittedRegion::Empty)
+        _ -> (EmittedRegion::Empty)
+    }
+
+    state pump(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64]
+    ) -> EmittedRegion {
+        transition self.byte_index < self.candidate_count {
+            true -> group(current_values, previous_values)
+            false -> finish()
+        }
+    }
+
+    // Group bounds: min(N, remaining candidates) — a partial group is the
+    // remainder tail.
+    state group(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64]
+    ) -> EmittedRegion {
+        let remaining: u64 = ((self.candidate_count as u64 in Saturating)
+            - (self.byte_index as u64 in Saturating)) as u64;
+        let lane_count: u64 = min(remaining, self.vector_size_in_bytes);
+        compare_lane(current_values, previous_values, lane_count, 0, 0)
+    }
+
+    state compare_lane(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_index < lane_count {
+            true -> lane_or(current_values, previous_values, lane_count, lane_index, hit_count, 0, false)
+            false -> decide(current_values, previous_values, lane_count, hit_count)
+        }
+    }
+
+    // Lane l: OR over i < periodicity of (window[byte_index + l] vs
+    // pattern[i]) — upstream's `|` fold of the per-byte compares (eq for
+    // Equal, ne for NotEqual).
+    state lane_or(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        pattern_index: u64,
+        fold: bool
+    ) -> EmittedRegion {
+        transition pattern_index < self.periodicity && !fold {
+            true -> lane_byte(
+                current_values, previous_values, lane_count, lane_index, hit_count, pattern_index)
+            false -> lane_mark(
+                current_values, previous_values, lane_count, lane_index, hit_count, fold)
+            _ -> lane_mark(
+                current_values, previous_values, lane_count, lane_index, hit_count, fold)
+        }
+    }
+
+    state lane_byte(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        pattern_index: u64
+    ) -> EmittedRegion {
+        let byte_at: u64 = ((self.byte_index as u64 in Saturating)
+            + (lane_index as u64 in Saturating)) as u64;
+        transition byte_at < current_values.len {
+            true -> lane_compare(
+                current_values, previous_values, lane_count, lane_index, hit_count, pattern_index, byte_at)
+            // Out-of-window bytes never match — the OR fold just doesn't
+            // gain a term.
+            false -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), false)
+            _ -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), false)
+        }
+    }
+
+    state lane_compare(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        pattern_index: u64,
+        byte_at: u64 [0..current_values.len]
+    ) -> EmittedRegion {
+        let window_byte: u64 = current_values[byte_at] % 256;
+        let pattern_byte: u64 =
+            periodic_pattern_byte(self.operand_value, self.periodicity, pattern_index) as u64;
+        transition self.check_equal {
+            true -> lane_eq(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                pattern_index, window_byte, pattern_byte)
+            false -> lane_ne(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                pattern_index, window_byte, pattern_byte)
+            _ -> lane_mark(
+                current_values, previous_values, lane_count, lane_index, hit_count, false)
+        }
+    }
+
+    state lane_eq(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        pattern_index: u64,
+        window_byte: u64,
+        pattern_byte: u64
+    ) -> EmittedRegion {
+        transition window_byte == pattern_byte {
+            true -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), true)
+            false -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), false)
+            _ -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), false)
+        }
+    }
+
+    state lane_ne(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        pattern_index: u64,
+        window_byte: u64,
+        pattern_byte: u64
+    ) -> EmittedRegion {
+        transition window_byte != pattern_byte {
+            true -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), true)
+            false -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), false)
+            _ -> lane_or(
+                current_values, previous_values, lane_count, lane_index, hit_count,
+                sat_inc(pattern_index), false)
+        }
+    }
+
+    state lane_mark(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64,
+        matched: bool
+    ) -> EmittedRegion {
+        transition matched && lane_index < 64 {
+            true -> lane_hit_write(current_values, previous_values, lane_count, lane_index, hit_count)
+            false -> lane_miss_write_gate(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> lane_miss_write_gate(current_values, previous_values, lane_count, lane_index, hit_count)
+        }
+    }
+
+    state lane_hit_write(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64 [0..64],
+        hit_count: u64
+    ) -> EmittedRegion {
+        self.lane_results[lane_index] = 1;
+        let next_lane: u64 = sat_inc(lane_index);
+        let next_hits: u64 = sat_inc(hit_count);
+        compare_lane(current_values, previous_values, lane_count, next_lane, next_hits)
+    }
+
+    state lane_miss_write_gate(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_index < 64 {
+            true -> lane_miss_write(current_values, previous_values, lane_count, lane_index, hit_count)
+            _ -> compare_lane(current_values, previous_values, lane_count, sat_inc(lane_index), hit_count)
+        }
+    }
+
+    state lane_miss_write(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64 [0..64],
+        hit_count: u64
+    ) -> EmittedRegion {
+        self.lane_results[lane_index] = 0;
+        compare_lane(
+            current_values,
+            previous_values,
+            lane_count,
+            ((lane_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64,
+            hit_count)
+    }
+
+    // Upstream's encode_results: all-true -> encode_range(N); all-false ->
+    // finalize_with_minimum_size_filtering(N, dtype); mixed or partial ->
+    // per-lane encode_range(1)/finalize_with_minimum_size_filtering(1,
+    // dtype) — the remainder-reload lane walk upstream calls
+    // encode_remainder_results for.
+    state decide(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_count == self.vector_size_in_bytes && hit_count == lane_count {
+            true -> encode_all(current_values, previous_values, lane_count)
+            false -> decide_miss(current_values, previous_values, lane_count, hit_count)
+            _ -> decide_miss(current_values, previous_values, lane_count, hit_count)
+        }
+    }
+
+    state decide_miss(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        hit_count: u64
+    ) -> EmittedRegion {
+        transition lane_count == self.vector_size_in_bytes && hit_count == 0 {
+            true -> encode_none(current_values, previous_values, lane_count)
+            false -> encode_lane(current_values, previous_values, lane_count, 0)
+            _ -> encode_lane(current_values, previous_values, lane_count, 0)
+        }
+    }
+
+    state encode_all(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        self.encoder.encode_range(self.vector_size_in_bytes);
+        self.byte_index = ((self.byte_index as u64 in Saturating)
+            + (lane_count as u64 in Saturating)) as u64;
+        pump(current_values, previous_values)
+    }
+
+    state encode_none(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode_with_minimum_size_filtering(
+                self.vector_size_in_bytes, self.data_type_size_bytes);
+        self.byte_index = ((self.byte_index as u64 in Saturating)
+            + (lane_count as u64 in Saturating)) as u64;
+        emit_or_pump(current_values, previous_values, emitted)
+    }
+
+    state encode_lane(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        transition lane_index < lane_count {
+            true -> encode_lane_read(current_values, previous_values, lane_count, lane_index)
+            false -> group_done(current_values, previous_values, lane_count)
+        }
+    }
+
+    state encode_lane_read(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        transition lane_index < 64 {
+            true -> encode_lane_take(current_values, previous_values, lane_count, lane_index)
+            _ -> encode_lane_miss(current_values, previous_values, lane_count, lane_index)
+        }
+    }
+
+    state encode_lane_take(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64 [0..64]
+    ) -> EmittedRegion {
+        let lane_result: u8 = self.lane_results[lane_index];
+        transition lane_result == 1 {
+            true -> encode_lane_hit(current_values, previous_values, lane_count, lane_index)
+            false -> encode_lane_miss(current_values, previous_values, lane_count, lane_index)
+            _ -> encode_lane_miss(current_values, previous_values, lane_count, lane_index)
+        }
+    }
+
+    state encode_lane_hit(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        self.encoder.encode_range(1);
+        let next_lane: u64 = sat_inc(lane_index);
+        encode_lane(current_values, previous_values, lane_count, next_lane)
+    }
+
+    state encode_lane_miss(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64
+    ) -> EmittedRegion {
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode_with_minimum_size_filtering(
+                1, self.data_type_size_bytes);
+        transition emitted {
+            EmittedRegion::Region { region } -> emit_advance(
+                current_values, previous_values, lane_count, lane_index, region)
+            EmittedRegion::Empty -> encode_lane(
+                current_values, previous_values, lane_count, sat_inc(lane_index))
+            _ -> encode_lane(current_values, previous_values, lane_count, sat_inc(lane_index))
+        }
+    }
+
+    state emit_advance(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64,
+        lane_index: u64,
+        region: SnapshotRegionFilter
+    ) -> EmittedRegion {
+        self.byte_index = ((self.byte_index as u64 in Saturating)
+            + (lane_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        (EmittedRegion::Region { region: region })
+    }
+
+    state group_done(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        lane_count: u64
+    ) -> EmittedRegion {
+        self.byte_index = ((self.byte_index as u64 in Saturating)
+            + (lane_count as u64 in Saturating)) as u64;
+        pump(current_values, previous_values)
+    }
+
+    state emit_or_pump(
+        &mut self,
+        current_values: &[u64],
+        previous_values: &[u64],
+        emitted: EmittedRegion
+    ) -> EmittedRegion {
+        transition emitted {
+            EmittedRegion::Region { region } -> (EmittedRegion::Region { region: region })
+            EmittedRegion::Empty -> pump(current_values, previous_values)
+            _ -> pump(current_values, previous_values)
+        }
+    }
+
+    state finish(&mut self) -> EmittedRegion {
+        transition self.finalized_tail {
+            true -> (EmittedRegion::Empty)
+            false -> tail_finalize()
+            _ -> tail_finalize()
+        }
+    }
+
+    // Upstream's post-loop
+    // `finalize_current_encode_with_minimum_size_filtering(0, dtype)`.
+    state tail_finalize(&mut self) -> EmittedRegion {
+        self.finalized_tail = true;
+        let emitted: EmittedRegion = self
+            .encoder
+            .finalize_current_encode_with_minimum_size_filtering(
+                0, self.data_type_size_bytes);
+        transition emitted {
+            EmittedRegion::Region { region } -> (EmittedRegion::Region { region: region })
+            EmittedRegion::Empty -> (EmittedRegion::Empty)
+            _ -> (EmittedRegion::Empty)
+        }
+    }
+}
+
+// Upstream `get_scanner_name` (`"Vector Overlapping (Bytewise Periodic)"`,
+// 38 bytes) — len/byte pair per the borrowed-string convention.
+pub machine VectorBytewisePeriodicScan::get_scanner_name_len(&self) -> u64
+satisfies Scanner::get_scanner_name_len
+{
+    38
+}
+
+pub machine VectorBytewisePeriodicScan::get_scanner_name_byte(
+    &self,
+    position: u64
+) -> u8
+satisfies Scanner::get_scanner_name_byte
+{
+    transition position < 38 {
+        true -> read(position)
+        _ -> (0)
+    }
+
+    state read(&self, position: u64) -> u8 {
+        transition position < 38 {
+            true -> take(position)
+            _ -> (0)
+        }
+    }
+
+    state take(&self, position: u64 [0..38]) -> u8 {
+        "Vector Overlapping (Bytewise Periodic)"[position]
+    }
+}
+
+// Unit receiver carrying upstream's `ScannerVectorOverlappingBytewisePeriodic::<N>`
+// namespace — the constructor the commented-out dispatch arm would have used.
+pub data ScannerVectorOverlappingBytewisePeriodic {}
+
+pub machine ScannerVectorOverlappingBytewisePeriodic::new(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+    vectorization_size: PlannedScanVectorizationSize
+) -> VectorBytewisePeriodicScan
+crashes Abort
+{
+    VectorBytewisePeriodicScan::new(
+        snapshot_region_filter,
+        snapshot_filter_element_scan_plan,
+        vectorization_size
+    )
+}
+
+// Pattern byte `pattern_index` of the packed operand — the periodic pattern
+// occupies the first `periodicity` bytes (little-endian element view, like
+// the byte-array scan's `byte_array_operand_byte`).
+machine periodic_pattern_byte(
+    operand_value: u64,
+    periodicity: u64,
+    pattern_index: u64
+) -> u8 {
+    transition pattern_index < periodicity && pattern_index < 8 {
+        true -> take(operand_value, pattern_index)
+        _ -> (0)
+    }
+
+    state take(operand_value: u64, pattern_index: u64) -> u8 {
+        transition pattern_index < 8 {
+            true -> read(operand_value, pattern_index)
+            _ -> (0)
+        }
+    }
+
+    state read(operand_value: u64, pattern_index: u64 [0..8]) -> u8 {
+        let divisor: u64 = periodic_pow256(pattern_index);
+        let shifted: u64 =
+            (operand_value as u64 in Wrapping) / (divisor as u64 in Wrapping);
+        (shifted % 256) as u8
+    }
+}
+
+machine periodic_pow256(pattern_index: u64 [0..8]) -> u64 {
+    transition pattern_index {
+        0 -> 1
+        1 -> 256
+        2 -> 65536
+        3 -> 16777216
+        4 -> 4294967296
+        5 -> 1099511627776
+        6 -> 281474976710656
+        7 -> 72057594037927936
+        _ -> 1
+    }
+}
+
+// Saturating single-step for unbounded u64 counters (lane/pattern indexes):
+// the compare/encode loops only ever reach their caller-bounded lane count,
+// but the param types carry no proof — upstream's plain `+1` would trip the
+// exact-arithmetic overflow check.
+machine sat_inc(value: u64) -> u64 {
+    ((value as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+}
