@@ -5,21 +5,26 @@ use src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
 use src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
 use src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use src::structures::scanning::plans::plan_types::planned_scan_type_byte_array::PlannedScanTypeByteArray;
 use src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
+use src::structures::scanning::plans::plan_types::planned_scan_type_vector::PlannedScanTypeVector;
+use src::structures::scanning::plans::plan_types::planned_scan_vectorization_size::PlannedScanVectorizationSize;
+use src::structures::data_types::generics::vectorization_plan::VectorizationPlan;
+use src::structures::data_types::generics::vector_generics::VectorGenerics;
 
 pub data RuleMapScanType {}
 
-// Port of built_in_filter_rules/filter_rule_map_scan_type.rs, scalar leg:
-// picks the planned scanner family for one snapshot region filter.
-// Upstream decides among byte-array, vector, and scalar families; only the
-// scalar family is ported this leg, so every arm that would select a
-// byte-array or vector plan instead lands on upstream's universal fallback
-// — PlannedScanType::Scalar(ScalarIterative), the same arm upstream reaches
-// when `has_supported_vector_scan` is false. The validity gate and the
-// region_size < 16 early-out are ported unchanged; the vector-plan walk
-// still computes the upstream vectorization size (used by the SIMD leg's
-// dispatch when it lands), but the final support check always resolves to
-// the scalar fallback until vector scan functions exist.
+// Port of built_in_filter_rules/filter_rule_map_scan_type.rs: picks the
+// planned scanner family for one snapshot region filter. The byte-array arm
+// selects via upstream's `should_use_byte_array_scan`, and the vector walk
+// is now real: widest valid `plan_vector_scan::<N>` for N = 64 -> 32 -> 16,
+// then the data-type-vs-alignment kind pick, then the supported-scan gate.
+// Named deviation on the gate: upstream's `has_supported_vector_scan` reads
+// the finalized constraint's `get_scan_function_vector::<N>` presence; the
+// element-window model has no distinct vector compare function (vector
+// scanners evaluate the same per-element compare the scalar fn carries),
+// so the port gates on `has_scan_function_scalar` — the same "does the
+// constraint resolve to a compare function" semantic.
 pub machine RuleMapScanType::map_parameters(
     scan_compare_type: ScanCompareType,
     has_current_values: bool,
@@ -52,14 +57,42 @@ pub machine RuleMapScanType::map_parameters(
         plan: &mut SnapshotFilterElementScanPlan
     ) {
         transition is_immediate_equal(scan_compare_type) && !is_floating_point && !prefer_type_scanner {
-            // Upstream selects ByteArray (BooyerMoore | BooyerMooreMasked by
-            // has_mask). Byte-array scanners are a separate leg; the scalar
-            // fallback covers the same elements and produces identical
-            // filters (named deviation).
-            true -> set_scalar(plan)
+            true -> select_byte_array(has_mask, plan)
             false -> small_region(region_size, data_type_size_bytes, memory_alignment_size, periodicity, prefer_type_scanner, plan)
             _ -> small_region(region_size, data_type_size_bytes, memory_alignment_size, periodicity, prefer_type_scanner, plan)
         }
+    }
+
+    // Upstream `should_use_byte_array_scan`: Immediate(Equal) on a
+    // non-float, non-type-preferred constraint picks the byte-array family —
+    // the masked variant when the constraint carries a mask.
+    state select_byte_array(
+        has_mask: bool,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        transition has_mask {
+            true -> set_byte_array_masked(plan)
+            false -> set_byte_array(plan)
+            _ -> set_byte_array(plan)
+        }
+    }
+
+    state set_byte_array(plan: &mut SnapshotFilterElementScanPlan) {
+        plan.set_planned_scan_type(
+            PlannedScanType::ByteArray {
+                scan_type: PlannedScanTypeByteArray::ByteArrayBooyerMoore
+            }
+        );
+        transition { _ -> done() }
+    }
+
+    state set_byte_array_masked(plan: &mut SnapshotFilterElementScanPlan) {
+        plan.set_planned_scan_type(
+            PlannedScanType::ByteArray {
+                scan_type: PlannedScanTypeByteArray::ByteArrayBooyerMooreMasked
+            }
+        );
+        transition { _ -> done() }
     }
 
     state small_region(
@@ -77,12 +110,9 @@ pub machine RuleMapScanType::map_parameters(
         }
     }
 
-    // Upstream picks the widest vector the region can hold and branches on
-    // data_type_size vs alignment and periodicity to choose the vector
-    // kind, then gates on `has_supported_vector_scan`. No vector compare
-    // functions exist in the scalar leg, so every arm upstream reaches
-    // here resolves to the scalar fallback directly (named deviation —
-    // the vector pick walk lands with the SIMD leg).
+    // Upstream `vectorization_size` pick: the widest width whose
+    // `plan_vector_scan::<N>` validates (elements_per_vector > 0 and
+    // element_count >= elements_per_vector), else ScalarIterative.
     state vector_pick(
         region_size: u64,
         data_type_size_bytes: u64,
@@ -91,7 +121,224 @@ pub machine RuleMapScanType::map_parameters(
         prefer_type_scanner: bool,
         plan: &mut SnapshotFilterElementScanPlan
     ) {
-        transition { _ -> set_scalar(plan) }
+        let vectorization_plan_64: VectorizationPlan =
+            VectorGenerics::plan_vector_scan<64>(
+                region_size, data_type_size_bytes, memory_alignment_size);
+        transition vectorization_plan_64.is_valid() {
+            true -> pick_vector_kind(
+                PlannedScanVectorizationSize::Vector64,
+                data_type_size_bytes,
+                memory_alignment_size,
+                periodicity,
+                prefer_type_scanner,
+                plan)
+            false -> try_32(
+                region_size,
+                data_type_size_bytes,
+                memory_alignment_size,
+                periodicity,
+                prefer_type_scanner,
+                plan)
+            _ -> try_32(
+                region_size,
+                data_type_size_bytes,
+                memory_alignment_size,
+                periodicity,
+                prefer_type_scanner,
+                plan)
+        }
+    }
+
+    state try_32(
+        region_size: u64,
+        data_type_size_bytes: u64,
+        memory_alignment_size: u64,
+        periodicity: u64,
+        prefer_type_scanner: bool,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        let vectorization_plan_32: VectorizationPlan =
+            VectorGenerics::plan_vector_scan<32>(
+                region_size, data_type_size_bytes, memory_alignment_size);
+        transition vectorization_plan_32.is_valid() {
+            true -> pick_vector_kind(
+                PlannedScanVectorizationSize::Vector32,
+                data_type_size_bytes,
+                memory_alignment_size,
+                periodicity,
+                prefer_type_scanner,
+                plan)
+            false -> try_16(
+                region_size,
+                data_type_size_bytes,
+                memory_alignment_size,
+                periodicity,
+                prefer_type_scanner,
+                plan)
+            _ -> try_16(
+                region_size,
+                data_type_size_bytes,
+                memory_alignment_size,
+                periodicity,
+                prefer_type_scanner,
+                plan)
+        }
+    }
+
+    state try_16(
+        region_size: u64,
+        data_type_size_bytes: u64,
+        memory_alignment_size: u64,
+        periodicity: u64,
+        prefer_type_scanner: bool,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        let vectorization_plan_16: VectorizationPlan =
+            VectorGenerics::plan_vector_scan<16>(
+                region_size, data_type_size_bytes, memory_alignment_size);
+        transition vectorization_plan_16.is_valid() {
+            true -> pick_vector_kind(
+                PlannedScanVectorizationSize::Vector16,
+                data_type_size_bytes,
+                memory_alignment_size,
+                periodicity,
+                prefer_type_scanner,
+                plan)
+            false -> set_scalar(plan)
+            _ -> set_scalar(plan)
+        }
+    }
+
+    // Upstream's kind branch: data_type_size > alignment resolves
+    // periodicity (1|2|4|8 -> OverlappingBytewiseStaggered, other ->
+    // Overlapping — upstream release builds comment out the dedicated
+    // staggered dispatch but still plan that arm; the staggered fallback
+    // lands in the dispatcher the way upstream routes it); < -> Sparse;
+    // == -> Aligned.
+    state pick_vector_kind(
+        vectorization_size: PlannedScanVectorizationSize,
+        data_type_size_bytes: u64,
+        memory_alignment_size: u64,
+        periodicity: u64,
+        prefer_type_scanner: bool,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        transition data_type_size_bytes > memory_alignment_size {
+            true -> periodicity_pick(
+                vectorization_size,
+                periodicity,
+                plan)
+            false -> sparse_or_aligned(
+                vectorization_size,
+                data_type_size_bytes,
+                memory_alignment_size,
+                prefer_type_scanner,
+                plan)
+            _ -> sparse_or_aligned(
+                vectorization_size,
+                data_type_size_bytes,
+                memory_alignment_size,
+                prefer_type_scanner,
+                plan)
+        }
+    }
+
+    // Upstream `match periodicity { 1 => (release comment: staggered lands
+    // the overlapping scanner), 2|4|8 => OverlappingBytewiseStaggered,
+    // _ => Overlapping }` — the arm arms are kept as upstream wrote them;
+    // the dispatch side maps the staggered plan kinds to its overlapping
+    // scanner exactly like upstream's commented-out dispatch arms.
+    state periodicity_pick(
+        vectorization_size: PlannedScanVectorizationSize,
+        periodicity: u64,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        transition periodicity {
+            1 -> set_vector(
+                PlannedScanTypeVector::OverlappingBytewiseStaggered,
+                vectorization_size,
+                plan)
+            2 -> set_vector(
+                PlannedScanTypeVector::OverlappingBytewiseStaggered,
+                vectorization_size,
+                plan)
+            4 -> set_vector(
+                PlannedScanTypeVector::OverlappingBytewiseStaggered,
+                vectorization_size,
+                plan)
+            8 -> set_vector(
+                PlannedScanTypeVector::OverlappingBytewiseStaggered,
+                vectorization_size,
+                plan)
+            _ -> set_vector(
+                PlannedScanTypeVector::Overlapping,
+                vectorization_size,
+                plan)
+        }
+    }
+
+    state sparse_or_aligned(
+        vectorization_size: PlannedScanVectorizationSize,
+        data_type_size_bytes: u64,
+        memory_alignment_size: u64,
+        prefer_type_scanner: bool,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        transition data_type_size_bytes < memory_alignment_size {
+            true -> sparse_gate(
+                vectorization_size,
+                prefer_type_scanner,
+                plan)
+            false -> set_vector(
+                PlannedScanTypeVector::Aligned,
+                vectorization_size,
+                plan)
+            _ -> set_vector(
+                PlannedScanTypeVector::Aligned,
+                vectorization_size,
+                plan)
+        }
+    }
+
+    // Upstream: PreferTypeScanner && data_type_size < alignment forces the
+    // scalar iterative scanner even when the sparse vector plan would hold.
+    state sparse_gate(
+        vectorization_size: PlannedScanVectorizationSize,
+        prefer_type_scanner: bool,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        transition prefer_type_scanner {
+            true -> set_scalar(plan)
+            false -> set_vector(
+                PlannedScanTypeVector::Sparse,
+                vectorization_size,
+                plan)
+            _ -> set_vector(
+                PlannedScanTypeVector::Sparse,
+                vectorization_size,
+                plan)
+        }
+    }
+
+    // Writes the Vector plan, then applies upstream's
+    // `has_supported_vector_scan` fallback: no compare function on the
+    // constraint rescinds the pick to ScalarIterative.
+    state set_vector(
+        scan_type: PlannedScanTypeVector,
+        vectorization_size: PlannedScanVectorizationSize,
+        plan: &mut SnapshotFilterElementScanPlan
+    ) {
+        plan.set_planned_scan_type(
+            PlannedScanType::Vector {
+                scan_type: scan_type,
+                vectorization_size: vectorization_size
+            }
+        );
+        transition plan.has_scan_function_scalar() {
+            true -> done()
+            false -> set_scalar(plan)
+            _ -> done()
+        }
     }
 
     state set_invalid(plan: &mut SnapshotFilterElementScanPlan) {

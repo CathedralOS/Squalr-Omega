@@ -3,6 +3,16 @@ module src::command_executors::element_scanner;
 use squalr_engine_api::src::structures::scan_results::scan_results_metadata::ScanResultsMetadata;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::memory_read_mode::MemoryReadMode;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::ScanResultAddresses;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
 use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter_collection::SnapshotRegionFilterCollection;
 use squalr_engine_api::src::structures::results::snapshot_region_scan_results::SnapshotRegionScanResults;
@@ -19,13 +29,106 @@ use src::command_executors::element_scan_dispatcher::ElementScanChainDispatcher;
 // Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
 pub data ElementScannerDriver {}
 
+// Scalar outcome of a supplied-window fixture scan — the exact counts and
+// addresses a test asserts on, carried as plain scalars so the record binds
+// in a caller frame.
+pub data SuppliedScanOutcome {
+    region_count: u64;
+    total_results: u64;
+    collected_bytes: u64;
+    emitted_count: u64;
+    emitted_first: u64;
+    emitted_second: u64;
+    emitted_third: u64;
+}
+
+// Supplied-window scan fixture (test adapter): builds the region and the
+// finalized plan inside the frame — owned plan/snapshot construction cannot
+// mint in a ProgramEntry machine — then runs the real `scan_snapshot` leg.
+// `element_count` up to 5 mirrors `SnapshotRegion::of_elements`'s window.
+pub machine ElementScannerDriver::run_supplied_fixture(
+    base_address: u64,
+    element_count: u64,
+    e0: u64,
+    e1: u64,
+    e2: u64,
+    e3: u64,
+    e4: u64,
+    operand_value: u64,
+    memory_alignment: MemoryAlignment
+) -> SuppliedScanOutcome
+crashes Abort
+{
+    let u8_ref: DataTypeRef = DataTypeRef::new("u8");
+    let region: SnapshotRegion = SnapshotRegion::of_elements(
+        base_address, element_count, e0, e1, e2, e3, e4);
+    let mut snapshot: Snapshot = Snapshot::new();
+    _ = snapshot.push_region(region);
+    let compare_type: ScanCompareType = ScanCompareType::Immediate {
+        compare_type: ScanCompareTypeImmediate::Equal
+    };
+    let operand_size_in_bytes: u64 = 1;
+    let unit_size_in_bytes: u64 = 1;
+    let periodicity: u64 = ScanConstraintFinalized::calculate_periodicity(
+        compare_type,
+        operand_value,
+        operand_size_in_bytes,
+        unit_size_in_bytes);
+    let is_floating_point: bool = u8_ref.is_floating_point();
+    let prefer_type_scanner: bool = u8_ref.prefers_type_scanner();
+    let container_type: ContainerType = u8_ref.get_result_container_type();
+    let read_mode: MemoryReadMode = MemoryReadMode::Skip;
+    let mut element_scan_plan: ElementScanPlan = ElementScanPlan::new(
+        memory_alignment,
+        read_mode,
+        true);
+    let scan_function: ScanFunctionScalar = ScanFunctionScalar::Immediate;
+    let planned_scan_type: PlannedScanType = PlannedScanType::Scalar {
+        scan_type: PlannedScanTypeScalar::ScalarIterative
+    };
+    _ = element_scan_plan.insert_profiled(
+        &u8_ref,
+        compare_type,
+        operand_value,
+        unit_size_in_bytes,
+        true,
+        scan_function,
+        memory_alignment,
+        periodicity,
+        is_floating_point,
+        prefer_type_scanner,
+        false,
+        container_type,
+        planned_scan_type);
+    let mut scan_control: ScanControl = ScanControl::new(false);
+    let metadata: ScanResultsMetadata = ElementScannerDriver::scan_snapshot(
+        &mut snapshot, &mut element_scan_plan, &mut scan_control);
+    let out: ScanResultAddresses = snapshot.collect_scan_result_addresses_for_data_type(&u8_ref);
+    let region_count: u64 = snapshot.get_region_count();
+    let total_results: u64 = metadata.get_result_count();
+    let collected_bytes: u64 = metadata.get_total_size_in_bytes();
+    let emitted_count: u64 = out.get_address_count();
+    let emitted_first: u64 = out.get(0);
+    let emitted_second: u64 = out.get(1);
+    let emitted_third: u64 = out.get(2);
+    SuppliedScanOutcome {
+        region_count: region_count,
+        total_results: total_results,
+        collected_bytes: collected_bytes,
+        emitted_count: emitted_count,
+        emitted_first: emitted_first,
+        emitted_second: emitted_second,
+        emitted_third: emitted_third
+    }
+}
+
 // Upstream `scan_snapshot(snapshot, symbol_registry, plan, scan_control,
 // with_logging, refresh)`: the owned-model port carries `scan_control` by
 // `&mut` since cancellation and the reported progress write onto the
 // control object (upstream reads a shared atomic + invokes a closure).
 pub machine ElementScannerDriver::scan_snapshot(
     snapshot: &mut Snapshot,
-    element_scan_plan: &ElementScanPlan,
+    element_scan_plan: &mut ElementScanPlan,
     scan_control: &mut ScanControl
 ) -> ScanResultsMetadata
 crashes Abort
