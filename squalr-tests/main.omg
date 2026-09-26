@@ -70,6 +70,29 @@ use squalr_engine_targets::src::target_providers::AddressWritable;
 use squalr_engine_targets::src::target_providers::OpenedProcessResult;
 use squalr_engine_targets::src::target_providers::ProcessAliveResult;
 use squalr_engine_targets::src::target_providers::ProcessQueryOutcome;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::memory::normalized_region::NormalizedRegion;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node::PointerScanNode;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node_type::PointerScanNodeType;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::ExpandedNodePage;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::MaterializedNodeLookup;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::MaterializedPageKeyEntry;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanModuleName;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use squalr_engine_scanning::src::pointer_scans::pointer_scan_executor_task::PointerScanExecutor;
+use squalr_engine_scanning::src::pointer_scans::pointer_scan_results_builder::BuiltLevelSpan;
+use squalr_engine_scanning::src::pointer_scans::structures::pointer_scan_collected_candidate::PointerScanCollectedCandidate;
+use squalr_engine_scanning::src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+use squalr_engine_scanning::src::pointer_scans::structures::pointer_scan_target_ranges::PointerScanTargetRangeBucket;
+use squalr_engine_scanning::src::pointer_scans::structures::snapshot_region_scan_task::SnapshotRegionScanTask;
+use squalr_engine_scanning::src::pointer_scans::structures::snapshot_region_scan_task_kind::SnapshotRegionScanTaskKind;
 
 // squalr-tests native probe for TARGETS-AND-THROUGHPUT. Default run keeps the
 // upstream geometry + command legs verbatim. When /tmp/squalr-native-probe.control
@@ -1669,6 +1692,7 @@ crashes Abort
     region_count == 0 && scanned_bytes == 0 && processed == 1 && total_results == 0 && emitted == 0
 }
 
+
 // Decimal emission: digits land LSD-first then reverse (same shape as
 // ProcName); the line "ticks=<n>" goes to the console for the driver.
 machine Main::emit_u64(&mut self, value: u64)
@@ -1792,4 +1816,334 @@ machine hex_value(byte: u8) -> u64 {
     state invalid(byte: u8) -> u64 {
         16
     }
+}
+
+
+// Pointer-scan materialization witness — port of upstream's
+// execute_scan_builds_pointer_chains_and_classifies_static_nodes test:
+// a pointer-scan run produces collected candidate addresses through the
+// dispatcher -> collector -> results path, materializing chain nodes owned
+// by the results partition. Upstream builds three 0x40-byte regions at
+// 0x1000/0x2000/0x3000; the port bounds snapshots at one region, so the
+// fixture collapses to a single 0x1000..0x2040 region covering every read
+// site (gap bytes read as zero and produce no candidates — 0 is neither in
+// module range nor in any target range).
+machine FixtureKit::absent_node() -> PointerScanNode {
+    let empty: [u8; 1] = [0];
+    (PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty, 0, false))
+}
+
+machine FixtureKit::node_at<'e, 'sh, 's, 'h>(results: &PointerScanResults<'e, 'sh, 's, 'h>, node_id: u64) -> PointerScanNode {
+    let lookup: MaterializedNodeLookup = results.find_materialized_node(node_id);
+    transition lookup {
+        MaterializedNodeLookup::Found { index } -> (results.copy_materialized_node(index))
+        _ -> (FixtureKit::absent_node())
+    }
+}
+
+machine FixtureKit::node_is_static(node: &PointerScanNode) -> bool {
+    transition node.get_pointer_scan_node_type() {
+        PointerScanNodeType::Static -> (true)
+        _ -> (false)
+    }
+}
+
+// Upstream's `.find(|n| n.get_pointer_address() == want)` over an expanded
+// page — order-independent node lookup by pointer address.
+machine FixtureKit::page_node_by_address<'e, 'sh, 's, 'h>(results: &PointerScanResults<'e, 'sh, 's, 'h>, ids: &[u64], want_address: u64) -> PointerScanNode {
+    transition { _ -> walk(results, ids, want_address, 0) }
+    state walk(results: &PointerScanResults<'e, 'sh, 's, 'h>, ids: &[u64], want_address: u64, position: u64) -> PointerScanNode {
+        transition position < ids.len {
+            true -> probe(results, ids, want_address, position)
+            false -> absent()
+        }
+    }
+    state probe(results: &PointerScanResults<'e, 'sh, 's, 'h>, ids: &[u64], want_address: u64, position: u64 [0..ids.len]) -> PointerScanNode {
+        let node: PointerScanNode = FixtureKit::node_at(results, ids[position]);
+        transition node.get_pointer_address() == want_address {
+            true -> (node)
+            false -> next(results, ids, want_address, position)
+        }
+    }
+    state next(results: &PointerScanResults<'e, 'sh, 's, 'h>, ids: &[u64], want_address: u64, position: u64) -> PointerScanNode {
+        let advanced: u64 = ((position as u64 in Wrapping) + 1) as u64;
+        transition { _ -> walk(results, ids, want_address, advanced) }
+    }
+    state absent() -> PointerScanNode {
+        (FixtureKit::absent_node())
+    }
+}
+
+pub machine FixtureKit::verify_pointer_scan_chains() -> bool
+crashes Abort
+{
+        let mut window: ElementWindow = ElementWindow::of_length(520);
+        window.set_element(2, 8176);
+        window.set_element(6, 12320);
+        window.set_element(256, 12288);
+        let mut region: SnapshotRegion = SnapshotRegion::from_elements(4096, window);
+        region.set_region_size(4160);
+        let regions: [SnapshotRegion; 1] = [region];
+        let mut snapshot: Snapshot = Snapshot::new();
+        snapshot.set_snapshot_regions(&regions, 1);
+        let module_name: [u8; 8] = [103, 97, 109, 101, 46, 101, 120, 101];
+        let modules: [NormalizedModule; 1] = [
+            NormalizedModule::new(&module_name, 4096, 256)
+        ];
+        let mut target_addresses: [u64; 1] = [12304];
+        let params: PointerScanParameters = PointerScanParameters::new(
+            PointerScanPointerSize::Pointer64,
+            32,
+            3,
+            true,
+            false
+        );
+        let target_descriptor: PointerScanTargetDescriptor = PointerScanTargetDescriptor::address(12304);
+        let mut sorted_scratch: [u64; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut target_ranges: [NormalizedRegion; 4] = [
+            NormalizedRegion::new(0, 0),
+            NormalizedRegion::new(0, 0),
+            NormalizedRegion::new(0, 0),
+            NormalizedRegion::new(0, 0)
+        ];
+        let mut lower_bounds: [u64; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut upper_bounds: [u64; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut target_range_buckets: [PointerScanTargetRangeBucket; 4] = [
+            PointerScanTargetRangeBucket::new(0, 0, 0),
+            PointerScanTargetRangeBucket::new(0, 0, 0),
+            PointerScanTargetRangeBucket::new(0, 0, 0),
+            PointerScanTargetRangeBucket::new(0, 0, 0)
+        ];
+        let mut tasks_scratch: [SnapshotRegionScanTask; 8] = [
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap },
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap },
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap },
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap },
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap },
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap },
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap },
+            SnapshotRegionScanTask { scan_base_address: 0, scan_end_address: 0, arena_start_offset: 0, arena_end_offset: 0, task_kind: SnapshotRegionScanTaskKind::Heap }
+        ];
+        let mut byte_arena: [u8; 4160];
+        let mut module_order: [u64; 4] = [0, 0, 0, 0];
+        let mut static_collected: [PointerScanCollectedCandidate; 16] = [
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 }
+        ];
+        let mut heap_collected: [PointerScanCollectedCandidate; 16] = [
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 },
+            PointerScanCollectedCandidate { pointer_address: 0, pointer_value: 0, module_index: 0, module_offset: 0 }
+        ];
+        let mut level_out: PointerScanCollectedLevel = PointerScanCollectedLevel::new(
+            &mut static_collected,
+            &mut heap_collected
+        );
+        let mut heap_addr_scratch: [u64; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut module_names: [PointerScanModuleName; 4] = [
+            PointerScanModuleName::new(&module_name),
+            PointerScanModuleName::new(&module_name),
+            PointerScanModuleName::new(&module_name),
+            PointerScanModuleName::new(&module_name)
+        ];
+        let mut levels_out: [PointerScanLevel; 4] = [
+            PointerScanLevel::new(0, 0, 0, 0),
+            PointerScanLevel::new(0, 0, 0, 0),
+            PointerScanLevel::new(0, 0, 0, 0),
+            PointerScanLevel::new(0, 0, 0, 0)
+        ];
+        let mut level_spans: [BuiltLevelSpan; 4] = [
+            BuiltLevelSpan { static_offset: 0, static_count: 0, heap_offset: 0, heap_count: 0 },
+            BuiltLevelSpan { static_offset: 0, static_count: 0, heap_offset: 0, heap_count: 0 },
+            BuiltLevelSpan { static_offset: 0, static_count: 0, heap_offset: 0, heap_count: 0 },
+            BuiltLevelSpan { static_offset: 0, static_count: 0, heap_offset: 0, heap_count: 0 }
+        ];
+        let mut static_arena: [PointerScanCandidate; 16] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        let mut heap_arena: [PointerScanCandidate; 16] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0),
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        // Placeholder candidates borrow dedicated empty views: the builder
+        // overwrites every element during the run, and borrowing the real
+        // arenas here would keep a shared borrow live across the &mut
+        // arena arguments to execute_scan.
+        let empty_static_view: [PointerScanCandidate; 1] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        let empty_heap_view: [PointerScanCandidate; 1] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        let mut level_candidates: [PointerScanLevelCandidates; 4] = [
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0)
+        ];
+        let empty_name: [u8; 1] = [0];
+        let mut materialized_nodes: [PointerScanNode; 16] = [
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false),
+            PointerScanNode::new_materialized(0, 0, 0, 0, 0, false, 0, PointerScanNodeType::Heap, 0, 0, 0, 0, &empty_name, 0, false)
+        ];
+        let mut node_id_slab: [u64; 32] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut page_key_cache: [MaterializedPageKeyEntry; 8] = [
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 },
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 },
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 },
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 },
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 },
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 },
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 },
+            MaterializedPageKeyEntry { has_parent_node_id: false, parent_node_id: 0, page_index: 0, page_size: 0, ids_start: 0, ids_len: 0 }
+        ];
+        let snaps: [&Snapshot; 1] = [&snapshot];
+        let executor: PointerScanExecutor = PointerScanExecutor {};
+        let mut results: PointerScanResults = executor.execute_scan(
+            &snaps,
+            41,
+            &params,
+            target_descriptor,
+            &mut target_addresses,
+            1,
+            PointerScanAddressSpace::EmulatorMemory,
+            &modules,
+            false,
+            &mut sorted_scratch,
+            &mut target_ranges,
+            &mut lower_bounds,
+            &mut upper_bounds,
+            &mut target_range_buckets,
+            &mut tasks_scratch,
+            &mut byte_arena,
+            &mut module_order,
+            &mut level_out,
+            &mut heap_addr_scratch,
+            &mut module_names,
+            &mut levels_out,
+            &mut level_spans,
+            &mut level_candidates,
+            &mut static_arena,
+            &mut heap_arena,
+            &mut materialized_nodes,
+            &mut node_id_slab,
+            &mut page_key_cache
+        );
+        let level0: PointerScanLevel = results.get_pointer_scan_level_copy(0);
+        let level1: PointerScanLevel = results.get_pointer_scan_level_copy(1);
+        let mut root_ids: [u64; 4] = [0, 0, 0, 0];
+        let root_page: ExpandedNodePage = results.get_expanded_node_page(
+            false,
+            0,
+            0,
+            4,
+            &mut root_ids
+        );
+        let chain_root: PointerScanNode = FixtureKit::page_node_by_address(&results, &root_ids, 4112);
+        let chain_root_id: u64 = chain_root.get_node_id();
+        let chain_root_static: bool = FixtureKit::node_is_static(&chain_root);
+        // Deviation: upstream asserts module_name == "game.exe"; here name
+        // identity is carried by len==8 plus module_offset/module_index.
+        // A byte-equality walk machine blew the check budget on this graph.
+        let chain_name: &[u8] = chain_root.get_module_name();
+        let chain_name_len: u64 = chain_name.len;
+        let direct_root: PointerScanNode = FixtureKit::page_node_by_address(&results, &root_ids, 4144);
+        let direct_root_static: bool = FixtureKit::node_is_static(&direct_root);
+        let direct_name: &[u8] = direct_root.get_module_name();
+        let direct_name_len: u64 = direct_name.len;
+        let mut child_ids: [u64; 4] = [0, 0, 0, 0];
+        let child_page: ExpandedNodePage = results.get_expanded_node_page(
+            true,
+            chain_root_id,
+            0,
+            4,
+            &mut child_ids
+        );
+        let child: PointerScanNode = FixtureKit::page_node_by_address(&results, &child_ids, 4112);
+        let child_id: u64 = child.get_node_id();
+        let child_static: bool = FixtureKit::node_is_static(&child);
+        let child_name: &[u8] = child.get_module_name();
+        let child_name_len: u64 = child_name.len;
+        let mut grandchild_ids: [u64; 4] = [0, 0, 0, 0];
+        let grandchild_page: ExpandedNodePage = results.get_expanded_node_page(
+            true,
+            child_id,
+            0,
+            4,
+            &mut grandchild_ids
+        );
+        let grandchild: PointerScanNode = FixtureKit::page_node_by_address(&results, &grandchild_ids, 8192);
+        let grandchild_static: bool = FixtureKit::node_is_static(&grandchild);
+
+        results.get_session_id() == 41 && results.get_root_node_count() == 2 && results.get_total_node_count() == 3 && results.get_total_static_node_count() == 2 && results.get_total_heap_node_count() == 1 && results.get_pointer_scan_level_count() == 2 && level0.get_depth() == 1 && level0.get_node_count() == 2 && level0.get_static_node_count() == 1 && level0.get_heap_node_count() == 1 && level1.get_depth() == 2 && level1.get_node_count() == 1 && level1.get_static_node_count() == 1 && level1.get_heap_node_count() == 0 && root_page.node_count == 2 && chain_root.get_pointer_address() == 4112 && chain_root.get_depth() == 1 && chain_root_static && chain_name_len == 8 && chain_root.get_module_offset() == 16 && chain_root.get_resolved_target_address() == 8176 && chain_root.get_pointer_offset() == 0 && chain_root.has_children() && child_page.node_count == 1 && child.get_pointer_address() == 4112 && child_static && child.get_depth() == 2 && child.get_resolved_target_address() == 8192 && child_name_len == 8 && child.get_pointer_offset() == 16 && child.has_children() && grandchild_page.node_count == 1 && grandchild.get_pointer_address() == 8192 && !grandchild_static && grandchild.get_depth() == 3 && grandchild.get_resolved_target_address() == 12304 && grandchild.get_pointer_offset() == 16 && !grandchild.has_children() && direct_root.get_pointer_address() == 4144 && direct_root_static && direct_root.get_depth() == 1 && direct_name_len == 8 && direct_root.get_module_offset() == 48 && direct_root.get_resolved_target_address() == 12304 && direct_root.get_pointer_offset() == -16 && !direct_root.has_children()
 }
