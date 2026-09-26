@@ -1,0 +1,231 @@
+module src::tasks::snapshot_scan_result_freeze_task;
+
+use squalr_engine_api::src::registries::freeze_list::freeze_list_registry::FreezeListRegistry;
+use squalr_engine_api::src::registries::freeze_list::freeze_list_registry::FrozenPointerEntry;
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use src::engine_privileged_state::EnginePrivilegedState;
+use src::os::supplied_memory_source::SuppliedMemorySource;
+
+// Port of tasks/snapshot_scan_result_freeze_task.rs: the periodic task that
+// rewrites every frozen address to its frozen value at the results-read
+// interval. Upstream `start_task` spawns a thread looping `freeze_values`
+// with a `ScanSettingsStore::get_results_read_interval_ms()` sleep and a
+// cancellation token — the port has no thread/task surface, so the loop
+// cadence is host-driven; `freeze_values` is one upstream iteration, 1:1.
+//
+// Upstream `pointer.resolve_final_address(module_resolver, pointer_read)`
+// walks the pointer's offset chain via memory reads. The freeze pipeline
+// only ever registers empty-offset pointers (module_offset + module_name),
+// so resolution reduces to `resolve_module(name) + offset` — the offset
+// walk is a documented no-op until symbolic-offset freezing lands.
+pub data SnapshotScanResultFreezeTask {}
+
+// Upstream `freeze_values`: with an opened process, walk each registered
+// entry, resolve its address against the current module list, and write the
+// frozen bytes back. Returns the number of entries written (upstream
+// returns `()` — the count is the port's verification surface).
+pub machine SnapshotScanResultFreezeTask::freeze_values(
+    engine_privileged_state: &mut EnginePrivilegedState
+) -> u64
+crashes Abort
+{
+    let has_process: bool = engine_privileged_state.has_opened_process();
+    transition has_process {
+        true -> load(engine_privileged_state)
+        false -> (0)
+        _ -> (0)
+    }
+
+    state load(
+        engine_privileged_state: &mut EnginePrivilegedState
+    ) -> u64 {
+        let empty_module_name: [u8; 1] = [0];
+        let mut supplied_modules: [NormalizedModule; 8] = [
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0)
+        ];
+        let module_count: u64 = engine_privileged_state.copy_supplied_modules(&mut supplied_modules);
+        let registry: &FreezeListRegistry = engine_privileged_state.get_freeze_list_registry();
+        let frozen_count: u64 = registry.get_frozen_count();
+        transition { _ -> each(engine_privileged_state, &supplied_modules, module_count, frozen_count, 0, 0) }
+    }
+    state each(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        frozen_count: u64,
+        position: u64,
+        written: u64
+    ) -> u64 {
+        transition position < frozen_count {
+            true -> entry(engine_privileged_state, supplied_modules, module_count, frozen_count, position, written)
+            false -> (written)
+            _ -> (written)
+        }
+    }
+    state entry(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        frozen_count: u64,
+        position: u64,
+        written: u64
+    ) -> u64 {
+        let registry: &FreezeListRegistry = engine_privileged_state.get_freeze_list_registry();
+        let mut frozen_entry: FrozenPointerEntry = FrozenPointerEntry::empty();
+        let copied: bool = registry.copy_entry(position, &mut frozen_entry);
+        transition copied {
+            true -> gate_name_len(engine_privileged_state, supplied_modules, module_count, frozen_count, position, written, &frozen_entry)
+            false -> each(engine_privileged_state, supplied_modules, module_count, frozen_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, written)
+            _ -> each(engine_privileged_state, supplied_modules, module_count, frozen_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, written)
+        }
+    }
+    // Registry-capped invariant (`store_name` writes min(name.len, 256)) —
+    // the bound guard proves the subslice; an out-of-range len takes the
+    // upstream module-not-found arm (skip the write, keep iterating).
+    state gate_name_len(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        frozen_count: u64,
+        position: u64,
+        written: u64,
+        frozen_entry: &FrozenPointerEntry
+    ) -> u64 {
+        transition frozen_entry.module_name_len <= 256 {
+            true -> resolve(engine_privileged_state, supplied_modules, module_count, frozen_count, position, written, frozen_entry, frozen_entry.module_name_len)
+            false -> each(engine_privileged_state, supplied_modules, module_count, frozen_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, written)
+            _ -> each(engine_privileged_state, supplied_modules, module_count, frozen_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, written)
+        }
+    }
+    state resolve(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        frozen_count: u64,
+        position: u64,
+        written: u64,
+        frozen_entry: &FrozenPointerEntry,
+        name_len: u64 [0..=256]
+    ) -> u64 {
+        // Upstream `resolve_module_address` — module base for the name, or 0
+        // (absolute address) when no module matches.
+        let module_name: &[u8] = frozen_entry.module_name[0..name_len];
+        let module_base: u64 = resolve_module_base(supplied_modules, module_count, module_name);
+        let resolved_address: u64 = ((module_base as u64 in Saturating) + (frozen_entry.module_offset as u64 in Saturating)) as u64;
+        transition { _ -> write(
+            engine_privileged_state,
+            supplied_modules,
+            module_count,
+            frozen_count,
+            position,
+            written,
+            resolved_address,
+            frozen_entry.value,
+            frozen_entry.value_byte_len) }
+    }
+    state write(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        frozen_count: u64,
+        position: u64,
+        written: u64,
+        resolved_address: u64,
+        value: u64,
+        value_byte_len: u64
+    ) -> u64 {
+        // Upstream `memory_write.write_bytes` — best-effort; the result is
+        // discarded (`let _success =`).
+        let source: &mut SuppliedMemorySource = engine_privileged_state.borrow_supplied_memory_source_mut();
+        let wrote: bool = source.try_write_window(resolved_address, value_byte_len, value);
+        transition wrote {
+            true -> each(
+                engine_privileged_state,
+                supplied_modules,
+                module_count,
+                frozen_count,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+                ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> each(
+                engine_privileged_state,
+                supplied_modules,
+                module_count,
+                frozen_count,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+                written)
+            _ -> each(
+                engine_privileged_state,
+                supplied_modules,
+                module_count,
+                frozen_count,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+                written)
+        }
+    }
+}
+
+// Upstream `memory_query.resolve_module_address(modules, name, offset)`'s
+// base lookup — first module whose name matches exactly (byte compare, same
+// as upstream's `module.get_module_name() == identifier`); an empty or
+// unmatched name yields base 0.
+machine resolve_module_base(
+    supplied_modules: &[NormalizedModule; 8],
+    module_count: u64,
+    module_name: &[u8]
+) -> u64 {
+    transition { _ -> each(supplied_modules, module_count, module_name, 0) }
+    state each(
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_name: &[u8],
+        position: u64
+    ) -> u64 {
+        transition position < module_count && position < 8 {
+            true -> probe(supplied_modules, module_count, module_name, position)
+            false -> (0)
+        }
+    }
+    state probe(
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_name: &[u8],
+        position: u64 [0..8]
+    ) -> u64 {
+        let candidate_name: &[u8] = supplied_modules[position].get_module_name();
+        let matched: bool = name_equals(candidate_name, module_name);
+        transition matched {
+            true -> (supplied_modules[position].get_base_address())
+            false -> each(supplied_modules, module_count, module_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> each(supplied_modules, module_count, module_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine name_equals(candidate_name: &[u8], module_name: &[u8]) -> bool {
+    let len_matches: bool = candidate_name.len == module_name.len;
+    transition len_matches {
+        true -> each(candidate_name, module_name, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state each(candidate_name: &[u8], module_name: &[u8], position: u64) -> bool {
+        transition position < candidate_name.len {
+            true -> compare(candidate_name, module_name, position)
+            false -> (true)
+        }
+    }
+    state compare(candidate_name: &[u8], module_name: &[u8], position: u64) -> bool {
+        transition position < module_name.len && candidate_name[position] == module_name[position] {
+            true -> each(candidate_name, module_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}

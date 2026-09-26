@@ -280,6 +280,51 @@ machine SuppliedMemorySource::covers_readable(&self, cursor: u64, limit: u64, it
     }
 }
 
+// Upstream `write_bytes(process_info, address, bytes) -> bool` surface:
+// `succeeded` iff the whole byte span is covered by mapped supplied
+// regions — the adapter's `is_readable` flag is the mapped-ness proxy for
+// writes too (fault injection marks the whole page, same as
+// process_vm_writev failing on any unmapped page in the range). The write
+// is one element-granular u64 store at the slot `address` maps to —
+// byte-precise merges below element stride are outside the element-window
+// storage model (named deviation, same bound as the read path).
+pub machine SuppliedMemorySource::try_write_window(
+    &mut self,
+    address: u64,
+    byte_len: u64,
+    value: u64
+) -> bool {
+    let limit: u64 = ((address as u64 in Saturating) + (byte_len as u64 in Saturating)) as u64;
+    let covered: bool = self.covers_readable(address, limit, 0);
+    transition covered {
+        true -> write(address, value, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state write(&mut self, address: u64, value: u64, position: u64) -> bool {
+        transition position < self.region_count && position < 4 {
+            true -> inside(address, value, position)
+            false -> (false)
+        }
+    }
+    state inside(&mut self, address: u64, value: u64, position: u64 [0..4]) -> bool {
+        let base: u64 = self.regions[position].get_base_address();
+        let size: u64 = self.regions[position].get_region_size();
+        let stride: u64 = self.regions[position].element_stride_bytes;
+        let limit: u64 = ((base as u64 in Saturating) + (size as u64 in Saturating)) as u64;
+        transition address >= base && address < limit && stride > 0 && self.regions[position].is_readable {
+            true -> store(address, value, position, base, stride)
+            false -> write(address, value, position + 1)
+        }
+    }
+    state store(&mut self, address: u64, value: u64, position: u64 [0..4], base: u64, stride: u64) -> bool {
+        let element_index: u64 = (((address as u64 in Saturating) - (base as u64 in Saturating))
+            / (stride as u64 in Saturating)) as u64;
+        self.regions[position].elements.set_element(element_index, value);
+        true
+    }
+}
+
 // Best-effort live read for `scan-results list` display — the value at the
 // element offset under `address`, or 0 when the address misses every
 // supplied region (upstream logs the read failure and shows the default).
