@@ -1,0 +1,286 @@
+module src::structures::structs::valued_struct_field;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::data_value::DataValue;
+use src::structures::structs::valued_struct::ValuedStructPool;
+
+// Port of structures/structs/valued_struct_field.rs: an editable display
+// field — a name, a payload, and a read-only flag.
+//
+// Upstream `ValuedStructFieldData::NestedStruct(Box<ValuedStruct>)` is heap
+// indirection. The byte domain has no heap-resident inline recursion, so the
+// NestedStruct case carries `nested_struct_index` — an index into the
+// bounded flat `ValuedStructPool` owned by the top-level ValuedStruct the
+// field belongs to (see valued_struct.omg). This preserves the tree shape
+// with arbitrary depth up to the pool bound — a named deviation mirroring
+// PointerScanNode::child_node_ids. A field created before its nested struct
+// is pushed into the pool keeps index 0; every recursive walk takes the pool
+// explicitly.
+pub data ValuedStructFieldData {
+    case Value(value: DataValue);
+    case NestedStruct(nested_struct_index: u64);
+}
+
+pub machine ValuedStructFieldData::default() -> ValuedStructFieldData {
+    ValuedStructFieldData::Value { value: DataValue::default() }
+}
+
+pub data ValuedStructField {
+    name: [u8; 256];
+    name_len: u64;
+    field_data: ValuedStructFieldData;
+    is_read_only: bool;
+}
+
+// Upstream `ValuedStructField::new` — stores the name up to the 256-byte
+// bound (named deviation: longer names truncate, matching the package's
+// bounded-name convention).
+pub machine ValuedStructField::new(
+    name: &[u8],
+    field_data: &ValuedStructFieldData,
+    is_read_only: bool
+) -> ValuedStructField {
+    let mut field: ValuedStructField = ValuedStructField {
+        name_len: 0,
+        field_data: ValuedStructFieldData::clone(field_data),
+        is_read_only: is_read_only
+    };
+    field.fill_name(name);
+    field
+}
+
+pub machine ValuedStructField::default() -> ValuedStructField {
+    ValuedStructField {
+        name_len: 0,
+        field_data: ValuedStructFieldData::default(),
+        is_read_only: false
+    }
+}
+
+pub machine ValuedStructFieldData::clone(source: &ValuedStructFieldData) -> ValuedStructFieldData {
+    transition source {
+        ValuedStructFieldData::Value { value } -> (ValuedStructFieldData::Value {
+            value: DataValue::clone(&value)
+        })
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> (ValuedStructFieldData::NestedStruct {
+            nested_struct_index: nested_struct_index
+        })
+        _ -> (ValuedStructFieldData::NestedStruct { nested_struct_index: 0 })
+    }
+}
+
+pub machine ValuedStructField::clone(source: &ValuedStructField) -> ValuedStructField {
+    let mut field: ValuedStructField = ValuedStructField {
+        name_len: 0,
+        field_data: ValuedStructFieldData::clone(&source.field_data),
+        is_read_only: source.is_read_only
+    };
+    field.fill_name_window(source, 0, source.name_len);
+    field
+}
+
+machine ValuedStructField::fill_name(&mut self, name: &[u8]) {
+    transition { _ -> copy(name, 0) }
+    state copy(&mut self, name: &[u8], position: u64) {
+        transition position < name.len && position < 256 {
+            true -> store(name, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, name: &[u8], position: u64) {
+        self.name[position] = name[position];
+        transition { _ -> copy(name, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.name_len = count;
+    }
+}
+
+machine ValuedStructField::fill_name_window(&mut self, source: &ValuedStructField, start: u64, end: u64) {
+    transition { _ -> copy(source, start, end, 0) }
+    state copy(&mut self, source: &ValuedStructField, at: u64, end: u64, position: u64) {
+        transition at < end && at < source.name_len && at < 256 && position < 256 {
+            true -> store(source, at, end, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, source: &ValuedStructField, at: u64, end: u64, position: u64) {
+        self.name[position] = source.name[at];
+        transition { _ -> copy(source, at + 1, end, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.name_len = count;
+    }
+}
+
+// Upstream `get_name` — the borrowed &str view is not retainable; reads are
+// length + per-byte plus a &[u8] window.
+pub machine ValuedStructField::get_name_len(&self) -> u64 {
+    self.name_len
+}
+
+pub machine ValuedStructField::get_name_byte(&self, position: u64) -> u8 {
+    transition position < self.name_len && position < 256 {
+        true -> (self.name[position])
+        false -> (0)
+        _ -> (0)
+    }
+}
+
+pub machine ValuedStructField::get_name(&self) -> &[u8] {
+    transition self.name_len <= 256 {
+        true -> (&self.name[0..self.name_len])
+        false -> (&self.name[0..0])
+        _ -> (&self.name[0..0])
+    }
+}
+
+// Upstream `field.get_name() == field_name` — byte-exact name equality.
+pub machine ValuedStructField::name_equals(&self, name: &[u8]) -> bool {
+    transition self.name_len == name.len {
+        true -> scan(0, name)
+        false -> (false)
+    }
+    state scan(&self, position: u64, name: &[u8]) -> bool {
+        transition position < self.name_len && position < name.len && position < 256 {
+            true -> compare(position, name)
+            false -> (true)
+        }
+    }
+    state compare(&self, position: u64 [0..256], name: &[u8]) -> bool {
+        transition self.name[position] == name[position] {
+            true -> scan(position + 1, name)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `get_data_value` — Optional<&DataValue>. Optional is unmatchable
+// in this pin; the field_data transition is the matchable surface, and this
+// accessor reports whether the payload is a Value.
+pub machine ValuedStructField::is_value(&self) -> bool {
+    transition self.field_data {
+        ValuedStructFieldData::Value { value } -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine ValuedStructField::is_nested_struct(&self) -> bool {
+    transition self.field_data {
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> (true)
+        _ -> (false)
+    }
+}
+
+// Upstream `get_data_value` for Value fields — hands the caller an owned
+// clone (upstream hands &DataValue; callers that mutate write back through
+// `set_field_data`).
+pub machine ValuedStructField::get_data_value(&self) -> DataValue {
+    transition self.field_data {
+        ValuedStructFieldData::Value { value } -> (DataValue::clone(&value))
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> (DataValue::default())
+        _ -> (DataValue::default())
+    }
+}
+
+// Upstream `NestedStruct(_)` index — the pool slot holding the child.
+pub machine ValuedStructField::get_nested_struct_index(&self) -> u64 {
+    transition self.field_data {
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> (nested_struct_index)
+        _ -> (0)
+    }
+}
+
+// Upstream `get_icon_id` — the value's data-type id, or empty for nested
+// structs.
+pub machine ValuedStructField::get_icon_id(&self) -> &[u8] {
+    transition self.field_data {
+        ValuedStructFieldData::Value { value } -> (value.get_data_type_id())
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> ("")
+        _ -> ("")
+    }
+}
+
+pub machine ValuedStructField::get_is_read_only(&self) -> bool {
+    self.is_read_only
+}
+
+// Upstream `set_field_data`.
+pub machine ValuedStructField::set_field_data(&mut self, valued_field_data: &ValuedStructFieldData) {
+    self.field_data = ValuedStructFieldData::clone(valued_field_data);
+}
+
+// Upstream `get_size_in_bytes` — Value → its byte length; NestedStruct → the
+// nested struct's size, resolved through the pool (upstream dereferences the
+// Box; the pool is the port's indirection). The pool machine walks the arena
+// with an explicit pending stack — the call graph stays acyclic.
+pub machine ValuedStructField::get_size_in_bytes(&self, pool: &ValuedStructPool) -> u64 {
+    transition self.field_data {
+        ValuedStructFieldData::Value { value } -> (value.get_size_in_bytes())
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> (
+            pool.get_struct_size_in_bytes(nested_struct_index)
+        )
+        _ -> (0)
+    }
+}
+
+// Upstream `get_bytes` — appends this field's bytes into `out` at `at`,
+// returning the count written. Nested structs resolve through the pool.
+pub machine ValuedStructField::get_bytes(&self, pool: &ValuedStructPool, out: &mut [u8], at: u64) -> u64 {
+    transition self.field_data {
+        ValuedStructFieldData::Value { value } -> (copy_value_bytes(&value, out, at))
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> (
+            pool.get_struct_bytes(nested_struct_index, out, at)
+        )
+        _ -> (0)
+    }
+}
+
+pub machine copy_value_bytes(value: &DataValue, out: &mut [u8], at: u64) -> u64 {
+    let bytes: &[u8] = value.get_value_bytes();
+    transition { _ -> copy(value, bytes, out, at, 0) }
+    state copy(value: &DataValue, bytes: &[u8], out: &mut [u8], at: u64, position: u64) -> u64 {
+        transition position < value.get_size_in_bytes() && position < 4096 && position < bytes.len && (((at as u64 in Wrapping) + (position as u64 in Wrapping)) as u64) < out.len {
+            true -> store(value, bytes, out, at, position, (((at as u64 in Wrapping) + (position as u64 in Wrapping)) as u64))
+            false -> (position)
+        }
+    }
+    state store(value: &DataValue, bytes: &[u8], out: &mut [u8], at: u64, position: u64 [0..4096], write_index: u64) -> u64 {
+        out[write_index] = bytes[position];
+        transition { _ -> copy(value, bytes, out, at, position + 1) }
+    }
+}
+
+// Upstream `copy_from_bytes` — writes this field's leading bytes from `bytes`.
+// Value fields hand the window to DataValue::copy_from_bytes; nested structs
+// recurse through the pool. Returns false only on size mismatch for nested
+// struct fields (upstream DataValue::copy_from_bytes never fails; the ported
+// bound refusal surfaces here).
+pub machine ValuedStructField::copy_from_bytes(
+    &mut self,
+    pool: &mut ValuedStructPool,
+    bytes: &[u8]
+) -> bool {
+    transition self.field_data {
+        ValuedStructFieldData::Value { value } -> value_arm(value, bytes)
+        ValuedStructFieldData::NestedStruct { nested_struct_index } -> (
+            pool.copy_struct_from_bytes(nested_struct_index, bytes)
+        )
+        _ -> (false)
+    }
+    // The case binding borrows the payload; upstream mutates in place
+    // through the Box. The port clones the DataValue, copies into the clone,
+    // then writes the updated payload back into `self.field_data`.
+    state value_arm(&mut self, value: &DataValue, bytes: &[u8]) -> bool {
+        let mut updated: DataValue = DataValue::clone(value);
+        let stored: bool = updated.copy_from_bytes(bytes);
+        self.field_data = ValuedStructFieldData::Value { value: updated };
+        stored
+    }
+}
+
+// Upstream `get_display_string` — the display-value formatter is owned by the
+// CLI response handler in this package (same delegation as
+// ScanResultValued's display vectors); nested-struct brace formatting lands
+// with that leg. Named deferral.

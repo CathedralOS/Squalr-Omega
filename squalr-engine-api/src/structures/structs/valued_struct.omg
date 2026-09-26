@@ -1,0 +1,898 @@
+module src::structures::structs::valued_struct;
+
+use src::structures::data_values::data_value::DataValue;
+use src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use src::structures::structs::symbolic_struct_ref::SymbolicStructRef;
+use src::structures::structs::valued_struct_error::ValuedStructError;
+use src::structures::structs::valued_struct_field::ValuedStructField;
+use src::structures::structs::valued_struct_field::ValuedStructFieldData;
+use src::structures::structs::valued_struct_field::copy_value_bytes;
+
+// Port of structures/structs/valued_struct.rs: a struct's materialized
+// values — a symbolic struct reference, a layout kind, and the editable
+// fields produced by resolving the struct's symbol definition.
+//
+// Storage deviations (both follow the package's bounded-inline convention):
+// - `fields: Vec<ValuedStructField>` becomes `[ValuedStructField; 64]` plus
+//   `field_count` — a named deviation: structs wider than 64 fields truncate
+//   on `set_field_data` append (upstream Vec is unbounded).
+// - `ValuedStructFieldData::NestedStruct(Box<ValuedStruct>)` becomes an index
+//   into `ValuedStructPool`, a bounded flat arena of ValuedStructs
+//   ([ValuedStruct; 32]) — a direct inline `ValuedStruct` member would be
+//   infinitely recursive retained storage, so the indirection lands as pool
+//   indices (same translation as PointerScanNode::child_node_ids). Every
+//   upstream method that dereferences the Box takes the pool explicitly.
+// - The recursive upstream walks (`get_size_in_bytes`, `get_bytes`,
+//   `copy_from_bytes`) are non-tail — runtime recursion is tail-only in this
+//   pin, and measured call cycles admit same-`self` receivers only, so the
+//   pool-resident descents run through an explicit pending stack of
+//   `StructCursor` frames (bounded at the arena's 32 slots — a chain deeper
+//   than the arena cannot exist). At the bound the descent refuses instead
+//   of diverging or smashing the stack.
+//
+// Named deferral: `get_struct_layout` (SymbolResolver::get_struct_layout /
+// Arc<SymbolicStructDefinition>) and `Display`/`FromStringPrivileged` string
+// surfaces belong to the symbol-registry and CLI-formatter legs
+// respectively; the resolver trait and struct-definition type ship with the
+// former.
+pub data ValuedStruct {
+    symbolic_struct_ref: SymbolicStructRef;
+    layout_kind: SymbolicLayoutKind;
+    fields: [ValuedStructField; 64];
+    field_count: u64;
+}
+
+// Flat arena of nested structs — indices carried by
+// ValuedStructFieldData::NestedStruct. The pool's own ValuedStructs may host
+// further NestedStruct indices into the same pool, giving arbitrary depth
+// within the 32-struct bound.
+pub data ValuedStructPool {
+    structs: [ValuedStruct; 32];
+    struct_count: u64;
+}
+
+// One paused ancestor level of the depth-first pool walk: which arena slot,
+// which field to resume at, the base offset the level writes/reads at, and
+// the running fold (sum for struct layout, max for union layout).
+pub data StructCursor {
+    index: u64 [0..32];
+    resume_at: u64;
+    base: u64;
+    accum: u64;
+}
+
+pub machine ValuedStruct::new(
+    symbolic_struct_ref: &SymbolicStructRef,
+    fields: &[ValuedStructField]
+) -> ValuedStruct {
+    ValuedStruct::new_with_layout_kind(symbolic_struct_ref, SymbolicLayoutKind::Struct, fields)
+}
+
+// Upstream `new_with_layout_kind`.
+pub machine ValuedStruct::new_with_layout_kind(
+    symbolic_struct_ref: &SymbolicStructRef,
+    layout_kind: SymbolicLayoutKind,
+    fields: &[ValuedStructField]
+) -> ValuedStruct {
+    let mut valued_struct: ValuedStruct = ValuedStruct {
+        symbolic_struct_ref: SymbolicStructRef::clone(symbolic_struct_ref),
+        layout_kind: layout_kind,
+        field_count: 0
+    };
+    valued_struct.fill_fields(fields);
+    valued_struct
+}
+
+// Upstream `new_anonymous`.
+pub machine ValuedStruct::new_anonymous(fields: &[ValuedStructField]) -> ValuedStruct {
+    ValuedStruct::new(&SymbolicStructRef::new_anonymous(), fields)
+}
+
+// Upstream `new_anonymous_with_layout_kind`.
+pub machine ValuedStruct::new_anonymous_with_layout_kind(
+    layout_kind: SymbolicLayoutKind,
+    fields: &[ValuedStructField]
+) -> ValuedStruct {
+    ValuedStruct::new_with_layout_kind(&SymbolicStructRef::new_anonymous(), layout_kind, fields)
+}
+
+pub machine ValuedStruct::default() -> ValuedStruct {
+    ValuedStruct::new_anonymous(&[])
+}
+
+pub machine ValuedStruct::clone(source: &ValuedStruct) -> ValuedStruct {
+    let mut valued_struct: ValuedStruct = ValuedStruct {
+        symbolic_struct_ref: SymbolicStructRef::clone(&source.symbolic_struct_ref),
+        layout_kind: source.layout_kind,
+        field_count: 0
+    };
+    valued_struct.copy_fields_window(source, 0, source.field_count);
+    valued_struct
+}
+
+machine ValuedStruct::fill_fields(&mut self, fields: &[ValuedStructField]) {
+    transition { _ -> copy(fields, 0) }
+    state copy(&mut self, fields: &[ValuedStructField], position: u64) {
+        transition position < fields.len && position < 64 {
+            true -> store(fields, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, fields: &[ValuedStructField], position: u64 [0..64]) {
+        self.fields[position] = ValuedStructField::clone(&fields[position]);
+        transition { _ -> copy(fields, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.field_count = count;
+    }
+}
+
+machine ValuedStruct::copy_fields_window(&mut self, source: &ValuedStruct, start: u64, end: u64) {
+    transition { _ -> copy(source, start, end, 0) }
+    state copy(&mut self, source: &ValuedStruct, at: u64, end: u64, position: u64) {
+        transition at < end && at < source.field_count && at < 64 && position < 64 {
+            true -> store(source, at, end, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, source: &ValuedStruct, at: u64 [0..64], end: u64, position: u64 [0..64]) {
+        self.fields[position] = ValuedStructField::clone(&source.fields[at]);
+        transition { _ -> copy(source, at + 1, end, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.field_count = count;
+    }
+}
+
+pub machine ValuedStruct::get_symbolic_struct_ref(&self) -> SymbolicStructRef {
+    SymbolicStructRef::clone(&self.symbolic_struct_ref)
+}
+
+pub machine ValuedStruct::get_layout_kind(&self) -> SymbolicLayoutKind {
+    self.layout_kind
+}
+
+pub machine ValuedStruct::get_field_count(&self) -> u64 {
+    self.field_count
+}
+
+// Upstream `get_fields` — index access replaces the borrowed slice view.
+pub machine ValuedStruct::get_field_at(&self, position: u64) -> ValuedStructField {
+    transition position < self.field_count && position < 64 {
+        true -> (ValuedStructField::clone(&self.fields[position]))
+        false -> (ValuedStructField::default())
+        _ -> (ValuedStructField::default())
+    }
+}
+
+// Upstream `get_fields_mut` — caller mutates a slot in place.
+pub machine ValuedStruct::set_field_at(&mut self, position: u64, field: &ValuedStructField) {
+    transition position < self.field_count && position < 64 {
+        true -> store(position, field)
+        false -> done()
+    }
+    state store(&mut self, position: u64 [0..64], field: &ValuedStructField) {
+        self.fields[position] = ValuedStructField::clone(field);
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `get_size_in_bytes` — sum of field sizes, or max for unions.
+// NestedStruct fields delegate to the pool's worklist walk.
+pub machine ValuedStruct::get_size_in_bytes(&self, pool: &ValuedStructPool) -> u64 {
+    let layout: SymbolicLayoutKind = self.layout_kind;
+    transition layout {
+        SymbolicLayoutKind::Union -> union_scan(0, 0, pool)
+        _ -> struct_scan(0, 0, pool)
+    }
+    state union_scan(&self, position: u64, best: u64, pool: &ValuedStructPool) -> u64 {
+        let count: u64 = self.field_count;
+        transition position < count && position < 64 {
+            true -> union_probe(position, best, pool)
+            false -> (best)
+        }
+    }
+    state union_probe(&self, position: u64 [0..64], best: u64, pool: &ValuedStructPool) -> u64 {
+        let field_size: u64 = self.fields[position].get_size_in_bytes(pool);
+        transition field_size > best {
+            true -> union_scan(position + 1, field_size, pool)
+            false -> union_scan(position + 1, best, pool)
+            _ -> union_scan(position + 1, best, pool)
+        }
+    }
+    state struct_scan(&self, position: u64, total: u64, pool: &ValuedStructPool) -> u64 {
+        let count: u64 = self.field_count;
+        transition position < count && position < 64 {
+            true -> struct_probe(position, total, pool)
+            false -> (total)
+        }
+    }
+    state struct_probe(&self, position: u64 [0..64], total: u64, pool: &ValuedStructPool) -> u64 {
+        let field_size: u64 = self.fields[position].get_size_in_bytes(pool);
+        transition { _ -> struct_scan(position + 1, ((total as u64 in Wrapping) + (field_size as u64 in Wrapping)) as u64, pool) }
+    }
+}
+
+// Upstream `get_field(field_name)` / `get_field_mut` — the borrowed-index
+// surface is `(found, index)` plus slot access via get_field_at / set_at.
+pub data ValuedStructFieldLookup [copy] {
+    case Missing;
+    case Found(index: u64);
+}
+
+pub machine ValuedStruct::find_field(&self, field_name: &[u8]) -> ValuedStructFieldLookup {
+    transition { _ -> scan(0, field_name) }
+    state scan(&self, position: u64, field_name: &[u8]) -> ValuedStructFieldLookup {
+        transition position < self.field_count && position < 64 {
+            true -> compare(position, field_name)
+            false -> (ValuedStructFieldLookup::Missing)
+        }
+    }
+    state compare(&self, position: u64 [0..64], field_name: &[u8]) -> ValuedStructFieldLookup {
+        transition self.fields[position].name_equals(field_name) {
+            true -> (ValuedStructFieldLookup::Found { index: position })
+            false -> scan(position + 1, field_name)
+            _ -> scan(position + 1, field_name)
+        }
+    }
+}
+
+// Upstream `set_field_data` — update in place when the name exists, else
+// push a new field (bounded: appends at the 64-field bound truncate).
+pub machine ValuedStruct::set_field_data(
+    &mut self,
+    field_name: &[u8],
+    valued_field_data: &ValuedStructFieldData,
+    is_read_only: bool
+) {
+    let lookup: ValuedStructFieldLookup = self.find_field(field_name);
+    transition lookup {
+        ValuedStructFieldLookup::Found { index } -> check_found(index, valued_field_data)
+        ValuedStructFieldLookup::Missing -> push(field_name, valued_field_data, is_read_only)
+        _ -> done()
+    }
+    state check_found(&mut self, index: u64, valued_field_data: &ValuedStructFieldData) {
+        transition index < self.field_count && index < 64 {
+            true -> update(index, valued_field_data)
+            false -> done()
+            _ -> done()
+        }
+    }
+    state update(&mut self, index: u64 [0..64], valued_field_data: &ValuedStructFieldData) {
+        self.fields[index].set_field_data(valued_field_data);
+    }
+    state push(&mut self, field_name: &[u8], valued_field_data: &ValuedStructFieldData, is_read_only: bool) {
+        transition self.field_count < 64 {
+            true -> append(field_name, valued_field_data, is_read_only)
+            false -> done()
+        }
+    }
+    state append(&mut self, field_name: &[u8], valued_field_data: &ValuedStructFieldData, is_read_only: bool) {
+        // `self.field_count < 64` dominates this state through `push`, so the
+        // index expression and the count store are both provably in range.
+        self.fields[self.field_count] = ValuedStructField::new(field_name, valued_field_data, is_read_only);
+        self.field_count = self.field_count + 1;
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `remove_field` — drop the first name match and shift the tail.
+pub machine ValuedStruct::remove_field(&mut self, field_name: &[u8]) -> bool {
+    let lookup: ValuedStructFieldLookup = self.find_field(field_name);
+    transition lookup {
+        ValuedStructFieldLookup::Found { index } -> check_index(index)
+        ValuedStructFieldLookup::Missing -> (false)
+        _ -> (false)
+    }
+    state check_index(&mut self, index: u64) -> bool {
+        transition index < self.field_count && index < 64 {
+            true -> shift(index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state shift(&mut self, index: u64 [0..64]) -> bool {
+        transition { _ -> slide(index, index + 1) }
+    }
+    state slide(&mut self, at: u64, from: u64) -> bool {
+        transition at < 64 && from < self.field_count && from < 64 {
+            true -> move_one(at, from)
+            false -> finish(at)
+        }
+    }
+    state move_one(&mut self, at: u64 [0..64], from: u64) -> bool {
+        transition from < 64 {
+            true -> apply(at, from)
+            false -> finish(at)
+        }
+    }
+    state apply(&mut self, at: u64 [0..64], from: u64 [0..64]) -> bool {
+        self.fields[at] = ValuedStructField::clone(&self.fields[from]);
+        transition { _ -> slide(at + 1, from + 1) }
+    }
+    state finish(&mut self, kept: u64) -> bool {
+        self.field_count = kept;
+        true
+    }
+}
+
+// Upstream `get_bytes` — concatenated field bytes, or the union overlay
+// (every field writes over offset zero). Writes into `out` at `at`,
+// returning the byte count written.
+pub machine ValuedStruct::get_bytes(&self, pool: &ValuedStructPool, out: &mut [u8], at: u64) -> u64 {
+    let layout: SymbolicLayoutKind = self.layout_kind;
+    transition layout {
+        SymbolicLayoutKind::Union -> union_write(0, pool, out, at)
+        _ -> struct_write(0, 0, pool, out, at)
+    }
+    state struct_write(&self, position: u64, written: u64, pool: &ValuedStructPool, out: &mut [u8], at: u64) -> u64 {
+        let count: u64 = self.field_count;
+        transition position < count && position < 64 {
+            true -> struct_write_one(position, written, pool, out, at)
+            false -> (written)
+        }
+    }
+    state struct_write_one(&self, position: u64 [0..64], written: u64, pool: &ValuedStructPool, out: &mut [u8], at: u64) -> u64 {
+        let count: u64 = self.fields[position].get_bytes(pool, out, ((at as u64 in Wrapping) + (written as u64 in Wrapping)) as u64);
+        transition { _ -> struct_write(position + 1, ((written as u64 in Wrapping) + (count as u64 in Wrapping)) as u64, pool, out, at) }
+    }
+    // Union: overlay each field's bytes starting at the same `at`; upstream
+    // writes min(remaining, field_len) — the caller's `out` must already be
+    // sized to the union width (upstream allocates a zeroed Vec of
+    // get_size_in_bytes, which is caller-visible here).
+    state union_write(&self, position: u64, pool: &ValuedStructPool, out: &mut [u8], at: u64) -> u64 {
+        let count: u64 = self.field_count;
+        transition position < count && position < 64 {
+            true -> union_write_one(position, pool, out, at)
+            false -> (self.get_size_in_bytes(pool))
+        }
+    }
+    state union_write_one(&self, position: u64 [0..64], pool: &ValuedStructPool, out: &mut [u8], at: u64) -> u64 {
+        let _written: u64 = self.fields[position].get_bytes(pool, out, at);
+        transition { _ -> union_write(position + 1, pool, out, at) }
+    }
+}
+
+// Upstream `copy_from_bytes` — writes every field's slice of `bytes`.
+// Struct layout walks fields sequentially; union layout hands the full
+// window to every field. Returns false on size mismatch.
+pub machine ValuedStruct::copy_from_bytes(&mut self, pool: &mut ValuedStructPool, bytes: &[u8]) -> bool {
+    let expected: u64 = self.get_size_in_bytes(pool);
+    transition bytes.len == expected {
+        true -> dispatch(self.layout_kind, bytes, pool)
+        false -> (false)
+        _ -> (false)
+    }
+    state dispatch(&mut self, layout_kind: SymbolicLayoutKind, bytes: &[u8], pool: &mut ValuedStructPool) -> bool {
+        transition layout_kind {
+            SymbolicLayoutKind::Union -> union_copy(0, bytes, pool)
+            _ -> struct_copy(0, 0, bytes, pool)
+        }
+    }
+    state struct_copy(&mut self, position: u64, offset: u64, bytes: &[u8], pool: &mut ValuedStructPool) -> bool {
+        let count: u64 = self.field_count;
+        transition position < count && position < 64 {
+            true -> struct_copy_one(position, offset, bytes, pool)
+            false -> (true)
+        }
+    }
+    state struct_copy_one(&mut self, position: u64 [0..64], offset: u64, bytes: &[u8], pool: &mut ValuedStructPool) -> bool {
+        let field_size: u64 = self.fields[position].get_size_in_bytes(pool);
+        let window_end: u64 = ((offset as u64 in Wrapping) + (field_size as u64 in Wrapping)) as u64;
+        transition window_end <= bytes.len && offset <= window_end {
+            true -> store_field(position, &bytes[offset..window_end], window_end, bytes, pool)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    // The field is moved out of `self.fields` for the mutation — the indexed
+    // member path isn't a writable machine receiver — then written back.
+    state store_field(&mut self, position: u64 [0..64], window: &[u8], window_end: u64, bytes: &[u8], pool: &mut ValuedStructPool) -> bool {
+        let mut field: ValuedStructField = ValuedStructField::clone(&self.fields[position]);
+        let stored: bool = field.copy_from_bytes(pool, window);
+        self.fields[position] = field;
+        transition stored {
+            true -> struct_copy(position + 1, window_end, bytes, pool)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state union_copy(&mut self, position: u64, bytes: &[u8], pool: &mut ValuedStructPool) -> bool {
+        let count: u64 = self.field_count;
+        transition position < count && position < 64 {
+            true -> union_copy_one(position, bytes, pool)
+            false -> (true)
+        }
+    }
+    state union_copy_one(&mut self, position: u64 [0..64], bytes: &[u8], pool: &mut ValuedStructPool) -> bool {
+        let field_size: u64 = self.fields[position].get_size_in_bytes(pool);
+        transition field_size <= bytes.len {
+            true -> union_apply(position, &bytes[0..field_size], bytes, pool)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state union_apply(&mut self, position: u64 [0..64], window: &[u8], bytes: &[u8], pool: &mut ValuedStructPool) -> bool {
+        let mut field: ValuedStructField = ValuedStructField::clone(&self.fields[position]);
+        let stored: bool = field.copy_from_bytes(pool, window);
+        self.fields[position] = field;
+        transition stored {
+            true -> union_copy(position + 1, bytes, pool)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `combine_exclusive` — fields present in every input struct.
+// The port takes the head struct plus the peers slice and keeps the head's
+// fields whose names appear in all peers. `head` rides as a state param —
+// locals do not cross states in this pin.
+pub machine ValuedStruct::combine_exclusive(
+    head: &ValuedStruct,
+    peers: &[ValuedStruct],
+    pool: &ValuedStructPool
+) -> ValuedStruct {
+    transition { _ -> keep(0, head, ValuedStruct::new_anonymous_with_layout_kind(head.layout_kind, &[]), peers, pool) }
+    state keep(
+        position: u64,
+        head: &ValuedStruct,
+        kept: ValuedStruct,
+        peers: &[ValuedStruct],
+        pool: &ValuedStructPool
+    ) -> ValuedStruct {
+        transition position < head.field_count && position < 64 {
+            true -> probe(position, head, kept, peers, pool)
+            false -> (kept)
+        }
+    }
+    state probe(
+        position: u64 [0..64],
+        head: &ValuedStruct,
+        kept: ValuedStruct,
+        peers: &[ValuedStruct],
+        pool: &ValuedStructPool
+    ) -> ValuedStruct {
+        let field: ValuedStructField = ValuedStructField::clone(&head.fields[position]);
+        let name: &[u8] = field.get_name();
+        transition all_peers_have(name, peers) {
+            true -> absorb(position, head, kept, &field, peers, pool)
+            false -> keep(position + 1, head, kept, peers, pool)
+            _ -> keep(position + 1, head, kept, peers, pool)
+        }
+    }
+    state absorb(
+        position: u64,
+        head: &ValuedStruct,
+        kept: ValuedStruct,
+        field: &ValuedStructField,
+        peers: &[ValuedStruct],
+        pool: &ValuedStructPool
+    ) -> ValuedStruct {
+        // Upstream retains the head's field order and payloads.
+        let mut next: ValuedStruct = kept;
+        next.append_field(field);
+        transition { _ -> keep(((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, head, next, peers, pool) }
+    }
+}
+
+machine ValuedStruct::append_field(&mut self, field: &ValuedStructField) {
+    transition self.field_count < 64 {
+        true -> append(field)
+        false -> done()
+    }
+    state append(&mut self, field: &ValuedStructField) {
+        self.fields[self.field_count] = ValuedStructField::clone(field);
+        self.field_count = self.field_count + 1;
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream's `iter().skip(1).all(...)` peer check as a flat scan.
+machine all_peers_have(name: &[u8], peers: &[ValuedStruct]) -> bool {
+    transition { _ -> scan(name, peers, 0) }
+    state scan(name: &[u8], peers: &[ValuedStruct], position: u64) -> bool {
+        transition position < peers.len {
+            true -> check_peer(name, peers, position)
+            false -> (true)
+        }
+    }
+    state check_peer(name: &[u8], peers: &[ValuedStruct], position: u64) -> bool {
+        let peer: ValuedStruct = ValuedStruct::clone(&peers[position]);
+        let lookup: ValuedStructFieldLookup = peer.find_field(name);
+        transition lookup {
+            ValuedStructFieldLookup::Found { index } -> scan(name, peers, position + 1)
+            ValuedStructFieldLookup::Missing -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// ValuedStructPool — the flat arena NestedStruct indices address.
+pub machine ValuedStructPool::empty() -> ValuedStructPool {
+    ValuedStructPool { struct_count: 0 }
+}
+
+// Push a nested struct into the pool, returning its index (upstream's Box
+// allocation point). At the 32-struct bound returns the bound — callers see
+// `index < struct_count` as the validity check (refusal convention).
+pub machine ValuedStructPool::push(&mut self, nested: &ValuedStruct) -> u64 {
+    transition self.struct_count < 32 {
+        true -> store(nested)
+        false -> (32)
+    }
+    state store(&mut self, nested: &ValuedStruct) -> u64 {
+        self.structs[self.struct_count] = ValuedStruct::clone(nested);
+        self.struct_count = self.struct_count + 1;
+        self.struct_count - 1
+    }
+}
+
+pub machine ValuedStructPool::get_struct(&self, index: u64) -> ValuedStruct {
+    transition index < self.struct_count && index < 32 {
+        true -> (ValuedStruct::clone(&self.structs[index]))
+        false -> (ValuedStruct::default())
+        _ -> (ValuedStruct::default())
+    }
+}
+
+pub machine ValuedStructPool::set_struct(&mut self, index: u64, nested: &ValuedStruct) {
+    transition index < self.struct_count && index < 32 {
+        true -> store(index, nested)
+        false -> done()
+        _ -> done()
+    }
+    state done(&mut self) {
+    }
+    state store(&mut self, index: u64 [0..32], nested: &ValuedStruct) {
+        self.structs[index] = ValuedStruct::clone(nested);
+    }
+}
+
+// Depth-first size walk over the arena with an explicit pending stack —
+// runtime recursion is tail-only, and the accumulative walk cannot be tail.
+// `accum` folds each level: sum under struct layout, max under union.
+// Returns 0 when the index or descent exceeds the arena bounds.
+pub machine ValuedStructPool::get_struct_size_in_bytes(&self, index: u64) -> u64 {
+    transition index < self.struct_count && index < 32 {
+        true -> open(index)
+        false -> (0)
+        _ -> (0)
+    }
+    state open(&self, index: u64 [0..32]) -> u64 {
+        let pending: [StructCursor; 32];
+        transition { _ -> visit(index, 0, 0, pending, 0) }
+    }
+    state visit(&self, index: u64 [0..32], position: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32]) -> u64 {
+        let count: u64 = self.structs[index].field_count;
+        transition position < count && position < 64 {
+            true -> field(index, position, accum, pending, pending_count)
+            false -> finish(index, accum, pending, pending_count)
+            _ -> finish(index, accum, pending, pending_count)
+        }
+    }
+    state field(&self, index: u64 [0..32], position: u64 [0..64], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32]) -> u64 {
+        transition self.structs[index].fields[position].field_data {
+            ValuedStructFieldData::Value { value } -> leaf(index, position, accum, pending, pending_count, value)
+            ValuedStructFieldData::NestedStruct { nested_struct_index } -> descend(index, position, accum, pending, pending_count, nested_struct_index)
+            _ -> (0)
+        }
+    }
+    state leaf(&self, index: u64 [0..32], position: u64 [0..64], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], value: &DataValue) -> u64 {
+        let field_size: u64 = value.get_size_in_bytes();
+        let union_layout: bool = self.structs[index].layout_kind.is_union();
+        transition union_layout {
+            true -> fold_union(index, position, accum, field_size, pending, pending_count)
+            false -> advance(index, position, ((accum as u64 in Wrapping) + (field_size as u64 in Wrapping)) as u64, pending, pending_count)
+            _ -> (0)
+        }
+    }
+    state fold_union(&self, index: u64 [0..32], position: u64 [0..64], accum: u64, field_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32]) -> u64 {
+        transition field_size > accum {
+            true -> advance(index, position, field_size, pending, pending_count)
+            false -> advance(index, position, accum, pending, pending_count)
+            _ -> advance(index, position, accum, pending, pending_count)
+        }
+    }
+    state advance(&self, index: u64 [0..32], position: u64 [0..64], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32]) -> u64 {
+        transition { _ -> visit(index, position + 1, accum, pending, pending_count) }
+    }
+    state descend(&self, index: u64 [0..32], position: u64 [0..64], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], nested_index: u64) -> u64 {
+        let count: u64 = self.struct_count;
+        transition pending_count < 32 && nested_index < count && nested_index < 32 {
+            true -> push(index, position, accum, pending, pending_count, nested_index)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state push(&self, index: u64 [0..32], position: u64 [0..64], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], nested_index: u64 [0..32]) -> u64 {
+        transition pending_count < 32 {
+            true -> apply(index, position, accum, pending, pending_count, nested_index)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state apply(&self, index: u64 [0..32], position: u64 [0..64], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..32], nested_index: u64 [0..32]) -> u64 {
+        let mut pending_next: [StructCursor; 32] = pending;
+        pending_next[pending_count] = StructCursor { index: index, resume_at: position + 1, base: 0, accum: accum };
+        transition { _ -> visit(nested_index, 0, 0, pending_next, pending_count + 1) }
+    }
+    state finish(&self, index: u64 [0..32], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32]) -> u64 {
+        transition pending_count > 0 {
+            true -> resume(accum, pending, pending_count)
+            false -> (accum)
+            _ -> (accum)
+        }
+    }
+    state resume(&self, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [1..=32]) -> u64 {
+        // `pending_count > 0` dominates from `finish`, so pending_count - 1
+        // lands in [0..31] — the pending pop's own index is provable.
+        let frame: StructCursor = pending[pending_count - 1];
+        let parent_union: bool = self.structs[frame.index].layout_kind.is_union();
+        transition parent_union {
+            true -> resume_union(frame, child_size, pending, pending_count - 1)
+            false -> resume_struct(frame, child_size, pending, pending_count - 1)
+            _ -> (0)
+        }
+    }
+    state resume_union(&self, frame: StructCursor, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32]) -> u64 {
+        transition child_size > frame.accum {
+            true -> visit(frame.index, frame.resume_at, child_size, pending, pending_count)
+            false -> visit(frame.index, frame.resume_at, frame.accum, pending, pending_count)
+            _ -> visit(frame.index, frame.resume_at, frame.accum, pending, pending_count)
+        }
+    }
+    state resume_struct(&self, frame: StructCursor, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32]) -> u64 {
+        transition { _ -> visit(frame.index, frame.resume_at, ((frame.accum as u64 in Wrapping) + (child_size as u64 in Wrapping)) as u64, pending, pending_count) }
+    }
+}
+
+// Depth-first byte write over the arena — concatenated field bytes in
+// struct order; union levels overlay every field at their level's `base`.
+// Returns the folded size (the written length), or 0 past the bounds.
+pub machine ValuedStructPool::get_struct_bytes(&self, index: u64, out: &mut [u8], at: u64) -> u64 {
+    transition index < self.struct_count && index < 32 {
+        true -> open(index, out, at)
+        false -> (0)
+        _ -> (0)
+    }
+    state open(&self, index: u64 [0..32], out: &mut [u8], at: u64) -> u64 {
+        let pending: [StructCursor; 32];
+        transition { _ -> visit(index, 0, at, 0, pending, 0, out) }
+    }
+    state visit(&self, index: u64 [0..32], position: u64, base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], out: &mut [u8]) -> u64 {
+        let count: u64 = self.structs[index].field_count;
+        transition position < count && position < 64 {
+            true -> field(index, position, base, accum, pending, pending_count, out)
+            false -> finish(index, accum, pending, pending_count, out)
+            _ -> finish(index, accum, pending, pending_count, out)
+        }
+    }
+    state field(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], out: &mut [u8]) -> u64 {
+        transition self.structs[index].fields[position].field_data {
+            ValuedStructFieldData::Value { value } -> write_value(index, position, base, accum, pending, pending_count, value, out)
+            ValuedStructFieldData::NestedStruct { nested_struct_index } -> descend(index, position, base, accum, pending, pending_count, nested_struct_index, out)
+            _ -> (0)
+        }
+    }
+    state write_value(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], value: &DataValue, out: &mut [u8]) -> u64 {
+        let field_size: u64 = value.get_size_in_bytes();
+        let union_layout: bool = self.structs[index].layout_kind.is_union();
+        transition union_layout {
+            true -> write_at(index, position, base, accum, field_size, base, pending, pending_count, value, out)
+            false -> write_at(index, position, base, accum, field_size, ((base as u64 in Wrapping) + (accum as u64 in Wrapping)) as u64, pending, pending_count, value, out)
+            _ -> (0)
+        }
+    }
+    state write_at(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, write_at: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], value: &DataValue, out: &mut [u8]) -> u64 {
+        let _written: u64 = copy_value_bytes(value, out, write_at);
+        transition { _ -> fold_value(index, position, base, accum, field_size, pending, pending_count, out) }
+    }
+    state fold_value(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], out: &mut [u8]) -> u64 {
+        let union_layout: bool = self.structs[index].layout_kind.is_union();
+        transition union_layout {
+            true -> fold_union(index, position, base, accum, field_size, pending, pending_count, out)
+            false -> visit(index, position + 1, base, ((accum as u64 in Wrapping) + (field_size as u64 in Wrapping)) as u64, pending, pending_count, out)
+            _ -> (0)
+        }
+    }
+    state fold_union(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], out: &mut [u8]) -> u64 {
+        transition field_size > accum {
+            true -> visit(index, position + 1, base, field_size, pending, pending_count, out)
+            false -> visit(index, position + 1, base, accum, pending, pending_count, out)
+            _ -> visit(index, position + 1, base, accum, pending, pending_count, out)
+        }
+    }
+    state descend(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], nested_index: u64, out: &mut [u8]) -> u64 {
+        let count: u64 = self.struct_count;
+        transition pending_count < 32 && nested_index < count && nested_index < 32 {
+            true -> push(index, position, base, accum, pending, pending_count, nested_index, out)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state push(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], nested_index: u64 [0..32], out: &mut [u8]) -> u64 {
+        transition pending_count < 32 {
+            true -> apply(index, position, base, accum, pending, pending_count, nested_index, out)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state apply(&self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..32], nested_index: u64 [0..32], out: &mut [u8]) -> u64 {
+        let mut pending_next: [StructCursor; 32] = pending;
+        let union_layout: bool = self.structs[index].layout_kind.is_union();
+        pending_next[pending_count] = StructCursor { index: index, resume_at: position + 1, base: base, accum: accum };
+        transition union_layout {
+            true -> visit(nested_index, 0, base, 0, pending_next, pending_count + 1, out)
+            false -> visit(nested_index, 0, ((base as u64 in Wrapping) + (accum as u64 in Wrapping)) as u64, 0, pending_next, pending_count + 1, out)
+            _ -> (0)
+        }
+    }
+    state finish(&self, index: u64 [0..32], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], out: &mut [u8]) -> u64 {
+        transition pending_count > 0 {
+            true -> resume(accum, pending, pending_count, out)
+            false -> (accum)
+            _ -> (accum)
+        }
+    }
+    state resume(&self, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [1..=32], out: &mut [u8]) -> u64 {
+        let frame: StructCursor = pending[pending_count - 1];
+        let parent_union: bool = self.structs[frame.index].layout_kind.is_union();
+        transition parent_union {
+            true -> resume_union(frame, child_size, pending, pending_count - 1, out)
+            false -> resume_struct(frame, child_size, pending, pending_count - 1, out)
+            _ -> (0)
+        }
+    }
+    state resume_union(&self, frame: StructCursor, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], out: &mut [u8]) -> u64 {
+        transition child_size > frame.accum {
+            true -> visit(frame.index, frame.resume_at, frame.base, child_size, pending, pending_count, out)
+            false -> visit(frame.index, frame.resume_at, frame.base, frame.accum, pending, pending_count, out)
+            _ -> visit(frame.index, frame.resume_at, frame.base, frame.accum, pending, pending_count, out)
+        }
+    }
+    state resume_struct(&self, frame: StructCursor, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], out: &mut [u8]) -> u64 {
+        transition { _ -> visit(frame.index, frame.resume_at, frame.base, ((frame.accum as u64 in Wrapping) + (child_size as u64 in Wrapping)) as u64, pending, pending_count, out) }
+    }
+}
+
+// Depth-first copy into the arena — the mirror of get_struct_bytes: each
+// Value field reads its slice of `bytes` at `base + accum` (struct levels)
+// or `base` (union levels), matching upstream's windowed layout. Returns
+// false on a window underrun or a bound refusal.
+pub machine ValuedStructPool::copy_struct_from_bytes(&mut self, index: u64, bytes: &[u8]) -> bool {
+    transition index < self.struct_count && index < 32 {
+        true -> open(index, bytes)
+        false -> (false)
+        _ -> (false)
+    }
+    state open(&mut self, index: u64 [0..32], bytes: &[u8]) -> bool {
+        let pending: [StructCursor; 32];
+        transition { _ -> visit(index, 0, 0, 0, pending, 0, bytes) }
+    }
+    state visit(&mut self, index: u64 [0..32], position: u64, base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        let count: u64 = self.structs[index].field_count;
+        transition position < count && position < 64 {
+            true -> field(index, position, base, accum, pending, pending_count, bytes)
+            false -> finish(index, accum, pending, pending_count, bytes)
+            _ -> finish(index, accum, pending, pending_count, bytes)
+        }
+    }
+    state field(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        transition self.structs[index].fields[position].field_data {
+            ValuedStructFieldData::Value { value } -> measure_value(index, position, base, accum, pending, pending_count, bytes, value)
+            ValuedStructFieldData::NestedStruct { nested_struct_index } -> descend(index, position, base, accum, pending, pending_count, nested_struct_index, bytes)
+            _ -> (false)
+        }
+    }
+    state measure_value(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8], value: &DataValue) -> bool {
+        let field_size: u64 = value.get_size_in_bytes();
+        let union_layout: bool = self.structs[index].layout_kind.is_union();
+        transition union_layout {
+            true -> check_window(index, position, base, accum, field_size, base, pending, pending_count, bytes)
+            false -> check_window(index, position, base, accum, field_size, ((base as u64 in Wrapping) + (accum as u64 in Wrapping)) as u64, pending, pending_count, bytes)
+            _ -> (false)
+        }
+    }
+    state check_window(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, read_at: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        let window_end: u64 = ((read_at as u64 in Wrapping) + (field_size as u64 in Wrapping)) as u64;
+        transition window_end <= bytes.len && read_at <= bytes.len {
+            true -> store_value(index, position, base, accum, field_size, read_at, window_end, pending, pending_count, bytes)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state store_value(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, read_at: u64, window_end: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        let mut updated: DataValue = self.structs[index].fields[position].get_data_value();
+        transition { _ -> apply_slice(index, position, base, accum, field_size, updated, pending, pending_count, bytes, read_at, window_end) }
+    }
+    state apply_slice(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, updated: DataValue, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8], read_at: u64, window_end: u64) -> bool {
+        transition read_at <= window_end && window_end <= bytes.len {
+            true -> copy_value(index, position, base, accum, field_size, updated, pending, pending_count, bytes, &bytes[read_at..window_end])
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state copy_value(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, updated: DataValue, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8], window: &[u8]) -> bool {
+        let mut written: DataValue = updated;
+        let stored: bool = written.copy_from_bytes(window);
+        transition stored {
+            true -> writeback_value(index, position, base, accum, field_size, written, pending, pending_count, bytes)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state writeback_value(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, updated: DataValue, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        self.structs[index].fields[position].set_field_data(&ValuedStructFieldData::Value { value: updated });
+        transition { _ -> fold_value(index, position, base, accum, field_size, pending, pending_count, bytes) }
+    }
+    state fold_value(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        let union_layout: bool = self.structs[index].layout_kind.is_union();
+        transition union_layout {
+            true -> fold_union(index, position, base, accum, field_size, pending, pending_count, bytes)
+            false -> visit(index, position + 1, base, ((accum as u64 in Wrapping) + (field_size as u64 in Wrapping)) as u64, pending, pending_count, bytes)
+            _ -> (false)
+        }
+    }
+    state fold_union(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, field_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        transition field_size > accum {
+            true -> visit(index, position + 1, base, field_size, pending, pending_count, bytes)
+            false -> visit(index, position + 1, base, accum, pending, pending_count, bytes)
+            _ -> visit(index, position + 1, base, accum, pending, pending_count, bytes)
+        }
+    }
+    state descend(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], nested_index: u64, bytes: &[u8]) -> bool {
+        let count: u64 = self.struct_count;
+        transition pending_count < 32 && nested_index < count && nested_index < 32 {
+            true -> push(index, position, base, accum, pending, pending_count, nested_index, bytes)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state push(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], nested_index: u64 [0..32], bytes: &[u8]) -> bool {
+        transition pending_count < 32 {
+            true -> apply(index, position, base, accum, pending, pending_count, nested_index, bytes)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state apply(&mut self, index: u64 [0..32], position: u64 [0..64], base: u64, accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..32], nested_index: u64 [0..32], bytes: &[u8]) -> bool {
+        let mut pending_next: [StructCursor; 32] = pending;
+        let union_layout: bool = self.structs[index].layout_kind.is_union();
+        pending_next[pending_count] = StructCursor { index: index, resume_at: position + 1, base: base, accum: accum };
+        transition union_layout {
+            true -> visit(nested_index, 0, base, 0, pending_next, pending_count + 1, bytes)
+            false -> visit(nested_index, 0, ((base as u64 in Wrapping) + (accum as u64 in Wrapping)) as u64, 0, pending_next, pending_count + 1, bytes)
+            _ -> (false)
+        }
+    }
+    state finish(&mut self, index: u64 [0..32], accum: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        transition pending_count > 0 {
+            true -> resume(accum, pending, pending_count, bytes)
+            false -> (true)
+            _ -> (true)
+        }
+    }
+    state resume(&mut self, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [1..=32], bytes: &[u8]) -> bool {
+        let frame: StructCursor = pending[pending_count - 1];
+        let parent_union: bool = self.structs[frame.index].layout_kind.is_union();
+        transition parent_union {
+            true -> resume_union(frame, child_size, pending, pending_count - 1, bytes)
+            false -> resume_struct(frame, child_size, pending, pending_count - 1, bytes)
+            _ -> (false)
+        }
+    }
+    state resume_union(&mut self, frame: StructCursor, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        transition child_size > frame.accum {
+            true -> visit(frame.index, frame.resume_at, frame.base, child_size, pending, pending_count, bytes)
+            false -> visit(frame.index, frame.resume_at, frame.base, frame.accum, pending, pending_count, bytes)
+            _ -> visit(frame.index, frame.resume_at, frame.base, frame.accum, pending, pending_count, bytes)
+        }
+    }
+    state resume_struct(&mut self, frame: StructCursor, child_size: u64, pending: [StructCursor; 32], pending_count: u64 [0..=32], bytes: &[u8]) -> bool {
+        transition { _ -> visit(frame.index, frame.resume_at, frame.base, ((frame.accum as u64 in Wrapping) + (child_size as u64 in Wrapping)) as u64, pending, pending_count, bytes) }
+    }
+}
