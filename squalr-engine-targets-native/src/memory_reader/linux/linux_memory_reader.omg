@@ -2,7 +2,10 @@ module src::memory_reader::linux::linux_memory_reader;
 
 use omega_language_std::filesystem_host;
 use omega::language::core::binding;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
 use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_api::src::structures::structs::valued_struct::ValuedStruct;
+use squalr_engine_api::src::structures::structs::valued_struct::ValuedStructPool;
 use squalr_engine_targets::src::target_providers::MemoryReadResult;
 use src::memory_reader::memory_reader_trait::MemoryReaderTrait;
 use src::proc_paths::ProcName;
@@ -108,6 +111,184 @@ invokes FilesystemHost;
         let _u3: i32 = self.host.close(self.proc_fd);
         self.scratch = _u3;
         transition { _ -> failed() }
+    }
+
+    state failed(&mut self) -> MemoryReadResult {
+        MemoryReadResult::Failed
+    }
+}
+
+// Upstream `read`: scratch vec sized to the value, one positioned read, then
+// `copy_from_bytes` installs the bytes. The scratch is caller-supplied (no
+// heap growable Vec in this pin) and must cover `data_value` size bytes;
+// upstream's `read_succeeded`-only return is widened to MemoryReadResult, and
+// a refused copy maps to Failed.
+pub linux_x86_64 machine LinuxMemoryReader::read(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    address: u64,
+    data_value: &mut DataValue,
+    scratch: &mut [u8]
+) -> MemoryReadResult
+satisfies MemoryReaderTrait::read
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let size: u64 = data_value.get_size_in_bytes();
+    transition {
+        size == 0 -> MemoryReadResult::Complete { count: 0 }
+        size > scratch.len -> failed()
+        _ -> issue(process_info, address, data_value, scratch, size)
+    }
+
+    state issue(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        data_value: &mut DataValue,
+        scratch: &mut [u8],
+        size: u64
+    ) -> MemoryReadResult {
+        // `_ ->` above carries no negation dominance, so the slice bound is
+        // re-proven here and the window is formed at the transition argument.
+        transition size <= scratch.len && size > 0 {
+            true -> read_slice(process_info, address, data_value, &mut scratch[0..size], size)
+            false -> failed()
+            _ -> failed()
+        }
+    }
+
+    state read_slice(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        data_value: &mut DataValue,
+        window: &mut [u8],
+        size: u64
+    ) -> MemoryReadResult {
+        let read_result: MemoryReadResult = self.read_bytes(
+            process_info, address, window);
+        transition read_result {
+            MemoryReadResult::Complete { count } -> check_size(data_value, window, size, read_result)
+            _ -> (read_result)
+        }
+    }
+
+    state check_size(
+        &mut self,
+        data_value: &mut DataValue,
+        window: &[u8],
+        size: u64,
+        read_result: MemoryReadResult
+    ) -> MemoryReadResult {
+        transition size <= window.len && size > 0 {
+            true -> copy_in(data_value, &window[0..size], read_result)
+            false -> (MemoryReadResult::Failed)
+            _ -> (MemoryReadResult::Failed)
+        }
+    }
+
+    state copy_in(
+        &mut self,
+        data_value: &mut DataValue,
+        window: &[u8],
+        read_result: MemoryReadResult
+    ) -> MemoryReadResult {
+        let copied: bool = data_value.copy_from_bytes(window);
+        transition copied {
+            true -> (read_result)
+            false -> (MemoryReadResult::Failed)
+        }
+    }
+
+    state failed(&mut self) -> MemoryReadResult {
+        MemoryReadResult::Failed
+    }
+}
+
+// Upstream `read_struct`: same scratch-then-copy shape, returning the
+// `copy_from_bytes` verdict itself on a successful read. `pool` is the flat
+// arena the ValuedStruct's nested-field indices address into — upstream's
+// `Box<ValuedStruct>` recursion needs no such parameter.
+pub linux_x86_64 machine LinuxMemoryReader::read_struct(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    address: u64,
+    valued_struct: &mut ValuedStruct,
+    pool: &mut ValuedStructPool,
+    scratch: &mut [u8]
+) -> MemoryReadResult
+satisfies MemoryReaderTrait::read_struct
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let size: u64 = valued_struct.get_size_in_bytes(pool);
+    transition {
+        size == 0 -> MemoryReadResult::Complete { count: 0 }
+        size > scratch.len -> failed()
+        _ -> issue(process_info, address, valued_struct, pool, scratch, size)
+    }
+
+    state issue(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        valued_struct: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        scratch: &mut [u8],
+        size: u64
+    ) -> MemoryReadResult {
+        transition size <= scratch.len && size > 0 {
+            true -> read_slice(process_info, address, valued_struct, pool, &mut scratch[0..size], size)
+            false -> failed()
+            _ -> failed()
+        }
+    }
+
+    state read_slice(
+        &mut self,
+        process_info: &OpenedProcessInfo,
+        address: u64,
+        valued_struct: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        window: &mut [u8],
+        size: u64
+    ) -> MemoryReadResult {
+        let read_result: MemoryReadResult = self.read_bytes(
+            process_info, address, window);
+        transition read_result {
+            MemoryReadResult::Complete { count } -> check_size(valued_struct, pool, window, size, read_result)
+            _ -> (read_result)
+        }
+    }
+
+    state check_size(
+        &mut self,
+        valued_struct: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        window: &[u8],
+        size: u64,
+        read_result: MemoryReadResult
+    ) -> MemoryReadResult {
+        transition size <= window.len && size > 0 {
+            true -> copy_in(valued_struct, pool, &window[0..size], read_result)
+            false -> (MemoryReadResult::Failed)
+            _ -> (MemoryReadResult::Failed)
+        }
+    }
+
+    state copy_in(
+        &mut self,
+        valued_struct: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        window: &[u8],
+        read_result: MemoryReadResult
+    ) -> MemoryReadResult {
+        let copied: bool = valued_struct.copy_from_bytes(pool, window);
+        transition copied {
+            true -> (read_result)
+            false -> (MemoryReadResult::Failed)
+        }
     }
 
     state failed(&mut self) -> MemoryReadResult {
