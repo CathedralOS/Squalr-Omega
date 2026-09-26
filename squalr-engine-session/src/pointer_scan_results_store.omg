@@ -1,0 +1,599 @@
+module src::pointer_scan_results_store;
+
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node::PointerScanNode;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::MaterializedPageKeyEntry;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanModuleName;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+
+// Port of the engine-side `Arc<RwLock<Option<PointerScanResults>>>` store —
+// upstream owns growable Vecs; the port's `PointerScanResults` borrows
+// caller extents, so the store owns bounded backing arenas and reassembles
+// a borrowed view per access (upstream's read()/write() guard window).
+//
+// Bounds (named deviations; upstream is unbounded):
+//   targets 64, module names 32, levels 8 (covers max_depth <= 8),
+//   4096 static + 4096 heap candidates, 512 materialized nodes,
+//   512 node-id slab entries, 64 page-key cache rows.
+// Scans exceeding a bound degrade the way the extents already do upstream
+// under a cap (builder reports what fits; materialized overflow sets the
+// persisted flag) — no results are silently invented.
+pub data PointerScanResultsStore {
+    has_results: bool;
+    session_id: u64;
+    target_descriptor: PointerScanTargetDescriptor;
+    address_space: PointerScanAddressSpace;
+    pointer_size: PointerScanPointerSize;
+    max_depth: u64;
+    offset_radius: u64;
+    root_node_count: u64;
+    total_node_count: u64;
+    total_static_node_count: u64;
+    total_heap_node_count: u64;
+    materialized_nodes_overflowed: bool;
+    target_addresses: [u64; 64];
+    target_address_count: u64;
+    module_names: [PointerScanModuleName; 32];
+    module_name_count: u64;
+    levels: [PointerScanLevel; 8];
+    level_count: u64;
+    // Per-level arena windows — rebuilt into borrowed `level_candidates`
+    // entries on each assemble. The builder fills windows contiguously in
+    // level order; `commit_level_windows` records each level's
+    // (start, count) so later accessors re-slice the same arenas.
+    level_static_starts: [u64; 8];
+    level_static_counts: [u64; 8];
+    level_heap_starts: [u64; 8];
+    level_heap_counts: [u64; 8];
+    static_candidate_arena: [PointerScanCandidate; 4096];
+    static_candidate_arena_count: u64;
+    heap_candidate_arena: [PointerScanCandidate; 4096];
+    heap_candidate_arena_count: u64;
+    materialized_nodes: [PointerScanNode; 512];
+    materialized_node_count: u64;
+    materialized_node_id_slab: [u64; 512];
+    materialized_node_id_slab_count: u64;
+    page_key_cache: [MaterializedPageKeyEntry; 64];
+    page_key_cache_count: u64;
+    next_materialized_node_id: u64;
+}
+
+pub machine PointerScanResultsStore::empty() -> PointerScanResultsStore {
+    PointerScanResultsStore {
+        has_results: false,
+        target_address_count: 0,
+        module_name_count: 0,
+        level_count: 0,
+        static_candidate_arena_count: 0,
+        heap_candidate_arena_count: 0,
+        materialized_node_count: 0,
+        materialized_node_id_slab_count: 0,
+        page_key_cache_count: 0,
+        // Upstream allocates materialized node ids from 1.
+        next_materialized_node_id: 1,
+    }
+}
+
+// Upstream `*pointer_scan_results_guard = None`.
+pub machine PointerScanResultsStore::clear(&mut self) {
+    self.has_results = false;
+    self.target_address_count = 0;
+    self.module_name_count = 0;
+    self.level_count = 0;
+    self.static_candidate_arena_count = 0;
+    self.heap_candidate_arena_count = 0;
+    self.materialized_node_count = 0;
+    self.materialized_node_id_slab_count = 0;
+    self.page_key_cache_count = 0;
+    self.next_materialized_node_id = 1;
+}
+
+pub machine PointerScanResultsStore::has_results(&self) -> bool {
+    self.has_results
+}
+
+// The scan header — written by the start/validate executors once
+// `execute_scan`/`validate_scan` returns its assembled view (the arenas
+// themselves are already this store's fields).
+pub machine PointerScanResultsStore::commit_header(
+    &mut self,
+    session_id: u64,
+    target_descriptor: PointerScanTargetDescriptor,
+    address_space: PointerScanAddressSpace,
+    pointer_size: PointerScanPointerSize,
+    max_depth: u64,
+    offset_radius: u64,
+    root_node_count: u64,
+    total_node_count: u64,
+    total_static_node_count: u64,
+    total_heap_node_count: u64,
+    target_address_count: u64,
+    module_name_count: u64,
+    level_count: u64,
+    materialized_node_count: u64,
+    materialized_node_id_slab_count: u64,
+    page_key_cache_count: u64,
+    next_materialized_node_id: u64,
+    materialized_nodes_overflowed: bool
+) {
+    self.has_results = true;
+    self.session_id = session_id;
+    self.target_descriptor = target_descriptor;
+    self.address_space = address_space;
+    self.pointer_size = pointer_size;
+    self.max_depth = max_depth;
+    self.offset_radius = offset_radius;
+    self.root_node_count = root_node_count;
+    self.total_node_count = total_node_count;
+    self.total_static_node_count = total_static_node_count;
+    self.total_heap_node_count = total_heap_node_count;
+    self.target_address_count = target_address_count;
+    self.module_name_count = module_name_count;
+    self.level_count = level_count;
+    self.static_candidate_arena_count = 0;
+    self.heap_candidate_arena_count = 0;
+    self.materialized_node_count = materialized_node_count;
+    self.materialized_node_id_slab_count = materialized_node_id_slab_count;
+    self.page_key_cache_count = page_key_cache_count;
+    self.next_materialized_node_id = next_materialized_node_id;
+    self.materialized_nodes_overflowed = materialized_nodes_overflowed;
+}
+
+// Records each level's (start, count) arena windows after a scan — the
+// builder packs candidates contiguously in level order, so a level's window
+// starts where the previous level's ended. Callers capture the per-level
+// node counts off the `level_candidates` array `execute_scan` filled and
+// pass them here (borrowed views cannot survive a state transition).
+pub machine PointerScanResultsStore::commit_level_windows(
+    &mut self,
+    level_static_counts: &[u64; 8],
+    level_heap_counts: &[u64; 8],
+    level_count: u64
+) {
+    transition { _ -> walk(level_static_counts, level_heap_counts, level_count, 0, 0, 0) }
+
+    state walk(
+        &mut self,
+        level_static_counts: &[u64; 8],
+        level_heap_counts: &[u64; 8],
+        level_count: u64,
+        level_index: u64,
+        static_cursor: u64,
+        heap_cursor: u64
+    ) {
+        transition level_index < level_count && level_index < 8 {
+            true -> record(level_static_counts, level_heap_counts, level_count, level_index, static_cursor, heap_cursor)
+            false -> done(static_cursor, heap_cursor)
+            _ -> done(static_cursor, heap_cursor)
+        }
+    }
+    state record(
+        &mut self,
+        level_static_counts: &[u64; 8],
+        level_heap_counts: &[u64; 8],
+        level_count: u64,
+        level_index: u64 [0..8],
+        static_cursor: u64,
+        heap_cursor: u64
+    ) {
+        let static_count: u64 = level_static_counts[level_index];
+        let heap_count: u64 = level_heap_counts[level_index];
+        self.level_static_starts[level_index] = static_cursor;
+        self.level_static_counts[level_index] = static_count;
+        self.level_heap_starts[level_index] = heap_cursor;
+        self.level_heap_counts[level_index] = heap_count;
+        transition { _ -> walk(
+            level_static_counts,
+            level_heap_counts,
+            level_count,
+            ((level_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+            ((static_cursor as u64 in Wrapping) + (static_count as u64 in Wrapping)) as u64,
+            ((heap_cursor as u64 in Wrapping) + (heap_count as u64 in Wrapping)) as u64) }
+    }
+    state done(&mut self, static_cursor: u64, heap_cursor: u64) {
+        self.static_candidate_arena_count = static_cursor;
+        self.heap_candidate_arena_count = heap_cursor;
+    }
+}
+
+// Write-back of the scalar fields a view mutates — upstream mutates the
+// stored record in place; the port's view copies scalars, so executors
+// commit the counters/flags back after each access window. Scalar params,
+// not the view itself: a `&PointerScanResults` argument would alias the
+// `&mut self` the store arenas still carry.
+pub machine PointerScanResultsStore::commit_view_scalars(
+    &mut self,
+    root_node_count: u64,
+    total_node_count: u64,
+    total_static_node_count: u64,
+    total_heap_node_count: u64,
+    materialized_node_count: u64,
+    materialized_node_id_slab_count: u64,
+    page_key_cache_count: u64,
+    next_materialized_node_id: u64,
+    materialized_nodes_overflowed: bool
+) {
+    self.root_node_count = root_node_count;
+    self.total_node_count = total_node_count;
+    self.total_static_node_count = total_static_node_count;
+    self.total_heap_node_count = total_heap_node_count;
+    self.materialized_node_count = materialized_node_count;
+    self.materialized_node_id_slab_count = materialized_node_id_slab_count;
+    self.page_key_cache_count = page_key_cache_count;
+    self.next_materialized_node_id = next_materialized_node_id;
+    self.materialized_nodes_overflowed = materialized_nodes_overflowed;
+}
+
+pub machine PointerScanResultsStore::get_session_id(&self) -> u64 {
+    self.session_id
+}
+
+pub machine PointerScanResultsStore::get_root_node_count(&self) -> u64 {
+    self.root_node_count
+}
+
+pub machine PointerScanResultsStore::get_total_node_count(&self) -> u64 {
+    self.total_node_count
+}
+
+pub machine PointerScanResultsStore::get_total_static_node_count(&self) -> u64 {
+    self.total_static_node_count
+}
+
+pub machine PointerScanResultsStore::get_total_heap_node_count(&self) -> u64 {
+    self.total_heap_node_count
+}
+
+pub machine PointerScanResultsStore::get_level_count(&self) -> u64 {
+    self.level_count
+}
+
+pub machine PointerScanResultsStore::get_level(&self, level_index: u64) -> PointerScanLevel {
+    transition level_index < self.level_count && level_index < 8 {
+        true -> (self.levels[level_index])
+        false -> (PointerScanLevel::new(0, 0, 0, 0))
+        _ -> (PointerScanLevel::new(0, 0, 0, 0))
+    }
+}
+
+// Arena extents as one disjoint-borrow bundle — a single `&mut self` call
+// mints the whole set (per-field accessors would need seven overlapping
+// `&mut` borrows of the same record, which no borrow checker admits). The
+// lifetime names match `PointerScanResults`/`execute_scan`'s so callers can
+// hand fields straight through.
+pub data PointerScanResultsArenas<'ext, 'sh, 's, 'h> {
+    target_addresses: &'ext mut [u64];
+    module_names: &'ext mut [PointerScanModuleName];
+    levels: &'sh mut [PointerScanLevel];
+    static_candidate_arena: &'s mut [PointerScanCandidate];
+    heap_candidate_arena: &'h mut [PointerScanCandidate];
+    materialized_nodes: &'ext mut [PointerScanNode];
+    materialized_node_id_slab: &'ext mut [u64];
+    page_key_cache: &'ext mut [MaterializedPageKeyEntry];
+}
+
+pub machine PointerScanResultsStore::borrow_arenas_mut<'ext, 'sh, 's, 'h>(
+    &mut self
+) -> PointerScanResultsArenas<'ext, 'sh, 's, 'h> {
+    PointerScanResultsArenas {
+        target_addresses: &mut self.target_addresses,
+        module_names: &mut self.module_names,
+        levels: &mut self.levels,
+        static_candidate_arena: &mut self.static_candidate_arena,
+        heap_candidate_arena: &mut self.heap_candidate_arena,
+        materialized_nodes: &mut self.materialized_nodes,
+        materialized_node_id_slab: &mut self.materialized_node_id_slab,
+        page_key_cache: &mut self.page_key_cache,
+    }
+}
+
+// Validation output is written into caller-owned arenas (upstream hands the
+// freshly built `PointerScanResults` its own Vecs — the prior results stay
+// readable under their session id). The single-slot store folds that to:
+// validate writes a separate arena set, then this commits the contents over
+// the stored arenas — the stored results become the validated ones and the
+// pre-validation entry is dropped (bounded-store deviation; upstream keeps
+// both keyed by distinct session ids).
+pub data PointerScanValidationArenas {
+    target_addresses: [u64; 64];
+    target_address_count: u64;
+    module_names: [PointerScanModuleName; 32];
+    module_name_count: u64;
+    levels: [PointerScanLevel; 8];
+    level_count: u64;
+    static_candidate_arena: [PointerScanCandidate; 4096];
+    heap_candidate_arena: [PointerScanCandidate; 4096];
+    materialized_nodes: [PointerScanNode; 512];
+    materialized_node_id_slab: [u64; 512];
+    page_key_cache: [MaterializedPageKeyEntry; 64];
+}
+
+// One disjoint-borrow bundle for the validation arenas — same reason as
+// `PointerScanResultsArenas`: per-field accessors cannot produce nine live
+// `&mut` borrows of one record.
+pub data PointerScanValidationArenaViews<'ext> {
+    target_addresses: &'ext mut [u64];
+    module_names: &'ext mut [PointerScanModuleName];
+    levels: &'ext mut [PointerScanLevel];
+    static_candidate_arena: &'ext mut [PointerScanCandidate];
+    heap_candidate_arena: &'ext mut [PointerScanCandidate];
+    materialized_nodes: &'ext mut [PointerScanNode];
+    materialized_node_id_slab: &'ext mut [u64];
+    page_key_cache: &'ext mut [MaterializedPageKeyEntry];
+}
+
+pub machine PointerScanValidationArenas::borrow_views_mut<'ext>(
+    &mut self
+) -> PointerScanValidationArenaViews<'ext> {
+    PointerScanValidationArenaViews {
+        target_addresses: &mut self.target_addresses,
+        module_names: &mut self.module_names,
+        levels: &mut self.levels,
+        static_candidate_arena: &mut self.static_candidate_arena,
+        heap_candidate_arena: &mut self.heap_candidate_arena,
+        materialized_nodes: &mut self.materialized_nodes,
+        materialized_node_id_slab: &mut self.materialized_node_id_slab,
+        page_key_cache: &mut self.page_key_cache,
+    }
+}
+
+pub machine PointerScanValidationArenas::empty() -> PointerScanValidationArenas {
+    PointerScanValidationArenas {
+        target_address_count: 0,
+        module_name_count: 0,
+        level_count: 0,
+    }
+}
+
+pub machine PointerScanValidationArenas::borrow_target_addresses_mut(&mut self) -> &mut [u64] {
+    &mut self.target_addresses
+}
+pub machine PointerScanValidationArenas::borrow_module_names_mut(&mut self) -> &mut [PointerScanModuleName] {
+    &mut self.module_names
+}
+pub machine PointerScanValidationArenas::borrow_levels_mut(&mut self) -> &mut [PointerScanLevel] {
+    &mut self.levels
+}
+pub machine PointerScanValidationArenas::borrow_static_candidate_arena_mut(&mut self) -> &mut [PointerScanCandidate] {
+    &mut self.static_candidate_arena
+}
+pub machine PointerScanValidationArenas::borrow_heap_candidate_arena_mut(&mut self) -> &mut [PointerScanCandidate] {
+    &mut self.heap_candidate_arena
+}
+pub machine PointerScanValidationArenas::borrow_materialized_nodes_mut(&mut self) -> &mut [PointerScanNode] {
+    &mut self.materialized_nodes
+}
+pub machine PointerScanValidationArenas::borrow_materialized_node_id_slab_mut(&mut self) -> &mut [u64] {
+    &mut self.materialized_node_id_slab
+}
+pub machine PointerScanValidationArenas::borrow_page_key_cache_mut(&mut self) -> &mut [MaterializedPageKeyEntry] {
+    &mut self.page_key_cache
+}
+
+// Commits the validated arena contents into the stored arenas — element
+// copies bounded by the validated counts upstream's builder reports.
+pub machine PointerScanResultsStore::commit_validated_arenas(
+    &mut self,
+    arenas: &PointerScanValidationArenas,
+    target_address_count: u64,
+    module_name_count: u64,
+    level_count: u64,
+    materialized_node_count: u64,
+    materialized_node_id_slab_count: u64,
+    page_key_cache_count: u64
+) {
+    transition { _ -> targets(arenas, target_address_count, module_name_count, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, 0) }
+
+    state targets(&mut self, arenas: &PointerScanValidationArenas, target_address_count: u64, module_name_count: u64, level_count: u64, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64) {
+        transition position < target_address_count && position < 64 {
+            true -> target(arenas, target_address_count, module_name_count, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position)
+            false -> names(arenas, module_name_count, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, 0)
+        }
+    }
+    state target(&mut self, arenas: &PointerScanValidationArenas, target_address_count: u64, module_name_count: u64, level_count: u64, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64 [0..64]) {
+        self.target_addresses[position] = arenas.target_addresses[position];
+        transition { _ -> targets(arenas, target_address_count, module_name_count, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position + 1) }
+    }
+    state names(&mut self, arenas: &PointerScanValidationArenas, module_name_count: u64, level_count: u64, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64) {
+        transition position < module_name_count && position < 32 {
+            true -> name(arenas, module_name_count, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position)
+            false -> levels(arenas, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, 0)
+        }
+    }
+    state name(&mut self, arenas: &PointerScanValidationArenas, module_name_count: u64, level_count: u64, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64 [0..32]) {
+        self.module_names[position] = arenas.module_names[position];
+        transition { _ -> names(arenas, module_name_count, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position + 1) }
+    }
+    state levels(&mut self, arenas: &PointerScanValidationArenas, level_count: u64, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64) {
+        transition position < level_count && position < 8 {
+            true -> level(arenas, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position)
+            false -> statics(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, 0)
+        }
+    }
+    state level(&mut self, arenas: &PointerScanValidationArenas, level_count: u64, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64 [0..8]) {
+        self.levels[position] = arenas.levels[position];
+        transition { _ -> levels(arenas, level_count, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position + 1) }
+    }
+    // statics/heaps bounded by the arena counts commit_level_windows set.
+    state statics(&mut self, arenas: &PointerScanValidationArenas, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64) {
+        transition position < self.static_candidate_arena_count && position < 4096 {
+            true -> static_one(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position)
+            false -> heaps(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, 0)
+        }
+    }
+    state static_one(&mut self, arenas: &PointerScanValidationArenas, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64 [0..4096]) {
+        self.static_candidate_arena[position] = arenas.static_candidate_arena[position];
+        transition { _ -> statics(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position + 1) }
+    }
+    state heaps(&mut self, arenas: &PointerScanValidationArenas, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64) {
+        transition position < self.heap_candidate_arena_count && position < 4096 {
+            true -> heap_one(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position)
+            false -> nodes(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, 0)
+        }
+    }
+    state heap_one(&mut self, arenas: &PointerScanValidationArenas, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64 [0..4096]) {
+        self.heap_candidate_arena[position] = arenas.heap_candidate_arena[position];
+        transition { _ -> heaps(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position + 1) }
+    }
+    state nodes(&mut self, arenas: &PointerScanValidationArenas, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64) {
+        transition position < materialized_node_count && position < 512 {
+            true -> node(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position)
+            false -> ids(arenas, materialized_node_id_slab_count, page_key_cache_count, 0)
+        }
+    }
+    state node(&mut self, arenas: &PointerScanValidationArenas, materialized_node_count: u64, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64 [0..512]) {
+        self.materialized_nodes[position] = arenas.materialized_nodes[position];
+        transition { _ -> nodes(arenas, materialized_node_count, materialized_node_id_slab_count, page_key_cache_count, position + 1) }
+    }
+    state ids(&mut self, arenas: &PointerScanValidationArenas, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64) {
+        transition position < materialized_node_id_slab_count && position < 512 {
+            true -> id(arenas, materialized_node_id_slab_count, page_key_cache_count, position)
+            false -> keys(arenas, page_key_cache_count, 0)
+        }
+    }
+    state id(&mut self, arenas: &PointerScanValidationArenas, materialized_node_id_slab_count: u64, page_key_cache_count: u64, position: u64 [0..512]) {
+        self.materialized_node_id_slab[position] = arenas.materialized_node_id_slab[position];
+        transition { _ -> ids(arenas, materialized_node_id_slab_count, page_key_cache_count, position + 1) }
+    }
+    state keys(&mut self, arenas: &PointerScanValidationArenas, page_key_cache_count: u64, position: u64) {
+        transition position < page_key_cache_count && position < 64 {
+            true -> key(arenas, page_key_cache_count, position)
+            false -> done()
+        }
+    }
+    state key(&mut self, arenas: &PointerScanValidationArenas, page_key_cache_count: u64, position: u64 [0..64]) {
+        self.page_key_cache[position] = arenas.page_key_cache[position];
+        transition { _ -> keys(arenas, page_key_cache_count, position + 1) }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Reassembles the borrowed `PointerScanResults` view upstream callers hold
+// through the store guard. `level_candidates_view` is caller storage —
+// its elements are rebuilt per access from the recorded arena windows.
+pub machine PointerScanResultsStore::assemble_results_view<'ext, 'sh, 's, 'h>(
+    &mut self,
+    level_candidates_view: &'ext mut [PointerScanLevelCandidates<'s, 'h>; 8]
+) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+    transition { _ -> fill_windows(level_candidates_view, 0) }
+
+    state fill_windows(
+        &mut self,
+        level_candidates_view: &'ext mut [PointerScanLevelCandidates<'s, 'h>; 8],
+        level_index: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        transition level_index < self.level_count && level_index < 8 {
+            true -> fill_window(level_candidates_view, level_index)
+            false -> build(level_candidates_view)
+            _ -> build(level_candidates_view)
+        }
+    }
+    state fill_window(
+        &mut self,
+        level_candidates_view: &'ext mut [PointerScanLevelCandidates<'s, 'h>; 8],
+        level_index: u64 [0..8]
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let static_start: u64 = self.level_static_starts[level_index];
+        let static_count: u64 = self.level_static_counts[level_index];
+        let heap_start: u64 = self.level_heap_starts[level_index];
+        let heap_count: u64 = self.level_heap_counts[level_index];
+        let depth: u64 = self.levels[level_index].get_depth();
+        // Recorded windows are committed from executor counts bounded by
+        // the arenas; the guard degrades a corrupt record to an empty
+        // window instead of an unchecked subslice.
+        transition static_start < 4096 && static_count <= 4096 && heap_start < 4096 && heap_count <= 4096 {
+            true -> fill_window_checked(level_candidates_view, level_index, depth, static_start, static_count, heap_start, heap_count)
+            false -> fill_window_checked(level_candidates_view, level_index, depth, 4095, 0, 4095, 0)
+            _ -> fill_window_checked(level_candidates_view, level_index, depth, 4095, 0, 4095, 0)
+        }
+    }
+    state fill_window_checked(
+        &mut self,
+        level_candidates_view: &'ext mut [PointerScanLevelCandidates<'s, 'h>; 8],
+        level_index: u64 [0..8],
+        depth: u64,
+        static_start: u64 [0..4096],
+        static_count: u64 [0..4097],
+        heap_start: u64 [0..4096],
+        heap_count: u64 [0..4097]
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        let static_end: u64 = static_start + static_count;
+        let heap_end: u64 = heap_start + heap_count;
+        transition static_start <= static_end && static_end <= 4096 && heap_start <= heap_end && heap_end <= 4096 {
+            true -> fill_window_write(level_candidates_view, level_index, depth,
+                &self.static_candidate_arena[static_start..static_end],
+                static_count,
+                &self.heap_candidate_arena[heap_start..heap_end],
+                heap_count)
+            false -> fill_window_write(level_candidates_view, level_index, depth,
+                &self.static_candidate_arena[0..0],
+                0,
+                &self.heap_candidate_arena[0..0],
+                0)
+            _ -> fill_window_write(level_candidates_view, level_index, depth,
+                &self.static_candidate_arena[0..0],
+                0,
+                &self.heap_candidate_arena[0..0],
+                0)
+        }
+    }
+    state fill_window_write(
+        &mut self,
+        level_candidates_view: &'ext mut [PointerScanLevelCandidates<'s, 'h>; 8],
+        level_index: u64 [0..8],
+        depth: u64,
+        static_window: &[PointerScanCandidate],
+        static_count: u64,
+        heap_window: &[PointerScanCandidate],
+        heap_count: u64
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        level_candidates_view[level_index] = PointerScanLevelCandidates::new_presorted(
+            depth,
+            static_window,
+            static_count,
+            heap_window,
+            heap_count);
+        transition { _ -> fill_windows(level_candidates_view, level_index + 1) }
+    }
+    state build(
+        &mut self,
+        level_candidates_view: &'ext mut [PointerScanLevelCandidates<'s, 'h>; 8]
+    ) -> PointerScanResults<'ext, 'sh, 's, 'h> {
+        // PointerScanResults::new re-sorts/dedups target addresses and
+        // recomputes root/total counts — idempotent on already-scanned
+        // data; the persisted overflow flag is restored after.
+        let mut pointer_scan_results: PointerScanResults<'ext, 'sh, 's, 'h> = PointerScanResults::new(
+            self.session_id,
+            self.target_descriptor,
+            &mut self.target_addresses,
+            self.target_address_count,
+            self.address_space,
+            self.pointer_size,
+            self.max_depth,
+            self.offset_radius,
+            &mut self.module_names,
+            self.module_name_count,
+            &self.levels,
+            self.level_count,
+            level_candidates_view,
+            self.level_count,
+            self.total_static_node_count,
+            self.total_heap_node_count,
+            &mut self.materialized_nodes,
+            &mut self.materialized_node_id_slab,
+            &mut self.page_key_cache);
+        pointer_scan_results.restore_materialization_state(
+            self.materialized_node_count,
+            self.materialized_node_id_slab_count,
+            self.page_key_cache_count,
+            self.next_materialized_node_id,
+            self.materialized_nodes_overflowed);
+        transition { _ -> (pointer_scan_results) }
+    }
+}
