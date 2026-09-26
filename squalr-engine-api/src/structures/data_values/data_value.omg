@@ -1,0 +1,211 @@
+module src::structures::data_values::data_value;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_types::data_type_ref::DataTypeRefParse;
+
+// Port of structures/data_values/data_value.rs: a value for a `DataType` —
+// the type identifier plus the raw value bytes the type object interprets
+// (int, string, serialized bitfield and mask, ...).
+//
+// Upstream keeps the bytes in a growable `Vec<u8>`; the byte domain keeps
+// them in a bounded inline buffer plus a length — the same translation
+// ElementWindow uses, bounded here at 4096 bytes (matching
+// AnonymousValueString's bound: anonymous and array values beyond it refuse
+// to store rather than truncate — named deviation from upstream's unbounded
+// Vec<u8>). Upstream is Clone, not Copy, so the record carries no [copy].
+//
+// Named deferral: `to_valued_struct*` constructors live in
+// structures/structs/valued_struct_field.omg beside their target type
+// (upstream places them here; the port splits the dependency the other way
+// so DataValue does not import the structs module).
+pub data DataValue {
+    data_type_ref: DataTypeRef;
+    value_bytes: [u8; 4096];
+    value_bytes_len: u64;
+}
+
+// Bespoke carrier for `from_string_privileged` — upstream Err is String;
+// the package's refusal convention is `Refused` (Optional is unmatchable in
+// this pin).
+pub data DataValueParse {
+    case Refused;
+    case Parsed(value: DataValue);
+}
+
+// Upstream `DataValue::new` — stores the type ref verbatim and the value
+// bytes up to the bound; over-long byte input truncates (named deviation —
+// callers that need the refusal check `get_size_in_bytes` against input
+// length, the same contract as `copy_from_bytes`).
+pub machine DataValue::new(data_type_ref: &DataTypeRef, value_bytes: &[u8]) -> DataValue {
+    let mut data_value: DataValue = DataValue {
+        data_type_ref: DataTypeRef::clone(data_type_ref),
+        value_bytes_len: 0
+    };
+    data_value.fill_bytes(value_bytes);
+    data_value
+}
+
+pub machine DataValue::default() -> DataValue {
+    DataValue {
+        data_type_ref: DataTypeRef::default(),
+        value_bytes_len: 0
+    }
+}
+
+pub machine DataValue::clone(source: &DataValue) -> DataValue {
+    let mut data_value: DataValue = DataValue {
+        data_type_ref: DataTypeRef::clone(&source.data_type_ref),
+        value_bytes_len: 0
+    };
+    data_value.copy_bytes_window(source, 0, source.value_bytes_len);
+    data_value
+}
+
+// Upstream `copy_from_bytes` — replaces the stored bytes when they differ.
+// Over-long input refuses (returns false) rather than truncating: unlike
+// `new`, this is the write path read/read_struct results flow through, and
+// silently dropping bytes would invent a shorter value than the memory
+// region supplied — named deviation, upstream's Vec<u8> always accepts.
+pub machine DataValue::copy_from_bytes(&mut self, value_bytes: &[u8]) -> bool {
+    transition value_bytes.len <= 4096 && !self.bytes_equal(value_bytes) {
+        true -> store(value_bytes)
+        false -> decide_equal(value_bytes)
+    }
+    state store(&mut self, value_bytes: &[u8]) -> bool {
+        self.fill_bytes(value_bytes);
+        true
+    }
+    state decide_equal(&mut self, value_bytes: &[u8]) -> bool {
+        // Upstream: unchanged bytes are a no-op success; over-long input is
+        // the only refusal.
+        transition value_bytes.len <= 4096 {
+            true -> (true)
+            false -> (false)
+        }
+    }
+}
+
+machine DataValue::bytes_equal(&self, value_bytes: &[u8]) -> bool {
+    transition self.value_bytes_len == value_bytes.len {
+        true -> scan(0, value_bytes)
+        false -> (false)
+    }
+    state scan(&self, position: u64, value_bytes: &[u8]) -> bool {
+        transition position < self.value_bytes_len && position < value_bytes.len && position < 4096 {
+            true -> compare(position, value_bytes)
+            false -> (true)
+        }
+    }
+    state compare(&self, position: u64 [0..4096], value_bytes: &[u8]) -> bool {
+        transition self.value_bytes[position] == value_bytes[position] {
+            true -> scan(position + 1, value_bytes)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+machine DataValue::fill_bytes(&mut self, value_bytes: &[u8]) {
+    transition { _ -> copy(value_bytes, 0) }
+    state copy(&mut self, value_bytes: &[u8], position: u64) {
+        transition position < value_bytes.len && position < 4096 {
+            true -> store(value_bytes, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, value_bytes: &[u8], position: u64) {
+        self.value_bytes[position] = value_bytes[position];
+        transition { _ -> copy(value_bytes, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.value_bytes_len = count;
+    }
+}
+
+machine DataValue::copy_bytes_window(&mut self, source: &DataValue, start: u64, end: u64) {
+    transition { _ -> copy(source, start, end, 0) }
+    state copy(&mut self, source: &DataValue, at: u64, end: u64, position: u64) {
+        transition at < end && at < source.value_bytes_len && at < 4096 && position < 4096 {
+            true -> store(source, at, end, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, source: &DataValue, at: u64, end: u64, position: u64) {
+        self.value_bytes[position] = source.value_bytes[at];
+        transition { _ -> copy(source, at + 1, end, position + 1) }
+    }
+    state finish(&mut self, count: u64) {
+        self.value_bytes_len = count;
+    }
+}
+
+// Upstream `get_data_type_ref` — the borrowed view is not retainable, so
+// callers take an owned clone (upstream callers Clone the ref where they
+// hold it past a mutation anyway).
+pub machine DataValue::get_data_type_ref(&self) -> DataTypeRef {
+    DataTypeRef::clone(&self.data_type_ref)
+}
+
+// Upstream `set_data_type_in_place` — updates the type without touching the
+// bytes.
+pub machine DataValue::set_data_type_in_place(&mut self, data_type_ref: &DataTypeRef) {
+    self.data_type_ref = DataTypeRef::clone(data_type_ref);
+}
+
+// Upstream `get_data_type_id` — forwarded to the ref's bounded id view.
+pub machine DataValue::get_data_type_id(&self) -> &[u8] {
+    self.data_type_ref.get_data_type_id()
+}
+
+pub machine DataValue::get_size_in_bytes(&self) -> u64 {
+    self.value_bytes_len
+}
+
+// Upstream `get_value_bytes` — the window over the stored bytes.
+pub machine DataValue::get_value_bytes(&self) -> &[u8] {
+    transition self.value_bytes_len <= 4096 {
+        true -> (&self.value_bytes[0..self.value_bytes_len])
+        false -> (&self.value_bytes[0..0])
+        _ -> (&self.value_bytes[0..0])
+    }
+}
+
+// Upstream `take_value_bytes` — the drained bytes are handed to the caller
+// through `out` (upstream returns the Vec; the byte domain copies into a
+// caller buffer) and the value is left empty. Returns the drained count.
+pub machine DataValue::take_value_bytes(&mut self, out: &mut [u8]) -> u64 {
+    transition { _ -> copy(out, 0) }
+    state copy(&mut self, out: &mut [u8], position: u64) -> u64 {
+        transition position < self.value_bytes_len && position < out.len && position < 4096 {
+            true -> store(out, position)
+            false -> drain(position)
+        }
+    }
+    state store(&mut self, out: &mut [u8], position: u64) -> u64 {
+        out[position] = self.value_bytes[position];
+        transition { _ -> copy(out, position + 1) }
+    }
+    state drain(&mut self, count: u64) -> u64 {
+        self.value_bytes_len = 0;
+        count
+    }
+}
+
+// Upstream FromStringPrivileged: "{data_type{;container}}={value}" split on
+// the first '='. The ported parse takes the pre-split halves — byte-string
+// splitting machinery lives with the CLI command parser; `parse` accepts the
+// type id and (unused, per upstream) value bytes. Upstream ignores the value
+// half and stores empty bytes — identical here.
+pub machine DataValue::parse(data_type_id: &[u8]) -> DataValueParse {
+    let ref_parse: DataTypeRefParse = DataTypeRef::parse(data_type_id);
+    transition { _ -> finish(ref_parse) }
+    state finish(ref_parse: DataTypeRefParse) -> DataValueParse {
+        transition ref_parse {
+            DataTypeRefParse::Refused -> (DataValueParse::Refused)
+            DataTypeRefParse::Parsed { value } -> (DataValueParse::Parsed {
+                value: DataValue::new(&value, "")
+            })
+            _ -> (DataValueParse::Refused)
+        }
+    }
+}
