@@ -49,20 +49,27 @@ use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::
 use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ElementScanRequest;
 use squalr_engine_api::src::commands::scan::new::scan_new_request::ScanNewRequest;
 use squalr_engine_api::src::commands::scan::scan_command::ScanCommand;
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultRefList;
+use squalr_engine_api::src::commands::scan_results::freeze::scan_results_freeze_request::ScanResultsFreezeRequest;
+use squalr_engine_api::src::commands::scan_results::freeze::scan_results_freeze_response::ScanResultsFreezeResponse;
 use squalr_engine_api::src::commands::scan_results::scan_results_command::ScanResultsCommand;
 use squalr_engine_api::src::commands::scan_results::list::scan_results_list_request::ScanResultsListRequest;
 use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultsListResponse;
 use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultPage;
 use squalr_engine_api::src::commands::scan_results::scan_results_response::ScanResultsResponse;
+use squalr_engine_api::src::commands::scan_results::set_property::scan_results_set_property_request::ScanResultsSetPropertyRequest;
 use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
 use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
 use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
 use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
 use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
 use squalr_engine_session::src::os::supplied_memory_source::SuppliedRegion;
 use squalr_engine::src::squalr_engine::SqualrEngine;
 use squalr_engine::src::command_executors::pointer_scan_command_executor::PointerScanCommandExecutor;
+use squalr_engine::src::command_executors::scan_results_command_executor::ScanResultsCommandExecutor;
 use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::tasks::snapshot_scan_result_freeze_task::SnapshotScanResultFreezeTask;
 use squalr_engine_api::src::commands::pointer_scan::pointer_scan_command::PointerScanCommand;
 use squalr_engine_api::src::commands::pointer_scan::pointer_scan_response::PointerScanResponse;
 use squalr_engine_api::src::commands::pointer_scan::start::pointer_scan_start_request::PointerScanStartRequest;
@@ -2326,5 +2333,156 @@ crashes Abort
     ) -> bool {
         let results_cleared: bool = !engine_privileged_state.pointer_scan_results_store.has_results();
         response.success && results_cleared
+    }
+}
+
+// CHECK-LEVEL freeze/set_property witness (not in the entry cone): drives
+// ScanResultsCommandExecutor::Freeze + SetProperty + the session freeze task
+// over the seeded 8-element u64 snapshot (region [0x1000, +64), element 2 =
+// address 0x1010). Asserts the upstream contract: freeze registers the
+// (module_offset, module_name) key and captures the current value;
+// freeze_values rewrites it after mutation; set_property "is_frozen" fires
+// the internal freeze request both directions; set_property "value" writes
+// the deanonymized bytes.
+// native_blocked: same entry-cone wall catalogue as the other fixtures.
+pub machine FixtureKit::verify_scan_results_freeze() -> bool
+crashes Abort
+{
+    transition { _ -> scan() }
+
+    state scan() -> bool {
+        let mut engine_privileged_state: EnginePrivilegedState = EnginePrivilegedState::new();
+        engine_privileged_state.init();
+        engine_privileged_state.set_opened_process_fixture(1);
+        engine_privileged_state.set_supplied_memory_fixture(4096, 8);
+        engine_privileged_state.seed_supplied_element(2, 999);
+        engine_privileged_state.seed_scan_snapshot_fixture();
+        engine_privileged_state.initialize_scan_results_fixture();
+        let module_name: [u8; 8] = [103, 97, 109, 101, 46, 101, 120, 101];
+        let module_pushed: bool = engine_privileged_state.push_supplied_module(&module_name, 4096, 256);
+        transition module_pushed {
+            true -> freeze(&mut engine_privileged_state)
+            false -> (false)
+        }
+    }
+
+    // Freeze ref index 2 (address 0x1010, value 999, inside "game.exe").
+    state freeze(engine_privileged_state: &mut EnginePrivilegedState) -> bool {
+        let mut refs: ScanResultRefList = ScanResultRefList::empty();
+        let scan_ref: ScanResultRef = ScanResultRef::new(2, false);
+        let pushed: bool = refs.push(&scan_ref);
+        let request: ScanResultsFreezeRequest = ScanResultsFreezeRequest::new(refs, true);
+        let response: ScanResultsResponse = ScanResultsCommandExecutor::execute(
+            engine_privileged_state,
+            ScanResultsCommand::Freeze { request: request }
+        );
+        transition response {
+            ScanResultsResponse::Freeze { response } -> frozen(&mut engine_privileged_state, response)
+            _ -> (false)
+        }
+    }
+
+    state frozen(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        response: ScanResultsFreezeResponse
+    ) -> bool {
+        let frozen_count: u64 = engine_privileged_state.get_freeze_list_count();
+        let ok: bool = response.get_failed_count() == 0 && frozen_count == 1;
+        transition ok {
+            true -> mutate(&mut engine_privileged_state)
+            false -> (false)
+        }
+    }
+
+    // Mutate the live element, then let the freeze task restore it.
+    state mutate(engine_privileged_state: &mut EnginePrivilegedState) -> bool {
+        engine_privileged_state.seed_supplied_element(2, 555);
+        let written: u64 = SnapshotScanResultFreezeTask::freeze_values(engine_privileged_state);
+        let restored: u64 = engine_privileged_state.get_supplied_memory_source().read_u64(4112);
+        let ok: bool = written == 1 && restored == 999;
+        transition ok {
+            true -> unfreeze(&mut engine_privileged_state)
+            false -> (false)
+        }
+    }
+
+    // set_property "is_frozen"="0" -> internal freeze request unfrozen arm.
+    state unfreeze(engine_privileged_state: &mut EnginePrivilegedState) -> bool {
+        let mut refs: ScanResultRefList = ScanResultRefList::empty();
+        let scan_ref: ScanResultRef = ScanResultRef::new(2, false);
+        let pushed: bool = refs.push(&scan_ref);
+        let container_type: ContainerType = ContainerType::default();
+        let value_string: AnonymousValueString = AnonymousValueString::new(
+            "0",
+            AnonymousValueStringFormat::Decimal,
+            container_type
+        );
+        let request: ScanResultsSetPropertyRequest = ScanResultsSetPropertyRequest::new(
+            refs,
+            value_string,
+            "is_frozen"
+        );
+        let response: ScanResultsResponse = ScanResultsCommandExecutor::execute(
+            engine_privileged_state,
+            ScanResultsCommand::SetProperty { request: request }
+        );
+        let remaining: u64 = engine_privileged_state.get_freeze_list_count();
+        transition response.is_set_property() && remaining == 0 {
+            true -> refreeze(&mut engine_privileged_state)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    // set_property "is_frozen"="1" -> freeze arm registers the key again.
+    state refreeze(engine_privileged_state: &mut EnginePrivilegedState) -> bool {
+        let mut refs: ScanResultRefList = ScanResultRefList::empty();
+        let scan_ref: ScanResultRef = ScanResultRef::new(2, false);
+        let pushed: bool = refs.push(&scan_ref);
+        let container_type: ContainerType = ContainerType::default();
+        let value_string: AnonymousValueString = AnonymousValueString::new(
+            "1",
+            AnonymousValueStringFormat::Decimal,
+            container_type
+        );
+        let request: ScanResultsSetPropertyRequest = ScanResultsSetPropertyRequest::new(
+            refs,
+            value_string,
+            "is_frozen"
+        );
+        let response: ScanResultsResponse = ScanResultsCommandExecutor::execute(
+            engine_privileged_state,
+            ScanResultsCommand::SetProperty { request: request }
+        );
+        let frozen_again: u64 = engine_privileged_state.get_freeze_list_count();
+        transition response.is_set_property() && frozen_again == 1 {
+            true -> set_value(&mut engine_privileged_state)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    // set_property "value"="777" -> deanonymized write to 0x1010.
+    state set_value(engine_privileged_state: &mut EnginePrivilegedState) -> bool {
+        let mut refs: ScanResultRefList = ScanResultRefList::empty();
+        let scan_ref: ScanResultRef = ScanResultRef::new(2, false);
+        let pushed: bool = refs.push(&scan_ref);
+        let container_type: ContainerType = ContainerType::default();
+        let value_string: AnonymousValueString = AnonymousValueString::new(
+            "777",
+            AnonymousValueStringFormat::Decimal,
+            container_type
+        );
+        let request: ScanResultsSetPropertyRequest = ScanResultsSetPropertyRequest::new(
+            refs,
+            value_string,
+            "value"
+        );
+        let response: ScanResultsResponse = ScanResultsCommandExecutor::execute(
+            engine_privileged_state,
+            ScanResultsCommand::SetProperty { request: request }
+        );
+        let current: u64 = engine_privileged_state.get_supplied_memory_source().read_u64(4112);
+        response.is_set_property() && current == 777
     }
 }
