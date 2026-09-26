@@ -1,0 +1,395 @@
+module src::command_executors::pointer_scan_start_request_executor;
+
+use squalr_engine_api::src::commands::pointer_scan::start::pointer_scan_start_request::PointerScanStartRequest;
+use squalr_engine_api::src::commands::pointer_scan::start::pointer_scan_start_response::PointerScanStartResponse;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_summary::PointerScanLevelSummary;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node_type::PointerScanNodeType;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_summary::StoredPointerScanSummary;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_scanning::src::pointer_scans::pointer_scan_executor_task::PointerScanExecutor;
+use squalr_engine_scanning::src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_session::src::pointer_scan_results_store::PointerScanResultsArenas;
+use src::command_executors::pointer_scan_scratch::PointerScanScratch;
+use src::command_executors::pointer_scan_target_resolution::PointerScanTargetResolution;
+use src::command_executors::pointer_scan_target_resolution::PointerScanTargetResolver;
+use src::command_executors::pointer_scan_target_resolution::resolve_pointer_scan_address_space;
+use src::command_executors::pointer_scan_target_resolution::resolve_pointer_size_for_process_bitness;
+use src::command_executors::snapshot_region_builder::SnapshotRegionBuilder;
+use src::command_executors::snapshot_value_collector::SnapshotValueCollector;
+
+// Port of command_executors/pointer_scan/start/pointer_scan_start_request_executor.rs
+// — the orchestrator entry: open-process gate → resolve address space +
+// pointer size → build the scan snapshot from the memory-query regions →
+// collect snapshot values → resolve the target request into concrete
+// target addresses → run PointerScanExecutor::execute_scan (dispatcher →
+// collectors → executor → results builder) → store the results on state.
+// `upstream's Sync wrapper + `track_performance_entry` folds to straight
+// calls; the memory-query provider reads come from `supplied_memory_source`
+// (the port's sanctioned target adapter) and `supplied_modules`.
+//
+// Deviations: `ScanSettings::get_debug_perform_validation_scan` is absent
+// from the ported settings surface — the params' debug flag pins false,
+// matching upstream's default-disabled debug scan. Value-target requests
+// resolve to upstream's `Err` surface (see pointer_scan_target_resolution).
+pub data PointerScanStartRequestExecutor {}
+
+pub machine PointerScanStartRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    pointer_scan_start_request: &PointerScanStartRequest
+) -> PointerScanStartResponse
+crashes Abort
+{
+    // Upstream `let Some(process_info) = get_opened_process() else return default`.
+    transition engine_privileged_state.has_opened_process {
+        true -> opened(engine_privileged_state, pointer_scan_start_request)
+        false -> (PointerScanStartResponse::default())
+        _ -> (PointerScanStartResponse::default())
+    }
+
+    state opened(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_start_request: &PointerScanStartRequest
+    ) -> PointerScanStartResponse {
+        let process_info: OpenedProcessInfo = engine_privileged_state.get_opened_process();
+        let effective_address_space: PointerScanAddressSpace = resolve_pointer_scan_address_space(
+            pointer_scan_start_request.address_space,
+            &pointer_scan_start_request.target);
+        let effective_pointer_size: PointerScanPointerSize = resolve_pointer_size_for_process_bitness(
+            pointer_scan_start_request.pointer_size,
+            effective_address_space,
+            &process_info);
+        transition {
+            _ -> regions(engine_privileged_state, pointer_scan_start_request, effective_address_space, effective_pointer_size)
+        }
+    }
+
+    // Upstream `get_memory_page_bounds(process)` merged into snapshot
+    // regions; an empty region list returns the default response.
+    state regions(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_start_request: &PointerScanStartRequest,
+        effective_address_space: PointerScanAddressSpace,
+        effective_pointer_size: PointerScanPointerSize
+    ) -> PointerScanStartResponse {
+        let mut builder: SnapshotRegionBuilder = SnapshotRegionBuilder::new();
+        SnapshotRegionBuilder::fill_from_supplied_source(
+            &mut builder,
+            engine_privileged_state.get_supplied_memory_source());
+        transition builder.get_region_count() == 0 {
+            true -> (PointerScanStartResponse::default())
+            false -> snapshot(engine_privileged_state, pointer_scan_start_request, effective_address_space, effective_pointer_size, builder)
+            _ -> snapshot(engine_privileged_state, pointer_scan_start_request, effective_address_space, effective_pointer_size, builder)
+        }
+    }
+
+    state snapshot(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_start_request: &PointerScanStartRequest,
+        effective_address_space: PointerScanAddressSpace,
+        effective_pointer_size: PointerScanPointerSize,
+        builder: SnapshotRegionBuilder
+    ) -> PointerScanStartResponse {
+        let mut snapshot: Snapshot = Snapshot::new();
+        SnapshotRegionBuilder::fill_snapshot(&builder, &mut snapshot);
+        engine_privileged_state.set_snapshot(snapshot);
+        // Upstream SnapshotValueCollector::collect_values(process, snapshot,
+        // memory_reader, true) — the fixture adapter collects the same
+        // snapshot over the supplied source.
+        SnapshotValueCollector::collect_all_regions(engine_privileged_state);
+        transition {
+            _ -> targets(engine_privileged_state, pointer_scan_start_request, effective_address_space, effective_pointer_size)
+        }
+    }
+
+    // Upstream `resolve_targets` writing into the results' own target
+    // arena (the store's); a Failed resolution leaves any stored results
+    // untouched, as upstream leaves the guard entry.
+    state targets(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_start_request: &PointerScanStartRequest,
+        effective_address_space: PointerScanAddressSpace,
+        effective_pointer_size: PointerScanPointerSize
+    ) -> PointerScanStartResponse {
+        let resolver: PointerScanTargetResolver = PointerScanTargetResolver {};
+        let resolution: PointerScanTargetResolution = resolver.resolve_targets(
+            &pointer_scan_start_request.target,
+            &mut engine_privileged_state.pointer_scan_results_store.target_addresses);
+        transition resolution {
+            PointerScanTargetResolution::Resolved { target_descriptor, target_address_count } -> scan(
+                engine_privileged_state,
+                pointer_scan_start_request,
+                effective_address_space,
+                effective_pointer_size,
+                target_descriptor,
+                target_address_count)
+            _ -> (PointerScanStartResponse::default())
+        }
+    }
+
+    state scan(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_start_request: &PointerScanStartRequest,
+        effective_address_space: PointerScanAddressSpace,
+        effective_pointer_size: PointerScanPointerSize,
+        target_descriptor: PointerScanTargetDescriptor,
+        target_address_count: u64
+    ) -> PointerScanStartResponse {
+        let pointer_scan_results_id: u64 = engine_privileged_state.allocate_pointer_scan_results_id();
+        let pointer_scan_parameters: PointerScanParameters = PointerScanParameters::new(
+            effective_pointer_size,
+            pointer_scan_start_request.offset_radius,
+            pointer_scan_start_request.max_depth,
+            engine_privileged_state.scan_settings.is_single_threaded_scan,
+            false);
+        let snapshots: [&Snapshot; 1] = [&engine_privileged_state.snapshot];
+        let mut scratch: PointerScanScratch = PointerScanScratch::new();
+        let empty_module_name: [u8; 1] = [0];
+        let mut supplied_modules: [NormalizedModule; 8] = [
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+            NormalizedModule::new(&empty_module_name[0..0], 0, 0)
+        ];
+        let supplied_module_count: u64 [0..9] = engine_privileged_state.copy_supplied_modules(&mut supplied_modules);
+        let arenas: PointerScanResultsArenas = (&mut engine_privileged_state.pointer_scan_results_store).borrow_arenas_mut();
+        let empty_static_view: [PointerScanCandidate; 1] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        let empty_heap_view: [PointerScanCandidate; 1] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        let mut level_candidates: [PointerScanLevelCandidates; 8] = [
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0)
+        ];
+        let mut level_out: PointerScanCollectedLevel = PointerScanCollectedLevel::new(
+            &mut scratch.collected_static_candidates,
+            &mut scratch.collected_heap_candidates);
+        let executor: PointerScanExecutor = PointerScanExecutor {};
+        let mut results: PointerScanResults = executor.execute_scan(
+            &snapshots,
+            pointer_scan_results_id,
+            &pointer_scan_parameters,
+            target_descriptor,
+            arenas.target_addresses,
+            target_address_count,
+            effective_address_space,
+            &supplied_modules[0..supplied_module_count],
+            false,
+            &mut scratch.sorted_scratch,
+            &mut scratch.target_ranges,
+            &mut scratch.lower_bounds,
+            &mut scratch.upper_bounds,
+            &mut scratch.target_range_buckets,
+            &mut scratch.tasks_scratch,
+            &mut scratch.byte_arena,
+            &mut scratch.module_order_scratch,
+            &mut level_out,
+            &mut scratch.heap_address_scratch,
+            arenas.module_names,
+            arenas.levels,
+            &mut scratch.level_spans_out,
+            &mut level_candidates,
+            arenas.static_candidate_arena,
+            arenas.heap_candidate_arena,
+            arenas.materialized_nodes,
+            arenas.materialized_node_id_slab,
+            arenas.page_key_cache);
+        // Capture the view scalars + per-level arena windows before the
+        // view dies with this state.
+        let root_node_count: u64 = results.get_root_node_count();
+        let total_node_count: u64 = results.get_total_node_count();
+        let total_static_node_count: u64 = results.get_total_static_node_count();
+        let total_heap_node_count: u64 = results.get_total_heap_node_count();
+        let module_name_count: u64 = results.get_module_name_count();
+        let level_count: u64 = results.get_pointer_scan_level_count();
+        let materialized_node_count: u64 = results.get_materialized_node_count();
+        let materialized_node_id_slab_count: u64 = results.get_materialized_node_id_slab_count();
+        let page_key_cache_count: u64 = results.get_page_key_cache_count();
+        let next_materialized_node_id: u64 = results.get_next_materialized_node_id();
+        let materialized_nodes_overflowed: bool = results.get_materialized_nodes_overflowed();
+        let mut level_static_counts: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        let mut level_heap_counts: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        let mut level_summaries: [PointerScanLevelSummary; 8] = [
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0)
+        ];
+        pointer_scan_harvest_level_data(
+            &results,
+            &mut level_static_counts,
+            &mut level_heap_counts,
+            &mut level_summaries);
+        transition {
+            _ -> commit(
+                engine_privileged_state,
+                pointer_scan_results_id,
+                target_descriptor,
+                effective_address_space,
+                effective_pointer_size,
+                pointer_scan_start_request.max_depth,
+                pointer_scan_start_request.offset_radius,
+                root_node_count,
+                total_node_count,
+                total_static_node_count,
+                total_heap_node_count,
+                target_address_count,
+                module_name_count,
+                level_count,
+                materialized_node_count,
+                materialized_node_id_slab_count,
+                page_key_cache_count,
+                next_materialized_node_id,
+                materialized_nodes_overflowed,
+                level_static_counts,
+                level_heap_counts,
+                level_summaries)
+        }
+    }
+
+    // Upstream `*pointer_scan_results_guard = Some(pointer_scan_results)` +
+    // the stored-summary response.
+    state commit(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        session_id: u64,
+        target_descriptor: PointerScanTargetDescriptor,
+        address_space: PointerScanAddressSpace,
+        pointer_size: PointerScanPointerSize,
+        max_depth: u64,
+        offset_radius: u64,
+        root_node_count: u64,
+        total_node_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        target_address_count: u64,
+        module_name_count: u64,
+        level_count: u64,
+        materialized_node_count: u64,
+        materialized_node_id_slab_count: u64,
+        page_key_cache_count: u64,
+        next_materialized_node_id: u64,
+        materialized_nodes_overflowed: bool,
+        level_static_counts: [u64; 8],
+        level_heap_counts: [u64; 8],
+        level_summaries: [PointerScanLevelSummary; 8]
+    ) -> PointerScanStartResponse {
+        engine_privileged_state.pointer_scan_results_store.clear();
+        engine_privileged_state.pointer_scan_results_store.commit_header(
+            session_id,
+            target_descriptor,
+            address_space,
+            pointer_size,
+            max_depth,
+            offset_radius,
+            root_node_count,
+            total_node_count,
+            total_static_node_count,
+            total_heap_node_count,
+            target_address_count,
+            module_name_count,
+            level_count,
+            materialized_node_count,
+            materialized_node_id_slab_count,
+            page_key_cache_count,
+            next_materialized_node_id,
+            materialized_nodes_overflowed);
+        engine_privileged_state.pointer_scan_results_store.commit_level_windows(
+            &level_static_counts,
+            &level_heap_counts,
+            level_count);
+        let stored_summary: StoredPointerScanSummary = StoredPointerScanSummary::of_scalars(
+            session_id,
+            target_descriptor,
+            address_space,
+            pointer_size,
+            max_depth,
+            offset_radius,
+            root_node_count,
+            total_node_count,
+            total_static_node_count,
+            total_heap_node_count,
+            &level_summaries, level_count);
+        transition {
+            _ -> (PointerScanStartResponse::of_summary(stored_summary))
+        }
+    }
+}
+
+// Captures the per-level node counts (for the store's arena windows) and
+// summaries (for the stored summary) off the returned view — upstream's
+// `summarize` reads the same fields; the port emits the data while the
+// borrowed view is still live.
+machine pointer_scan_harvest_level_data<'ext, 'sh, 's, 'h>(
+    pointer_scan_results: &PointerScanResults<'ext, 'sh, 's, 'h>,
+    level_static_counts: &mut [u64; 8],
+    level_heap_counts: &mut [u64; 8],
+    level_summaries: &mut [PointerScanLevelSummary; 8]
+) {
+    transition { _ -> walk(pointer_scan_results, level_static_counts, level_heap_counts, level_summaries, 0) }
+
+    state walk(
+        pointer_scan_results: &PointerScanResults<'ext, 'sh, 's, 'h>,
+        level_static_counts: &mut [u64; 8],
+        level_heap_counts: &mut [u64; 8],
+        level_summaries: &mut [PointerScanLevelSummary; 8],
+        level_index: u64
+    ) {
+        transition level_index < pointer_scan_results.get_pointer_scan_level_count()
+            && level_index < 8 {
+            true -> harvest(pointer_scan_results, level_static_counts, level_heap_counts, level_summaries, level_index)
+            false -> done()
+            _ -> done()
+        }
+    }
+    state harvest(
+        pointer_scan_results: &PointerScanResults<'ext, 'sh, 's, 'h>,
+        level_static_counts: &mut [u64; 8],
+        level_heap_counts: &mut [u64; 8],
+        level_summaries: &mut [PointerScanLevelSummary; 8],
+        level_index: u64 [0..8]
+    ) {
+        let level: PointerScanLevel = pointer_scan_results.get_pointer_scan_level_copy(level_index);
+        level_static_counts[level_index] = level.get_static_node_count();
+        level_heap_counts[level_index] = level.get_heap_node_count();
+        let depth: u64 = level.get_depth();
+        let node_count: u64 = level.get_node_count();
+        let static_node_count: u64 = level.get_static_node_count();
+        let heap_node_count: u64 = level.get_heap_node_count();
+        level_summaries[level_index] = PointerScanLevelSummary::new(
+            depth,
+            node_count,
+            static_node_count,
+            heap_node_count);
+        transition {
+            _ -> walk(pointer_scan_results, level_static_counts, level_heap_counts, level_summaries, level_index + 1)
+        }
+    }
+    state done() {
+    }
+}
