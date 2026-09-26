@@ -1,0 +1,296 @@
+module src::command_executors::pointer_scan_target_resolution;
+
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::memory::address_display::is_virtual_module_address;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_request::PointerScanTargetRequest;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+
+// Port of services/pointer_scans/pointer_scan_target_resolution.rs — the
+// pure resolution half. `resolve_targets`' upstream value-target arm runs an
+// ElementScan over the snapshot through the symbol registry; neither the
+// registry nor that round trip is ported yet, so value targets resolve to
+// the upstream `Err` surface (`Failed { .. }`) — the request still parses
+// and the executor still answers with the default response, matching
+// upstream's failure path. A named deviation, not a stub: address targets
+// (the upstream GameMemory/EmulatorMemory flow) resolve 1:1.
+//
+// Upstream `Result<ResolvedPointerScanTargets, String>`: the union's
+// `Failed` arm stands in for `Err(String)` — the error text only feeds
+// upstream's log/status fields; see the executor's status handling.
+pub data PointerScanTargetResolution {
+    case Resolved(target_descriptor: PointerScanTargetDescriptor, target_address_count: u64);
+    case Failed;
+}
+
+// Upstream `resolve_pointer_scan_address_space`: Auto resolves to
+// GameMemory when the target address parses inside a virtual module range,
+// otherwise EmulatorMemory.
+pub machine resolve_pointer_scan_address_space(
+    requested_address_space: PointerScanAddressSpace,
+    target_request: &PointerScanTargetRequest
+) -> PointerScanAddressSpace {
+    transition requested_address_space {
+        PointerScanAddressSpace::Auto -> route_auto(target_request)
+        PointerScanAddressSpace::GameMemory -> (PointerScanAddressSpace::GameMemory)
+        PointerScanAddressSpace::EmulatorMemory -> (PointerScanAddressSpace::EmulatorMemory)
+        _ -> (PointerScanAddressSpace::EmulatorMemory)
+    }
+    state route_auto(
+        target_request: &PointerScanTargetRequest
+    ) -> PointerScanAddressSpace {
+        transition target_request.has_target_address {
+            true -> parse(target_request)
+            false -> (PointerScanAddressSpace::EmulatorMemory)
+        }
+    }
+    state parse(
+        target_request: &PointerScanTargetRequest
+    ) -> PointerScanAddressSpace {
+        let target_address: &AnonymousValueString = target_request.get_target_address();
+        let parsed: PointerScanTargetAddressParse = parse_target_address(
+            target_address);
+        transition parsed {
+            PointerScanTargetAddressParse::Parsed { value } -> module_check(value)
+            _ -> (PointerScanAddressSpace::EmulatorMemory)
+        }
+    }
+    state module_check(address: u64) -> PointerScanAddressSpace {
+        transition is_virtual_module_address(address) {
+            true -> (PointerScanAddressSpace::GameMemory)
+            false -> (PointerScanAddressSpace::EmulatorMemory)
+            _ -> (PointerScanAddressSpace::EmulatorMemory)
+        }
+    }
+}
+
+// Upstream `resolve_pointer_size_for_process_bitness`: GameMemory keeps the
+// request; every other space pins to the process's pointer size.
+pub machine resolve_pointer_size_for_process_bitness(
+    requested_pointer_size: PointerScanPointerSize,
+    address_space: PointerScanAddressSpace,
+    process_info: &OpenedProcessInfo
+) -> PointerScanPointerSize {
+    transition address_space {
+        PointerScanAddressSpace::GameMemory -> (requested_pointer_size)
+        _ -> (PointerScanPointerSize::from_process_bitness(process_info.get_bitness()))
+    }
+}
+
+// Upstream `Option<u64>` folds to the same union convention the api
+// package's parsers use (cross-package destructuring needs a data union).
+pub data PointerScanTargetAddressParse {
+    case Refused;
+    case Parsed(value: u64);
+}
+
+// Upstream `parse_target_address`: trim → format-selected radix parse.
+// `AnonymousValueString` stores pre-trimmed bytes (its setters strip
+// whitespace — matching upstream `trim()`), so this walks bytes directly.
+// Address/Hexadecimal strip a 0x/0X prefix then radix-16; Binary strips
+// 0b/0B then radix-2; Decimal and every other format parse decimal.
+pub machine parse_target_address(
+    target_address: &AnonymousValueString
+) -> PointerScanTargetAddressParse {
+    let value_len: u64 = target_address.get_anonymous_value_string_len();
+    transition value_len == 0 {
+        true -> (PointerScanTargetAddressParse::Refused)
+        false -> radix(target_address)
+    }
+    state radix(
+        target_address: &AnonymousValueString
+    ) -> PointerScanTargetAddressParse {
+        transition target_address.get_anonymous_value_string_format() {
+            AnonymousValueStringFormat::Address -> hex(target_address)
+            AnonymousValueStringFormat::Hexadecimal -> hex(target_address)
+            AnonymousValueStringFormat::Binary -> binary(target_address)
+            _ -> (scan_radix(target_address, 0, 0, 10))
+        }
+    }
+    state hex(
+        target_address: &AnonymousValueString
+    ) -> PointerScanTargetAddressParse {
+        (scan_radix(target_address, 120, 88, 16))
+    }
+    state binary(
+        target_address: &AnonymousValueString
+    ) -> PointerScanTargetAddressParse {
+        (scan_radix(target_address, 98, 66, 2))
+    }
+}
+
+// Byte-wise radix walk — prefix_code selects the second byte to skip
+// ('x'=120 strips "0x", 'b'=98 strips "0b", 0 keeps the whole string).
+machine scan_radix(
+    target_address: &AnonymousValueString,
+    prefix_code: u64 [0..256],
+    upper_prefix_code: u64 [0..256],
+    radix: u64
+) -> PointerScanTargetAddressParse {
+    let value_len: u64 = target_address.get_anonymous_value_string_len();
+    transition { _ -> prefix_check(target_address, value_len, prefix_code, upper_prefix_code, radix) }
+
+    state prefix_check(
+        target_address: &AnonymousValueString,
+        value_len: u64,
+        prefix_code: u64 [0..256],
+        upper_prefix_code: u64 [0..256],
+        radix: u64
+    ) -> PointerScanTargetAddressParse {
+        let first_byte: u8 = target_address.get_anonymous_value_string_byte(0);
+        let second_byte: u8 = target_address.get_anonymous_value_string_byte(1);
+        // 'x'/'b' uppercase prefix bytes ('X'=88, 'B'=66) arrive as
+        // caller literals — the [0..256] bound keeps the u8 casts exact.
+        let has_prefix: bool = prefix_code != 0
+            && value_len > 2
+            && first_byte == 48
+            && (second_byte == (prefix_code as u8) || second_byte == (upper_prefix_code as u8));
+        transition has_prefix {
+            true -> scan(target_address, value_len, 2, 0, radix)
+            false -> scan(target_address, value_len, 0, 0, radix)
+        }
+    }
+    state scan(
+        target_address: &AnonymousValueString,
+        value_len: u64,
+        position: u64,
+        acc: u64,
+        radix: u64
+    ) -> PointerScanTargetAddressParse {
+        transition position < value_len {
+            true -> digit(target_address, value_len, position, acc, radix)
+            false -> (PointerScanTargetAddressParse::Parsed { value: acc })
+        }
+    }
+    state digit(
+        target_address: &AnonymousValueString,
+        value_len: u64,
+        position: u64,
+        acc: u64,
+        radix: u64
+    ) -> PointerScanTargetAddressParse {
+        let byte: u8 = target_address.get_anonymous_value_string_byte(position);
+        transition byte >= 48 && byte <= 57 {
+            true -> merge(target_address, value_len, position, acc, radix, ((byte as u64 in Wrapping) - 48) as u64)
+            false -> alpha(byte, target_address, value_len, position, acc, radix)
+            _ -> alpha(byte, target_address, value_len, position, acc, radix)
+        }
+    }
+    state alpha(
+        byte: u8,
+        target_address: &AnonymousValueString,
+        value_len: u64,
+        position: u64,
+        acc: u64,
+        radix: u64
+    ) -> PointerScanTargetAddressParse {
+        transition radix == 16 && byte >= 97 && byte <= 102 {
+            true -> merge(target_address, value_len, position, acc, radix, ((byte as u64 in Wrapping) - 87) as u64)
+            false -> upper(byte, target_address, value_len, position, acc, radix)
+            _ -> upper(byte, target_address, value_len, position, acc, radix)
+        }
+    }
+    state upper(
+        byte: u8,
+        target_address: &AnonymousValueString,
+        value_len: u64,
+        position: u64,
+        acc: u64,
+        radix: u64
+    ) -> PointerScanTargetAddressParse {
+        transition radix == 16 && byte >= 65 && byte <= 70 {
+            true -> merge(target_address, value_len, position, acc, radix, ((byte as u64 in Wrapping) - 55) as u64)
+            false -> (PointerScanTargetAddressParse::Refused)
+            _ -> (PointerScanTargetAddressParse::Refused)
+        }
+    }
+    state merge(
+        target_address: &AnonymousValueString,
+        value_len: u64,
+        position: u64,
+        acc: u64,
+        radix: u64,
+        digit_value: u64
+    ) -> PointerScanTargetAddressParse {
+        transition digit_value < radix {
+            true -> scan(target_address, value_len, position + 1, (((acc as u64 in Wrapping) * (radix as u64 in Wrapping)) + (digit_value as u64 in Wrapping)) as u64, radix)
+            false -> (PointerScanTargetAddressParse::Refused)
+        }
+    }
+}
+
+pub data PointerScanTargetResolver {}
+
+// Upstream `PointerScanTargetResolver::resolve_targets` dispatch: the
+// (address), (value+type), and error arms are preserved in order. Resolved
+// addresses land in the caller's `out_target_addresses` extent; the address
+// arm emits exactly one as upstream does.
+pub machine PointerScanTargetResolver::resolve_targets(
+    target_request: &PointerScanTargetRequest,
+    out_target_addresses: &mut [u64]
+) -> PointerScanTargetResolution {
+    transition {
+        _ -> route(target_request, out_target_addresses)
+    }
+    state route(
+        target_request: &PointerScanTargetRequest,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        let has_address: bool = target_request.has_target_address;
+        let has_value: bool = target_request.has_target_value;
+        let has_type: bool = target_request.has_target_data_type_ref;
+        transition has_address && !has_value && !has_type {
+            true -> address(target_request, out_target_addresses)
+            false -> value_or_error(has_address, has_value, has_type)
+            _ -> value_or_error(has_address, has_value, has_type)
+        }
+    }
+    state address(
+        target_request: &PointerScanTargetRequest,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        // Upstream resolve_address_target goes through the symbol registry
+        // (deanonymize → read_address_value). The registry is unported; the
+        // equivalent parse here is the same `parse_target_address` upstream
+        // itself uses for address-space/module resolution — Address/Hex/
+        // Decimal/Binary formats decode identically.
+        let target_address: &AnonymousValueString = target_request.get_target_address();
+        let parsed: PointerScanTargetAddressParse = parse_target_address(
+            target_address);
+        transition parsed {
+            PointerScanTargetAddressParse::Parsed { value } -> emit(value, out_target_addresses)
+            _ -> (PointerScanTargetResolution::Failed)
+        }
+    }
+    state emit(
+        target_address: u64,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        transition out_target_addresses.len > 0 {
+            true -> stored(target_address, out_target_addresses)
+            false -> (PointerScanTargetResolution::Failed)
+        }
+    }
+    state stored(
+        target_address: u64,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        out_target_addresses[0] = target_address;
+        (PointerScanTargetResolution::Resolved {
+            target_descriptor: PointerScanTargetDescriptor::address(target_address),
+            target_address_count: 1,
+        })
+    }
+    // Upstream's error arms, preserved as Failed — the value arm's
+    // element-scan round trip is the deferred surface named above.
+    state value_or_error(
+        has_address: bool,
+        has_value: bool,
+        has_type: bool
+    ) -> PointerScanTargetResolution {
+        (PointerScanTargetResolution::Failed)
+    }
+}
