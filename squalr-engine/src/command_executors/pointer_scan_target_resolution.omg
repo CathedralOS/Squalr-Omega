@@ -1,22 +1,39 @@
 module src::command_executors::pointer_scan_target_resolution;
 
+use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ScanConstraintSet;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
 use squalr_engine_api::src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
 use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
 use squalr_engine_api::src::structures::memory::address_display::is_virtual_module_address;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
 use squalr_engine_api::src::structures::pointer_scans::pointer_scan_address_space::PointerScanAddressSpace;
 use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
 use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_request::PointerScanTargetRequest;
 use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::ScanResultAddresses;
+use squalr_engine_api::src::structures::scan_results::scan_results_metadata::ScanResultsMetadata;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use squalr_engine_api::src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraint;
+use squalr_engine_api::src::structures::scanning::memory_read_mode::MemoryReadMode;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_scanning::src::scanners::scan_control::ScanControl;
+use src::command_executors::constraint_deanonymizer::ConstraintDeanonymizer;
+use src::command_executors::element_scanner::ElementScannerDriver;
 
 // Port of services/pointer_scans/pointer_scan_target_resolution.rs — the
-// pure resolution half. `resolve_targets`' upstream value-target arm runs an
-// ElementScan over the snapshot through the symbol registry; neither the
-// registry nor that round trip is ported yet, so value targets resolve to
-// the upstream `Err` surface (`Failed { .. }`) — the request still parses
-// and the executor still answers with the default response, matching
-// upstream's failure path. A named deviation, not a stub: address targets
-// (the upstream GameMemory/EmulatorMemory flow) resolve 1:1.
+// pure resolution half. Both upstream arms are now live: address targets
+// parse through the same `parse_target_address` upstream itself uses, and
+// value targets run upstream's `resolve_value_target` chain — an exact Equal
+// constraint -> deanonymize to a per-type plan list -> ElementScanPlan ->
+// clone-for-value-target snapshot -> element scan -> collected addresses.
+// The symbol registry's role for primitive-typed anonymous values is the
+// data-type deanonymize the ConstraintDeanonymizer already performs —
+// upstream's `SymbolRegistry` handle adds module/symbol lookup that only the
+// unmanaged-plugin surface reaches; named deviation recorded below.
 //
 // Upstream `Result<ResolvedPointerScanTargets, String>`: the union's
 // `Failed` arm stands in for `Err(String)` — the error text only feeds
@@ -225,18 +242,40 @@ machine scan_radix(
 pub data PointerScanTargetResolver {}
 
 // Upstream `PointerScanTargetResolver::resolve_targets` dispatch: the
-// (address), (value+type), and error arms are preserved in order. Resolved
-// addresses land in the caller's `out_target_addresses` extent; the address
-// arm emits exactly one as upstream does.
+// (Some(address), None, None) arm resolves an address; (None, Some(value),
+// Some(data_type_ref)) resolves a value; every other combination is an
+// upstream `Err` arm (missing target / both address+value / type without
+// value / value without type / address with type) collapsed to `Failed`.
+// Resolved addresses land in the caller's `out_target_addresses` extent;
+// the address arm emits exactly one as upstream does.
+//
+// Params mirror upstream `(target_request, symbol_registry,
+// address_pointer_size, snapshot, memory_alignment,
+// floating_point_tolerance, is_single_thread_scan,
+// debug_perform_validation_scan)`: `symbol_registry` is subsumed by the
+// ConstraintDeanonymizer's primitive-type deanonymize (see resolve_value),
+// `floating_point_tolerance` rides inside the ported constraint/plan
+// surface, and `debug_perform_validation_scan` has no counterpart on the
+// ported ElementScanPlan — deviations noted in place.
 pub machine PointerScanTargetResolver::resolve_targets(
     target_request: &PointerScanTargetRequest,
+    address_pointer_size: PointerScanPointerSize,
+    snapshot: &Snapshot,
+    memory_alignment: MemoryAlignment,
+    is_single_threaded_scan: bool,
     out_target_addresses: &mut [u64]
-) -> PointerScanTargetResolution {
+) -> PointerScanTargetResolution
+crashes Abort
+{
     transition {
-        _ -> route(target_request, out_target_addresses)
+        _ -> route(target_request, address_pointer_size, snapshot, memory_alignment, is_single_threaded_scan, out_target_addresses)
     }
     state route(
         target_request: &PointerScanTargetRequest,
+        address_pointer_size: PointerScanPointerSize,
+        snapshot: &Snapshot,
+        memory_alignment: MemoryAlignment,
+        is_single_threaded_scan: bool,
         out_target_addresses: &mut [u64]
     ) -> PointerScanTargetResolution {
         let has_address: bool = target_request.has_target_address;
@@ -244,8 +283,8 @@ pub machine PointerScanTargetResolver::resolve_targets(
         let has_type: bool = target_request.has_target_data_type_ref;
         transition has_address && !has_value && !has_type {
             true -> address(target_request, out_target_addresses)
-            false -> value_or_error(has_address, has_value, has_type)
-            _ -> value_or_error(has_address, has_value, has_type)
+            false -> value_arm(has_address, has_value, has_type, target_request, snapshot, memory_alignment, is_single_threaded_scan, out_target_addresses)
+            _ -> value_arm(has_address, has_value, has_type, target_request, snapshot, memory_alignment, is_single_threaded_scan, out_target_addresses)
         }
     }
     state address(
@@ -284,13 +323,159 @@ pub machine PointerScanTargetResolver::resolve_targets(
             target_address_count: 1,
         })
     }
-    // Upstream's error arms, preserved as Failed — the value arm's
-    // element-scan round trip is the deferred surface named above.
-    state value_or_error(
+    // Upstream's second match arm: (None, Some(value), Some(type)).
+    state value_arm(
         has_address: bool,
         has_value: bool,
-        has_type: bool
+        has_type: bool,
+        target_request: &PointerScanTargetRequest,
+        snapshot: &Snapshot,
+        memory_alignment: MemoryAlignment,
+        is_single_threaded_scan: bool,
+        out_target_addresses: &mut [u64]
     ) -> PointerScanTargetResolution {
-        (PointerScanTargetResolution::Failed)
+        transition !has_address && has_value && has_type {
+            true -> constrain(target_request, snapshot, memory_alignment, is_single_threaded_scan, out_target_addresses)
+            false -> (PointerScanTargetResolution::Failed)
+            _ -> (PointerScanTargetResolution::Failed)
+        }
+    }
+    // resolve_value_target — upstream: AnonymousScanConstraint::new(
+    // ScanCompareType::Immediate(Equal), Some(target_value.clone())).
+    state constrain(
+        target_request: &PointerScanTargetRequest,
+        snapshot: &Snapshot,
+        memory_alignment: MemoryAlignment,
+        is_single_threaded_scan: bool,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        let target_value: AnonymousValueString = AnonymousValueString::clone(target_request.get_target_value());
+        let exact_scan_constraint: AnonymousScanConstraint = AnonymousScanConstraint::new(
+            ScanCompareType::Immediate { compare_type: ScanCompareTypeImmediate::Equal },
+            target_value);
+        let mut constraints: ScanConstraintSet = ScanConstraintSet::empty();
+        let pushed: bool = constraints.push(&exact_scan_constraint);
+        transition pushed {
+            true -> plan(target_request, &constraints, snapshot, memory_alignment, is_single_threaded_scan, out_target_addresses)
+            false -> (PointerScanTargetResolution::Failed)
+            _ -> (PointerScanTargetResolution::Failed)
+        }
+    }
+    // Upstream: ScanConstraintBuilder::build + the ElementScanRuleRegistry
+    // param-rules fold + ScanConstraintFinalized — ConstraintDeanonymizer's
+    // build_type_plan_list is the ported equivalent of that whole pipeline
+    // (builder + rules fold + finalize; unparseable constraints drop like
+    // upstream's filter_map). An empty list is upstream's
+    // "Failed to parse pointer scan value target." Err.
+    state plan(
+        target_request: &PointerScanTargetRequest,
+        constraints: &ScanConstraintSet,
+        snapshot: &Snapshot,
+        memory_alignment: MemoryAlignment,
+        is_single_threaded_scan: bool,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        let plan_list: TypePlanList = ConstraintDeanonymizer::build_type_plan_list(
+            constraints,
+            target_request.get_target_data_type_ref(),
+            memory_alignment);
+        transition plan_list.get_plan_count() > 0 {
+            true -> scan(target_request, plan_list, snapshot, memory_alignment, is_single_threaded_scan, out_target_addresses)
+            false -> (PointerScanTargetResolution::Failed)
+            _ -> (PointerScanTargetResolution::Failed)
+        }
+    }
+    // Upstream: ElementScanPlan::new({type: finals}, alignment, tolerance,
+    // MemoryReadMode::Skip, single_thread, debug_validation) — the ported
+    // constructor takes (alignment, read_mode, single_threaded); tolerance
+    // and the debug-validation flag are carried inside the ported
+    // constraint/plan surface (deviation). Then upstream clones the
+    // snapshot minus scan results and runs ElementScanner::scan_snapshot.
+    state scan(
+        target_request: &PointerScanTargetRequest,
+        plan_list: TypePlanList,
+        snapshot: &Snapshot,
+        memory_alignment: MemoryAlignment,
+        is_single_threaded_scan: bool,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        let mut element_scan_plan: ElementScanPlan = ElementScanPlan::new(
+            memory_alignment, MemoryReadMode::Skip, is_single_threaded_scan);
+        let data_type_ref: &DataTypeRef = target_request.get_target_data_type_ref();
+        let installed: bool = element_scan_plan.push_type_plans(data_type_ref, &plan_list);
+        transition installed {
+            true -> scan_cloned(target_request, element_scan_plan, snapshot, out_target_addresses)
+            false -> (PointerScanTargetResolution::Failed)
+            _ -> (PointerScanTargetResolution::Failed)
+        }
+    }
+    state scan_cloned(
+        target_request: &PointerScanTargetRequest,
+        element_scan_plan: ElementScanPlan,
+        snapshot: &Snapshot,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        let mut cloned_snapshot: Snapshot = Snapshot::clone_for_value_target_scan(snapshot);
+        let mut carried_plan: ElementScanPlan = element_scan_plan;
+        let mut scan_control: ScanControl = ScanControl::new(false);
+        let scan_metadata: ScanResultsMetadata = ElementScannerDriver::scan_snapshot(
+            &mut cloned_snapshot, &mut carried_plan, &mut scan_control);
+        transition { _ -> collect(target_request, &cloned_snapshot, out_target_addresses) }
+    }
+    // Upstream: get_number_of_results + get_scan_results_page → collect
+    // get_address() → sort_unstable + dedup →
+    // ResolvedPointerScanTargets{Value{value, type, count}, addresses}.
+    // collect_scan_result_addresses_for_data_type already walks pages in
+    // ascending address order with no duplicates, so the upstream
+    // sort+dedup is a no-op here (deviation note); the ScanResultAddresses
+    // carrier is bounded [u64; 64] like the package's other query surfaces.
+    state collect(
+        target_request: &PointerScanTargetRequest,
+        cloned_snapshot: &Snapshot,
+        out_target_addresses: &mut [u64]
+    ) -> PointerScanTargetResolution {
+        let data_type_ref: &DataTypeRef = target_request.get_target_data_type_ref();
+        let addresses: ScanResultAddresses = cloned_snapshot.collect_scan_result_addresses_for_data_type(data_type_ref);
+        transition { _ -> copy_each(target_request, addresses, out_target_addresses, 0, 0) }
+    }
+    state copy_each(
+        target_request: &PointerScanTargetRequest,
+        addresses: ScanResultAddresses,
+        out_target_addresses: &mut [u64],
+        position: u64,
+        written: u64
+    ) -> PointerScanTargetResolution {
+        transition position < addresses.get_address_count() && position < 64 && written < 64 && written < out_target_addresses.len {
+            true -> store(target_request, addresses, out_target_addresses, position, written)
+            false -> resolved_value(target_request, written)
+            _ -> resolved_value(target_request, written)
+        }
+    }
+    state store(
+        target_request: &PointerScanTargetRequest,
+        addresses: ScanResultAddresses,
+        out_target_addresses: &mut [u64],
+        position: u64 [0..64],
+        written: u64 [0..64]
+    ) -> PointerScanTargetResolution {
+        out_target_addresses[written] = addresses.get(position);
+        transition {
+            _ -> copy_each(target_request, addresses, out_target_addresses,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+                ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // PointerScanTargetDescriptor::value(target_value, data_type_ref,
+    // target_addresses.len()) — `written` is the collected count.
+    state resolved_value(
+        target_request: &PointerScanTargetRequest,
+        target_address_count: u64
+    ) -> PointerScanTargetResolution {
+        let target_value: AnonymousValueString = AnonymousValueString::clone(target_request.get_target_value());
+        let data_type_ref: DataTypeRef = DataTypeRef::clone(target_request.get_target_data_type_ref());
+        (PointerScanTargetResolution::Resolved {
+            target_descriptor: PointerScanTargetDescriptor::value(target_value, data_type_ref, target_address_count),
+            target_address_count: target_address_count,
+        })
     }
 }
