@@ -1,0 +1,110 @@
+module src::command_executors::pointer_scan_summary_request_executor;
+
+use squalr_engine_api::src::commands::pointer_scan::summary::pointer_scan_summary_request::PointerScanSummaryRequest;
+use squalr_engine_api::src::commands::pointer_scan::summary::pointer_scan_summary_response::PointerScanSummaryResponse;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level::PointerScanLevel;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_summary::PointerScanLevelSummary;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_summary::StoredPointerScanSummary;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+
+// Port of command_executors/pointer_scan/summary/pointer_scan_summary_request_executor.rs.
+// Upstream: no session id → summarize the first stored entry; a session id
+// that misses the store → default response. The port's store is one slot:
+// `has_session_id` false reads it, a mismatched id is the miss.
+pub data PointerScanSummaryRequestExecutor {}
+
+pub machine PointerScanSummaryRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    pointer_scan_summary_request: &PointerScanSummaryRequest
+) -> PointerScanSummaryResponse
+crashes Abort
+{
+    transition engine_privileged_state.pointer_scan_results_store.has_results() {
+        true -> session(engine_privileged_state, pointer_scan_summary_request)
+        false -> (PointerScanSummaryResponse::empty())
+        _ -> (PointerScanSummaryResponse::empty())
+    }
+
+    state session(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_summary_request: &PointerScanSummaryRequest
+    ) -> PointerScanSummaryResponse {
+        let matches: bool = !pointer_scan_summary_request.has_session_id
+            || pointer_scan_summary_request.session_id == engine_privileged_state.pointer_scan_results_store.get_session_id();
+        transition matches {
+            true -> summarize(engine_privileged_state)
+            false -> (PointerScanSummaryResponse::empty())
+            _ -> (PointerScanSummaryResponse::empty())
+        }
+    }
+
+    state summarize(
+        engine_privileged_state: &mut EnginePrivilegedState
+    ) -> PointerScanSummaryResponse {
+        let mut level_summaries: [PointerScanLevelSummary; 8] = [
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0),
+            PointerScanLevelSummary::new(0, 0, 0, 0)
+        ];
+        transition { _ -> collect(engine_privileged_state, level_summaries, 0) }
+    }
+
+    state collect(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        level_summaries: [PointerScanLevelSummary; 8],
+        level_index: u64
+    ) -> PointerScanSummaryResponse {
+        transition level_index < engine_privileged_state.pointer_scan_results_store.get_level_count()
+            && level_index < 8 {
+            true -> level(engine_privileged_state, level_summaries, level_index)
+            false -> respond(engine_privileged_state, level_summaries)
+            _ -> respond(engine_privileged_state, level_summaries)
+        }
+    }
+
+    state level(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        level_summaries: [PointerScanLevelSummary; 8],
+        level_index: u64 [0..8]
+    ) -> PointerScanSummaryResponse {
+        let level: PointerScanLevel = engine_privileged_state.pointer_scan_results_store.get_level(level_index);
+        let mut next_summaries: [PointerScanLevelSummary; 8] = level_summaries;
+        let depth: u64 = level.get_depth();
+        let node_count: u64 = level.get_node_count();
+        let static_node_count: u64 = level.get_static_node_count();
+        let heap_node_count: u64 = level.get_heap_node_count();
+        next_summaries[level_index] = PointerScanLevelSummary::new(
+            depth,
+            node_count,
+            static_node_count,
+            heap_node_count);
+        transition { _ -> collect(engine_privileged_state, next_summaries, level_index + 1) }
+    }
+
+    // Upstream `Some(pointer_scan_results.summarize())` — the stored
+    // scalars already carry the summary fields.
+    state respond(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        level_summaries: [PointerScanLevelSummary; 8]
+    ) -> PointerScanSummaryResponse {
+        let level_count: u64 = engine_privileged_state.pointer_scan_results_store.get_level_count();
+        let stored_summary: StoredPointerScanSummary = StoredPointerScanSummary::of_scalars(
+            engine_privileged_state.pointer_scan_results_store.get_session_id(),
+            engine_privileged_state.pointer_scan_results_store.target_descriptor,
+            engine_privileged_state.pointer_scan_results_store.address_space,
+            engine_privileged_state.pointer_scan_results_store.pointer_size,
+            engine_privileged_state.pointer_scan_results_store.max_depth,
+            engine_privileged_state.pointer_scan_results_store.offset_radius,
+            engine_privileged_state.pointer_scan_results_store.root_node_count,
+            engine_privileged_state.pointer_scan_results_store.total_node_count,
+            engine_privileged_state.pointer_scan_results_store.total_static_node_count,
+            engine_privileged_state.pointer_scan_results_store.total_heap_node_count,
+            &level_summaries, level_count);
+        transition { _ -> (PointerScanSummaryResponse::of_summary(stored_summary)) }
+    }
+}
