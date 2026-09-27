@@ -1,0 +1,207 @@
+module src::command_executors::pointer_scan_expand_request_executor;
+
+use squalr_engine_api::src::commands::pointer_scan::expand::pointer_scan_expand_request::PointerScanExpandRequest;
+use squalr_engine_api::src::commands::pointer_scan::expand::pointer_scan_expand_response::PointerScanExpandResponse;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_candidate::PointerScanCandidate;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_level_candidates::PointerScanLevelCandidates;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node::PointerScanNode;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_node_type::PointerScanNodeType;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::ExpandedNodePage;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::MaterializedNodeLookup;
+use squalr_engine_api::src::structures::pointer_scans::pointer_scan_results::PointerScanResults;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+
+// Port of command_executors/pointer_scan/expand/pointer_scan_expand_request_executor.rs.
+// Upstream reads `get_expanded_node_page` off the stored results — the
+// call materializes nodes into the results' arenas and returns the node
+// ids; the response carries the node objects. The port reassembles the
+// borrowed view per access and commits the materialization counters the
+// call advanced (upstream mutates them in place on the stored record).
+pub data PointerScanExpandRequestExecutor {}
+
+pub machine PointerScanExpandRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    pointer_scan_expand_request: &PointerScanExpandRequest
+) -> PointerScanExpandResponse
+crashes Abort
+{
+    transition engine_privileged_state.pointer_scan_results_store.has_results() {
+        true -> session(engine_privileged_state, pointer_scan_expand_request)
+        false -> (PointerScanExpandResponse::empty(
+            pointer_scan_expand_request.session_id,
+            pointer_scan_expand_request.has_parent_node_id,
+            pointer_scan_expand_request.parent_node_id))
+        _ -> (PointerScanExpandResponse::empty(
+            pointer_scan_expand_request.session_id,
+            pointer_scan_expand_request.has_parent_node_id,
+            pointer_scan_expand_request.parent_node_id))
+    }
+
+    // Upstream `if results.get_session_id() == self.session_id` else the
+    // empty response.
+    state session(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_expand_request: &PointerScanExpandRequest
+    ) -> PointerScanExpandResponse {
+        let store_session_id: u64 = engine_privileged_state.pointer_scan_results_store.get_session_id();
+        transition store_session_id == pointer_scan_expand_request.session_id {
+            true -> page(engine_privileged_state, pointer_scan_expand_request)
+            false -> (PointerScanExpandResponse::empty(
+                pointer_scan_expand_request.session_id,
+                pointer_scan_expand_request.has_parent_node_id,
+                pointer_scan_expand_request.parent_node_id))
+            _ -> (PointerScanExpandResponse::empty(
+                pointer_scan_expand_request.session_id,
+                pointer_scan_expand_request.has_parent_node_id,
+                pointer_scan_expand_request.parent_node_id))
+        }
+    }
+
+    state page(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        pointer_scan_expand_request: &PointerScanExpandRequest
+    ) -> PointerScanExpandResponse {
+        let empty_static_view: [PointerScanCandidate; 1] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        let empty_heap_view: [PointerScanCandidate; 1] = [
+            PointerScanCandidate::new(0, 0, PointerScanNodeType::Heap, 0, 0, 0, 0)
+        ];
+        let mut level_candidates_view: [PointerScanLevelCandidates; 8] = [
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0),
+            PointerScanLevelCandidates::new_presorted(0, &empty_static_view[0..0], 0, &empty_heap_view[0..0], 0)
+        ];
+        let mut results: PointerScanResults = engine_privileged_state
+            .pointer_scan_results_store
+            .assemble_results_view(&mut level_candidates_view);
+        let response: PointerScanExpandResponse = pointer_scan_build_expand_response(
+            &mut results,
+            pointer_scan_expand_request);
+        // The expand materialized nodes/ids/page keys into the store's own
+        // arenas; only the counters are view-local — capture them for the
+        // commit (upstream mutates the stored record in place).
+        let root_node_count: u64 = results.get_root_node_count();
+        let total_node_count: u64 = results.get_total_node_count();
+        let total_static_node_count: u64 = results.get_total_static_node_count();
+        let total_heap_node_count: u64 = results.get_total_heap_node_count();
+        let materialized_node_count: u64 = results.get_materialized_node_count();
+        let materialized_node_id_slab_count: u64 = results.get_materialized_node_id_slab_count();
+        let page_key_cache_count: u64 = results.get_page_key_cache_count();
+        let next_materialized_node_id: u64 = results.get_next_materialized_node_id();
+        let materialized_nodes_overflowed: bool = results.get_materialized_nodes_overflowed();
+        transition {
+            _ -> commit(
+                engine_privileged_state,
+                response,
+                root_node_count,
+                total_node_count,
+                total_static_node_count,
+                total_heap_node_count,
+                materialized_node_count,
+                materialized_node_id_slab_count,
+                page_key_cache_count,
+                next_materialized_node_id,
+                materialized_nodes_overflowed)
+        }
+    }
+
+    state commit(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        response: PointerScanExpandResponse,
+        root_node_count: u64,
+        total_node_count: u64,
+        total_static_node_count: u64,
+        total_heap_node_count: u64,
+        materialized_node_count: u64,
+        materialized_node_id_slab_count: u64,
+        page_key_cache_count: u64,
+        next_materialized_node_id: u64,
+        materialized_nodes_overflowed: bool
+    ) -> PointerScanExpandResponse {
+        engine_privileged_state.pointer_scan_results_store.commit_view_scalars(
+            root_node_count,
+            total_node_count,
+            total_static_node_count,
+            total_heap_node_count,
+            materialized_node_count,
+            materialized_node_id_slab_count,
+            page_key_cache_count,
+            next_materialized_node_id,
+            materialized_nodes_overflowed);
+        transition { _ -> (response) }
+    }
+}
+
+// Runs the page query + node fetch inside the view's borrow window —
+// upstream's `(nodes, page_index, last_page_index, total_node_count)`
+// destructure plus the per-id node reads.
+machine pointer_scan_build_expand_response<'ext, 'sh, 's, 'h>(
+    pointer_scan_results: &mut PointerScanResults<'ext, 'sh, 's, 'h>,
+    pointer_scan_expand_request: &PointerScanExpandRequest
+) -> PointerScanExpandResponse {
+    let mut node_ids: [u64; 64] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let page: ExpandedNodePage = pointer_scan_results.get_expanded_node_page(
+        pointer_scan_expand_request.has_parent_node_id,
+        pointer_scan_expand_request.parent_node_id,
+        pointer_scan_expand_request.page_index,
+        pointer_scan_expand_request.page_size,
+        &mut node_ids);
+    let mut response: PointerScanExpandResponse = PointerScanExpandResponse::empty(
+        pointer_scan_expand_request.session_id,
+        pointer_scan_expand_request.has_parent_node_id,
+        pointer_scan_expand_request.parent_node_id);
+    response.page_index = page.page_index;
+    response.last_page_index = page.last_page_index;
+    response.total_node_count = page.total_node_count;
+    transition { _ -> fill(pointer_scan_results, response, node_ids, page.node_count, 0) }
+
+    state fill(
+        pointer_scan_results: &mut PointerScanResults<'ext, 'sh, 's, 'h>,
+        response: PointerScanExpandResponse,
+        node_ids: [u64; 64],
+        node_count: u64,
+        position: u64
+    ) -> PointerScanExpandResponse {
+        transition position < node_count && position < 64 {
+            true -> node(pointer_scan_results, response, node_ids, node_count, position)
+            false -> (response)
+            _ -> (response)
+        }
+    }
+    state node(
+        pointer_scan_results: &mut PointerScanResults<'ext, 'sh, 's, 'h>,
+        response: PointerScanExpandResponse,
+        node_ids: [u64; 64],
+        node_count: u64,
+        position: u64 [0..64]
+    ) -> PointerScanExpandResponse {
+        let lookup: MaterializedNodeLookup = pointer_scan_results.find_materialized_node(node_ids[position]);
+        transition lookup {
+            MaterializedNodeLookup::Found { index } -> push(pointer_scan_results, response, node_ids, node_count, position, index)
+            _ -> fill(pointer_scan_results, response, node_ids, node_count, position + 1)
+        }
+    }
+    state push(
+        pointer_scan_results: &mut PointerScanResults<'ext, 'sh, 's, 'h>,
+        response: PointerScanExpandResponse,
+        node_ids: [u64; 64],
+        node_count: u64,
+        position: u64 [0..64],
+        arena_index: u64
+    ) -> PointerScanExpandResponse {
+        let node: PointerScanNode = pointer_scan_results.copy_materialized_node(arena_index);
+        let mut next_response: PointerScanExpandResponse = response;
+        let pushed: bool = next_response.push_node(node);
+        transition { _ -> fill(pointer_scan_results, next_response, node_ids, node_count, position + 1) }
+    }
+}
