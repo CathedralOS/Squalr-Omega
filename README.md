@@ -4,13 +4,19 @@ An essentially 1:1 port of [Squalr](https://github.com/Squalr/Squalr) from Rust 
 Omega, starting with CLI and headless use. This is an application and a compiler
 customer, not a collection of compiler-shaped demos.
 
-**Setup stage, not a working scanner yet.** The workspace declares the 17
-headless packages and their 37 internal dependency edges. Most packages have
-only their build declaration. The source seed ports memory alignment, the
-region operations needed by `SnapshotRegionFilter`, and filter geometry, with
-12 authored headless checks, now passing through native execution on macOS ARM64.
-There is no supplied-byte scanner or CLI entry yet. The remaining work is
-listed in [TASKS.md](TASKS.md); passing repository checks is not port completion.
+The workspace has 17 headless packages and 37 internal dependency edges, with
+source for snapshots, scalar scanning, result encoding, command execution and
+target access. The CLI entry and its read/dispatch/print loop are also present.
+Source presence does not establish native acceptance or complete Rust parity.
+
+The current published `squalr-tests` entry runs 12 geometry checks followed by
+seeded snapshot/tombstone layout checks. Existing supplied-byte scan, exact-result
+and repeated-scan checks are still outside its normal success path. The historical
+12-check geometry application passed natively on macOS ARM64 with an older entry
+and compiler; that evidence does not cover the current full application. Current
+`Main::main` and its filesystem/time provider route target Linux x86_64. Full
+application and CLI native acceptance remain unverified. See [TASKS.md](TASKS.md)
+and [PORTING.md](PORTING.md) for the remaining work and acceptance contract.
 
 ## Build and test
 
@@ -24,15 +30,22 @@ in package checking. The commands work in PowerShell and macOS/Linux shells:
 python tools/verify.py layout --upstream ../squalr_workspace
 python tools/verify.py audit --omega /path/to/omega
 python tools/verify.py check --timeout 600 --omega /path/to/omega
-python tools/verify.py native --timeout 600 --omega /path/to/omega
+python tools/verify.py native --target linux_x86_64 --timeout 600 --omega /path/to/omega
 ```
 
 On Windows use the path to `omega.exe`; on macOS use `python3` if necessary.
-The default application is `squalr-tests`. `--project squalr-cli` selects
-the real CLI lane, whose entry remains unported. No entry is silently generated.
-`--target windows_x86_64` (or another supported target) makes selection explicit.
-Use `check --project squalr-engine-api` to isolate library checking without
-dropping the application's dependency edges.
+The default application is `squalr-tests`; `--project squalr-cli` selects the
+CLI source entry. Run the native command above on Linux x86_64, the current full
+application's authored target. The harness itself runs on Windows and macOS too;
+other application targets still need matching entry/provider support and runtime
+validation. Use `check --project squalr-engine-api` to isolate library checking
+without dropping the application's dependency edges.
+
+For `check` and `audit`, `--target` selects the compiler target. For `native`, it
+asserts that the target matches the executing Python host; a mismatch is rejected
+before invoking Omega. The harness then invokes `omega run --keep` without an
+explicit target so Omega executes the host image. An explicit target on Omega's
+own `run` command emits an image without executing it.
 
 `layout` checks repository setup and the pinned Rust package mapping only.
 `audit`, `check` and `native` invoke the actual Omega CLI. Failures stay failures;
@@ -41,13 +54,20 @@ interpretation. It retains the command, host, output and exit status under
 `build/verification/`. Ordinary package review/acceptance is a separate explicit
 step; no generated approval file is checked in.
 
-Before native execution, use `omega update --project squalr-tests --target <target>`
-with the same compiler (`macos_arm64` on macOS or `windows_x86_64` on Windows).
-Inspect the reported review, resolve its exact pending decisions, then run
-`omega update --resume --project squalr-tests`. The checked-in `omega.lock`
-records the reviewed macOS baseline. Local package identities include checkout
-paths, so another checkout needs ordinary update/review for its local owners;
-Windows acceptance and runtime validation remain open. A timeout is not a
+Before native execution, use the same compiler for ordinary package review:
+
+```text
+omega update --project squalr-tests --target linux_x86_64
+omega update --resume --project squalr-tests
+```
+
+Inspect the first command's review and resolve its exact pending decisions before
+resuming. The initial update selects the target; resume retains the proposal's
+targets and does not accept a target override. The checked-in
+`squalr-tests/omega.lock` records a reviewed Linux x86_64 baseline. Local package
+identities include checkout paths, so another checkout needs ordinary
+update/review for its local owners. A lock records package admission; native
+acceptance still requires executing the application. A timeout is not a
 successful check.
 
 If a newer compiler rejects a historical lock policy version, preserve the old
