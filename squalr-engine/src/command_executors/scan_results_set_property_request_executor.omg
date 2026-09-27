@@ -1,0 +1,264 @@
+module src::command_executors::scan_results_set_property_request_executor;
+
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultRefList;
+use squalr_engine_api::src::commands::scan_results::freeze::scan_results_freeze_request::ScanResultsFreezeRequest;
+use squalr_engine_api::src::commands::scan_results::freeze::scan_results_freeze_response::ScanResultsFreezeResponse;
+use squalr_engine_api::src::commands::scan_results::set_property::scan_results_set_property_request::ScanResultsSetPropertyRequest;
+use squalr_engine_api::src::commands::scan_results::set_property::scan_results_set_property_response::ScanResultsSetPropertyResponse;
+use squalr_engine_api::src::structures::data_types::built_in_types::primitive_data_type_numeric::DeanonymizeResult;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_types::built_in_types::primitive_data_type_numeric::PrimitiveDataTypeNumeric;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::StructuralResult;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
+use squalr_engine_api::src::structures::scan_results::scan_result_base::ScanResultBase;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
+use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
+use src::command_executors::scan_results_freeze_request_executor::ScanResultsFreezeRequestExecutor;
+
+// Port of command_executors/scan_results/set_property/scan_results_set_property_request_executor.rs:
+// dispatches on `field_namespace` —
+//   "value"          : deanonymize the anonymous value string against the
+//                      result's data type and best-effort write the bytes
+//                      (only when a process is opened; failures warn only)
+//   "is_frozen"      : parse the value as bool32, then fire an internal
+//                      ScanResultsFreezeRequest with the same refs
+//   "address" | "module" | "module_offset" : read-only — warn and no-op
+//   _                : unsupported — warn and no-op
+//
+// Named deviations:
+// - Upstream `symbol_registry.deanonymize_value_string(data_type_ref, ...)`
+//   resolves the registered type's parser. The ported scalar leg plans u64
+//   scans only, so the port calls `PrimitiveDataTypeNumeric::deanonymize`
+//   with `element_size` from `DataTypeRef::get_unit_size_in_bytes`
+//   (little-endian, unsigned — u64 is the single ported type). A 0 size
+//   (unported type) skips the write, matching upstream's `Err` arm.
+// - Upstream `DataTypeBool32` for the is_frozen parse maps to element_size
+//   4, unsigned, little-endian — the bool32 shape.
+// - Upstream `log::warn!` on read-only/unsupported namespaces has no port
+//   surface — the arms are deliberate no-ops (the response is empty either
+//   way upstream).
+pub data ScanResultsSetPropertyRequestExecutor {}
+
+pub machine ScanResultsSetPropertyRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    scan_results_set_property_request: &ScanResultsSetPropertyRequest
+) -> ScanResultsSetPropertyResponse
+crashes Abort
+{
+    let value_ns: &[u8] = ScanResult::property_name_value();
+    let frozen_ns: &[u8] = ScanResult::property_name_is_frozen();
+    let is_value: bool = scan_results_set_property_request.field_namespace_is(value_ns);
+    let is_frozen_ns: bool = scan_results_set_property_request.field_namespace_is(frozen_ns);
+    transition is_value {
+        true -> set_value(engine_privileged_state, scan_results_set_property_request)
+        false -> not_value(engine_privileged_state, scan_results_set_property_request, is_frozen_ns)
+        _ -> not_value(engine_privileged_state, scan_results_set_property_request, is_frozen_ns)
+    }
+
+    // "value" — per-ref deanonymize + best-effort write.
+    state set_value(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest
+    ) -> ScanResultsSetPropertyResponse {
+        transition { _ -> each(engine_privileged_state, scan_results_set_property_request, 0) }
+    }
+    state each(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest,
+        position: u64
+    ) -> ScanResultsSetPropertyResponse {
+        let refs: &ScanResultRefList = scan_results_set_property_request.get_scan_result_refs();
+        let ref_count: u64 = refs.get_count();
+        transition position < ref_count {
+            true -> resolve(engine_privileged_state, scan_results_set_property_request, position)
+            false -> (ScanResultsSetPropertyResponse::empty())
+            _ -> (ScanResultsSetPropertyResponse::empty())
+        }
+    }
+    state resolve(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest,
+        position: u64
+    ) -> ScanResultsSetPropertyResponse {
+        let refs: &ScanResultRefList = scan_results_set_property_request.get_scan_result_refs();
+        let scan_result_ref: ScanResultRef = refs.get(position);
+        let global_index: u64 = scan_result_ref.get_scan_result_index();
+        let snapshot: &Snapshot = engine_privileged_state.borrow_snapshot();
+        let structural_result: StructuralResult = snapshot.get_scan_result(global_index);
+        transition structural_result {
+            StructuralResult::Found { valued_result } -> deanonymize(
+                engine_privileged_state,
+                scan_results_set_property_request,
+                valued_result,
+                position)
+            _ -> each(engine_privileged_state, scan_results_set_property_request, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state deanonymize(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest,
+        valued_result: ScanResultValued,
+        position: u64
+    ) -> ScanResultsSetPropertyResponse {
+        let base: ScanResultBase = valued_result.get_base_result();
+        let address: u64 = base.get_address();
+        let data_type_ref: DataTypeRef = base.get_data_type_ref();
+        let element_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let numeric: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let mut value_bytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        let anonymous_value_string: &AnonymousValueString = scan_results_set_property_request.get_anonymous_value_string();
+        let parsed: DeanonymizeResult = numeric.deanonymize(
+            anonymous_value_string,
+            false,
+            element_size,
+            false,
+            &mut value_bytes[0..8]);
+        transition parsed {
+            DeanonymizeResult::Bytes { count } -> write_value(
+                engine_privileged_state,
+                scan_results_set_property_request,
+                address,
+                element_size,
+                &value_bytes,
+                position)
+            _ -> each(engine_privileged_state, scan_results_set_property_request, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state write_value(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest,
+        address: u64,
+        element_size: u64,
+        value_bytes: &[u8; 8],
+        position: u64
+    ) -> ScanResultsSetPropertyResponse {
+        let has_process: bool = engine_privileged_state.has_opened_process();
+        transition has_process && element_size > 0 && element_size <= 8 {
+            true -> apply_write(
+                engine_privileged_state,
+                scan_results_set_property_request,
+                address,
+                element_size,
+                value_bytes,
+                position)
+            false -> each(engine_privileged_state, scan_results_set_property_request, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> each(engine_privileged_state, scan_results_set_property_request, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state apply_write(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest,
+        address: u64,
+        element_size: u64,
+        value_bytes: &[u8; 8],
+        position: u64
+    ) -> ScanResultsSetPropertyResponse {
+        let value: u64 = load_u64_le(value_bytes, element_size);
+        let source: &mut SuppliedMemorySource = engine_privileged_state.borrow_supplied_memory_source_mut();
+        let wrote: bool = source.try_write_window(address, element_size, value);
+        transition { _ -> each(engine_privileged_state, scan_results_set_property_request, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // "is_frozen" — upstream deanonymizes as bool32 and fires the internal
+    // freeze request; the freeze response is discarded like upstream's
+    // `let _ =` fire-and-forget.
+    state not_value(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest,
+        is_frozen_ns: bool
+    ) -> ScanResultsSetPropertyResponse {
+        transition is_frozen_ns {
+            true -> parse_frozen(engine_privileged_state, scan_results_set_property_request)
+            false -> read_only(engine_privileged_state, scan_results_set_property_request)
+            _ -> read_only(engine_privileged_state, scan_results_set_property_request)
+        }
+    }
+    state parse_frozen(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest
+    ) -> ScanResultsSetPropertyResponse {
+        let numeric: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let mut flag_bytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        let anonymous_value_string: &AnonymousValueString = scan_results_set_property_request.get_anonymous_value_string();
+        let parsed: DeanonymizeResult = numeric.deanonymize(
+            anonymous_value_string,
+            false,
+            4,
+            false,
+            &mut flag_bytes[0..8]);
+        transition parsed {
+            DeanonymizeResult::Bytes { count } -> fire_freeze(
+                engine_privileged_state,
+                scan_results_set_property_request,
+                &flag_bytes,
+                count)
+            _ -> (ScanResultsSetPropertyResponse::empty())
+        }
+    }
+    state fire_freeze(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest,
+        flag_bytes: &[u8; 8],
+        count: u64
+    ) -> ScanResultsSetPropertyResponse {
+        // Upstream `value_bytes.iter().any(|&byte| byte != 0)` over the
+        // parsed bool32 buffer.
+        let frozen: bool = any_byte_set(flag_bytes, count);
+        let mut internal_refs: ScanResultRefList = ScanResultRefList::empty();
+        internal_refs.clone_from(scan_results_set_property_request.get_scan_result_refs());
+        let freeze_request: ScanResultsFreezeRequest = ScanResultsFreezeRequest::new(internal_refs, frozen);
+        let freeze_response: ScanResultsFreezeResponse = ScanResultsFreezeRequestExecutor::execute(
+            engine_privileged_state,
+            &freeze_request);
+        transition { _ -> (ScanResultsSetPropertyResponse::empty()) }
+    }
+
+    // Upstream's read-only + unsupported warn arms — both land here as a
+    // no-op empty response (the warn log has no port surface).
+    state read_only(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_set_property_request: &ScanResultsSetPropertyRequest
+    ) -> ScanResultsSetPropertyResponse {
+        (ScanResultsSetPropertyResponse::empty())
+    }
+}
+
+// Little-endian byte assembly of the deanonymized buffer — the port's u64
+// scalar convention. `count` caps how many bytes contribute.
+machine load_u64_le(value_bytes: &[u8; 8], count: u64) -> u64 {
+    transition { _ -> fold(value_bytes, count, 0, 0) }
+    state fold(value_bytes: &[u8; 8], count: u64, position: u64, acc: u64) -> u64 {
+        transition position < count && position < 8 {
+            true -> add(value_bytes, count, position, acc)
+            false -> (acc)
+        }
+    }
+    state add(value_bytes: &[u8; 8], count: u64, position: u64, acc: u64) -> u64 {
+        let shift: u64 = (((position as u64 in Wrapping) * (8 as u64 in Wrapping)) as u64);
+        let byte_value: u64 = (((value_bytes[position] as u64 in Wrapping)) << (shift as u64 in Wrapping)) as u64;
+        let next: u64 = ((acc as u64 in Wrapping) | (byte_value as u64 in Wrapping)) as u64;
+        transition { _ -> fold(value_bytes, count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next) }
+    }
+}
+
+// Upstream `bytes.iter().any(|&byte| byte != 0)`.
+machine any_byte_set(bytes: &[u8; 8], count: u64) -> bool {
+    transition { _ -> each(bytes, count, 0) }
+    state each(bytes: &[u8; 8], count: u64, position: u64) -> bool {
+        transition position < count && position < 8 {
+            true -> probe(bytes, count, position)
+            false -> (false)
+        }
+    }
+    state probe(bytes: &[u8; 8], count: u64, position: u64) -> bool {
+        transition bytes[position] != 0 {
+            true -> (true)
+            false -> each(bytes, count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> each(bytes, count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}

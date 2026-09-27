@@ -1,46 +1,100 @@
 module src::structures::pointer_scans::pointer_scan_target_descriptor;
 
-// Port of structures/pointer_scans/pointer_scan_target_descriptor.rs.
-//
-// Named deviation: upstream's second variant
-//   Value { target_value: AnonymousValueString,
-//           data_type_ref: DataTypeRef,
-//           target_address_count: u64 }
-// is NOT ported yet: it needs `structures::data_types::data_type_ref::DataTypeRef`,
-// which exists only on z2's unmerged lane `leaf/supplied-bytes-scan`
-// (`data_types/data_type_ref.omg`). `AnonymousValueString` already exists.
-// Everything that pattern-matches `Value` (multi-target terminal
-// materialization in the results materializer) currently reduces to the
-// Address path; `is_value_descriptor` is kept as the single seam so the
-// variant slots back in without touching call sites.
-//
-// `fmt::Display` is not ported: there is no formatting surface yet; the
-// value-side text joins land with the Value variant.
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::container_type::ContainerType;
 
-pub data PointerScanTargetDescriptor [copy] {
+// Port of structures/pointer_scans/pointer_scan_target_descriptor.rs — both
+// upstream variants: Address (resolved absolute address) and Value (named
+// value target resolved through the element-scan query path, carrying the
+// parsed value string + data type + resolved target count).
+//
+// `fmt::Display` is not ported: there is no formatting surface yet.
+// Value carries by-value records, so the union is no longer [copy] —
+// upstream derives Clone, mirrored by `clone` below.
+
+pub data PointerScanTargetDescriptor {
     case Address(target_address: u64);
+    case Value(
+        target_value: AnonymousValueString,
+        data_type_ref: DataTypeRef,
+        target_address_count: u64
+    );
 }
 
-// Upstream derives PartialEq/Eq: `==`/`!=` select the Equatable route on this
-// type.
-trait Equatable {
-    machine equals(&self, other: &Self) -> bool;
+// Upstream derived Clone.
+pub machine PointerScanTargetDescriptor::clone(source: &PointerScanTargetDescriptor) -> PointerScanTargetDescriptor {
+    transition source {
+        PointerScanTargetDescriptor::Address { target_address } -> (
+            PointerScanTargetDescriptor::Address { target_address: target_address })
+        PointerScanTargetDescriptor::Value { target_value, data_type_ref, target_address_count } -> (
+            PointerScanTargetDescriptor::Value {
+                target_value: AnonymousValueString::clone(target_value),
+                data_type_ref: DataTypeRef::clone(data_type_ref),
+                target_address_count: target_address_count })
+        _ -> (PointerScanTargetDescriptor::Address { target_address: 0 })
+    }
 }
 
-PointerScanTargetDescriptorEquatable: PointerScanTargetDescriptor satisfies Equatable;
-
-// Upstream derived PartialEq. Address-only today (see header): two
-// descriptors are equal when the carried target address matches. Revisit
-// when the Value variant lands.
+// Upstream derived PartialEq: Address compares the address; Value compares
+// value string + data type + address count. Union-payload bindings cannot
+// cross a state boundary as `&` args, so the Value arm re-reads `self`'s
+// fields through the owned getters in the target state.
 pub machine PointerScanTargetDescriptor::equals(&self, other: &PointerScanTargetDescriptor) -> bool {
-    let self_address: u64 = self.get_target_address();
-    let other_address: u64 = other.get_target_address();
-    (self_address == other_address)
+    transition self {
+        PointerScanTargetDescriptor::Address { target_address } -> address_case(target_address, other)
+        PointerScanTargetDescriptor::Value { target_value, data_type_ref, target_address_count } -> value_case(other, target_address_count)
+        _ -> (false)
+    }
+    state address_case(target_address: u64, other: &PointerScanTargetDescriptor) -> bool {
+        transition other {
+            PointerScanTargetDescriptor::Address { target_address } -> self_equal(target_address, other)
+            _ -> (false)
+        }
+    }
+    state self_equal(target_address: u64, other: &PointerScanTargetDescriptor) -> bool {
+        (target_address == other.get_target_address())
+    }
+    state value_case(&self, other: &PointerScanTargetDescriptor, self_count: u64) -> bool {
+        transition other.is_value_descriptor() {
+            true -> value_match(other, self_count)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state value_match(
+        &self,
+        other: &PointerScanTargetDescriptor,
+        self_count: u64
+    ) -> bool {
+        let self_value: AnonymousValueString = self.get_target_value();
+        let self_type: DataTypeRef = self.get_target_data_type_ref();
+        let other_value: AnonymousValueString = other.get_target_value();
+        let other_type: DataTypeRef = other.get_target_data_type_ref();
+        let other_count: u64 = other.get_target_address_count();
+        let strings_equal: bool = self_value.equals(&other_value);
+        let types_equal: bool = self_type.equals(&other_type);
+        (strings_equal && types_equal && self_count == other_count)
+    }
 }
 
 // Upstream `PointerScanTargetDescriptor::address`.
 pub machine PointerScanTargetDescriptor::address(target_address: u64) -> PointerScanTargetDescriptor {
     PointerScanTargetDescriptor::Address { target_address: target_address }
+}
+
+// Upstream `PointerScanTargetDescriptor::value`.
+pub machine PointerScanTargetDescriptor::value(
+    target_value: AnonymousValueString,
+    data_type_ref: DataTypeRef,
+    target_address_count: u64
+) -> PointerScanTargetDescriptor {
+    PointerScanTargetDescriptor::Value {
+        target_value: target_value,
+        data_type_ref: data_type_ref,
+        target_address_count: target_address_count
+    }
 }
 
 // Upstream `get_target_address`: Option<u64> -> has_target_address + address.
@@ -62,13 +116,34 @@ pub machine PointerScanTargetDescriptor::get_target_address(&self) -> u64 {
 pub machine PointerScanTargetDescriptor::get_target_address_count(&self) -> u64 {
     transition self {
         PointerScanTargetDescriptor::Address { target_address } -> (1)
+        PointerScanTargetDescriptor::Value { target_value, data_type_ref, target_address_count } -> (target_address_count)
         _ -> (0)
     }
 }
 
-// Seam for upstream `matches!(descriptor, Value { .. })` checks — the
-// materializer's multi-target terminal path keys off this until the Value
-// variant exists.
+// Upstream `get_target_value`: Option<&AnonymousValueString> — the owned
+// port returns a clone for Value, the empty value string for Address
+// (upstream's None arm).
+pub machine PointerScanTargetDescriptor::get_target_value(&self) -> AnonymousValueString {
+    transition self {
+        PointerScanTargetDescriptor::Value { target_value, data_type_ref, target_address_count } -> (
+            AnonymousValueString::clone(target_value))
+        _ -> (AnonymousValueString::new("", AnonymousValueStringFormat::default(), ContainerType::default()))
+    }
+}
+
+// Upstream `get_target_data_type_ref`: Option<&DataTypeRef> — the owned
+// port returns a clone for Value, the default ref for Address.
+pub machine PointerScanTargetDescriptor::get_target_data_type_ref(&self) -> DataTypeRef {
+    transition self {
+        PointerScanTargetDescriptor::Value { target_value, data_type_ref, target_address_count } -> (
+            DataTypeRef::clone(data_type_ref))
+        _ -> (DataTypeRef::default())
+    }
+}
+
+// Upstream `matches!(descriptor, Value { .. })` — the materializer's
+// multi-target terminal path keys off this.
 pub machine PointerScanTargetDescriptor::is_value_descriptor(&self) -> bool {
     transition self {
         PointerScanTargetDescriptor::Address { target_address } -> (false)

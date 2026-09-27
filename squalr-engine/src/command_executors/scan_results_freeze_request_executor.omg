@@ -1,0 +1,502 @@
+module src::command_executors::scan_results_freeze_request_executor;
+
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultRefList;
+use squalr_engine_api::src::commands::scan_results::freeze::scan_results_freeze_request::ScanResultsFreezeRequest;
+use squalr_engine_api::src::commands::scan_results::freeze::scan_results_freeze_response::ScanResultsFreezeResponse;
+use squalr_engine_api::src::registries::freeze_list::freeze_list_registry::FreezeListRegistry;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::results::snapshot_region_scan_results::StructuralResult;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_api::src::structures::scan_results::scan_result_base::ScanResultBase;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
+use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::ReadWindowResult;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
+
+// Port of command_executors/scan_results/freeze/scan_results_freeze_request_executor.rs:
+// for each requested scan-result ref, resolve the result's address through
+// the snapshot, reduce the address to a (module_name, module_offset) key
+// when it lands inside a module, then either register the address frozen at
+// its current bytes or drop it from the freeze list. Refs that cannot be
+// resolved/read are collected into `failed_freeze_toggle_scan_result_refs`.
+//
+// Named deviations:
+// - Upstream wraps the (offset, name) pair in a `Pointer` keyed by a
+//   HashMap; the ported registry stores the decomposed key directly — the
+//   pipeline only builds empty-offset pointers (see the registry file).
+// - Upstream `symbol_registry.get_default_value(data_type_ref)` sizes the
+//   read buffer by the registered type. The port has no symbol registry;
+//   `DataTypeRef::get_unit_size_in_bytes` is its analogue — a 0 size (the
+//   type is not a ported u64 scalar) maps to upstream's `None` arm and the
+//   ref is failed.
+// - Upstream reads current bytes through `memory_read`; the supplied
+//   memory source is the adapter reader — element-granular u64.
+// - Upstream failure of `get_modules`/`address_to_module` leaves the raw
+//   address as the offset and an empty module name — same here, and a
+//   failed module lookup is NOT a failed ref upstream.
+pub data ScanResultsFreezeRequestExecutor {}
+
+pub machine ScanResultsFreezeRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    scan_results_freeze_request: &ScanResultsFreezeRequest
+) -> ScanResultsFreezeResponse
+crashes Abort
+{
+    let empty_module_name: [u8; 1] = [0];
+    let mut supplied_modules: [NormalizedModule; 8] = [
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0)
+    ];
+    let supplied_module_count: u64 = engine_privileged_state.copy_supplied_modules(&mut supplied_modules);
+    let has_process: bool = engine_privileged_state.has_opened_process();
+    // Upstream collects `modules` only when a process is opened — an
+    // unopened target freezes against an empty module list.
+    transition has_process {
+        true -> with_modules(engine_privileged_state, scan_results_freeze_request, &supplied_modules, supplied_module_count)
+        false -> with_modules(engine_privileged_state, scan_results_freeze_request, &supplied_modules, 0)
+        _ -> with_modules(engine_privileged_state, scan_results_freeze_request, &supplied_modules, 0)
+    }
+
+    state with_modules(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64
+    ) -> ScanResultsFreezeResponse {
+        transition { _ -> each(
+            engine_privileged_state,
+            scan_results_freeze_request,
+            supplied_modules,
+            module_count,
+            ScanResultsFreezeResponse::empty(),
+            0) }
+    }
+    state each(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        let refs: &ScanResultRefList = scan_results_freeze_request.get_scan_result_refs();
+        let ref_count: u64 = refs.get_count();
+        transition position < ref_count {
+            true -> resolve(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                response,
+                position)
+            false -> (response)
+            _ -> (response)
+        }
+    }
+    state resolve(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        let refs: &ScanResultRefList = scan_results_freeze_request.get_scan_result_refs();
+        let scan_result_ref: ScanResultRef = refs.get(position);
+        let global_index: u64 = scan_result_ref.get_scan_result_index();
+        let snapshot: &Snapshot = engine_privileged_state.borrow_snapshot();
+        let structural_result: StructuralResult = snapshot.get_scan_result(global_index);
+        transition structural_result {
+            StructuralResult::Found { valued_result } -> locate_module(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                valued_result,
+                scan_result_ref,
+                response,
+                position)
+            _ -> push_failed(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                scan_result_ref,
+                response,
+                position)
+        }
+    }
+
+    // Upstream's `address_to_module` walk: `module_name`/`module_offset`
+    // default to "" and the raw address; a containing module replaces both.
+    state locate_module(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        valued_result: ScanResultValued,
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        let base: ScanResultBase = valued_result.get_base_result();
+        let address: u64 = base.get_address();
+        let data_type_ref: DataTypeRef = base.get_data_type_ref();
+        let byte_len: u64 = data_type_ref.get_unit_size_in_bytes();
+        transition { _ -> probe_module(
+            engine_privileged_state,
+            scan_results_freeze_request,
+            supplied_modules,
+            module_count,
+            address,
+            byte_len,
+            scan_result_ref,
+            response,
+            position,
+            0) }
+    }
+    state probe_module(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        address: u64,
+        byte_len: u64,
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64,
+        module_index: u64
+    ) -> ScanResultsFreezeResponse {
+        transition module_index < module_count && module_index < 8 {
+            true -> test_module(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                scan_result_ref,
+                response,
+                position,
+                module_index)
+            false -> apply(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                address,
+                "",
+                scan_result_ref,
+                response,
+                position)
+            _ -> apply(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                address,
+                "",
+                scan_result_ref,
+                response,
+                position)
+        }
+    }
+    state test_module(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        address: u64,
+        byte_len: u64,
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64,
+        module_index: u64 [0..8]
+    ) -> ScanResultsFreezeResponse {
+        let contained: bool = supplied_modules[module_index].contains_address(address);
+        transition contained {
+            true -> found_module(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                scan_result_ref,
+                response,
+                position,
+                module_index)
+            false -> probe_module(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                scan_result_ref,
+                response,
+                position,
+                module_index + 1)
+            _ -> probe_module(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                scan_result_ref,
+                response,
+                position,
+                module_index + 1)
+        }
+    }
+    state found_module(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        address: u64,
+        byte_len: u64,
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64,
+        module_index: u64 [0..8]
+    ) -> ScanResultsFreezeResponse {
+        let base_address: u64 = supplied_modules[module_index].get_base_address();
+        let module_offset: u64 = ((address as u64 in Saturating) - (base_address as u64 in Saturating)) as u64;
+        let module_name: &[u8] = supplied_modules[module_index].get_module_name();
+        transition { _ -> apply(
+            engine_privileged_state,
+            scan_results_freeze_request,
+            supplied_modules,
+            module_count,
+            address,
+            byte_len,
+            module_offset,
+            module_name,
+            scan_result_ref,
+            response,
+            position) }
+    }
+
+    // Upstream `Pointer::new(module_offset, vec![], module_name)` followed
+    // by the is_frozen branch — the decomposed key flows straight to the
+    // registry.
+    state apply(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        address: u64,
+        byte_len: u64,
+        module_offset: u64,
+        module_name: &[u8],
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        transition scan_results_freeze_request.get_is_frozen() {
+            true -> gate_process(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                module_offset,
+                module_name,
+                scan_result_ref,
+                response,
+                position)
+            false -> unfrozen(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                module_offset,
+                module_name,
+                scan_result_ref,
+                response,
+                position)
+            _ -> unfrozen(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                module_offset,
+                module_name,
+                scan_result_ref,
+                response,
+                position)
+        }
+    }
+    state gate_process(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        address: u64,
+        byte_len: u64,
+        module_offset: u64,
+        module_name: &[u8],
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        // Upstream: freeze requires an opened process AND a typed default
+        // value — either missing pushes the ref to the failed list.
+        let has_process: bool = engine_privileged_state.has_opened_process();
+        transition has_process && byte_len > 0 {
+            true -> read_value(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                address,
+                byte_len,
+                module_offset,
+                module_name,
+                scan_result_ref,
+                response,
+                position)
+            false -> push_failed(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                scan_result_ref,
+                response,
+                position)
+            _ -> push_failed(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                scan_result_ref,
+                response,
+                position)
+        }
+    }
+    state read_value(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        address: u64,
+        byte_len: u64,
+        module_offset: u64,
+        module_name: &[u8],
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        let source: &SuppliedMemorySource = engine_privileged_state.get_supplied_memory_source();
+        let read: ReadWindowResult = source.try_read_window(address, byte_len);
+        let value: u64 = read.window.get_element(0);
+        transition read.succeeded {
+            true -> store_frozen(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                module_offset,
+                module_name,
+                value,
+                byte_len,
+                scan_result_ref,
+                response,
+                position)
+            false -> push_failed(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                scan_result_ref,
+                response,
+                position)
+            _ -> push_failed(
+                engine_privileged_state,
+                scan_results_freeze_request,
+                supplied_modules,
+                module_count,
+                scan_result_ref,
+                response,
+                position)
+        }
+    }
+    state store_frozen(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_offset: u64,
+        module_name: &[u8],
+        value: u64,
+        byte_len: u64,
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        let registry: &mut FreezeListRegistry = engine_privileged_state.borrow_freeze_list_registry_mut();
+        registry.set_address_frozen(module_offset, module_name, value, byte_len);
+        transition { _ -> each(
+            engine_privileged_state,
+            scan_results_freeze_request,
+            supplied_modules,
+            module_count,
+            response,
+            ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state unfrozen(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_offset: u64,
+        module_name: &[u8],
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        let registry: &mut FreezeListRegistry = engine_privileged_state.borrow_freeze_list_registry_mut();
+        let removed: bool = registry.set_address_unfrozen(module_offset, module_name);
+        transition { _ -> each(
+            engine_privileged_state,
+            scan_results_freeze_request,
+            supplied_modules,
+            module_count,
+            response,
+            ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state push_failed(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        scan_results_freeze_request: &ScanResultsFreezeRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        scan_result_ref: ScanResultRef,
+        response: ScanResultsFreezeResponse,
+        position: u64
+    ) -> ScanResultsFreezeResponse {
+        let mut carried: ScanResultsFreezeResponse = response;
+        carried.push_failed(&scan_result_ref);
+        transition { _ -> each(
+            engine_privileged_state,
+            scan_results_freeze_request,
+            supplied_modules,
+            module_count,
+            carried,
+            ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
