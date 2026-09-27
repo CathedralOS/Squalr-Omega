@@ -70,8 +70,24 @@ def compiler_command(mode, executable, application, target, report):
     elif mode == "check":
         command = [executable, "--check", "--build-dir", str(report / "compiler"), str(application / "main.omg")]
     else:
+        # Omega's explicit-target run publishes an image without executing it.
+        # Here --target asserts the execution host; it must not turn this native
+        # acceptance gate into a compile-only invocation.
+        if target:
+            host = {
+                ("Darwin", "arm64"): "macos_arm64",
+                ("Darwin", "x86_64"): "macos_x86_64",
+                ("Linux", "aarch64"): "linux_arm64",
+                ("Linux", "x86_64"): "linux_x86_64",
+                ("Windows", "amd64"): "windows_x86_64",
+            }.get((platform.system(), platform.machine().lower()))
+            if target != host:
+                raise ValueError(
+                    f"native target {target} does not match host {host or platform.platform()}; "
+                    "run on a matching host, or use check for target compilation"
+                )
         command = [executable, "run", "--keep", str(application / "main.omg")]
-    if target:
+    if target and mode != "native":
         command += ["--target", target]
     return command
 
@@ -142,7 +158,10 @@ def main():
     if Path(executable).is_file():
         executable = str(Path(executable).resolve())
     report = ROOT / "build" / "verification" / arguments.project / arguments.mode
-    command = compiler_command(arguments.mode, executable, application, arguments.target, report)
+    try:
+        command = compiler_command(arguments.mode, executable, application, arguments.target, report)
+    except ValueError as error:
+        parser.error(str(error))
     return run_compiler(command, report, arguments.mode, arguments.timeout, arguments.project)
 
 
