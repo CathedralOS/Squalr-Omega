@@ -39,10 +39,15 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   Live-snapshot chain status: attach/enumerate/region/memory-io providers are
   ported and check-green; `get_processes` reproduces the sysinfo sweep minus
   the unported window-detect leg (`require_windowed` -> NotImplemented).
-  Session privileged-state, region merge, snapshot collect and the headless
-  probe entry are deferred on sibling snapshot structures
-  (`Snapshot`/`SnapshotRegion`, lane `path/scalar-scan-headless`), the
-  crash-route realization gap (`SnapshotRegionFilter::get_element_count` has
-  no admitted body for native), and toolchain-settled fused
-  `FilesystemHost`/`TimeHost` providers — residual evidence and resume steps
-  live in `tools/native_probe_resume.md`.
+  Session privileged-state (`engine_privileged_state.omg`), region merge
+  (`SnapshotRegionBuilder::add_memory_region`), snapshot collect
+  (`snapshot_value_collector.omg`, `Snapshot::collect_region_values`) and the
+  headless probe entry (`ElementScannerDriver::run_supplied_fixture`) are
+  ported — the `path/scalar-scan-headless` snapshot-structures deferral and
+  the `SnapshotRegionFilter::get_element_count` crash-route gap are resolved.
+  What still gates the native probe is toolchain-settled fused
+  `FilesystemHost`/`TimeHost` machinery: the canonical leaf tables mint rows
+  only for linux_x86_64 scalar-positional syscalls, so `open`/`read`/
+  `canonicalize` (path/slice carriers) and non-linux targets resolve to zero
+  provider rows at terminal-authority review — residual evidence and resume
+  steps live in `tools/native_probe_resume.md`.
