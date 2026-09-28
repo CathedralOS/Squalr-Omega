@@ -1,9 +1,11 @@
 module src::command_executors::memory_freeze_request_executor;
 
 use squalr_engine_api::src::commands::memory::freeze::memory_freeze_request::MemoryFreezeRequest;
+use squalr_engine_api::src::commands::memory::freeze::memory_freeze_request::MemoryFreezeTargetList;
 use squalr_engine_api::src::commands::memory::freeze::memory_freeze_response::MemoryFreezeResponse;
 use squalr_engine_api::src::commands::memory::freeze::memory_freeze_target::MemoryFreezeTarget;
 use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::registries::freeze_list::freeze_list_registry::FreezeListRegistry;
 use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
 use squalr_engine_session::src::os::supplied_memory_source::ReadWindowResult;
 use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
@@ -24,6 +26,9 @@ use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource
 //   supplied memory source is element-granular, so hops read one u64 lane.
 // - A failed module lookup or unreadable hop counts the target failed —
 //   upstream's `resolve_final_address` `None` arm.
+// - Wrapping address arithmetic matches upstream release-mode `u64`
+//   wrap semantics exactly; `offset as u64 in Wrapping` is the i64->u64
+//   two's-complement bitcast `as` performs in Rust.
 pub data MemoryFreezeRequestExecutor {}
 
 pub machine MemoryFreezeRequestExecutor::execute(
@@ -32,6 +37,9 @@ pub machine MemoryFreezeRequestExecutor::execute(
 ) -> MemoryFreezeResponse
 crashes Abort
 {
+    let freeze_targets: &MemoryFreezeTargetList =
+        memory_freeze_request.get_freeze_targets();
+    let target_count: u64 = freeze_targets.get_count();
     let empty_module_name: [u8; 1] = [0];
     let mut supplied_modules: [NormalizedModule; 8] = [
         NormalizedModule::new(&empty_module_name[0..0], 0, 0),
@@ -45,62 +53,70 @@ crashes Abort
     ];
     let supplied_module_count: u64 = engine_privileged_state.copy_supplied_modules(&mut supplied_modules);
     transition memory_freeze_request.get_is_frozen() {
-        true -> check_process(engine_privileged_state, memory_freeze_request, &supplied_modules, supplied_module_count)
-        false -> unfrozen(engine_privileged_state, memory_freeze_request, 0)
-        _ -> unfrozen(engine_privileged_state, memory_freeze_request, 0)
+        true -> check_process(engine_privileged_state, freeze_targets, target_count, &supplied_modules, supplied_module_count)
+        false -> unfrozen(engine_privileged_state, freeze_targets, target_count, 0)
+        _ -> unfrozen(engine_privileged_state, freeze_targets, target_count, 0)
     }
 
     // Unfreeze needs no opened process upstream — unregister each target's
     // (address, module_name) key and report success.
     state unfrozen(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         position: u64
     ) -> MemoryFreezeResponse {
-        let target_count: u64 = memory_freeze_request.get_freeze_targets().get_count();
         transition position < target_count {
-            true -> unfreeze_one(engine_privileged_state, memory_freeze_request, position)
+            true -> unfreeze_one(engine_privileged_state, freeze_targets, target_count, position)
             false -> (MemoryFreezeResponse::new(0))
             _ -> (MemoryFreezeResponse::new(0))
         }
     }
     state unfreeze_one(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         position: u64
-    ) -> MemoryFreezeResponse {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
-        engine_privileged_state.borrow_freeze_list_registry_mut().set_address_unfrozen(
-            target.get_address(), target.get_module_name());
-        transition { _ -> unfrozen(engine_privileged_state, memory_freeze_request, position + 1) }
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    {
+        let target: &MemoryFreezeTarget = freeze_targets.get_target(position);
+        let module_offset: u64 = target.get_address();
+        let module_name: &[u8] = target.get_module_name();
+        let registry: &mut FreezeListRegistry =
+            engine_privileged_state.borrow_freeze_list_registry_mut();
+        _ = registry.set_address_unfrozen(module_offset, module_name);
+        transition { _ -> unfrozen(engine_privileged_state, freeze_targets, target_count, position + 1) }
     }
 
     // Upstream: no opened process fails every target.
     state check_process(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64
     ) -> MemoryFreezeResponse {
-        let target_count: u64 = memory_freeze_request.get_freeze_targets().get_count();
         transition engine_privileged_state.has_opened_process() {
-            true -> each(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, 0, 0)
+            true -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, 0, 0)
             false -> (MemoryFreezeResponse::new(target_count))
             _ -> (MemoryFreezeResponse::new(target_count))
         }
     }
     state each(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
         failed_count: u64
-    ) -> MemoryFreezeResponse {
-        let target_count: u64 = memory_freeze_request.get_freeze_targets().get_count();
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position <= target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    {
         transition position < target_count {
-            true -> resolve_base(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count)
+            true -> resolve_base(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count)
             false -> (MemoryFreezeResponse::new(failed_count))
             _ -> (MemoryFreezeResponse::new(failed_count))
         }
@@ -111,38 +127,49 @@ crashes Abort
     // absolute; an absent module name fails the target.
     state resolve_base(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
         failed_count: u64
-    ) -> MemoryFreezeResponse {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    {
+        let target: &MemoryFreezeTarget = freeze_targets.get_target(position);
+        let target_address: u64 = target.get_address();
+        let offset_count: u64 = target.get_pointer_offset_count();
         transition target.get_module_name().len == 0 {
-            true -> chase(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, target.get_address(), 0)
-            false -> find_module(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, 0)
-            _ -> chase(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, target.get_address(), 0)
+            true -> chase(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, target_address, 0, offset_count)
+            false -> find_module(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, 0)
+            _ -> chase(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, target_address, 0, offset_count)
         }
     }
     state find_module(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
         failed_count: u64,
         module_index: u64
-    ) -> MemoryFreezeResponse {
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    requires 0 <= module_index && module_index <= 8;
+    {
         transition module_index < module_count && module_index < 8 {
-            true -> compare_name(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, module_index, 0)
-            false -> each(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position + 1, failed_count + 1)
-            _ -> each(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position + 1, failed_count + 1)
+            true -> compare_name(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, module_index, 0)
+            false -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position + 1, failed_count + 1)
+            _ -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position + 1, failed_count + 1)
         }
     }
     state compare_name(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
@@ -150,22 +177,24 @@ crashes Abort
         module_index: u64,
         name_position: u64
     ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
     requires 0 <= module_index && module_index < 8;
     {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
+        let target: &MemoryFreezeTarget = freeze_targets.get_target(position);
         let module: &NormalizedModule = &supplied_modules[module_index];
         let target_name: &[u8] = target.get_module_name();
         let module_name: &[u8] = module.get_module_name();
         transition name_position < target_name.len {
-            true -> compare_byte(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, module_index, name_position)
-            false -> resolved_module(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, module_index)
-            _ -> resolved_module(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, module_index)
+            true -> compare_byte(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, module_index, name_position)
+            false -> resolved_module(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, module_index)
+            _ -> resolved_module(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, module_index)
         }
     }
     state compare_byte(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
@@ -173,35 +202,39 @@ crashes Abort
         module_index: u64,
         name_position: u64
     ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
     requires 0 <= module_index && module_index < 8;
     {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
+        let target: &MemoryFreezeTarget = freeze_targets.get_target(position);
         let module: &NormalizedModule = &supplied_modules[module_index];
         let target_name: &[u8] = target.get_module_name();
         let module_name: &[u8] = module.get_module_name();
-        transition name_position < module_name.len && module_name[name_position] == target_name[name_position] {
-            true -> compare_name(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, module_index, name_position + 1)
-            false -> find_module(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, module_index + 1)
-            _ -> find_module(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, module_index + 1)
+        transition name_position < module_name.len && name_position < target_name.len && module_name[name_position] == target_name[name_position] {
+            true -> compare_name(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, module_index, name_position + 1)
+            false -> find_module(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, module_index + 1)
+            _ -> find_module(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, module_index + 1)
         }
     }
     state resolved_module(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
         failed_count: u64,
         module_index: u64
     ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
     requires 0 <= module_index && module_index < 8;
     {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
-        let absolute: u64 = ((supplied_modules[module_index].get_base_address() as u64 in Saturating)
-            + (target.get_address() as u64 in Saturating)) as u64;
-        transition { _ -> chase(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, absolute, 0) }
+        let target: &MemoryFreezeTarget = freeze_targets.get_target(position);
+        let absolute: u64 = (((supplied_modules[module_index].get_base_address() as u64 in Wrapping)
+            + (target.get_address() as u64 in Wrapping)) as u64);
+        let offset_count: u64 = target.get_pointer_offset_count();
+        transition { _ -> chase(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, absolute, 0, offset_count) }
     }
 
     // Pointer chase: upstream reads `pointer_size` bytes at each hop and
@@ -209,82 +242,141 @@ crashes Abort
     // A hop that cannot be read fails the target.
     state chase(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
         failed_count: u64,
         current_address: u64,
-        hop: u64
-    ) -> MemoryFreezeResponse {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
-        transition hop < target.get_pointer_offset_count() {
-            true -> hop_read(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, current_address, hop)
-            false -> register(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count)
-            _ -> register(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count)
+        hop: u64,
+        offset_count: u64
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    requires 0 <= hop && hop <= offset_count;
+    {
+        transition hop < offset_count {
+            true -> hop_read(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, current_address, hop, offset_count)
+            false -> register(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, current_address)
+            _ -> register(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, current_address)
         }
     }
     state hop_read(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
         failed_count: u64,
         current_address: u64,
-        hop: u64
-    ) -> MemoryFreezeResponse {
-        let read_result: ReadWindowResult = engine_privileged_state
-            .get_supplied_memory_source()
-            .try_read_window(current_address, 8);
+        hop: u64,
+        offset_count: u64
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    requires 0 <= hop && hop < offset_count;
+    {
+        let source: &SuppliedMemorySource = engine_privileged_state.get_supplied_memory_source();
+        let read_result: ReadWindowResult = source.try_read_window(current_address, 8);
         transition read_result.succeeded {
-            true -> hop_apply(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, hop, read_result.window.get_element(0))
-            false -> each(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position + 1, failed_count + 1)
-            _ -> each(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position + 1, failed_count + 1)
+            true -> hop_apply_with(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, hop, offset_count, read_result)
+            false -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position + 1, failed_count + 1)
+            _ -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position + 1, failed_count + 1)
         }
     }
-    state hop_apply(
+    state hop_apply_with(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
         failed_count: u64,
         hop: u64,
-        pointer_value: u64
-    ) -> MemoryFreezeResponse {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
-        let next_address: u64 = apply_i64_offset(pointer_value, target.get_pointer_offset(hop));
-        transition { _ -> chase(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position, failed_count, next_address, hop + 1) }
+        offset_count: u64,
+        read_result: ReadWindowResult
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    requires 0 <= hop && hop < offset_count;
+    {
+        let pointer_value: u64 = read_result.window.get_element(0);
+        transition { _ -> hop_apply(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, hop, offset_count, pointer_value) }
     }
-    state register(
+    state hop_apply(
         engine_privileged_state: &mut EnginePrivilegedState,
-        memory_freeze_request: &MemoryFreezeRequest,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         position: u64,
-        failed_count: u64
-    ) -> MemoryFreezeResponse {
-        let target: &MemoryFreezeTarget =
-            memory_freeze_request.get_freeze_targets().get_target(position);
-        engine_privileged_state.borrow_freeze_list_registry_mut().set_address_frozen(
-            target.get_address(), target.get_module_name());
-        transition { _ -> each(engine_privileged_state, memory_freeze_request, supplied_modules, module_count, position + 1, failed_count) }
+        failed_count: u64,
+        hop: u64,
+        offset_count: u64,
+        pointer_value: u64
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    requires 0 <= hop && hop < offset_count;
+    {
+        let target: &MemoryFreezeTarget = freeze_targets.get_target(position);
+        let pointer_offset: i64 = target.get_pointer_offset(hop);
+        let next_address: u64 = apply_i64_offset(pointer_value, pointer_offset);
+        transition { _ -> chase(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, next_address, hop + 1, offset_count) }
+    }
+    // Upstream freezes `set_address_frozen(pointer, valued_struct.get_bytes())`
+    // — the key is the target pointer, the stored value is the bytes read at
+    // the resolved address. The element-granular source reads one u64 lane;
+    // an unreadable resolved address counts the target failed (upstream's
+    // `read_struct` failure arm).
+    state register(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        position: u64,
+        failed_count: u64,
+        current_address: u64
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    {
+        let source: &SuppliedMemorySource =
+            engine_privileged_state.get_supplied_memory_source();
+        let read_result: ReadWindowResult = source.try_read_window(current_address, 8);
+        transition read_result.succeeded {
+            true -> register_write(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position, failed_count, read_result)
+            false -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position + 1, failed_count + 1)
+            _ -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position + 1, failed_count + 1)
+        }
+    }
+    state register_write(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        freeze_targets: &MemoryFreezeTargetList,
+        target_count: u64,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        position: u64,
+        failed_count: u64,
+        read_result: ReadWindowResult
+    ) -> MemoryFreezeResponse
+    requires 0 <= position && position < target_count;
+    requires 0 <= failed_count && failed_count <= position;
+    {
+        let target: &MemoryFreezeTarget = freeze_targets.get_target(position);
+        let module_offset: u64 = target.get_address();
+        let module_name: &[u8] = target.get_module_name();
+        let value: u64 = read_result.window.get_element(0);
+        let registry: &mut FreezeListRegistry =
+            engine_privileged_state.borrow_freeze_list_registry_mut();
+        registry.set_address_frozen(module_offset, module_name, value, 8);
+        transition { _ -> each(engine_privileged_state, freeze_targets, target_count, supplied_modules, module_count, position + 1, failed_count) }
     }
 }
 
 machine apply_i64_offset(base: u64, offset: i64) -> u64 {
-    transition offset < 0 {
-        true -> negative(base, offset)
-        false -> positive(base, offset)
-        _ -> positive(base, offset)
-    }
-    state positive(base: u64, offset: i64) -> u64 {
-        ((base as u64 in Saturating) + ((offset as u64) as u64 in Saturating)) as u64
-    }
-    state negative(base: u64, offset: i64) -> u64 {
-        ((base as u64 in Saturating) - (((0 - offset) as u64) as u64 in Saturating)) as u64
-    }
+    (((base as u64 in Wrapping) + (offset as u64 in Wrapping)) as u64)
 }
