@@ -1,0 +1,263 @@
+module src::command_executors::memory_write_request_executor;
+
+use squalr_engine_api::src::commands::memory::write::memory_write_request::MemoryWriteMode;
+use squalr_engine_api::src::commands::memory::write::memory_write_request::MemoryWriteRequest;
+use squalr_engine_api::src::commands::memory::write::memory_write_response::MemoryWriteResponse;
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+
+// Port of command_executors/memory/write/memory_write_request_executor.rs:
+// with an opened process, Raw mode resolves `address` against `module_name`
+// when one is named and writes the request's bytes at the resolved
+// address; no process fails with upstream's "No process is opened to write
+// to." error.
+//
+// Named deviations:
+// - `MemoryWriteMode::CheckedCode` upstream routes through the patch
+//   service under a debugger pause — both services are unported, so the
+//   mode answers upstream's failure arm with an explanatory error rather
+//   than pretending a write happened.
+// - Upstream `write_bytes` is byte-granular; the supplied memory source is
+//   element-granular — each u64 lane of the value is packed and written
+//   through `try_write_window`, and a lane that cannot be written fails
+//   the request (upstream's `write_bytes -> false` arm).
+pub data MemoryWriteRequestExecutor {}
+
+pub machine MemoryWriteRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    memory_write_request: &MemoryWriteRequest
+) -> MemoryWriteResponse
+crashes Abort
+{
+    transition engine_privileged_state.has_opened_process() {
+        true -> dispatch(engine_privileged_state, memory_write_request)
+        false -> no_process()
+        _ -> no_process()
+    }
+
+    state no_process() -> MemoryWriteResponse {
+        MemoryWriteResponse::new(false, "No process is opened to write to.")
+    }
+
+    state dispatch(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest
+    ) -> MemoryWriteResponse {
+        transition memory_write_request.get_write_mode() {
+            MemoryWriteMode::CheckedCode -> checked_code(memory_write_request)
+            _ -> resolve(engine_privileged_state, memory_write_request)
+        }
+    }
+    state checked_code(
+        memory_write_request: &MemoryWriteRequest
+    ) -> MemoryWriteResponse {
+        MemoryWriteResponse::new(
+            false, "Checked code writes require the patch service, which is not ported yet.")
+    }
+
+    state resolve(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest
+    ) -> MemoryWriteResponse {
+        transition memory_write_request.get_module_name().len == 0 {
+            true -> write_lanes(
+                engine_privileged_state,
+                memory_write_request,
+                memory_write_request.get_address(),
+                0)
+            false -> find_module(engine_privileged_state, memory_write_request, 0)
+            _ -> write_lanes(
+                engine_privileged_state,
+                memory_write_request,
+                memory_write_request.get_address(),
+                0)
+        }
+    }
+    state find_module(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest,
+        module_index: u64
+    ) -> MemoryWriteResponse {
+        let module_count: u64 = engine_privileged_state.get_supplied_module_count();
+        transition module_index < module_count && module_index < 8 {
+            true -> compare_name(engine_privileged_state, memory_write_request, module_index, 0)
+            false -> failed()
+            _ -> failed()
+        }
+    }
+    state compare_name(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest,
+        module_index: u64,
+        name_position: u64
+    ) -> MemoryWriteResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let target_name: &[u8] = memory_write_request.get_module_name();
+        let module_name: &[u8] = engine_privileged_state
+            .get_supplied_modules()[module_index].get_module_name();
+        transition module_name.len == target_name.len {
+            true -> compare_byte(engine_privileged_state, memory_write_request, module_index, name_position)
+            false -> find_module(engine_privileged_state, memory_write_request, module_index + 1)
+            _ -> find_module(engine_privileged_state, memory_write_request, module_index + 1)
+        }
+    }
+    state compare_byte(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest,
+        module_index: u64,
+        name_position: u64
+    ) -> MemoryWriteResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let target_name: &[u8] = memory_write_request.get_module_name();
+        let module_name: &[u8] = engine_privileged_state
+            .get_supplied_modules()[module_index].get_module_name();
+        transition name_position < target_name.len {
+            true -> byte_at(engine_privileged_state, memory_write_request, module_index, name_position)
+            false -> resolved(engine_privileged_state, memory_write_request, module_index)
+            _ -> resolved(engine_privileged_state, memory_write_request, module_index)
+        }
+    }
+    state byte_at(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest,
+        module_index: u64,
+        name_position: u64
+    ) -> MemoryWriteResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let target_name: &[u8] = memory_write_request.get_module_name();
+        let module_name: &[u8] = engine_privileged_state
+            .get_supplied_modules()[module_index].get_module_name();
+        transition module_name[name_position] == target_name[name_position] {
+            true -> compare_byte(engine_privileged_state, memory_write_request, module_index, name_position + 1)
+            false -> find_module(engine_privileged_state, memory_write_request, module_index + 1)
+            _ -> find_module(engine_privileged_state, memory_write_request, module_index + 1)
+        }
+    }
+    state resolved(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest,
+        module_index: u64
+    ) -> MemoryWriteResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let absolute: u64 = ((engine_privileged_state
+            .get_supplied_modules()[module_index].get_base_address() as u64 in Saturating)
+            + (memory_write_request.get_address() as u64 in Saturating)) as u64;
+        transition { _ -> write_lanes(engine_privileged_state, memory_write_request, absolute, 0) }
+    }
+
+    // One u64 lane per 8 bytes of `value`; an unwritten lane fails the
+    // request — upstream's `write_bytes` false arm and its "Memory write
+    // failed." error.
+    state write_lanes(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest,
+        address: u64,
+        lane: u64
+    ) -> MemoryWriteResponse {
+        let lane_count: u64 = ((memory_write_request.get_value_len() as u64 in Saturating)
+            + (7 as u64 in Saturating)) as u64 / 8;
+        transition lane < lane_count {
+            true -> write_lane(engine_privileged_state, memory_write_request, address, lane)
+            false -> (MemoryWriteResponse::ok())
+            _ -> (MemoryWriteResponse::ok())
+        }
+    }
+    state write_lane(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_write_request: &MemoryWriteRequest,
+        address: u64,
+        lane: u64
+    ) -> MemoryWriteResponse {
+        let lane_value: u64 = pack_lane(memory_write_request, lane);
+        let lane_address: u64 = ((address as u64 in Saturating)
+            + ((lane as u64 in Saturating) * (8 as u64 in Saturating))) as u64;
+        let written: bool = engine_privileged_state
+            .borrow_supplied_memory_source_mut()
+            .try_write_window(lane_address, lane_value);
+        transition written {
+            true -> write_lanes(engine_privileged_state, memory_write_request, address, lane + 1)
+            false -> failed()
+            _ -> failed()
+        }
+    }
+    state failed() -> MemoryWriteResponse {
+        MemoryWriteResponse::new(false, "Memory write failed.")
+    }
+}
+
+// Little-endian pack of `value[lane*8 .. lane*8+8]` — partial tail lanes
+// pack the remaining low bytes, same as upstream's write of a sub-8 slice.
+machine pack_lane(memory_write_request: &MemoryWriteRequest, lane: u64) -> u64 {
+    transition { _ -> each(memory_write_request, lane, 0, 0) }
+    state each(
+        memory_write_request: &MemoryWriteRequest,
+        lane: u64,
+        byte_position: u64,
+        accum: u64
+    ) -> u64 {
+        let value_len: u64 = memory_write_request.get_value_len();
+        let index: u64 = ((lane as u64 in Saturating) * (8 as u64 in Saturating))
+            as u64 + byte_position;
+        transition byte_position < 8 && index < value_len {
+            true -> step(memory_write_request, lane, byte_position, accum)
+            false -> (accum)
+            _ -> (accum)
+        }
+    }
+    state step(
+        memory_write_request: &MemoryWriteRequest,
+        lane: u64,
+        byte_position: u64,
+        accum: u64
+    ) -> u64 {
+        let value_len: u64 = memory_write_request.get_value_len();
+        let index: u64 = ((lane as u64 in Saturating) * (8 as u64 in Saturating))
+            as u64 + byte_position;
+        transition index < value_len && index < 4096 {
+            true -> fold(memory_write_request, lane, byte_position, accum, index)
+            false -> each(memory_write_request, lane, byte_position + 1, accum)
+            _ -> each(memory_write_request, lane, byte_position + 1, accum)
+        }
+    }
+    state fold(
+        memory_write_request: &MemoryWriteRequest,
+        lane: u64,
+        byte_position: u64,
+        accum: u64,
+        index: u64
+    ) -> u64
+    requires 0 <= index && index < 4096;
+    {
+        let byte: u64 = memory_write_request.value_byte_at(index) as u64;
+        let shift_count: u64 = ((byte_position as u64 in Wrapping) * (8 as u64 in Wrapping)) as u64;
+        let shifted: u64 = shl_u64(byte, shift_count);
+        let next: u64 = ((accum as u64 in Wrapping) + (shifted as u64 in Wrapping)) as u64;
+        transition { _ -> each(memory_write_request, lane, byte_position + 1, next) }
+    }
+}
+
+machine shl_u64(value: u64, shift: u64) -> u64 {
+    transition shift < 64 {
+        true -> shifted(value, shift)
+        false -> (0)
+        _ -> (0)
+    }
+    state shifted(value: u64, shift: u64) -> u64 {
+        ((value as u64 in Wrapping) * pow2(shift)) as u64
+    }
+}
+
+machine pow2(shift: u64) -> u64 {
+    transition { _ -> each(1, 0, shift) }
+    state each(acc: u64, position: u64, shift: u64) -> u64 {
+        transition position < shift {
+            true -> each(((acc as u64 in Wrapping) * (2 as u64 in Wrapping)) as u64, position + 1, shift)
+            false -> (acc)
+            _ -> (acc)
+        }
+    }
+}
