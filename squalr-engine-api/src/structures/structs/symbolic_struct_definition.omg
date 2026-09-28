@@ -93,3 +93,277 @@ pub machine SymbolicLayoutKind::is_union(&self) -> bool {
         SymbolicLayoutKind::Union -> (true)
     }
 }
+
+use src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldOffsetResolution;
+use src::structures::structs::symbolic_struct_ref::SymbolicStructRef;
+use src::structures::structs::valued_struct::ValuedStruct;
+use src::structures::structs::valued_struct_field::ValuedStructField;
+use src::structures::structs::valued_struct_field::ValuedStructFieldData;
+use src::structures::data_values::data_value::DataValue;
+
+// Port of structures/structs/symbolic_struct_definition.rs: a namespace plus
+// an ordered field list, with a static layout kind and optional declared
+// size. `fields: Vec<SymbolicFieldDefinition>` folds to the port's bounded
+// list convention.
+pub data SymbolicStructDefinition {
+    symbol_namespace: [u8; 256];
+    symbol_namespace_len: u64;
+    layout_kind: SymbolicLayoutKind;
+    has_declared_size: bool;
+    declared_size_in_bytes: u64;
+    fields: [SymbolicFieldDefinition; 64];
+    field_count: u64;
+}
+
+pub machine SymbolicStructDefinition::new(
+    symbol_namespace: &[u8],
+    fields: &[SymbolicFieldDefinition]
+) -> SymbolicStructDefinition {
+    SymbolicStructDefinition::new_with_layout_kind(
+        symbol_namespace, SymbolicLayoutKind::Struct, fields)
+}
+
+pub machine SymbolicStructDefinition::new_with_layout_kind(
+    symbol_namespace: &[u8],
+    layout_kind: SymbolicLayoutKind,
+    fields: &[SymbolicFieldDefinition]
+) -> SymbolicStructDefinition {
+    let mut definition: SymbolicStructDefinition = SymbolicStructDefinition {
+        symbol_namespace_len: 0,
+        layout_kind: layout_kind,
+        has_declared_size: false,
+        declared_size_in_bytes: 0,
+        field_count: 0,
+    };
+    definition.set_symbol_namespace(symbol_namespace);
+    definition.fill_fields(fields);
+    definition
+}
+
+pub machine SymbolicStructDefinition::get_symbol_namespace(&self) -> &[u8] {
+    transition self.symbol_namespace_len <= 256 {
+        true -> (&self.symbol_namespace[0..self.symbol_namespace_len])
+        false -> (&self.symbol_namespace[0..256])
+        _ -> (&self.symbol_namespace[0..256])
+    }
+}
+
+pub machine SymbolicStructDefinition::get_layout_kind(&self) -> SymbolicLayoutKind {
+    self.layout_kind
+}
+
+pub machine SymbolicStructDefinition::get_field_count(&self) -> u64 {
+    self.field_count
+}
+
+pub machine SymbolicStructDefinition::get_field(&self, position: u64) -> &SymbolicFieldDefinition {
+    transition position < self.field_count && position < 64 {
+        true -> at(position)
+        false -> (self.head())
+        _ -> (self.head())
+    }
+    state at(&self, position: u64) -> &SymbolicFieldDefinition
+    requires 0 <= position && position < 64;
+    {
+        &self.fields[position]
+    }
+}
+
+machine SymbolicStructDefinition::head(&self) -> &SymbolicFieldDefinition {
+    &self.fields[0]
+}
+
+// Upstream `add_field` — appends within the bounded list.
+pub machine SymbolicStructDefinition::add_field(
+    &mut self,
+    symbolic_struct_field: &SymbolicFieldDefinition
+) -> bool {
+    transition self.field_count < 64 {
+        true -> store(symbolic_struct_field)
+        false -> (false)
+    }
+    state store(&mut self, symbolic_struct_field: &SymbolicFieldDefinition) -> bool {
+        self.fields[self.field_count] = SymbolicFieldDefinition::clone(symbolic_struct_field);
+        self.field_count = self.field_count + 1;
+        true
+    }
+}
+
+// Upstream `get_size_in_bytes`: walk fields — Static offsets are absolute,
+// Sequential (and resolver-id'd, see the named deviation on
+// symbolic_field_definition) lay out at the running edge or 0 under unions —
+// then take the max against any declared size.
+pub machine SymbolicStructDefinition::get_size_in_bytes(&self) -> u64 {
+    transition { _ -> each(0, 0) }
+    state each(&self, position: u64, next_sequential_offset: u64) -> u64 {
+        transition position < self.field_count && position < 64 {
+            true -> at(position, next_sequential_offset)
+            false -> done(next_sequential_offset)
+            _ -> done(next_sequential_offset)
+        }
+    }
+    state at(&self, position: u64, next_sequential_offset: u64) -> u64
+    requires 0 <= position && position < 64;
+    {
+        let field_offset: u64 = self.resolve_field_offset(position, next_sequential_offset);
+        let field_size: u64 = self.fields[position].get_size_in_bytes();
+        let candidate: u64 = ((field_offset as u64 in Saturating)
+            + (field_size as u64 in Saturating)) as u64;
+        let next: u64 = max_u64(next_sequential_offset, candidate);
+        transition { _ -> each(position + 1, next) }
+    }
+    state done(&self, next_sequential_offset: u64) -> u64 {
+        transition self.has_declared_size {
+            true -> (max_u64(next_sequential_offset, self.declared_size_in_bytes))
+            false -> (next_sequential_offset)
+            _ -> (next_sequential_offset)
+        }
+    }
+}
+
+// Upstream's field-offset walk evaluated for a single field — the offset
+// the field occupies in the layout (Static wins; Sequential lands at the
+// running edge or 0 under unions).
+pub machine SymbolicStructDefinition::get_field_offset(&self, field_index: u64) -> u64 {
+    transition { _ -> each(field_index, 0, 0) }
+    state each(&self, field_index: u64, position: u64, next_sequential_offset: u64) -> u64 {
+        transition position < self.field_count && position < 64 {
+            true -> at(field_index, position, next_sequential_offset)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state at(&self, field_index: u64, position: u64, next_sequential_offset: u64) -> u64
+    requires 0 <= position && position < 64;
+    {
+        let field_offset: u64 = self.resolve_field_offset(position, next_sequential_offset);
+        let field_size: u64 = self.fields[position].get_size_in_bytes();
+        let next: u64 = max_u64(
+            next_sequential_offset,
+            ((field_offset as u64 in Saturating) + (field_size as u64 in Saturating)) as u64);
+        transition position == field_index {
+            true -> (field_offset)
+            false -> each(field_index, position + 1, next)
+            _ -> each(field_index, position + 1, next)
+        }
+    }
+}
+
+machine SymbolicStructDefinition::resolve_field_offset(
+    &self,
+    position: u64,
+    next_sequential_offset: u64
+) -> u64
+requires 0 <= position && position < 64;
+{
+    transition self.fields[position].get_offset_resolution() {
+        SymbolicFieldOffsetResolution::Static { offset_in_bytes } -> (offset_in_bytes)
+        _ -> sequential(next_sequential_offset)
+    }
+    state sequential(&self, next_sequential_offset: u64) -> u64 {
+        transition self.layout_kind.is_union() {
+            true -> (0)
+            false -> (next_sequential_offset)
+            _ -> (next_sequential_offset)
+        }
+    }
+}
+
+machine max_u64(left: u64, right: u64) -> u64 {
+    transition left < right {
+        true -> (right)
+        false -> (left)
+        _ -> (left)
+    }
+}
+
+// Upstream `get_default_valued_struct`: skip unassigned spans and mint each
+// defined field as a Value over the data type's default bytes. Upstream's
+// `unwrap_or_default`/`or_else` fallback chain lands on `DataValue::default()`
+// whenever the registry lacks the entry — the same outcome the port's
+// resolver-less path produces.
+pub machine SymbolicStructDefinition::get_default_valued_struct(&self) -> ValuedStruct {
+    let struct_ref: SymbolicStructRef = SymbolicStructRef::new(
+        self.get_symbol_namespace());
+    let mut valued: ValuedStruct = ValuedStruct::new_with_layout_kind(
+        &struct_ref, self.layout_kind, &[]);
+    self.fill_default_fields(&mut valued);
+    valued
+}
+
+machine SymbolicStructDefinition::fill_default_fields(
+    &self,
+    valued: &mut ValuedStruct
+) {
+    transition { _ -> each(valued, 0) }
+    state each(&self, valued: &mut ValuedStruct, position: u64) {
+        transition position < self.field_count && position < 64 {
+            true -> at(valued, position)
+            false -> done(valued)
+            _ -> done(valued)
+        }
+    }
+    state at(&self, valued: &mut ValuedStruct, position: u64)
+    requires 0 <= position && position < 64;
+    {
+        transition self.fields[position].is_unassigned() {
+            true -> each(valued, position + 1)
+            false -> push(valued, position)
+            _ -> each(valued, position + 1)
+        }
+    }
+    state push(&self, valued: &mut ValuedStruct, position: u64)
+    requires 0 <= position && position < 64;
+    {
+        let field: ValuedStructField = self.fields[position].get_valued_struct_field();
+        valued.append_field(&field);
+        transition { _ -> each(valued, position + 1) }
+    }
+    state done(&self, valued: &mut ValuedStruct) {
+    }
+}
+
+machine SymbolicStructDefinition::set_symbol_namespace(&mut self, namespace: &[u8]) {
+    let mut position: u64 = 0;
+    self.symbol_namespace_len = 0;
+    transition { _ -> copy(position, namespace) }
+    state copy(&mut self, position: u64, namespace: &[u8]) {
+        transition position < namespace.len && position < 256 {
+            true -> step(position, namespace)
+            false -> done()
+        }
+    }
+    state step(&mut self, position: u64, namespace: &[u8]) {
+        self.symbol_namespace[position] = namespace[position];
+        self.symbol_namespace_len = position + 1;
+        transition { _ -> copy(position + 1, namespace) }
+    }
+    state done(&mut self) {
+        self.symbol_namespace_len = self.symbol_namespace_len;
+    }
+}
+
+machine SymbolicStructDefinition::fill_fields(
+    &mut self,
+    fields: &[SymbolicFieldDefinition]
+) {
+    let mut position: u64 = 0;
+    transition { _ -> copy(position, fields) }
+    state copy(&mut self, position: u64, fields: &[SymbolicFieldDefinition]) {
+        transition position < fields.len && position < 64 {
+            true -> step(position, fields)
+            false -> done()
+        }
+    }
+    state step(&mut self, position: u64, fields: &[SymbolicFieldDefinition])
+    requires 0 <= position && position < 64;
+    {
+        self.fields[position] = SymbolicFieldDefinition::clone(&fields[position]);
+        self.field_count = position + 1;
+        transition { _ -> copy(position + 1, fields) }
+    }
+    state done(&mut self) {
+        self.field_count = self.field_count;
+    }
+}

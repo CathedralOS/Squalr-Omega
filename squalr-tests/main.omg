@@ -332,14 +332,23 @@ crashes Trap
         self.found_page = false;
         self.found_guard = false;
         let bounds: MemoryBoundsOpen = self.providers.open_page_bounds(&self.open_result.info, 0);
-        transition bounds {
-            MemoryBoundsOpen::Opened -> enum_step()
+        let bounds_ok: bool = bounds.is_opened();
+        transition bounds_ok {
+            true -> enum_step()
             _ -> probe_fail_enum()
         }
     }
 
     state enum_step(&mut self) {
         let step: MemoryBoundsStep = self.providers.next_page_bounds_region(&mut self.region);
+        // Three-way kind dispatch — union scrutinees are admitted on
+        // params, not locals, so the split rides a hop state.
+        transition {
+            _ -> enum_step_kind(step)
+        }
+    }
+
+    state enum_step_kind(&mut self, step: MemoryBoundsStep) {
         transition step {
             MemoryBoundsStep::Region -> enum_record()
             MemoryBoundsStep::Finished -> enum_done()
@@ -386,8 +395,9 @@ crashes Trap
     state writable_checks(&mut self) {
         let w_addr: u64 = self.page_addr;
         let w: AddressWritable = self.providers.is_address_writable(&self.open_result.info, w_addr);
-        transition w {
-            AddressWritable::Writable -> writable_guard()
+        let w_ok: bool = w.is_writable();
+        transition w_ok {
+            true -> writable_guard()
             _ -> probe_fail_writable()
         }
     }
@@ -395,8 +405,9 @@ crashes Trap
     state writable_guard(&mut self) {
         let g_addr: u64 = self.guard_addr;
         let g: AddressWritable = self.providers.is_address_writable(&self.open_result.info, g_addr);
-        transition g {
-            AddressWritable::Writable -> probe_fail_writable()
+        let g_ok: bool = g.is_writable();
+        transition g_ok {
+            true -> probe_fail_writable()
             _ -> read_magic()
         }
     }
@@ -405,8 +416,9 @@ crashes Trap
     state read_magic(&mut self) {
         let addr: u64 = self.page_addr;
         let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.magic_buf);
-        transition read {
-            MemoryReadResult::Complete { count } -> check_magic(count)
+        let read_complete: bool = read.is_complete();
+        transition read_complete {
+            true -> check_magic(read.count())
             _ -> probe_fail_read()
         }
     }
@@ -424,9 +436,9 @@ crashes Trap
     state read_partial(&mut self) {
         let addr: u64 = ((self.page_addr as u64 in Wrapping) + (4080 as u64 in Wrapping)) as u64;
         let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, addr, &mut self.part_buf);
-        transition read {
-            MemoryReadResult::Partial { count } -> check_partial(count)
-            MemoryReadResult::Complete { count } -> check_partial(count)
+        let read_have: bool = read.is_partial() || read.is_complete();
+        transition read_have {
+            true -> check_partial(read.count())
             _ -> probe_fail_partial()
         }
     }
@@ -444,9 +456,9 @@ crashes Trap
     state read_guard(&mut self) {
         let gaddr: u64 = self.guard_addr;
         let read: MemoryReadResult = self.providers.read_bytes(&self.open_result.info, gaddr, &mut self.magic_buf);
-        transition read {
-            MemoryReadResult::Complete { count } -> check_guard_count(count)
-            MemoryReadResult::Partial { count } -> check_guard_count(count)
+        let read_have: bool = read.is_complete() || read.is_partial();
+        transition read_have {
+            true -> check_guard_count(read.count())
             _ -> cancel_probe()
         }
     }
@@ -548,9 +560,10 @@ crashes Trap
     state alive_check(&mut self) {
         let pid: u32 = (self.pid_u64 as u32 in Trapping) as u32;
         let alive: ProcessAliveResult = self.providers.is_process_alive(pid);
-        transition alive {
-            ProcessAliveResult::Alive -> probe_pass()
-            ProcessAliveResult::Dead -> probe_fail_alive()
+        let is_alive: bool = alive.is_alive();
+        transition is_alive {
+            true -> probe_pass()
+            _ -> probe_fail_alive()
         }
     }
 
@@ -2269,6 +2282,17 @@ crashes Abort
                 request: PointerScanSummaryRequest::of_session(1)
             }
         );
+        // Response payload is a non-copy record — the case split rides a
+        // param-position scrutinee in a hop state.
+        transition {
+            _ -> summary_kind(engine_privileged_state, response)
+        }
+    }
+
+    state summary_kind(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        response: PointerScanResponse
+    ) -> bool {
         transition response {
             PointerScanResponse::Summary { response } -> checked_summary(&mut engine_privileged_state, response)
             _ -> (false)
@@ -2298,6 +2322,15 @@ crashes Abort
                 request: PointerScanExpandRequest::new(1, false, 0, 0, 4)
             }
         );
+        transition {
+            _ -> expand_kind(engine_privileged_state, response)
+        }
+    }
+
+    state expand_kind(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        response: PointerScanResponse
+    ) -> bool {
         transition response {
             PointerScanResponse::Expand { response } -> checked_expand(&mut engine_privileged_state, response)
             _ -> (false)
@@ -2331,6 +2364,15 @@ crashes Abort
             engine_privileged_state,
             &PointerScanCommand::Reset { request: PointerScanResetRequest {} }
         );
+        transition {
+            _ -> reset_kind(engine_privileged_state, response)
+        }
+    }
+
+    state reset_kind(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        response: PointerScanResponse
+    ) -> bool {
         transition response {
             PointerScanResponse::Reset { response } -> cleared(&mut engine_privileged_state, response)
             _ -> (false)
@@ -2386,6 +2428,15 @@ crashes Abort
             engine_privileged_state,
             ScanResultsCommand::Freeze { request: request }
         );
+        transition {
+            _ -> freeze_kind(engine_privileged_state, response)
+        }
+    }
+
+    state freeze_kind(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        response: ScanResultsResponse
+    ) -> bool {
         transition response {
             ScanResultsResponse::Freeze { response } -> frozen(&mut engine_privileged_state, response)
             _ -> (false)
