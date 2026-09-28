@@ -1,0 +1,1916 @@
+module src::structures::scanning::constraints::scan_constraint_builder;
+
+use src::conversions::conversions_from_hex_pattern::ConversionsFromHexPattern;
+use src::conversions::conversions_from_hex_pattern::HexPatternParseResult;
+use src::structures::data_types::built_in_types::primitive_data_type_numeric::DeanonymizeResult;
+use src::structures::data_types::built_in_types::primitive_data_type_numeric::PrimitiveDataTypeNumeric;
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_types::floating_point_tolerance::FloatingPointTolerance;
+use src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::data_values::data_value::DataValue;
+use src::structures::memory::endian::Endian;
+use src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use src::structures::scanning::comparisons::scan_compare_type_immediate::ScanCompareTypeImmediate;
+use src::structures::scanning::comparisons::scan_compare_type_relative::ScanCompareTypeRelative;
+use src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraint;
+use src::structures::scanning::constraints::scan_constraint::ScanConstraint;
+
+// Port of structures/scanning/constraints/scan_constraint_builder.rs — the
+// anonymous -> finalized constraint pipeline: valueless relative
+// constraints, hex byte patterns ("DE AD ??" via use_hex_pattern_matching),
+// wildcard array tokens, and plain scalar deanonymization. The executor
+// side consumes this surface to turn a parsed AnonymousScanConstraint into
+// the constraint a scan plan runs.
+//
+// Named deviations:
+// - Upstream's `symbol_registry` receiver is absent: the registry facts the
+//   builder reads (unit size, endian, signedness) are flattened onto
+//   DataTypeRef itself (get_unit_size_in_bytes / get_endian / is_signed).
+// - `Result<Option<ScanConstraint>, ScanConstraintBuilderError>` respells
+//   to ScanConstraintBuild: Refused is Err, Empty is Ok(None). The
+//   byte-pattern arm produces a PatternScanConstraint rather than a
+//   ScanConstraint because the scalar constraint packs its operand into
+//   u64 — patterns wider than 8 bytes exceed the pack (upstream's
+//   `data_value: Vec<u8>` is unbounded; the bounded 4096 carrier refuses
+//   overflow rather than truncates).
+// - Token splitting is bounded at 512 tokens — an over-long array operand
+//   refuses (upstream's Vec is unbounded; pathological only).
+// - Non-numeric ids (string/bool) deanonymize through the numeric parser —
+//   upstream's per-type deanonymize for those lands with the type legs.
+
+// The byte-pattern constraint shape — upstream expresses it inside
+// ScanConstraint{data_value: Vec<u8>, mask: Option<Vec<u8>>} for the
+// array/hex-pattern paths; the port's ScanConstraint carries a u64 operand,
+// so array patterns ride this record instead. `data_value` holds the
+// pattern bytes (bounded 4096 as everywhere in the package);
+// `mask_bytes`/`mask_bytes_len` carry the per-byte mask when `has_mask`.
+pub data PatternScanConstraint {
+    scan_compare_type: ScanCompareType;
+    data_value: DataValue;
+    has_mask: bool;
+    mask_bytes: [u8; 4096];
+    mask_bytes_len: u64;
+    result_container_type: ContainerType;
+}
+
+pub machine PatternScanConstraint::new(
+    scan_compare_type: ScanCompareType,
+    data_value: &DataValue,
+    result_container_type: ContainerType
+) -> PatternScanConstraint {
+    PatternScanConstraint {
+        scan_compare_type: scan_compare_type,
+        data_value: DataValue::clone(data_value),
+        has_mask: false,
+        mask_bytes_len: 0,
+        result_container_type: result_container_type,
+    }
+}
+
+// Writes the mask span (upstream `ScanConstraint::new_masked`'s mask field);
+// over-bound input refuses (returns false) rather than truncates.
+pub machine PatternScanConstraint::set_mask_bytes(&mut self, mask: &[u8]) -> bool {
+    transition mask.len <= 4096 {
+        true -> copy(mask, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state copy(&mut self, mask: &[u8], position: u64) -> bool {
+        transition position < mask.len && position < 4096 {
+            true -> one(mask, position)
+            false -> finish(mask)
+        }
+    }
+    state one(&mut self, mask: &[u8], position: u64) -> bool
+        requires position < 4096
+    {
+        self.mask_bytes[position] = mask[position];
+        transition { _ -> copy(mask, position + 1) }
+    }
+    state finish(&mut self, mask: &[u8]) -> bool {
+        self.mask_bytes_len = mask.len;
+        self.has_mask = true;
+        true
+    }
+}
+
+pub machine PatternScanConstraint::get_scan_compare_type(&self) -> ScanCompareType {
+    self.scan_compare_type
+}
+
+pub machine PatternScanConstraint::get_data_value(&self) -> DataValue {
+    DataValue::clone(&self.data_value)
+}
+
+// The pattern bytes as a span — upstream's `get_data_value().get_value_bytes()`.
+pub machine PatternScanConstraint::get_pattern_bytes(&self) -> &[u8] {
+    self.data_value.get_value_bytes()
+}
+
+pub machine PatternScanConstraint::get_pattern_len(&self) -> u64 {
+    self.data_value.get_size_in_bytes()
+}
+
+pub machine PatternScanConstraint::has_mask(&self) -> bool {
+    self.has_mask
+}
+
+pub machine PatternScanConstraint::get_mask_len(&self) -> u64 {
+    self.mask_bytes_len
+}
+
+// The stored mask bytes as a span; absent masks yield the empty span
+// (upstream's Option<Vec<u8>> None arm).
+pub machine PatternScanConstraint::get_mask_bytes(&self) -> &[u8] {
+    transition self.mask_bytes_len <= 4096 && self.has_mask {
+        true -> (&self.mask_bytes[0..self.mask_bytes_len])
+        false -> (&self.mask_bytes[0..0])
+        _ -> (&self.mask_bytes[0..0])
+    }
+}
+
+pub machine PatternScanConstraint::get_result_container_type(&self) -> ContainerType {
+    self.result_container_type
+}
+
+// Upstream `Result<Option<ScanConstraint>, ScanConstraintBuilderError>`.
+pub data ScanConstraintBuild<'a> {
+    case Refused;
+    case Empty;
+    case Built(value: ScanConstraint<'a>);
+    case BuiltPattern(value: PatternScanConstraint);
+}
+
+// Split-token windows into a value text — (start, end) byte pairs.
+// `overflowed` marks the >512-token refusal.
+pub data ScanConstraintTokenList {
+    starts: [u64; 512];
+    ends: [u64; 512];
+    count: u64;
+    overflowed: bool;
+}
+
+pub machine ScanConstraintTokenList::get_count(&self) -> u64 {
+    self.count
+}
+
+pub machine ScanConstraintTokenList::get_start(&self, position: u64) -> u64 {
+    transition position < self.count && position < 512 {
+        true -> (self.starts[position])
+        false -> (0)
+        _ -> (0)
+    }
+}
+
+pub machine ScanConstraintTokenList::get_end(&self, position: u64) -> u64 {
+    transition position < self.count && position < 512 {
+        true -> (self.ends[position])
+        false -> (0)
+        _ -> (0)
+    }
+}
+
+// The wildcard-array fill result: upstream accumulates pattern_bytes /
+// mask_bytes Vecs independently (a full-wildcard token writes `unit` zeros
+// to both; a clean token writes its `count` pattern bytes and `unit` mask
+// bytes), so the two lengths are tracked separately.
+pub data WildcardFill [copy] {
+    case Refused;
+    case Done(pattern_len: u64, mask_len: u64);
+}
+
+pub data ScanConstraintBuilder {
+    floating_point_tolerance: FloatingPointTolerance;
+}
+
+// Upstream `ScanConstraintBuilder::new(symbol_registry, tolerance)` — the
+// registry receiver is dropped (its facts ride on DataTypeRef).
+pub machine ScanConstraintBuilder::new(
+    floating_point_tolerance: FloatingPointTolerance
+) -> ScanConstraintBuilder {
+    ScanConstraintBuilder {
+        floating_point_tolerance: floating_point_tolerance,
+    }
+}
+
+// Upstream `validate_scan_shape`: a multi-element value only scans as an
+// array under an equality comparison — anything else refuses.
+pub machine ScanConstraintBuilder::valid_scan_shape(
+    scan_compare_type: ScanCompareType,
+    size_in_bytes: u64,
+    unit_size_in_bytes: u64
+) -> bool {
+    transition size_in_bytes > unit_size_in_bytes {
+        true -> require_equal(scan_compare_type)
+        false -> (true)
+        _ -> (true)
+    }
+    state require_equal(scan_compare_type: ScanCompareType) -> bool {
+        transition scan_compare_type {
+            ScanCompareType::Immediate { compare_type } -> is_equal(compare_type)
+            _ -> (false)
+        }
+    }
+    state is_equal(compare_type: ScanCompareTypeImmediate) -> bool {
+        transition compare_type {
+            ScanCompareTypeImmediate::Equal -> (true)
+            _ -> (false)
+        }
+    }
+}
+
+// ',' or ASCII whitespace — upstream `split(|c| c == ',' ||
+// c.is_whitespace())` on the byte domain.
+machine ScanConstraintBuilder::is_token_separator(byte: u8) -> bool {
+    transition byte {
+        44 -> (true)
+        9 -> (true)
+        10 -> (true)
+        11 -> (true)
+        12 -> (true)
+        13 -> (true)
+        32 -> (true)
+        _ -> (false)
+    }
+}
+
+// Upstream `token_contains_wildcard` — 'x'/'X' marks a wildcard nibble or a
+// full-element wildcard.
+machine ScanConstraintBuilder::token_contains_wildcard(
+    text: &[u8],
+    start: u64,
+    end: u64
+) -> bool {
+    transition { _ -> scan(text, start, end) }
+    state scan(text: &[u8], at: u64, end: u64) -> bool {
+        transition at < end && at < text.len {
+            true -> probe(text, at, end)
+            false -> (false)
+        }
+    }
+    state probe(text: &[u8], at: u64, end: u64) -> bool
+        requires at < text.len
+    {
+        transition at < end && at < text.len && (text[at] == 120 || text[at] == 88) {
+            true -> (true)
+            false -> scan(text, at + 1, end)
+            _ -> scan(text, at + 1, end)
+        }
+    }
+}
+
+// Upstream `token_is_full_wildcard` — trimmed nonempty token of only x/X.
+machine ScanConstraintBuilder::token_is_full_wildcard(
+    text: &[u8],
+    start: u64,
+    end: u64
+) -> bool {
+    transition start < end && end <= text.len {
+        true -> scan(text, start, end)
+        false -> (false)
+    }
+    state scan(text: &[u8], at: u64, end: u64) -> bool {
+        transition at < end && at < text.len {
+            true -> probe(text, at, end)
+            false -> (true)
+        }
+    }
+    state probe(text: &[u8], at: u64, end: u64) -> bool
+        requires at < text.len
+    {
+        transition at < end && at < text.len && (text[at] == 120 || text[at] == 88) {
+            true -> scan(text, at + 1, end)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `split_array_tokens` — ',' or ASCII whitespace separates; empty
+// runs never mint a token. `in_token`/`token_start` carry the open window.
+machine ScanConstraintBuilder::split_array_tokens(text: &[u8]) -> ScanConstraintTokenList {
+    let mut list: ScanConstraintTokenList = ScanConstraintTokenList {
+        count: 0,
+        overflowed: false,
+    };
+    transition { _ -> scan(text, &mut list, 0, 0, false) }
+
+    state scan(
+        text: &[u8],
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64,
+        in_token: bool
+    ) -> ScanConstraintTokenList {
+        transition at < text.len {
+            true -> byte(text, list, at, token_start, in_token)
+            false -> finish(list, at, token_start, in_token)
+        }
+    }
+    state byte(
+        text: &[u8],
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64,
+        in_token: bool
+    ) -> ScanConstraintTokenList
+        requires at < text.len
+    {
+        transition ScanConstraintBuilder::is_token_separator(text[at]) {
+            true -> close(text, list, at, token_start, in_token)
+            false -> open(text, list, at, token_start, in_token)
+            _ -> open(text, list, at, token_start, in_token)
+        }
+    }
+    state open(
+        text: &[u8],
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64,
+        in_token: bool
+    ) -> ScanConstraintTokenList {
+        transition in_token {
+            true -> scan(text, list, at + 1, token_start, true)
+            false -> scan(text, list, at + 1, at, true)
+            _ -> scan(text, list, at + 1, at, true)
+        }
+    }
+    state close(
+        text: &[u8],
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64,
+        in_token: bool
+    ) -> ScanConstraintTokenList {
+        transition in_token {
+            true -> record(text, list, at, token_start)
+            false -> scan(text, list, at + 1, 0, false)
+            _ -> scan(text, list, at + 1, 0, false)
+        }
+    }
+    state record(
+        text: &[u8],
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64
+    ) -> ScanConstraintTokenList {
+        let count: u64 = list.count;
+        transition count < 512 {
+            true -> store(text, list, at, token_start, count)
+            false -> overflow()
+            _ -> overflow()
+        }
+    }
+    state store(
+        text: &[u8],
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64,
+        count: u64
+    ) -> ScanConstraintTokenList
+        requires count < 512
+    {
+        list.starts[count] = token_start;
+        list.ends[count] = at;
+        list.count = count + 1;
+        transition { _ -> scan(text, list, at + 1, 0, false) }
+    }
+    state overflow() -> ScanConstraintTokenList {
+        (ScanConstraintTokenList { count: 0, overflowed: true })
+    }
+    state finish(
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64,
+        in_token: bool
+    ) -> ScanConstraintTokenList {
+        transition in_token {
+            true -> record_tail(list, at, token_start)
+            false -> (list)
+            _ -> (list)
+        }
+    }
+    state record_tail(
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64
+    ) -> ScanConstraintTokenList {
+        let count: u64 = list.count;
+        transition count < 512 {
+            true -> store_tail(list, at, token_start, count)
+            false -> overflow()
+            _ -> overflow()
+        }
+    }
+    state store_tail(
+        list: &mut ScanConstraintTokenList,
+        at: u64,
+        token_start: u64,
+        count: u64
+    ) -> ScanConstraintTokenList
+        requires count < 512
+    {
+        list.starts[count] = token_start;
+        list.ends[count] = at;
+        list.count = count + 1;
+        (list)
+    }
+}
+
+// A parsed wildcard nibble: Wild is the all-wildcard arm, Digit carries the
+// nibble's value 0..=15, Invalid refuses (upstream's Err).
+pub data WildcardNibble [copy] {
+    case Invalid;
+    case Wild;
+    case Digit(value: u8);
+}
+
+// Upstream `parse_hex_wildcard_nibble` on the byte domain.
+machine ScanConstraintBuilder::parse_wildcard_nibble(byte: u8) -> WildcardNibble {
+    transition byte == 120 || byte == 88 {
+        true -> (WildcardNibble::Wild)
+        false -> digit(byte)
+        _ -> digit(byte)
+    }
+    state digit(byte: u8) -> WildcardNibble {
+        transition byte >= 48 && byte <= 57 {
+            true -> (WildcardNibble::Digit { value: byte - 48 })
+            false -> upper(byte)
+            _ -> upper(byte)
+        }
+    }
+    state upper(byte: u8) -> WildcardNibble {
+        transition byte >= 65 && byte <= 70 {
+            true -> (WildcardNibble::Digit { value: byte - 55 })
+            false -> lower(byte)
+            _ -> lower(byte)
+        }
+    }
+    state lower(byte: u8) -> WildcardNibble {
+        transition byte >= 97 && byte <= 102 {
+            true -> (WildcardNibble::Digit { value: byte - 87 })
+            false -> (WildcardNibble::Invalid)
+            _ -> (WildcardNibble::Invalid)
+        }
+    }
+}
+
+// The `0x`/`0X` prefix width — upstream's `trim_start_matches("0x")` over
+// the token body.
+machine ScanConstraintBuilder::hex_prefix_len(text: &[u8], start: u64, end: u64) -> u64 {
+    transition start < end && end <= text.len {
+        true -> measure(text, start, end)
+        false -> (0)
+        _ -> (0)
+    }
+    state measure(text: &[u8], start: u64, end: u64) -> u64 {
+        let span: u64 = ((end as u64 in Wrapping)
+            - (start as u64 in Wrapping)) as u64;
+        transition span >= 2 {
+            true -> probe(text, start, end)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state probe(text: &[u8], start: u64, end: u64) -> u64
+    {
+        let second: u64 = ((start as u64 in Wrapping)
+            + (1 as u64 in Wrapping)) as u64;
+        transition second < end && start < text.len && second < text.len {
+            true -> read(text, start, second)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state read(text: &[u8], start: u64, second: u64) -> u64
+        requires start < text.len && second < text.len
+    {
+        transition text[start] == 48 && (text[second] == 120 || text[second] == 88) {
+            true -> (2)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+}
+
+// The nibble at padded-field position `pos` — positions inside the left-pad
+// read as literal '0' digits; body positions read the token's byte.
+machine ScanConstraintBuilder::padded_nibble(
+    text: &[u8],
+    body_start: u64,
+    end: u64,
+    pos: u64,
+    pad: u64
+) -> WildcardNibble {
+    transition pos < pad {
+        true -> (WildcardNibble::Digit { value: 0 })
+        false -> body(text, body_start, end, pos, pad)
+        _ -> body(text, body_start, end, pos, pad)
+    }
+    state body(
+        text: &[u8],
+        body_start: u64,
+        end: u64,
+        pos: u64,
+        pad: u64
+    ) -> WildcardNibble {
+        transition pos >= pad && body_start <= end && end <= text.len {
+            true -> read(text, body_start, end, pos, pad)
+            false -> (WildcardNibble::Invalid)
+            _ -> (WildcardNibble::Invalid)
+        }
+    }
+    state read(
+        text: &[u8],
+        body_start: u64,
+        end: u64,
+        pos: u64,
+        pad: u64
+    ) -> WildcardNibble
+    {
+        let at: u64 = ((body_start as u64 in Wrapping)
+            + ((pos as u64 in Wrapping) - (pad as u64 in Wrapping))) as u64;
+        transition at < end && at < text.len {
+            true -> value(text, at)
+            false -> (WildcardNibble::Invalid)
+            _ -> (WildcardNibble::Invalid)
+        }
+    }
+    state value(text: &[u8], at: u64) -> WildcardNibble
+        requires at < text.len
+    {
+        (ScanConstraintBuilder::parse_wildcard_nibble(text[at]))
+    }
+}
+
+// Little-endian elements emit output bytes reversed — upstream's
+// `pattern_bytes.reverse()` when `endian == Little && unit_size > 1`.
+// `emit_index` maps the authored byte index to its store slot.
+machine ScanConstraintBuilder::emit_index(byte_index: u64, unit: u64, big_endian: bool) -> u64 {
+    transition !big_endian && unit > 1 {
+        true -> reversed(byte_index, unit)
+        false -> (byte_index)
+        _ -> (byte_index)
+    }
+    state reversed(byte_index: u64, unit: u64) -> u64 {
+        (((unit as u64 in Saturating)
+            - (byte_index as u64 in Saturating)) - 1) as u64
+    }
+}
+
+machine ScanConstraintBuilder::nibble_pattern(nibble: WildcardNibble) -> u8 {
+    transition nibble {
+        WildcardNibble::Digit { value } -> (value)
+        _ -> (0)
+    }
+}
+
+machine ScanConstraintBuilder::nibble_mask(nibble: WildcardNibble) -> u8 {
+    transition nibble {
+        WildcardNibble::Digit { value } -> (15)
+        _ -> (0)
+    }
+}
+
+// Packs `bytes[0..count]` little-endian into u64 — the same byte order
+// `ScanConstraint`'s `operand_value` uses.
+machine ScanConstraintBuilder::pack_bytes_le(bytes: &[u8], count: u64) -> u64 {
+    transition { _ -> pack(bytes, count, 0, 0) }
+    state pack(bytes: &[u8], count: u64, at: u64, acc: u64) -> u64 {
+        transition at < count && at < bytes.len {
+            true -> one(bytes, count, at, acc)
+            false -> (acc)
+        }
+    }
+    state one(bytes: &[u8], count: u64, at: u64, acc: u64) -> u64
+    {
+        let byte: u64 = bytes[at] as u64;
+        let shifted: u64 = ((byte as u64 in Wrapping)
+            * (pow256(at) as u64 in Wrapping)) as u64;
+        transition { _ -> pack(bytes, count,
+            ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+            ((acc as u64 in Wrapping) + (shifted as u64 in Wrapping)) as u64) }
+    }
+}
+
+// 256^at as u64 — the LE byte-placement multiplier.
+machine pow256(at: u64) -> u64 {
+    transition { _ -> each(1, 0, at) }
+    state each(acc: u64, step: u64, at: u64) -> u64 {
+        transition step < at && step < 8 {
+            true -> each(((acc as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64,
+                step + 1, at)
+            false -> (acc)
+        }
+    }
+}
+
+// Any token carrying a wildcard nibble — upstream's
+// `tokens.iter().any(token_contains_wildcard)`.
+machine ScanConstraintBuilder::any_token_wildcard(
+    text: &[u8],
+    tokens: &ScanConstraintTokenList
+) -> bool {
+    transition { _ -> scan(text, tokens, 0) }
+    state scan(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        index: u64
+    ) -> bool {
+        transition index < tokens.count && index < 512 {
+            true -> probe(text, tokens, index)
+            false -> (false)
+        }
+    }
+    state probe(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        index: u64
+    ) -> bool
+        requires index < 512
+    {
+        let has: bool = ScanConstraintBuilder::token_contains_wildcard(
+            text, tokens.starts[index], tokens.ends[index]);
+        transition has {
+            true -> (true)
+            false -> scan(text, tokens, index + 1)
+            _ -> scan(text, tokens, index + 1)
+        }
+    }
+}
+
+// Upstream `parse_wildcard_array_token` + the `for token` accumulation loop:
+// per token, a full wildcard appends `unit` zeros to both accumulators; a
+// hex-format wildcard token nibble-parses; a clean token deanonymizes and
+// masks the element 0xFF; a non-hex partial wildcard refuses.
+machine ScanConstraintBuilder::fill_wildcard_tokens(
+    text: &[u8],
+    tokens: &ScanConstraintTokenList,
+    format: AnonymousValueStringFormat,
+    data_type_ref: &DataTypeRef,
+    unit: u64,
+    pattern: &mut [u8],
+    mask: &mut [u8]
+) -> WildcardFill
+{
+    transition { _ -> each(text, tokens, format, data_type_ref, unit,
+        pattern, mask, 0, 0, 0) }
+
+    state each(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64
+    ) -> WildcardFill
+        requires index <= 512
+    {
+        transition index < tokens.count && index < 512 {
+            true -> route(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written)
+            false -> (WildcardFill::Done {
+                pattern_len: pattern_written, mask_len: mask_written })
+        }
+    }
+
+    state route(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        transition index < 512 {
+            true -> bounds(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state bounds(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64
+    ) -> WildcardFill
+        requires index < 512 && index < 512
+    {
+        let start: u64 = tokens.starts[index];
+        let end: u64 = tokens.ends[index];
+        transition start <= end && end <= text.len {
+            true -> token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state token(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        start: u64,
+        end: u64
+    ) -> WildcardFill
+        requires index < 512 && start <= end && end <= text.len
+    {
+        let full: bool =
+            ScanConstraintBuilder::token_is_full_wildcard(text, start, end);
+        transition full {
+            true -> zero_token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written)
+            false -> wild_or_plain(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+            _ -> wild_or_plain(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+        }
+    }
+
+    // A full wildcard token appends `unit` zero bytes to both pattern and
+    // mask — upstream `(vec![0u8; unit], vec![0u8; unit])`.
+    state zero_token(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let next_pattern: u64 = ((pattern_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        let next_mask: u64 = ((mask_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        transition next_pattern <= 4096 && next_mask <= 4096 && unit <= 8 {
+            true -> zero_fill(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, 0)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state zero_fill(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        at: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        transition at < unit {
+            true -> zero_byte(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, at)
+            false -> zero_next(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written)
+        }
+    }
+    state zero_byte(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        at: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let pattern_slot: u64 = ((pattern_written as u64 in Wrapping)
+            + (at as u64 in Wrapping)) as u64;
+        let mask_slot: u64 = ((mask_written as u64 in Wrapping)
+            + (at as u64 in Wrapping)) as u64;
+        transition pattern_slot < pattern.len && mask_slot < mask.len {
+            true -> zero_write(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, at,
+                pattern_slot, mask_slot)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state zero_write(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        at: u64,
+        pattern_slot: u64,
+        mask_slot: u64
+    ) -> WildcardFill
+        requires index < 512 && pattern_slot < pattern.len && mask_slot < mask.len
+    {
+        pattern[pattern_slot] = 0;
+        mask[mask_slot] = 0;
+        transition { _ -> zero_fill(text, tokens, format, data_type_ref, unit,
+            pattern, mask, index, pattern_written, mask_written, at + 1) }
+    }
+    state zero_next(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let next_pattern: u64 = ((pattern_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        let next_mask: u64 = ((mask_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        transition next_pattern <= 4096 && next_mask <= 4096 {
+            true -> each(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index + 1, next_pattern, next_mask)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+
+    state wild_or_plain(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        start: u64,
+        end: u64
+    ) -> WildcardFill
+        requires index < 512 && start <= end && end <= text.len
+    {
+        let wild: bool =
+            ScanConstraintBuilder::token_contains_wildcard(text, start, end);
+        transition format {
+            AnonymousValueStringFormat::Hexadecimal -> hex_route(text, tokens,
+                format, data_type_ref, unit, pattern, mask, index,
+                pattern_written, mask_written, start, end, wild)
+            AnonymousValueStringFormat::Decimal -> nonhex_route(text, tokens,
+                format, data_type_ref, unit, pattern, mask, index,
+                pattern_written, mask_written, start, end, wild)
+            AnonymousValueStringFormat::Binary -> nonhex_route(text, tokens,
+                format, data_type_ref, unit, pattern, mask, index,
+                pattern_written, mask_written, start, end, wild)
+            AnonymousValueStringFormat::Address -> nonhex_route(text, tokens,
+                format, data_type_ref, unit, pattern, mask, index,
+                pattern_written, mask_written, start, end, wild)
+            _ -> plain_token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+        }
+    }
+    state hex_route(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        start: u64,
+        end: u64,
+        wild: bool
+    ) -> WildcardFill
+        requires index < 512 && start <= end && end <= text.len
+    {
+        transition wild {
+            true -> hex_wildcard_token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+            false -> plain_token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+            _ -> plain_token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+        }
+    }
+    // Upstream: a partial wildcard under a non-hex format refuses; a clean
+    // token deanonymizes.
+    state nonhex_route(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        start: u64,
+        end: u64,
+        wild: bool
+    ) -> WildcardFill
+        requires index < 512 && start <= end && end <= text.len
+    {
+        transition wild {
+            true -> (WildcardFill::Refused)
+            false -> plain_token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+            _ -> plain_token(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+        }
+    }
+
+    // Upstream `parse_hex_wildcard_token`: strip a `0x`/`0X` prefix, left-pad
+    // to unit*2 nibbles, emit per-nibble (pattern, mask) pairs, then reverse
+    // the unit bytes for little-endian multi-byte elements.
+    state hex_wildcard_token(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        start: u64,
+        end: u64
+    ) -> WildcardFill
+        requires index < 512 && start <= end && end <= text.len
+    {
+        let prefixed: u64 = ScanConstraintBuilder::hex_prefix_len(text, start, end);
+        let body_start: u64 = ((start as u64 in Wrapping)
+            + (prefixed as u64 in Wrapping)) as u64;
+        let nibbles: u64 = ((end as u64 in Wrapping)
+            - (body_start as u64 in Wrapping)) as u64;
+        let expected: u64 = ((unit as u64 in Wrapping)
+            * (2 as u64 in Wrapping)) as u64;
+        let next_pattern: u64 = ((pattern_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        let next_mask: u64 = ((mask_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        transition nibbles > 0 && nibbles <= expected && unit <= 8
+            && body_start <= end && body_start <= text.len
+            && next_pattern <= 4096 && next_mask <= 4096 {
+            true -> hex_byte(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                body_start, end, nibbles, expected, 0)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    // Emitted byte `byte_index` covers padded nibble positions 2*byte_index
+    // (high) and 2*byte_index+1 (low).
+    state hex_byte(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        body_start: u64,
+        end: u64,
+        nibbles: u64,
+        expected: u64,
+        byte_index: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        transition byte_index < unit {
+            true -> emit_pair(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                body_start, end, nibbles, expected, byte_index)
+            false -> hex_done(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written)
+        }
+    }
+    state hex_done(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let next_pattern: u64 = ((pattern_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        let next_mask: u64 = ((mask_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        transition next_pattern <= 4096 && next_mask <= 4096 {
+            true -> each(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index + 1, next_pattern, next_mask)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state emit_pair(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        body_start: u64,
+        end: u64,
+        nibbles: u64,
+        expected: u64,
+        byte_index: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let pad: u64 = ((expected as u64 in Wrapping)
+            - (nibbles as u64 in Wrapping)) as u64;
+        let hi_pos: u64 = ((byte_index as u64 in Wrapping)
+            * (2 as u64 in Wrapping)) as u64;
+        let lo_pos: u64 = ((hi_pos as u64 in Wrapping)
+            + (1 as u64 in Wrapping)) as u64;
+        let hi: WildcardNibble = ScanConstraintBuilder::padded_nibble(
+            text, body_start, end, hi_pos, pad);
+        let lo: WildcardNibble = ScanConstraintBuilder::padded_nibble(
+            text, body_start, end, lo_pos, pad);
+        transition hi {
+            WildcardNibble::Invalid -> (WildcardFill::Refused)
+            _ -> pair_lo(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                body_start, end, nibbles, expected, byte_index, hi, lo)
+        }
+    }
+    state pair_lo(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        body_start: u64,
+        end: u64,
+        nibbles: u64,
+        expected: u64,
+        byte_index: u64,
+        hi: WildcardNibble,
+        lo: WildcardNibble
+    ) -> WildcardFill
+        requires index < 512
+    {
+        transition lo {
+            WildcardNibble::Invalid -> (WildcardFill::Refused)
+            _ -> pair_emit(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                body_start, end, nibbles, expected, byte_index, hi, lo)
+        }
+    }
+    state pair_emit(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        body_start: u64,
+        end: u64,
+        nibbles: u64,
+        expected: u64,
+        byte_index: u64,
+        hi: WildcardNibble,
+        lo: WildcardNibble
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let hi_pattern: u8 = ScanConstraintBuilder::nibble_pattern(hi);
+        let lo_pattern: u8 = ScanConstraintBuilder::nibble_pattern(lo);
+        let hi_mask: u8 = ScanConstraintBuilder::nibble_mask(hi);
+        let lo_mask: u8 = ScanConstraintBuilder::nibble_mask(lo);
+        let target: u64 = ScanConstraintBuilder::emit_index(
+            byte_index, unit, big_endian);
+        let pattern_slot: u64 = ((pattern_written as u64 in Wrapping)
+            + (target as u64 in Wrapping)) as u64;
+        let mask_slot: u64 = ((mask_written as u64 in Wrapping)
+            + (target as u64 in Wrapping)) as u64;
+        transition target < unit && pattern_slot < pattern.len && mask_slot < mask.len {
+            true -> pair_store(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                body_start, end, nibbles, expected, byte_index,
+                pattern_slot, mask_slot, hi_pattern, lo_pattern, hi_mask, lo_mask)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state pair_store(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        body_start: u64,
+        end: u64,
+        nibbles: u64,
+        expected: u64,
+        byte_index: u64,
+        pattern_slot: u64,
+        mask_slot: u64,
+        hi_pattern: u8,
+        lo_pattern: u8,
+        hi_mask: u8,
+        lo_mask: u8
+    ) -> WildcardFill
+        requires index < 512 && pattern_slot < pattern.len && mask_slot < mask.len
+    {
+        pattern[pattern_slot] = (((hi_pattern as u8 in Wrapping)
+            * (16 as u8 in Wrapping)) + (lo_pattern as u8 in Wrapping)) as u8;
+        mask[mask_slot] = (((hi_mask as u8 in Wrapping)
+            * (16 as u8 in Wrapping)) + (lo_mask as u8 in Wrapping)) as u8;
+        transition { _ -> hex_byte(text, tokens, format, data_type_ref, unit,
+            pattern, mask, index, pattern_written, mask_written,
+            body_start, end, nibbles, expected, byte_index + 1) }
+    }
+
+    // A clean (non-wildcard) token deanonymizes per element size and gains
+    // the full mask — upstream `(token_value, vec![0xFFu8; unit])`.
+    state plain_token(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        start: u64,
+        end: u64
+    ) -> WildcardFill
+        requires index < 512 && start <= end && end <= text.len
+    {
+        let span: u64 = ((end as u64 in Wrapping)
+            - (start as u64 in Wrapping)) as u64;
+        transition span <= 4096 {
+            true -> plain_parse(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, start, end)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state plain_parse(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        start: u64,
+        end: u64
+    ) -> WildcardFill
+        requires index < 512 && start <= end && end <= text.len
+    {
+        let token_value: AnonymousValueString = AnonymousValueString::new(
+            &text[start..end], format, ContainerType::None);
+        let numeric: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let mut element: [u8; 4096];
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let signed: bool = data_type_ref.is_signed();
+        let parsed: DeanonymizeResult = numeric.deanonymize(
+            &token_value, big_endian, unit, signed, &mut element);
+        transition parsed {
+            DeanonymizeResult::Bytes { count } -> plain_append(
+                text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                &element, count)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state plain_append(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        element: &[u8],
+        count: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let next_pattern: u64 = ((pattern_written as u64 in Wrapping)
+            + (count as u64 in Wrapping)) as u64;
+        let next_mask: u64 = ((mask_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        transition next_pattern <= 4096 && next_mask <= 4096
+            && count <= element.len && count <= 8 && unit <= 8 {
+            true -> plain_copy(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                element, count, 0)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state plain_copy(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        element: &[u8],
+        count: u64,
+        at: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        transition at < count {
+            true -> plain_byte(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                element, count, at)
+            false -> plain_mask(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, count, 0)
+        }
+    }
+    state plain_byte(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        element: &[u8],
+        count: u64,
+        at: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let pattern_slot: u64 = ((pattern_written as u64 in Wrapping)
+            + (at as u64 in Wrapping)) as u64;
+        transition pattern_slot < pattern.len && at < element.len {
+            true -> plain_write(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written,
+                element, count, at, pattern_slot)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state plain_write(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        element: &[u8],
+        count: u64,
+        at: u64,
+        pattern_slot: u64
+    ) -> WildcardFill
+        requires index < 512 && pattern_slot < pattern.len && at < element.len
+    {
+        pattern[pattern_slot] = element[at];
+        transition { _ -> plain_copy(text, tokens, format, data_type_ref, unit,
+            pattern, mask, index, pattern_written, mask_written,
+            element, count, at + 1) }
+    }
+    // Upstream masks the whole element 0xFF — `unit` bytes regardless of
+    // the deanonymized `count` (a short parse still masks the element).
+    // `count` rides along to advance the pattern cursor on exit.
+    state plain_mask(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        count: u64,
+        at: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        transition at < unit {
+            true -> mask_byte(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, count, at)
+            false -> plain_next(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, count)
+        }
+    }
+    state mask_byte(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        count: u64,
+        at: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let mask_slot: u64 = ((mask_written as u64 in Wrapping)
+            + (at as u64 in Wrapping)) as u64;
+        transition mask_slot < mask.len {
+            true -> mask_write(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index, pattern_written, mask_written, count,
+                at, mask_slot)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+    state mask_write(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        count: u64,
+        at: u64,
+        mask_slot: u64
+    ) -> WildcardFill
+        requires index < 512 && mask_slot < mask.len
+    {
+        mask[mask_slot] = 255;
+        transition { _ -> plain_mask(text, tokens, format, data_type_ref, unit,
+            pattern, mask, index, pattern_written, mask_written, count, at + 1) }
+    }
+    state plain_next(
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat,
+        data_type_ref: &DataTypeRef,
+        unit: u64,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        index: u64,
+        pattern_written: u64,
+        mask_written: u64,
+        count: u64
+    ) -> WildcardFill
+        requires index < 512
+    {
+        let next_pattern: u64 = ((pattern_written as u64 in Wrapping)
+            + (count as u64 in Wrapping)) as u64;
+        let next_mask: u64 = ((mask_written as u64 in Wrapping)
+            + (unit as u64 in Wrapping)) as u64;
+        transition next_pattern <= 4096 && next_mask <= 4096 {
+            true -> each(text, tokens, format, data_type_ref, unit,
+                pattern, mask, index + 1, next_pattern, next_mask)
+            false -> (WildcardFill::Refused)
+            _ -> (WildcardFill::Refused)
+        }
+    }
+}
+
+// The upstream `build` entry: valueless constraints take the relative arm,
+// hex-pattern flagged constraints take the hex-pattern arm, an array
+// operand with a wildcard token takes the wildcard-array arm, and every
+// other valued constraint deanonymizes as a scalar (or scalar array).
+pub machine ScanConstraintBuilder::build<'a>(
+    &self,
+    anonymous_scan_constraint: &AnonymousScanConstraint,
+    data_type_ref: &DataTypeRef
+) -> ScanConstraintBuild<'a> {
+    transition anonymous_scan_constraint.has_value() {
+        true -> valued(anonymous_scan_constraint, data_type_ref)
+        false -> valueless(anonymous_scan_constraint, data_type_ref)
+        _ -> (ScanConstraintBuild::Refused)
+    }
+
+    // Upstream `build_valueless_constraint`: only Relative compare types
+    // stand without an operand; the type's default (zero) supplies the
+    // operand — anything else is upstream's Ok(None).
+    state valueless(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef
+    ) -> ScanConstraintBuild<'a> {
+        transition anonymous_scan_constraint.get_scan_compare_type() {
+            ScanCompareType::Relative { compare_type } -> relative(
+                compare_type, data_type_ref)
+            _ -> (ScanConstraintBuild::Empty)
+        }
+    }
+    state relative(
+        compare_type: ScanCompareTypeRelative,
+        data_type_ref: &DataTypeRef
+    ) -> ScanConstraintBuild<'a> {
+        let cloned: DataTypeRef = DataTypeRef::clone(data_type_ref);
+        let unit: u64 = data_type_ref.get_unit_size_in_bytes();
+        let signed: bool = data_type_ref.is_signed();
+        let floating: bool = data_type_ref.is_floating_point();
+        let prefer: bool = data_type_ref.prefers_type_scanner();
+        (ScanConstraintBuild::Built {
+            value: ScanConstraint::new(
+                cloned,
+                ScanCompareType::Relative { compare_type: compare_type },
+                0,
+                unit,
+                signed,
+                floating,
+                prefer)
+        })
+    }
+
+    state valued(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef
+    ) -> ScanConstraintBuild<'a> {
+        transition anonymous_scan_constraint.uses_hex_pattern_matching() {
+            true -> hex_pattern(anonymous_scan_constraint, data_type_ref)
+            false -> wildcard_or_scalar(anonymous_scan_constraint, data_type_ref)
+            _ -> wildcard_or_scalar(anonymous_scan_constraint, data_type_ref)
+        }
+    }
+
+    // Upstream `build_hex_pattern_constraint`: ConversionsFromHexPattern::
+    // parse yields (pattern_bytes, mask_bytes); wildcards in the mask mark
+    // the constraint masked.
+    state hex_pattern(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef
+    ) -> ScanConstraintBuild<'a> {
+        let anonymous_value_string: AnonymousValueString =
+            anonymous_scan_constraint.get_anonymous_value_string();
+        let container: ContainerType =
+            anonymous_value_string.get_container_type();
+        let mut text: [u8; 4096];
+        let text_len: u64 =
+            anonymous_value_string.copy_anonymous_value_string(&mut text);
+        transition text_len <= 4096 {
+            true -> hex_parse(anonymous_scan_constraint, data_type_ref,
+                container, &text[0..text_len])
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state hex_parse(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        container: ContainerType,
+        text: &[u8]
+    ) -> ScanConstraintBuild<'a> {
+        let mut pattern: [u8; 4096];
+        let mut mask: [u8; 4096];
+        let parsed: HexPatternParseResult =
+            ConversionsFromHexPattern::parse(text, &mut pattern, &mut mask);
+        transition parsed {
+            HexPatternParseResult::Ok { count } -> hex_shape(
+                anonymous_scan_constraint, data_type_ref, container,
+                &mut pattern, &mut mask, count)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state hex_shape(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        container: ContainerType,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        count: u64
+    ) -> ScanConstraintBuild<'a> {
+        let compare_type: ScanCompareType =
+            anonymous_scan_constraint.get_scan_compare_type();
+        let unit: u64 = data_type_ref.get_unit_size_in_bytes();
+        let valid: bool = ScanConstraintBuilder::valid_scan_shape(
+            compare_type, count, unit);
+        transition valid && count <= 4096 {
+            true -> hex_emit(compare_type, data_type_ref, container,
+                pattern, mask, count)
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state hex_emit(
+        compare_type: ScanCompareType,
+        data_type_ref: &DataTypeRef,
+        container: ContainerType,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        count: u64
+    ) -> ScanConstraintBuild<'a>
+        requires count <= 4096
+    {
+        let masked: bool =
+            ConversionsFromHexPattern::has_wildcards(&mask[0..count]);
+        let data_value: DataValue =
+            DataValue::new(data_type_ref, &pattern[0..count]);
+        let mut built: PatternScanConstraint =
+            PatternScanConstraint::new(compare_type, &data_value, container);
+        transition masked {
+            true -> hex_mask(built, mask, count)
+            false -> (ScanConstraintBuild::BuiltPattern { value: built })
+            _ -> (ScanConstraintBuild::BuiltPattern { value: built })
+        }
+    }
+    state hex_mask(
+        built: PatternScanConstraint,
+        mask: &mut [u8],
+        count: u64
+    ) -> ScanConstraintBuild<'a>
+        requires count <= 4096
+    {
+        let mut stored: PatternScanConstraint = built;
+        let wrote: bool = stored.set_mask_bytes(&mask[0..count]);
+        transition wrote {
+            true -> (ScanConstraintBuild::BuiltPattern { value: stored })
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+
+    // Upstream `build_wildcard_array_constraint`'s applicability test (the
+    // Ok(None) arm falls through to scalar deanonymization): the container
+    // must be Array or ArrayFixed and some token must carry a wildcard.
+    state wildcard_or_scalar(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef
+    ) -> ScanConstraintBuild<'a> {
+        let anonymous_value_string: AnonymousValueString =
+            anonymous_scan_constraint.get_anonymous_value_string();
+        let container: ContainerType =
+            anonymous_value_string.get_container_type();
+        let is_array: bool =
+            container.is_array() || container.is_array_fixed();
+        let unit: u64 = data_type_ref.get_unit_size_in_bytes();
+        transition is_array {
+            true -> wildcard_split(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, container, unit)
+            false -> scalar(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit)
+            _ -> scalar(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit)
+        }
+    }
+    state wildcard_split(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        container: ContainerType,
+        unit: u64
+    ) -> ScanConstraintBuild<'a> {
+        let mut text: [u8; 4096];
+        let text_len: u64 =
+            anonymous_value_string.copy_anonymous_value_string(&mut text);
+        // Upstream's zero-unit-size refusal fires once the array container
+        // check has passed.
+        transition unit > 0 && text_len <= 4096 {
+            true -> wildcard_tokens(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, container, unit, &text[0..text_len])
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state wildcard_tokens(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        container: ContainerType,
+        unit: u64,
+        text: &[u8]
+    ) -> ScanConstraintBuild<'a>
+    {
+        let tokens: ScanConstraintTokenList =
+            ScanConstraintBuilder::split_array_tokens(text);
+        let count: u64 = tokens.count;
+        let overflowed: bool = tokens.overflowed;
+        transition count > 0 && !overflowed {
+            true -> wildcard_any(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, container, unit, text, &tokens)
+            false -> scalar(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state wildcard_any(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        container: ContainerType,
+        unit: u64,
+        text: &[u8],
+        tokens: &ScanConstraintTokenList
+    ) -> ScanConstraintBuild<'a>
+    {
+        let any: bool =
+            ScanConstraintBuilder::any_token_wildcard(text, tokens);
+        transition any {
+            true -> wildcard_fixed_check(anonymous_scan_constraint,
+                data_type_ref, anonymous_value_string, container, unit,
+                text, tokens)
+            false -> scalar(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit)
+            _ -> scalar(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit)
+        }
+    }
+    // Upstream `ContainerType::ArrayFixed(expected)`: the token count must
+    // equal the declared element count exactly.
+    state wildcard_fixed_check(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        container: ContainerType,
+        unit: u64,
+        text: &[u8],
+        tokens: &ScanConstraintTokenList
+    ) -> ScanConstraintBuild<'a>
+    {
+        let fixed: bool = container.is_array_fixed();
+        let expected: u64 = container.array_fixed_length();
+        let format: AnonymousValueStringFormat =
+            anonymous_value_string.get_anonymous_value_string_format();
+        transition !fixed || expected == tokens.count {
+            true -> wildcard_fill(anonymous_scan_constraint, data_type_ref,
+                container, unit, text, tokens, format)
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state wildcard_fill(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        container: ContainerType,
+        unit: u64,
+        text: &[u8],
+        tokens: &ScanConstraintTokenList,
+        format: AnonymousValueStringFormat
+    ) -> ScanConstraintBuild<'a>
+    {
+        let mut pattern: [u8; 4096];
+        let mut mask: [u8; 4096];
+        let filled: WildcardFill = ScanConstraintBuilder::fill_wildcard_tokens(
+            text, tokens, format, data_type_ref, unit, &mut pattern, &mut mask);
+        transition filled {
+            WildcardFill::Done { pattern_len, mask_len } -> wildcard_shape(
+                anonymous_scan_constraint, data_type_ref, container,
+                &mut pattern, &mut mask, pattern_len, mask_len)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state wildcard_shape(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        container: ContainerType,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        pattern_len: u64,
+        mask_len: u64
+    ) -> ScanConstraintBuild<'a> {
+        let compare_type: ScanCompareType =
+            anonymous_scan_constraint.get_scan_compare_type();
+        let unit: u64 = data_type_ref.get_unit_size_in_bytes();
+        let valid: bool = ScanConstraintBuilder::valid_scan_shape(
+            compare_type, pattern_len, unit);
+        transition valid && pattern_len <= 4096 && mask_len <= 4096 {
+            true -> wildcard_emit(compare_type, data_type_ref, container,
+                pattern, mask, pattern_len, mask_len)
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state wildcard_emit(
+        compare_type: ScanCompareType,
+        data_type_ref: &DataTypeRef,
+        container: ContainerType,
+        pattern: &mut [u8],
+        mask: &mut [u8],
+        pattern_len: u64,
+        mask_len: u64
+    ) -> ScanConstraintBuild<'a>
+        requires pattern_len <= 4096 && mask_len <= 4096
+    {
+        let data_value: DataValue =
+            DataValue::new(data_type_ref, &pattern[0..pattern_len]);
+        let mut built: PatternScanConstraint =
+            PatternScanConstraint::new(compare_type, &data_value, container);
+        // The wildcard arm is upstream's `ScanConstraint::new_masked`
+        // unconditionally — a wildcard token guarantees mask zeros.
+        let wrote: bool = built.set_mask_bytes(&mask[0..mask_len]);
+        transition wrote {
+            true -> (ScanConstraintBuild::BuiltPattern { value: built })
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+
+    // The scalar arm: upstream's `deanonymize_value_string` followed by
+    // `validate_scan_shape`. A parsed byte vector wider than one element is
+    // upstream's multi-element array case — only equality scans build, and
+    // the operand rides the pattern carrier when it exceeds the u64 pack.
+    state scalar(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        unit: u64
+    ) -> ScanConstraintBuild<'a> {
+        transition unit > 0 {
+            true -> scalar_parse(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit)
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state scalar_parse(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        unit: u64
+    ) -> ScanConstraintBuild<'a>
+        requires unit > 0
+    {
+        let numeric: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let mut out: [u8; 4096];
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let signed: bool = data_type_ref.is_signed();
+        let parsed: DeanonymizeResult = numeric.deanonymize(
+            anonymous_value_string, big_endian, unit, signed, &mut out);
+        transition parsed {
+            DeanonymizeResult::Bytes { count } -> scalar_shape(
+                anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit, &out, count)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state scalar_shape(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        unit: u64,
+        bytes: &[u8],
+        count: u64
+    ) -> ScanConstraintBuild<'a> {
+        let compare_type: ScanCompareType =
+            anonymous_scan_constraint.get_scan_compare_type();
+        let valid: bool = ScanConstraintBuilder::valid_scan_shape(
+            compare_type, count, unit);
+        transition valid && count <= 4096 && count <= bytes.len {
+            true -> scalar_emit(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit, bytes, count)
+            false -> (ScanConstraintBuild::Refused)
+            _ -> (ScanConstraintBuild::Refused)
+        }
+    }
+    state scalar_emit(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        unit: u64,
+        bytes: &[u8],
+        count: u64
+    ) -> ScanConstraintBuild<'a>
+        requires count <= 4096 && count <= bytes.len
+    {
+        transition count <= 8 {
+            true -> scalar_pack(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, unit, bytes, count)
+            false -> scalar_pattern(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, bytes, count)
+            _ -> scalar_pattern(anonymous_scan_constraint, data_type_ref,
+                anonymous_value_string, bytes, count)
+        }
+    }
+    state scalar_pack(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        unit: u64,
+        bytes: &[u8],
+        count: u64
+    ) -> ScanConstraintBuild<'a>
+        requires count <= 8 && count <= bytes.len
+    {
+        let operand: u64 =
+            ScanConstraintBuilder::pack_bytes_le(bytes, count);
+        let cloned: DataTypeRef = DataTypeRef::clone(data_type_ref);
+        let compare_type: ScanCompareType =
+            anonymous_scan_constraint.get_scan_compare_type();
+        let signed: bool = data_type_ref.is_signed();
+        let floating: bool = data_type_ref.is_floating_point();
+        let prefer: bool = data_type_ref.prefers_type_scanner();
+        let container: ContainerType =
+            anonymous_value_string.get_container_type();
+        let mut built: ScanConstraint<'a> = ScanConstraint::new(
+            cloned, compare_type, operand, unit, signed, floating, prefer);
+        built.set_result_container_type(container);
+        (ScanConstraintBuild::Built { value: built })
+    }
+    state scalar_pattern(
+        anonymous_scan_constraint: &AnonymousScanConstraint,
+        data_type_ref: &DataTypeRef,
+        anonymous_value_string: &AnonymousValueString,
+        bytes: &[u8],
+        count: u64
+    ) -> ScanConstraintBuild<'a>
+        requires count <= 4096 && count <= bytes.len
+    {
+        let compare_type: ScanCompareType =
+            anonymous_scan_constraint.get_scan_compare_type();
+        let container: ContainerType =
+            anonymous_value_string.get_container_type();
+        let data_value: DataValue =
+            DataValue::new(data_type_ref, &bytes[0..count]);
+        let built: PatternScanConstraint =
+            PatternScanConstraint::new(compare_type, &data_value, container);
+        (ScanConstraintBuild::BuiltPattern { value: built })
+    }
+}
