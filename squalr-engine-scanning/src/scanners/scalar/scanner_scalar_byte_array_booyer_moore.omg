@@ -16,16 +16,26 @@ use src::scanners::structures::snapshot_region_filter_run_length_encoder::Snapsh
 // scan over a region's captured current bytes.
 //
 // Storage notes (deviations, per AGENTS.md recorded here):
-//  * Upstream's `DataValue` carries the scan pattern as a byte vector; the
-//    plan's operand is a u64 word, so the pattern lands as `scan_pattern:
-//    [u8; 8]` + `pattern_length` (= the data type's unit width, exactly
-//    `scan_pattern.len` upstream). The same holds for the mask word.
+//  * Upstream's `DataValue` carries the scan pattern as a `Vec<u8>` of
+//    arbitrary length. The port bounds the record's inline pattern/mask at
+//    4096 (the same capacity `DataValue`'s byte store uses, so every pattern
+//    a `DataValue` can express is scannable); `new_supplied` takes the
+//    caller's `pattern: &[u8]`/`mask: &[u8]` spans and `pattern_length`
+//    tracks `pattern.len`, exactly `scan_pattern.len` upstream. Patterns
+//    beyond the capacity — and masked
+//    patterns whose mask length differs — report upstream's unsupported-shape
+//    result (empty stream), matching its `scan_pattern.len() !=
+//    scan_mask.len()` / error-log-and-empty arms.
+//  * The plan-driven `new` still reads the u64-packed operand
+//    (`get_operand_value`): the plan has no byte-span surface yet (the api
+//    leg lands separately), so that path remains capped at 8 pattern bytes.
+//    The supplied entry is the caller-provided-byte-array path.
 //  * Upstream's `BoyerMooreTable` heap-owns its suffix-shift Vec; the ported
 //    table takes a caller-lent `&mut [u64]` backing which cannot ride inside
 //    this pull-driver record, so the tables live inline on the scan instead
 //    (`mismatch_index_table: [OptionalIndex; 256]` mirrors upstream's
-//    fixed-256 Vec<Option<usize>>; `matching_suffix_shift_table: [u64; 8]`
-//    covers every pattern length the u64 operand can express). The
+//    fixed-256 Vec<Option<usize>>; `matching_suffix_shift_table: [u64; 4096]`
+//    covers every pattern length the record can express). The
 //    table-build states below are upstream `BoyerMooreTable::build_table`
 //    (`is_prefix`/`suffix_length`/`round_up_to_alignment` helpers included)
 //    with `self.scan_pattern`/`self.pattern_length` standing in for the
@@ -47,14 +57,14 @@ pub data ScalarByteArrayScan {
     encoder: SnapshotRegionFilterRunLengthEncoder;
     scan_index: u64;
     region_size: u64;
-    scan_pattern: [u8; 8];
+    scan_pattern: [u8; 4096];
     pattern_length: u64;
-    scan_mask: [u8; 8];
+    scan_mask: [u8; 4096];
     has_mask: bool;
     memory_alignment_size: u64;
     data_type_size_padding: u64;
     mismatch_index_table: [OptionalIndex; 256];
-    matching_suffix_shift_table: [u64; 8];
+    matching_suffix_shift_table: [u64; 4096];
     supported: bool;
     finalized_tail: bool;
 }
@@ -200,6 +210,179 @@ pub machine ScalarByteArrayScan::new(
     }
 }
 
+// The supplied-pattern entry: the caller hands the scan its byte array (and
+// its mask, when masking) as spans — upstream's `data_value`/`get_mask`
+// element views without the plan's u64 packing. Pattern bytes land in the
+// record's bounded stores; `pattern_length` is the span's own length, so the
+// walk/table/compare machinery runs patterns of any length it can hold.
+pub machine ScalarByteArrayScan::new_supplied(
+    snapshot_region_filter: &SnapshotRegionFilter,
+    snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+    has_mask: bool,
+    pattern: &[u8],
+    mask: &[u8]
+) -> ScalarByteArrayScan {
+    transition snapshot_filter_element_scan_plan.get_scan_compare_type() {
+        ScanCompareType::Immediate { compare_type } -> immediate(
+            compare_type,
+            snapshot_region_filter,
+            snapshot_filter_element_scan_plan,
+            has_mask,
+            pattern,
+            mask
+        )
+        _ -> (ScalarByteArrayScan::unsupported(snapshot_region_filter))
+    }
+
+    state immediate(
+        compare_type: ScanCompareTypeImmediate,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+        has_mask: bool,
+        pattern: &[u8],
+        mask: &[u8]
+    ) -> ScalarByteArrayScan {
+        transition compare_type {
+            ScanCompareTypeImmediate::Equal -> build(
+                snapshot_region_filter,
+                snapshot_filter_element_scan_plan,
+                has_mask,
+                pattern,
+                mask
+            )
+            _ -> (ScalarByteArrayScan::unsupported(snapshot_region_filter))
+        }
+    }
+
+    state build(
+        snapshot_region_filter: &SnapshotRegionFilter,
+        snapshot_filter_element_scan_plan: &SnapshotFilterElementScanPlan,
+        has_mask: bool,
+        pattern: &[u8],
+        mask: &[u8]
+    ) -> ScalarByteArrayScan {
+        let align_size: u64 =
+            snapshot_filter_element_scan_plan.get_memory_alignment().get_size_in_bytes();
+        let pat_len: u64 = pattern.len;
+        // Upstream validates `scan_pattern.len() >= 1` and (masked)
+        // `scan_pattern.len() == scan_mask.len()`; the record's bounded
+        // stores add the capacity bound — out-of-capacity patterns report
+        // upstream's unsupported-shape result (empty stream).
+        let is_supported: bool = pat_len >= 1 && pat_len <= 4096
+            && (!has_mask || mask.len == pat_len);
+        let mut scan: ScalarByteArrayScan = ScalarByteArrayScan {
+            encoder: SnapshotRegionFilterRunLengthEncoder::new(
+                snapshot_region_filter.get_base_address()
+            ),
+            scan_index: 0,
+            region_size: snapshot_region_filter.get_region_size(),
+            pattern_length: pat_len,
+            has_mask: has_mask,
+            memory_alignment_size: align_size,
+            data_type_size_padding: ((pat_len as u64 in Saturating)
+                - (align_size as u64 in Saturating)) as u64,
+            supported: is_supported,
+            finalized_tail: false,
+        };
+        transition is_supported {
+            true -> fill(scan, pattern, mask)
+            _ -> (scan)
+        }
+    }
+
+    state fill(
+        scan: ScalarByteArrayScan,
+        pattern: &[u8],
+        mask: &[u8]
+    ) -> ScalarByteArrayScan {
+        let mut filled: ScalarByteArrayScan = scan;
+        filled.fill_span(pattern, mask, 0);
+        // Upstream's masked variant never builds the Boyer-Moore tables — its
+        // shift walk replaces them — so table-build runs only unmasked.
+        transition filled.has_mask {
+            true -> (filled)
+            false -> tables(filled)
+            _ -> (filled)
+        }
+    }
+
+    state tables(scan: ScalarByteArrayScan) -> ScalarByteArrayScan {
+        let mut built: ScalarByteArrayScan = scan;
+        built.build_tables();
+        built
+    }
+}
+
+// Copies the supplied pattern/mask spans into the record's inline stores.
+// Masked scans write the mask word per byte; unmasked scans leave `scan_mask`
+// at the identity fill (the compare path never reads it).
+machine ScalarByteArrayScan::fill_span(
+    &mut self,
+    pattern: &[u8],
+    mask: &[u8],
+    index: u64
+) {
+    transition index < self.pattern_length && index < pattern.len && index < 4096 {
+        true -> write_span(pattern, mask, index)
+        _ -> done()
+    }
+
+    // Re-guarding loop state — the head transition runs once; `walk` carries
+    // the iteration afterward (same idiom as `fill_bytes`' store arm).
+    state walk(&mut self, pattern: &[u8], mask: &[u8], index: u64) {
+        transition index < self.pattern_length && index < pattern.len && index < 4096 {
+            true -> write_span(pattern, mask, index)
+            _ -> done()
+        }
+    }
+
+    state done(&mut self) {
+    }
+
+    state write_span(
+        &mut self,
+        pattern: &[u8],
+        mask: &[u8],
+        index: u64
+    )
+    requires 0 <= index && index < 4096 && index < pattern.len;
+    {
+        self.scan_pattern[index] = pattern[index];
+        transition { _ -> write_mask(pattern, mask, index) }
+    }
+
+    state write_mask(
+        &mut self,
+        pattern: &[u8],
+        mask: &[u8],
+        index: u64
+    )
+    requires 0 <= index && index < 4096 && index < pattern.len;
+    {
+        transition self.has_mask && index < mask.len {
+            true -> store_mask(pattern, mask, index)
+            _ -> advance(pattern, mask, index)
+        }
+    }
+
+    state store_mask(
+        &mut self,
+        pattern: &[u8],
+        mask: &[u8],
+        index: u64
+    )
+    requires 0 <= index && index < 4096 && index < mask.len;
+    {
+        self.scan_mask[index] = mask[index];
+        transition { _ -> advance(pattern, mask, index) }
+    }
+
+    state advance(&mut self, pattern: &[u8], mask: &[u8], index: u64) {
+        transition { _ -> walk(pattern, mask,
+            ((index as u64 in Saturating) + (1 as u64 in Saturating)) as u64) }
+    }
+}
+
 // The dead byte-array payload carried by `ScalarRegionScan` whenever the
 // selected scanner is not byte-array (and by fixtures declaring the union
 // cell). Array fields default-omit; the scan is never driven.
@@ -246,7 +429,7 @@ machine ScalarByteArrayScan::fill_bytes(
     mask_value: u64,
     index: u64
 ) {
-    transition index < self.pattern_length && index < 8 {
+    transition index < self.pattern_length && index < 4096 {
         true -> store(operand_value, mask_value, index)
         _ -> done()
     }
@@ -257,7 +440,7 @@ machine ScalarByteArrayScan::fill_bytes(
         mask_value: u64,
         index: u64
     ) {
-        transition index < self.pattern_length && index < 8 {
+        transition index < self.pattern_length && index < 4096 {
             true -> write(operand_value, mask_value, index)
             _ -> done()
         }
@@ -272,14 +455,14 @@ machine ScalarByteArrayScan::fill_bytes(
         mask_value: u64,
         index: u64
     )
-    requires 0 <= index && index < 8;
+    requires 0 <= index && index < 4096;
     {
         self.scan_pattern[index] =
             byte_array_operand_byte(operand_value, self.pattern_length, index);
         self.scan_mask[index] =
             byte_array_operand_byte(mask_value, self.pattern_length, index);
         // The byte walk is a state-graph loop (constant stack, bounded by
-        // index < 8) — the same idiom as the table-build passes below.
+        // index < 4096) — the same idiom as the table-build passes below.
         transition { _ -> store(operand_value, mask_value,
             ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
@@ -293,7 +476,7 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
     transition { _ -> mismatch_fill(0) }
 
     state mismatch_fill(&mut self, index: u64) {
-        transition index < self.pattern_length && index < 8 {
+        transition index < self.pattern_length && index < 4096 {
             true -> mismatch_store(index)
             false -> shift_init(0)
             _ -> shift_init(0)
@@ -301,14 +484,14 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
     }
 
     state mismatch_store(&mut self, index: u64) {
-        transition index < self.pattern_length && index < 8 {
+        transition index < self.pattern_length && index < 4096 {
             true -> mismatch_byte(index)
             _ -> shift_init(0)
         }
     }
 
     state mismatch_byte(&mut self, index: u64)
-    requires 0 <= index && index < 8;
+    requires 0 <= index && index < 4096;
     {
         let byte: u64 = self.scan_pattern[index] as u64;
         transition byte < 256 {
@@ -331,7 +514,7 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
             self.pattern_length,
             self.memory_alignment_size
         );
-        transition index < self.pattern_length && index < 8 {
+        transition index < self.pattern_length && index < 4096 {
             true -> shift_store(index, aligned_length)
             false -> prefix_probe()
             _ -> prefix_probe()
@@ -339,14 +522,14 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
     }
 
     state shift_store(&mut self, index: u64, aligned_length: u64) {
-        transition index < 8 {
+        transition index < 4096 {
             true -> shift_write(index, aligned_length)
             _ -> prefix_probe()
         }
     }
 
     state shift_write(&mut self, index: u64, aligned_length: u64)
-    requires 0 <= index && index < 8;
+    requires 0 <= index && index < 4096;
     {
         self.matching_suffix_shift_table[index] = aligned_length;
         transition { _ -> shift_init(
@@ -366,7 +549,7 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
 
     state prefix_pass(&mut self, start_index: u64) {
         transition start_index < self.pattern_length && start_index <= self.pattern_length
-            && start_index < 8 {
+            && start_index < 4096 {
             true -> prefix_check(start_index)
             _ -> suffix_pass(0)
         }
@@ -387,21 +570,21 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
             raw_shift,
             self.memory_alignment_size
         );
-        transition start_index < 8 {
+        transition start_index < 4096 {
             true -> prefix_min_write(start_index, aligned_shift)
             _ -> prefix_next(start_index)
         }
     }
 
     state prefix_min_write(&mut self, start_index: u64, aligned_shift: u64) {
-        transition start_index < 8 {
+        transition start_index < 4096 {
             true -> prefix_min_store(start_index, aligned_shift)
             _ -> prefix_next(start_index)
         }
     }
 
     state prefix_min_store(&mut self, start_index: u64, aligned_shift: u64)
-    requires 0 <= start_index && start_index < 8;
+    requires 0 <= start_index && start_index < 4096;
     {
         let current: u64 = self.matching_suffix_shift_table[start_index];
         self.matching_suffix_shift_table[start_index] =
@@ -424,7 +607,7 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
         let pattern_length_minus_one: u64 =
             ((self.pattern_length as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
         transition pattern_index < pattern_length_minus_one
-            && pattern_index < self.pattern_length && pattern_index < 8 {
+            && pattern_index < self.pattern_length && pattern_index < 4096 {
             true -> suffix_step(pattern_index, pattern_length_minus_one)
             _ -> done()
         }
@@ -445,7 +628,7 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
             shift,
             self.memory_alignment_size
         );
-        transition shift_table_index < 8 {
+        transition shift_table_index < 4096 {
             true -> suffix_min_write(pattern_index, shift_table_index, aligned_shift)
             _ -> suffix_pass(
                 ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
@@ -454,7 +637,7 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
     }
 
     state suffix_min_write(&mut self, pattern_index: u64, shift_table_index: u64, aligned_shift: u64) {
-        transition shift_table_index < 8 {
+        transition shift_table_index < 4096 {
             true -> suffix_min_store(pattern_index, shift_table_index, aligned_shift)
             _ -> suffix_pass(
                 ((pattern_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64
@@ -463,7 +646,7 @@ machine ScalarByteArrayScan::build_tables(&mut self) {
     }
 
     state suffix_min_store(&mut self, pattern_index: u64, shift_table_index: u64, aligned_shift: u64)
-    requires 0 <= shift_table_index && shift_table_index < 8;
+    requires 0 <= shift_table_index && shift_table_index < 4096;
     {
         let current: u64 = self.matching_suffix_shift_table[shift_table_index];
         self.matching_suffix_shift_table[shift_table_index] =
@@ -495,7 +678,7 @@ requires
     }
 
     state walk(&mut self, reverse: u64, suffix_len: u64, forward: u64) -> bool {
-        transition forward < suffix_len && forward < 8 && reverse < 8
+        transition forward < suffix_len && forward < 4096 && reverse < 4096
             && forward < self.pattern_length && reverse < self.pattern_length {
             true -> compare(reverse, suffix_len, forward)
             _ -> (true)
@@ -503,7 +686,7 @@ requires
     }
 
     state compare(&mut self, reverse: u64, suffix_len: u64, forward: u64) -> bool
-    requires 0 <= reverse && reverse < 8 && 0 <= forward && forward < 8;
+    requires 0 <= reverse && reverse < 4096 && 0 <= forward && forward < 4096;
     {
         transition self.scan_pattern[forward] != self.scan_pattern[reverse] {
             true -> (false)
@@ -540,14 +723,14 @@ requires
 
     state walk(&mut self, suffix_index: u64, pattern_end_index: u64, length: u64) -> u64 {
         transition suffix_index < self.pattern_length && pattern_end_index < self.pattern_length
-            && suffix_index < 8 && pattern_end_index < 8 {
+            && suffix_index < 4096 && pattern_end_index < 4096 {
             true -> compare(suffix_index, pattern_end_index, length)
             _ -> (length)
         }
     }
 
     state compare(&mut self, suffix_index: u64, pattern_end_index: u64, length: u64) -> u64
-    requires 0 <= suffix_index && suffix_index < 8 && 0 <= pattern_end_index && pattern_end_index < 8;
+    requires 0 <= suffix_index && suffix_index < 4096 && 0 <= pattern_end_index && pattern_end_index < 4096;
     {
         transition self.scan_pattern[suffix_index] == self.scan_pattern[pattern_end_index] {
             true -> step(suffix_index, pattern_end_index, length)
@@ -586,21 +769,21 @@ machine ScalarByteArrayScan::masked_safe_mismatch_shift(
     }
 
     state walk(&mut self, mismatched_byte: u8, mismatch_pattern_index: u64, compatible_pattern_index: u64) -> u64 {
-        transition compatible_pattern_index < mismatch_pattern_index && compatible_pattern_index < 8 {
+        transition compatible_pattern_index < mismatch_pattern_index && compatible_pattern_index < 4096 {
             true -> test(mismatched_byte, mismatch_pattern_index, compatible_pattern_index)
             _ -> fallback(mismatch_pattern_index)
         }
     }
 
     state test(&mut self, mismatched_byte: u8, mismatch_pattern_index: u64, compatible_pattern_index: u64) -> u64 {
-        transition compatible_pattern_index < 8 {
+        transition compatible_pattern_index < 4096 {
             true -> bounded(mismatched_byte, mismatch_pattern_index, compatible_pattern_index)
             _ -> fallback(mismatch_pattern_index)
         }
     }
 
     state bounded(&mut self, mismatched_byte: u8, mismatch_pattern_index: u64, compatible_pattern_index: u64) -> u64
-    requires 0 <= compatible_pattern_index && compatible_pattern_index < 8;
+    requires 0 <= compatible_pattern_index && compatible_pattern_index < 4096;
     {
         let pattern_mask: u8 = self.scan_mask[compatible_pattern_index];
         let masked_pattern_byte: u8 = self.scan_pattern[compatible_pattern_index] & pattern_mask;
@@ -676,7 +859,7 @@ satisfies Scanner::next
     state compare_gate(&mut self, current_values: &[u64], inverse_index: u64) -> EmittedRegion {
         let byte_offset: u64 = ((self.scan_index as u64 in Saturating)
             + (inverse_index as u64 in Saturating)) as u64;
-        transition byte_offset < current_values.len && inverse_index < 8
+        transition byte_offset < current_values.len && inverse_index < 4096
             && inverse_index < self.pattern_length {
             true -> compare_byte(current_values, inverse_index, byte_offset)
             _ -> tail()
@@ -689,7 +872,7 @@ satisfies Scanner::next
         inverse_index: u64,
         byte_offset: u64
     ) -> EmittedRegion {
-        transition byte_offset < current_values.len && inverse_index < 8 {
+        transition byte_offset < current_values.len && inverse_index < 4096 {
             true -> compare_load(current_values, inverse_index, byte_offset)
             _ -> tail()
         }
@@ -701,7 +884,7 @@ satisfies Scanner::next
         inverse_index: u64,
         byte_offset: u64
     ) -> EmittedRegion
-    requires 0 <= inverse_index && inverse_index < 8 && 0 <= byte_offset && byte_offset < current_values.len;
+    requires 0 <= inverse_index && inverse_index < 4096 && 0 <= byte_offset && byte_offset < current_values.len;
     {
         let byte_word: u64 = current_values[byte_offset];
         let current_byte: u8 =
@@ -718,7 +901,7 @@ satisfies Scanner::next
         inverse_index: u64,
         current_byte: u8
     ) -> EmittedRegion
-    requires 0 <= inverse_index && inverse_index < 8;
+    requires 0 <= inverse_index && inverse_index < 4096;
     {
         transition current_byte == self.scan_pattern[inverse_index] {
             true -> match_step(current_values, inverse_index)
@@ -732,7 +915,7 @@ satisfies Scanner::next
         inverse_index: u64,
         current_byte: u8
     ) -> EmittedRegion
-    requires 0 <= inverse_index && inverse_index < 8;
+    requires 0 <= inverse_index && inverse_index < 4096;
     {
         let masked_current_byte: u8 = current_byte & self.scan_mask[inverse_index];
         let masked_pattern_byte: u8 = self.scan_pattern[inverse_index] & self.scan_mask[inverse_index];
@@ -855,7 +1038,7 @@ satisfies Scanner::next
             ((inverse_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
         let index_after: u64 =
             ((good_index as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
-        transition index_after < self.pattern_length && good_index < 8 {
+        transition index_after < self.pattern_length && good_index < 4096 {
             true -> shift_good_read(current_values, inverse_index, bad_char_shift, good_index)
             _ -> shift_combine(current_values, bad_char_shift, 0)
         }
@@ -868,7 +1051,7 @@ satisfies Scanner::next
         bad_char_shift: u64,
         good_index: u64
     ) -> EmittedRegion {
-        transition good_index < 8 {
+        transition good_index < 4096 {
             true -> shift_good_bounded(current_values, bad_char_shift, good_index)
             _ -> shift_combine(current_values, bad_char_shift, 0)
         }
@@ -880,7 +1063,7 @@ satisfies Scanner::next
         bad_char_shift: u64,
         good_index: u64
     ) -> EmittedRegion
-    requires 0 <= good_index && good_index < 8;
+    requires 0 <= good_index && good_index < 4096;
     {
         let good_suffix_shift: u64 = self.matching_suffix_shift_table[good_index];
         transition { _ -> shift_combine(current_values, bad_char_shift, good_suffix_shift) }
