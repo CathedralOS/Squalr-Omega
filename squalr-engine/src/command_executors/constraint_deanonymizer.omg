@@ -2,138 +2,355 @@ module src::command_executors::constraint_deanonymizer;
 
 use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ScanConstraintSet;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
-use squalr_engine_api::src::structures::data_values::anonymous_value_string::U64ValueParse;
+use squalr_engine_api::src::structures::data_types::floating_point_tolerance::FloatingPointTolerance;
 use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
-use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
 use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
 use squalr_engine_api::src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
 use squalr_engine_api::src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraint;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint::ScanConstraint;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_builder::PatternScanConstraint;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_builder::ScanConstraintBuild;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_builder::ScanConstraintBuilder;
 use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_finalized::ScanConstraintFinalized;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_byte_array::PlannedScanTypeByteArray;
 use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
-use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
 
 // Port of the executor's deanonymize step: `ScanConstraintBuilder::build`
-// per (anonymous constraint, data type) — parses the value text against the
-// type — followed by the parameter-rule pass that finalizes each
-// `ScanConstraintFinalized`. For the scalar u64 leg the built constraint is
-// the same record upstream produces: compare type + parsed operand + the
-// scalar compare-function marker (immediate scans carry no scalar function).
-//
-// Constraints whose value refuses to parse are dropped exactly as upstream's
-// `filter_map` drops builder errors. The parse itself covers the scalar u64
-// leg's operand spellings (decimal and `0x` hex); other type spellings are
-// their own board legs.
+// per (anonymous constraint, data type) — upstream calls the builder inside
+// `filter_map`, so `Refused`/`Empty` arms drop the constraint the way
+// Err/None results drop there. `Built` is the scalar u64 carrier;
+// `BuiltPattern` is upstream's byte-vector constraint (hex patterns,
+// wildcard arrays, multi-element scalars) and lands on the plan's pattern
+// carriers — patterns up to 8 bytes additionally pack into `operand_value`
+// for the u64 fast path the byte-array scanners read.
 // Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
 pub data ConstraintDeanonymizer {}
 
-pub machine ConstraintDeanonymizer::build_type_plan_list(
+pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
     scan_constraints: &ScanConstraintSet,
     data_type_ref: &DataTypeRef,
     memory_alignment: MemoryAlignment
 ) -> TypePlanList {
+    // Upstream builds one `ScanConstraintBuilder` per executor call (holding
+    // symbol registry + floating point tolerance); the port's builder keeps
+    // the tolerance only — type facts ride on DataTypeRef.
+    let floating_point_tolerance: FloatingPointTolerance =
+        FloatingPointTolerance::default();
+    let builder: ScanConstraintBuilder =
+        ScanConstraintBuilder::new(floating_point_tolerance);
     let mut plan_list: TypePlanList = TypePlanList::empty();
-    transition { _ -> each(&mut plan_list, scan_constraints, data_type_ref, memory_alignment, 0) }
+    transition { _ -> each(&mut plan_list, &builder, scan_constraints, data_type_ref, memory_alignment, 0) }
 
     state each(
         plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
         scan_constraints: &ScanConstraintSet,
         data_type_ref: &DataTypeRef,
         memory_alignment: MemoryAlignment,
         position: u64
     ) {
         transition position < scan_constraints.get_count() {
-            true -> build(plan_list, scan_constraints, data_type_ref, memory_alignment, position)
+            true -> build(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position)
             false -> done(plan_list)
         }
     }
 
+    // Upstream's `match scan_constraint_builder.build(anonymous_scan_constraint,
+    // data_type_ref) { Ok(c) => c, Err(_) => None }` inside filter_map.
     state build(
         plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
         scan_constraints: &ScanConstraintSet,
         data_type_ref: &DataTypeRef,
         memory_alignment: MemoryAlignment,
         position: u64
     ) {
         let constraint: AnonymousScanConstraint = scan_constraints.get(position);
-        let value_text: AnonymousValueString = constraint.get_anonymous_value_string();
-        let parse: U64ValueParse = value_text.parse_u64();
-        transition parse.ok {
-            true -> plan(
-                plan_list, scan_constraints, constraint, parse.value, data_type_ref, memory_alignment, position)
-            false -> next(plan_list, scan_constraints, data_type_ref, memory_alignment, position)
-            _ -> next(plan_list, scan_constraints, data_type_ref, memory_alignment, position)
+        let built: ScanConstraintBuild<'a> =
+            builder.build(&constraint, data_type_ref);
+        transition built {
+            ScanConstraintBuild::Built { value } -> plan_scalar(
+                plan_list, builder, scan_constraints, value,
+                data_type_ref, memory_alignment, position)
+            ScanConstraintBuild::BuiltPattern { value } -> plan_pattern(
+                plan_list, builder, scan_constraints, value,
+                data_type_ref, memory_alignment, position)
+            _ -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position)
         }
     }
 
-    // The built plan: `operand_value` is the parsed operand,
-    // `unit_size_in_bytes` the data type's unit; `has_scan_function_scalar`
-    // marks immediate scans (no two-pointer compare needed).
-    state plan(
+    // The scalar plan: `operand_value`/`mask_value` are the built
+    // constraint's u64-packed words; `result_container_type` reads off the
+    // built constraint (the anonymous string's container — Array/ArrayFixed
+    // when the value text declared a collection).
+    state plan_scalar(
         plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
         scan_constraints: &ScanConstraintSet,
-        constraint: AnonymousScanConstraint,
-        operand_value: u64,
+        built: ScanConstraint<'a>,
         data_type_ref: &DataTypeRef,
         memory_alignment: MemoryAlignment,
         position: u64
     ) {
-        let has_value: bool = constraint.has_value();
         let unit_size_in_bytes: u64 = data_type_ref.get_unit_size_in_bytes();
-        // The constraint-derived scalars upstream's finalized constraint
-        // would carry: periodicity per the finalized-calculation (operand
-        // parsed at unit width), the symbol-registry type flags, and the
-        // mask presence (masks are unported — no constraint can carry one).
-        let scan_compare_type: ScanCompareType = constraint.get_scan_compare_type();
+        let scan_compare_type: ScanCompareType = built.get_scan_compare_type();
+        let operand_value: u64 = built.get_operand_value();
         let periodicity: u64 = ScanConstraintFinalized::calculate_periodicity(
             scan_compare_type,
             operand_value,
             unit_size_in_bytes,
             unit_size_in_bytes);
-        let mut built: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::new(
+        let scalar_function: ScanFunctionScalar =
+            ScanConstraintFinalized::build_scan_function_scalar(scan_compare_type);
+        let mut plan: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::new(
             scan_compare_type,
             operand_value,
             unit_size_in_bytes,
-            has_value,
-            ScanFunctionScalar::Immediate,
+            true,
+            scalar_function,
             memory_alignment);
-        let result_container_type: ContainerType =
-            data_type_ref.get_result_container_type();
-        // Anonymous constraints carry no mask bytes (upstream's `??`
-        // wildcard syntax parses into `ScanConstraint::new_masked`, which
-        // the anonymous parse path does not yet reach) — has_mask stays
-        // false and the packed mask word is empty.
-        built.set_scan_profile(
+        let built_is_floating_point: bool = data_type_ref.is_floating_point();
+        let built_prefers_type_scanner: bool = data_type_ref.prefers_type_scanner();
+        let built_has_mask: bool = built.has_mask();
+        let built_mask_value: u64 = built.get_mask_value();
+        let built_result_container_type: ContainerType = built.get_result_container_type();
+        plan.set_scan_profile(
             periodicity,
-            data_type_ref.is_floating_point(),
-            data_type_ref.prefers_type_scanner(),
-            false,
-            0,
-            result_container_type);
+            built_is_floating_point,
+            built_prefers_type_scanner,
+            built_has_mask,
+            built_mask_value,
+            built_result_container_type);
         // The scalar leg's plan-type rule: a present current window makes
         // the filter scannable scalar-iteratively (upstream's byte-array and
         // vector specializations land with their own legs; scalar covers the
         // same filter set, only less specialized).
-        built.set_planned_scan_type(PlannedScanType::Scalar {
+        plan.set_planned_scan_type(PlannedScanType::Scalar {
             scan_type: PlannedScanTypeScalar::ScalarIterative });
-        let pushed: bool = plan_list.push(&built);
-        transition { _ -> next(plan_list, scan_constraints, data_type_ref, memory_alignment, position) }
+        let pushed: bool = plan_list.push(&plan);
+        transition { _ -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position) }
     }
 
-    state next(
+    // The pattern plan: byte-pattern constraints (upstream's
+    // `ScanConstraint{data_value: Vec<u8>, mask}`) ride the plan's bounded
+    // pattern carriers; the u64 operand words pack the pattern when it fits
+    // so the existing byte-array scanners read them unchanged. Masked
+    // patterns pick upstream's masked Boyer-Moore plan type.
+    state plan_pattern(
         plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let unit_size_in_bytes: u64 = data_type_ref.get_unit_size_in_bytes();
+        let scan_compare_type: ScanCompareType = pattern.get_scan_compare_type();
+        let pattern_len: u64 = pattern.get_pattern_len();
+        transition pattern_len <= 8 {
+            true -> pattern_operand(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                scan_compare_type, unit_size_in_bytes)
+            false -> pattern_fill(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                scan_compare_type, unit_size_in_bytes, 0, 0)
+            _ -> pattern_fill(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                scan_compare_type, unit_size_in_bytes, 0, 0)
+        }
+    }
+
+    // Packs pattern bytes (and mask bytes when present) into the u64
+    // operand words — the <=8-byte path.
+    state pattern_operand(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        scan_compare_type: ScanCompareType,
+        unit_size_in_bytes: u64
+    ) {
+        let pattern_bytes: &[u8] = pattern.get_pattern_bytes();
+        let pattern_len: u64 = pattern.get_pattern_len();
+        let operand_value: u64 =
+            pack_bytes_le_u64(pattern_bytes, pattern_len);
+        transition pattern.has_mask() {
+            true -> pattern_mask_pack(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                scan_compare_type, unit_size_in_bytes, operand_value)
+            false -> pattern_fill(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                scan_compare_type, unit_size_in_bytes, operand_value, 0)
+            _ -> pattern_fill(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                scan_compare_type, unit_size_in_bytes, operand_value, 0)
+        }
+    }
+
+    state pattern_mask_pack(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        scan_compare_type: ScanCompareType,
+        unit_size_in_bytes: u64,
+        operand_value: u64
+    ) {
+        let mask_bytes: &[u8] = pattern.get_mask_bytes();
+        let mask_len: u64 = pattern.get_mask_len();
+        let mask_value: u64 =
+            pack_bytes_le_u64(mask_bytes, mask_len);
+        transition { _ -> pattern_fill(
+            plan_list, builder, scan_constraints, pattern,
+            data_type_ref, memory_alignment, position,
+            scan_compare_type, unit_size_in_bytes, operand_value, mask_value) }
+    }
+
+    state pattern_fill(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        scan_compare_type: ScanCompareType,
+        unit_size_in_bytes: u64,
+        operand_value: u64,
+        mask_value: u64
+    ) {
+        let mut plan: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::new(
+            scan_compare_type,
+            operand_value,
+            unit_size_in_bytes,
+            true,
+            ScanFunctionScalar::Immediate,
+            memory_alignment);
+        // Byte-array scans carry no scalar compare function — the flag marks
+        // the pattern carrier so scanners read the byte span instead.
+        let pattern_periodicity: u64 = ScanConstraintFinalized::calculate_periodicity(
+            scan_compare_type, operand_value, unit_size_in_bytes, unit_size_in_bytes);
+        let is_floating_point: bool = data_type_ref.is_floating_point();
+        let prefers_type_scanner: bool = data_type_ref.prefers_type_scanner();
+        let pattern_has_mask: bool = pattern.has_mask();
+        let pattern_result_container_type: ContainerType = pattern.get_result_container_type();
+        plan.set_scan_profile(
+            pattern_periodicity,
+            is_floating_point,
+            prefers_type_scanner,
+            pattern_has_mask,
+            mask_value,
+            pattern_result_container_type);
+        let pattern_bytes: &[u8] = pattern.get_pattern_bytes();
+        let mask_bytes: &[u8] = pattern.get_mask_bytes();
+        let wrote_pattern: bool =
+            plan.set_pattern_bytes(pattern_bytes);
+        let wrote_mask: bool =
+            plan.set_pattern_mask_bytes(mask_bytes);
+        transition wrote_pattern && wrote_mask {
+            true -> pattern_store(
+                plan_list, builder, plan, pattern, scan_constraints,
+                data_type_ref, memory_alignment, position)
+            false -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position)
+            _ -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position)
+        }
+    }
+
+    state pattern_store(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        plan: SnapshotFilterElementScanPlan,
+        pattern: PatternScanConstraint,
         scan_constraints: &ScanConstraintSet,
         data_type_ref: &DataTypeRef,
         memory_alignment: MemoryAlignment,
         position: u64
     ) {
-        transition { _ -> each(plan_list, scan_constraints, data_type_ref, memory_alignment, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+        let mut stored: SnapshotFilterElementScanPlan = plan;
+        let pattern_has_mask: bool = pattern.has_mask();
+        let planned_scan_type: PlannedScanType =
+            planned_byte_array_scan_type(pattern_has_mask);
+        stored.set_planned_scan_type(planned_scan_type);
+        let pushed: bool = plan_list.push(&stored);
+        transition { _ -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position) }
+    }
+
+    state next(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        transition { _ -> each(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
 
     state done(plan_list: &mut TypePlanList) -> TypePlanList {
         (TypePlanList::clone(&mut plan_list))
     }
 }
+
+// Upstream's masked/unmasked byte-array scanner pick — the pattern
+// constraint's `has_mask()` selects Boyer-Moore vs masked Boyer-Moore.
+machine planned_byte_array_scan_type(has_mask: bool) -> PlannedScanType {
+    transition has_mask {
+        true -> (PlannedScanType::ByteArray {
+            scan_type: PlannedScanTypeByteArray::ByteArrayBooyerMooreMasked })
+        false -> (PlannedScanType::ByteArray {
+            scan_type: PlannedScanTypeByteArray::ByteArrayBooyerMoore })
+        _ -> (PlannedScanType::ByteArray {
+            scan_type: PlannedScanTypeByteArray::ByteArrayBooyerMoore })
+    }
+}
+
+// Packs `bytes[0..count]` little-endian into u64 — the same byte order
+// `ScanConstraint`'s `operand_value` uses. Callers bound count <= 8.
+machine pack_bytes_le_u64(bytes: &[u8], count: u64) -> u64 {
+    transition { _ -> pack(bytes, count, 0, 0) }
+    state pack(bytes: &[u8], count: u64, at: u64, acc: u64) -> u64 {
+        transition at < count && at < bytes.len && at < 8 {
+            true -> one(bytes, count, at, acc)
+            false -> (acc)
+        }
+    }
+    state one(bytes: &[u8], count: u64, at: u64, acc: u64) -> u64
+    {
+        let byte: u64 = bytes[at] as u64;
+        let shifted: u64 = ((byte as u64 in Wrapping)
+            * (pow256_u64(at) as u64 in Wrapping)) as u64;
+        transition { _ -> pack(bytes, count,
+            ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+            ((acc as u64 in Wrapping) + (shifted as u64 in Wrapping)) as u64) }
+    }
+}
+
+// 256^at as u64 — the LE byte-placement multiplier.
+machine pow256_u64(at: u64) -> u64 {
+    transition { _ -> each(1, 0, at) }
+    state each(acc: u64, step: u64, at: u64) -> u64 {
+        transition step < at && step < 8 {
+            true -> each(((acc as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64,
+                step + 1, at)
+            false -> (acc)
+        }
+    }
+}
+
