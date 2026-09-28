@@ -100,14 +100,8 @@ pub machine PointerScanModuleName::fill_module_name(&mut self, module_name: &[u8
 
 pub machine PointerScanModuleName::get_module_name(&self) -> &[u8] {
     transition (self.module_name_len <= 256) {
-        true -> arm_result_102_0()
+        true -> (self.module_name[0..self.module_name_len])
         false -> (self.module_name[0..256])
-    }
-    state arm_result_102_0(&self) -> &[u8]
-    
-    requires (self.module_name_len <= 256);
-{
-        (self.module_name[0..self.module_name_len])
     }
 }
 
@@ -141,22 +135,26 @@ pub data MaterializedPageKeyEntry [copy] {
     ids_len: u64;
 }
 
-// Cache-row lookup result (Option<row index>).
+// Cache-row lookup result (Option<row index>). [copy] record carrier —
+// a union-typed local cannot serve as a transition scrutinee, so `found`
+// replaces the Found case tag and the index is a field.
 pub data MaterializedPageKeyLookup [copy] {
-    case Found(index: u64);
-    case Absent;
+    found: bool;
+    index: u64;
 }
 
-// Materialized-node lookup result (Option<arena index>).
+// Materialized-node lookup result (Option<arena index>). [copy] record
+// carrier — same union-local scrutinee constraint.
 pub data MaterializedNodeLookup [copy] {
-    case Found(index: u64);
-    case Absent;
+    found: bool;
+    index: u64;
 }
 
-// Upstream Option<i64> pointer offset.
+// Upstream Option<i64> pointer offset. [copy] record carrier — same
+// union-local scrutinee constraint; `fits` replaces the Fits case tag.
 pub data PointerOffsetLookup [copy] {
-    case Fits(offset: i64);
-    case Overflow;
+    fits: bool;
+    offset: i64;
 }
 
 // Upstream Option<usize> module-name index.
@@ -679,30 +677,26 @@ machine pointer_scan_results_pointer_offset(target_address: u64, pointer_value: 
     state positive(target_address: u64, pointer_value: u64) -> PointerOffsetLookup {
         let difference: u64 = ((target_address as u64 in Wrapping) - (pointer_value as u64 in Wrapping)) as u64;
         transition (difference <= 9223372036854775807) {
-            true -> arm_result_675_0(difference)
-            false -> (PointerOffsetLookup::Overflow)
+            true -> (PointerOffsetLookup { fits: true, offset: (difference as i64 in Wrapping) as i64 })
+            false -> (PointerOffsetLookup { fits: false, offset: 0 })
         }
     }
     state negative(target_address: u64, pointer_value: u64) -> PointerOffsetLookup {
         let difference: u64 = ((pointer_value as u64 in Wrapping) - (target_address as u64 in Wrapping)) as u64;
         transition (difference <= 9223372036854775808) {
             true -> negate(difference)
-            false -> (PointerOffsetLookup::Overflow)
+            false -> (PointerOffsetLookup { fits: false, offset: 0 })
         }
     }
     state negate(difference: u64) -> PointerOffsetLookup {
         let signed_difference: i64 = (difference as i64 in Wrapping) as i64;
-        (PointerOffsetLookup::Fits { offset: ((0 as i64 in Wrapping) - (signed_difference as i64 in Wrapping)) as i64 })
-    }
-    state arm_result_675_0(difference: u64) -> PointerOffsetLookup
-    {
-        (PointerOffsetLookup::Fits { offset: (difference as i64 in Wrapping) as i64 })
+        (PointerOffsetLookup { fits: true, offset: ((0 as i64 in Wrapping) - (signed_difference as i64 in Wrapping)) as i64 })
     }
 }
 
 // ==== Accessors ====
 pub machine PointerScanResults::get_session_id(&self) -> u64 { self.session_id }
-pub machine PointerScanResults::get_target_descriptor(&self) -> PointerScanTargetDescriptor { PointerScanTargetDescriptor::clone(&self.target_descriptor) }
+pub machine PointerScanResults::get_target_descriptor(&self) -> PointerScanTargetDescriptor { self.target_descriptor.clone() }
 pub machine PointerScanResults::get_target_address_count(&self) -> u64 { self.target_address_count }
 pub machine PointerScanResults::get_address_space(&self) -> PointerScanAddressSpace { self.address_space }
 pub machine PointerScanResults::get_pointer_size(&self) -> PointerScanPointerSize { self.pointer_size }
@@ -852,13 +846,9 @@ pub machine PointerScanResults::get_module_index_by_name(&self, module_name: &[u
         let candidate_name: &[u8] = module_names[index].get_module_name();
         let names_equal: bool = pointer_scan_results_bytes_equal(candidate_name, module_name);
         transition (names_equal) {
-            true -> arm_result_844_0(index, names_equal)
+            true -> (ModuleIndexLookup::Found { index: index })
             false -> scan(((index as u64 in Wrapping) + 1) as u64, module_name)
         }
-    }
-    state arm_result_844_0(index: u64, names_equal: bool) -> ModuleIndexLookup
-    {
-        (ModuleIndexLookup::Found { index: index })
     }
 }
 
@@ -915,7 +905,7 @@ pub machine PointerScanResults::summarize<'o>(&self, pointer_scan_level_summarie
     transition {
         _ -> (PointerScanSummary::new(
             self.session_id,
-            PointerScanTargetDescriptor::clone(&self.target_descriptor),
+            self.target_descriptor.clone(),
             self.address_space,
             self.pointer_size,
             self.max_depth,
@@ -975,24 +965,20 @@ pub machine PointerScanResults::count_root_display_nodes(&self, discovery_depth:
 pub machine PointerScanResults::find_materialized_node(&self, node_id: u64) -> MaterializedNodeLookup {
     transition (node_id >= 1) {
         true -> gate(node_id)
-        false -> (MaterializedNodeLookup::Absent)
+        false -> (MaterializedNodeLookup { found: false, index: 0 })
     }
     state gate(&self, node_id: u64) -> MaterializedNodeLookup {
         let arena_index: u64 = ((node_id as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
         transition (arena_index < self.materialized_node_count) {
             true -> gate_len(arena_index)
-            false -> (MaterializedNodeLookup::Absent)
+            false -> (MaterializedNodeLookup { found: false, index: 0 })
         }
     }
     state gate_len(&self, arena_index: u64) -> MaterializedNodeLookup {
         transition (arena_index < self.materialized_nodes.len) {
-            true -> arm_result_974_0(arena_index)
-            false -> (MaterializedNodeLookup::Absent)
+            true -> (MaterializedNodeLookup { found: true, index: arena_index })
+            false -> (MaterializedNodeLookup { found: false, index: 0 })
         }
-    }
-    state arm_result_974_0(arena_index: u64) -> MaterializedNodeLookup
-    {
-        (MaterializedNodeLookup::Found { index: arena_index })
     }
 }
 
@@ -1004,13 +990,13 @@ pub machine PointerScanResults::page_cache_find(&self, has_parent_node_id: bool,
     state scan(&self, index: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64) -> MaterializedPageKeyLookup {
         transition (index < self.page_key_cache_count) {
             true -> gate(index, has_parent_node_id, parent_node_id, page_index, page_size)
-            false -> (MaterializedPageKeyLookup::Absent)
+            false -> (MaterializedPageKeyLookup { found: false, index: 0 })
         }
     }
     state gate(&self, index: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64) -> MaterializedPageKeyLookup {
         transition (index < self.page_key_cache.len) {
             true -> at(&self.page_key_cache, index, has_parent_node_id, parent_node_id, page_index, page_size)
-            false -> (MaterializedPageKeyLookup::Absent)
+            false -> (MaterializedPageKeyLookup { found: false, index: 0 })
         }
     }
     state at(&self, page_key_cache: &[MaterializedPageKeyEntry], index: u64, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64) -> MaterializedPageKeyLookup
@@ -1019,13 +1005,9 @@ pub machine PointerScanResults::page_cache_find(&self, has_parent_node_id: bool,
         let entry: MaterializedPageKeyEntry = page_key_cache[index];
         let keys_match: bool = entry.has_parent_node_id == has_parent_node_id && entry.parent_node_id == parent_node_id && entry.page_index == page_index && entry.page_size == page_size;
         transition (keys_match) {
-            true -> arm_result_1003_0(index, keys_match)
+            true -> (MaterializedPageKeyLookup { found: true, index: index })
             false -> scan(((index as u64 in Wrapping) + 1) as u64, has_parent_node_id, parent_node_id, page_index, page_size)
         }
-    }
-    state arm_result_1003_0(index: u64, keys_match: bool) -> MaterializedPageKeyLookup
-    {
-        (MaterializedPageKeyLookup::Found { index: index })
     }
 }
 
@@ -1215,27 +1197,15 @@ pub machine PointerScanResults::create_materialized_pointer_scan_node(
 
 pub machine PointerScanResults::get_target_addresses(&self) -> &[u64] {
     transition (self.target_address_count <= self.target_addresses.len) {
-        true -> arm_result_1195_0()
+        true -> (self.target_addresses[0..self.target_address_count])
         false -> (self.target_addresses[0..self.target_addresses.len])
-    }
-    state arm_result_1195_0(&self) -> &[u64]
-    
-    requires (self.target_address_count <= self.target_addresses.len);
-{
-        (self.target_addresses[0..self.target_address_count])
     }
 }
 
 pub machine PointerScanResults::get_pointer_scan_levels(&self) -> &[PointerScanLevel] {
     transition (self.pointer_scan_level_count <= self.pointer_scan_levels.len) {
-        true -> arm_result_1202_0()
+        true -> (self.pointer_scan_levels[0..self.pointer_scan_level_count])
         false -> (self.pointer_scan_levels[0..self.pointer_scan_levels.len])
-    }
-    state arm_result_1202_0(&self) -> &[PointerScanLevel]
-    
-    requires (self.pointer_scan_level_count <= self.pointer_scan_levels.len);
-{
-        (self.pointer_scan_levels[0..self.pointer_scan_level_count])
     }
 }
 
@@ -1364,8 +1334,9 @@ pub machine PointerScanResults::materialize_terminal_target_node_page(
     {
         let resolved_target_address: u64 = target_addresses[target_index];
         let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(resolved_target_address, pointer_value);
-        transition offset_lookup {
-            PointerOffsetLookup::Fits { offset } -> gate_out(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, offset, out_node_ids, write_start, ids_written)
+        transition offset_lookup.fits {
+            true -> gate_out(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, offset_lookup.offset, out_node_ids, write_start, ids_written)
+            false -> emit_next(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
             _ -> emit_next(target_addresses, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
         }
     }
@@ -1460,8 +1431,9 @@ pub machine PointerScanResults::materialize_display_node_page(
     state resolve_target(&mut self, candidate_id: u64, discovery_depth: u64, branch_total_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_name_kind: u64, module_name_index: u64, module_offset: u64, display_depth: u64, has_parent_node_id: bool, parent_node_id: u64, page_start_index: u64, page_node_count: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
         let target_address: u64 = self.target_descriptor.get_target_address();
         let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(target_address, pointer_value);
-        transition offset_lookup {
-            PointerOffsetLookup::Fits { offset } -> gate_out(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, target_address, offset, out_node_ids, write_start)
+        transition offset_lookup.fits {
+            true -> gate_out(candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, target_address, offset_lookup.offset, out_node_ids, write_start)
+            false -> (0)
             _ -> (0)
         }
     }
@@ -1549,8 +1521,9 @@ pub machine PointerScanResults::materialize_display_node_page(
         let child_pointer_address: u64 = heap_candidate.get_pointer_address();
         let resolved_target_address: u64 = heap_candidate.get_pointer_value();
         let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(child_pointer_address, pointer_value);
-        transition offset_lookup {
-            PointerOffsetLookup::Fits { offset } -> gate_out_heap(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, heap_candidate, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, offset, out_node_ids, write_start, ids_written)
+        transition offset_lookup.fits {
+            true -> gate_out_heap(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, heap_candidate, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, resolved_target_address, offset_lookup.offset, out_node_ids, write_start, ids_written)
+            false -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
             _ -> emit_next(pointer_scan_level_candidates, level_index, range_start_index, emit_index, emit_count, candidate_id, discovery_depth, branch_total_depth, pointer_scan_node_type, pointer_address, pointer_value, module_name_kind, module_name_index, module_offset, display_depth, has_parent_node_id, parent_node_id, page_start_index, out_node_ids, write_start, ids_written)
         }
     }
@@ -1715,8 +1688,9 @@ pub machine PointerScanResults::materialize_root_pointer_scan_nodes(
     state resolve_target(&mut self, candidate_id: u64, discovery_depth: u64, pointer_scan_node_type: PointerScanNodeType, pointer_address: u64, pointer_value: u64, module_index: u64, module_offset: u64, out_node_ids: &mut [u64], write_start: u64) -> u64 {
         let target_address: u64 = self.target_descriptor.get_target_address();
         let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(target_address, pointer_value);
-        transition offset_lookup {
-            PointerOffsetLookup::Fits { offset } -> gate_out_leaf(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, target_address, offset, out_node_ids, write_start)
+        transition offset_lookup.fits {
+            true -> gate_out_leaf(candidate_id, discovery_depth, pointer_scan_node_type, pointer_address, pointer_value, module_index, module_offset, target_address, offset_lookup.offset, out_node_ids, write_start)
+            false -> (0)
             _ -> (0)
         }
     }
@@ -2003,8 +1977,9 @@ pub machine PointerScanResults::materialize_root_child_node_page(
         let child: PointerScanCandidate = pointer_scan_level_candidates[level_index].copy_heap_candidate(candidate_index);
         let child_pointer_address: u64 = child.get_pointer_address();
         let offset_lookup: PointerOffsetLookup = pointer_scan_results_pointer_offset(resolved_target_address, child_pointer_address);
-        transition offset_lookup {
-            PointerOffsetLookup::Fits { offset } -> emit_node(level_index, range_start, page_start_index, emit_count, position, ids_written, child, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, offset, out_node_ids)
+        transition offset_lookup.fits {
+            true -> emit_node(level_index, range_start, page_start_index, emit_count, position, ids_written, child, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, offset_lookup.offset, out_node_ids)
+            false -> emit_loop(level_index, range_start, page_start_index, emit_count, ((position as u64 in Wrapping) + 1) as u64, ids_written, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, &mut out_node_ids)
             _ -> emit_loop(level_index, range_start, page_start_index, emit_count, ((position as u64 in Wrapping) + 1) as u64, ids_written, candidate_id, resolved_target_address, parent_node_index, parent_node_id, module_name_kind, module_name_index, &mut out_node_ids)
         }
     }
@@ -2239,8 +2214,9 @@ pub machine PointerScanResults::compute_page_total(
     }
     state find_parent(&mut self, parent_node_id: u64) -> u64 {
         let lookup: MaterializedNodeLookup = self.find_materialized_node(parent_node_id);
-        transition lookup {
-            MaterializedNodeLookup::Found { index } -> parent_total(index)
+        transition lookup.found {
+            true -> parent_total(lookup.index)
+            false -> (0)
             _ -> (0)
         }
     }
@@ -2269,8 +2245,9 @@ pub machine PointerScanResults::get_expanded_node_page(
     }
     state with_size(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
         let lookup: MaterializedPageKeyLookup = self.page_cache_find(has_parent_node_id, parent_node_id, page_index, page_size);
-        transition lookup {
-            MaterializedPageKeyLookup::Found { index } -> cache_hit(has_parent_node_id, parent_node_id, page_index, page_size, index, out_node_ids)
+        transition lookup.found {
+            true -> cache_hit(has_parent_node_id, parent_node_id, page_index, page_size, lookup.index, out_node_ids)
+            false -> route_page(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
             _ -> route_page(has_parent_node_id, parent_node_id, page_index, page_size, out_node_ids)
         }
     }
@@ -2338,8 +2315,9 @@ pub machine PointerScanResults::get_expanded_node_page(
     }
     state child_page(&mut self, has_parent_node_id: bool, parent_node_id: u64, page_index: u64, page_size: u64, out_node_ids: &mut [u64]) -> ExpandedNodePage {
         let lookup: MaterializedNodeLookup = self.find_materialized_node(parent_node_id);
-        transition lookup {
-            MaterializedNodeLookup::Found { index } -> child_total(has_parent_node_id, parent_node_id, page_index, page_size, index, out_node_ids)
+        transition lookup.found {
+            true -> child_total(has_parent_node_id, parent_node_id, page_index, page_size, lookup.index, out_node_ids)
+            false -> page_done(has_parent_node_id, parent_node_id, page_index, page_size, 0, 0)
             _ -> page_done(has_parent_node_id, parent_node_id, page_index, page_size, 0, 0)
         }
     }
