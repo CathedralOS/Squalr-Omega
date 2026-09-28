@@ -42,6 +42,17 @@ pub data SnapshotFilterElementScanPlan {
     // Upstream `ScanConstraint::result_container_type` — the data type's
     // result layout, resolved by the plan builder per data type.
     result_container_type: ContainerType;
+    // The byte-pattern carrier for `BuiltPattern` constraints — upstream's
+    // plan reads `get_data_value().get_value_bytes()` and `get_mask()` off
+    // the borrowed finalized constraint; the owned plan stores the bytes
+    // instead (bounded 4096, the package's Vec respell — over-bound input
+    // refuses rather than truncates). `operand_value`/`mask_value` remain
+    // the <=8-byte fast path the scalar/byte-array scanners read.
+    has_pattern_bytes: bool;
+    pattern_bytes: [u8; 4096];
+    pattern_bytes_len: u64;
+    pattern_mask_bytes: [u8; 4096];
+    pattern_mask_bytes_len: u64;
 }
 
 pub machine SnapshotFilterElementScanPlan::new(
@@ -66,6 +77,9 @@ pub machine SnapshotFilterElementScanPlan::new(
         has_mask: false,
         mask_value: 0,
         result_container_type: ContainerType::default(),
+        has_pattern_bytes: false,
+        pattern_bytes_len: 0,
+        pattern_mask_bytes_len: 0,
     }
 }
 
@@ -225,25 +239,16 @@ pub machine SnapshotFilterElementScanPlan::default() -> SnapshotFilterElementSca
         has_mask: false,
         mask_value: 0,
         result_container_type: ContainerType::None,
+        has_pattern_bytes: false,
+        pattern_bytes_len: 0,
+        pattern_mask_bytes_len: 0,
     }
 }
 
 pub machine SnapshotFilterElementScanPlan::clone(source: &SnapshotFilterElementScanPlan) -> SnapshotFilterElementScanPlan {
-    SnapshotFilterElementScanPlan {
-        scan_compare_type: source.scan_compare_type,
-        operand_value: source.operand_value,
-        unit_size_in_bytes: source.unit_size_in_bytes,
-        has_scan_function_scalar: source.has_scan_function_scalar,
-        scan_function_scalar: source.scan_function_scalar,
-        memory_alignment: source.memory_alignment,
-        planned_scan_type: source.planned_scan_type,
-        periodicity: source.periodicity,
-        is_floating_point: source.is_floating_point,
-        prefer_type_scanner: source.prefer_type_scanner,
-        has_mask: source.has_mask,
-        mask_value: source.mask_value,
-        result_container_type: source.result_container_type,
-    }
+    let mut plan: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::default();
+    plan.clone_from(source);
+    (plan)
 }
 
 // The constraint-derived scalars ride clone_from through the same field copy
@@ -262,4 +267,120 @@ pub machine SnapshotFilterElementScanPlan::clone_from(&mut self, source: &Snapsh
     self.result_container_type = source.result_container_type;
     self.memory_alignment = source.memory_alignment;
     self.planned_scan_type = source.planned_scan_type;
+    self.has_pattern_bytes = source.has_pattern_bytes;
+    self.pattern_bytes_len = source.pattern_bytes_len;
+    self.pattern_mask_bytes_len = source.pattern_mask_bytes_len;
+    transition { _ -> copy_pattern(source, 0) }
+    state copy_pattern(&mut self, source: &SnapshotFilterElementScanPlan, position: u64) {
+        transition position < source.pattern_bytes_len && position < 4096 {
+            true -> one_pattern(source, position)
+            false -> copy_mask(source, 0)
+        }
+    }
+    state one_pattern(&mut self, source: &SnapshotFilterElementScanPlan, position: u64)
+        requires position < 4096
+    {
+        self.pattern_bytes[position] = source.pattern_bytes[position];
+        transition { _ -> copy_pattern(source, position + 1) }
+    }
+    state copy_mask(&mut self, source: &SnapshotFilterElementScanPlan, position: u64) {
+        transition position < source.pattern_mask_bytes_len && position < 4096 {
+            true -> one_mask(source, position)
+            false -> done()
+        }
+    }
+    state done(&mut self) {
+        self.has_pattern_bytes = self.has_pattern_bytes;
+    }
+    state one_mask(&mut self, source: &SnapshotFilterElementScanPlan, position: u64)
+        requires position < 4096
+    {
+        self.pattern_mask_bytes[position] = source.pattern_mask_bytes[position];
+        transition { _ -> copy_mask(source, position + 1) }
+    }
+}
+
+// The pattern-carrier write — upstream `set_data_value` on the constraint.
+// Over-bound input refuses (returns false) rather than truncates; the
+// `has_pattern_bytes` flag marks the constraint as byte-pattern-carried so
+// byte-array scanners know to read the carriers instead of the u64 operand.
+pub machine SnapshotFilterElementScanPlan::set_pattern_bytes(&mut self, bytes: &[u8]) -> bool {
+    transition bytes.len <= 4096 {
+        true -> copy(bytes, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state copy(&mut self, bytes: &[u8], position: u64) {
+        transition position < bytes.len && position < 4096 {
+            true -> one(bytes, position)
+            false -> finish(bytes)
+        }
+    }
+    state one(&mut self, bytes: &[u8], position: u64)
+        requires position < 4096
+    {
+        self.pattern_bytes[position] = bytes[position];
+        transition { _ -> copy(bytes, position + 1) }
+    }
+    state finish(&mut self, bytes: &[u8]) -> bool {
+        self.pattern_bytes_len = bytes.len;
+        self.has_pattern_bytes = true;
+        true
+    }
+}
+
+pub machine SnapshotFilterElementScanPlan::set_pattern_mask_bytes(&mut self, bytes: &[u8]) -> bool {
+    transition bytes.len <= 4096 {
+        true -> copy(bytes, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state copy(&mut self, bytes: &[u8], position: u64) {
+        transition position < bytes.len && position < 4096 {
+            true -> one(bytes, position)
+            false -> finish(bytes)
+        }
+    }
+    state one(&mut self, bytes: &[u8], position: u64)
+        requires position < 4096
+    {
+        self.pattern_mask_bytes[position] = bytes[position];
+        transition { _ -> copy(bytes, position + 1) }
+    }
+    state finish(&mut self, bytes: &[u8]) -> bool {
+        self.pattern_mask_bytes_len = bytes.len;
+        true
+    }
+}
+
+pub machine SnapshotFilterElementScanPlan::has_pattern_bytes(&self) -> bool {
+    self.has_pattern_bytes
+}
+
+pub machine SnapshotFilterElementScanPlan::get_pattern_bytes_len(&self) -> u64 {
+    self.pattern_bytes_len
+}
+
+// Upstream `get_data_value().get_value_bytes()` — the pattern bytes as a
+// span; absent patterns yield the empty span.
+pub machine SnapshotFilterElementScanPlan::get_pattern_bytes(&self) -> &[u8] {
+    transition self.pattern_bytes_len <= 4096 && self.has_pattern_bytes {
+        true -> (&self.pattern_bytes[0..self.pattern_bytes_len])
+        false -> (&self.pattern_bytes[0..0])
+        _ -> (&self.pattern_bytes[0..0])
+    }
+}
+
+// Upstream `get_scan_constraint().get_mask()` pattern-byte form; absent
+// masks yield the empty span.
+pub machine SnapshotFilterElementScanPlan::get_pattern_mask_bytes(&self) -> &[u8] {
+    transition self.pattern_mask_bytes_len <= 4096 && self.has_pattern_bytes {
+        true -> (&self.pattern_mask_bytes[0..self.pattern_mask_bytes_len])
+        false -> (&self.pattern_mask_bytes[0..0])
+        _ -> (&self.pattern_mask_bytes[0..0])
+    }
+}
+
+pub machine SnapshotFilterElementScanPlan::get_pattern_mask_bytes_len(&self) -> u64 {
+    self.pattern_mask_bytes_len
 }
