@@ -1,0 +1,205 @@
+module src::structures::structs::symbolic_field_definition;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::data_values::data_value::DataValue;
+use src::structures::structs::valued_struct_field::ValuedStructField;
+use src::structures::structs::valued_struct_field::ValuedStructFieldData;
+
+// Port of structures/structs/symbolic_field_definition.rs: one entry in a
+// symbolic struct layout — a defined field or an unassigned padding span.
+//
+// Named deviations:
+// - Upstream resolver references (`SymbolicResolverRef`,
+//   `SymbolicFieldCountResolution::Resolver`,
+//   `SymbolicFieldOffsetResolution::Resolver`, `active_when_resolver`) carry
+//   registry ids; the resolver trait and SymbolRegistry belong to the
+//   symbol-registry leg (see valued_struct.omg). The port keeps the resolver
+//   id as data so documents round-trip, and evaluates it through upstream's
+//   own non-resolver fallbacks: unresolved counts/offsets behave as
+//   Inferred/Sequential — matching what upstream produces when the registry
+//   lacks the resolver entry.
+// - Strings fold to [u8;256]+len per the port's name convention.
+
+pub data SymbolicFieldCountResolution [copy] {
+    case Inferred;
+    case Resolver;
+}
+
+pub data SymbolicFieldOffsetResolution [copy] {
+    case Sequential;
+    case Static(offset_in_bytes: u64);
+    case Resolver;
+}
+
+pub data SymbolicDefinedField {
+    field_name: [u8; 256];
+    field_name_len: u64;
+    data_type_ref: DataTypeRef;
+    container_type: ContainerType;
+    count_resolution: SymbolicFieldCountResolution;
+    offset_resolution: SymbolicFieldOffsetResolution;
+}
+
+pub data SymbolicFieldDefinition {
+    case Field(field: SymbolicDefinedField);
+    case Unassigned(size_in_bytes: u64);
+}
+
+pub machine SymbolicFieldCountResolution::is_inferred(&self) -> bool {
+    transition self {
+        SymbolicFieldCountResolution::Inferred -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine SymbolicFieldOffsetResolution::is_sequential(&self) -> bool {
+    transition self {
+        SymbolicFieldOffsetResolution::Sequential -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine SymbolicFieldDefinition::new_defined(
+    field_name: &[u8],
+    data_type_ref: &DataTypeRef,
+    container_type: ContainerType
+) -> SymbolicFieldDefinition {
+    let mut field: SymbolicDefinedField = SymbolicDefinedField {
+        field_name_len: 0,
+        data_type_ref: DataTypeRef::clone(data_type_ref),
+        container_type: container_type,
+        count_resolution: SymbolicFieldCountResolution::Inferred,
+        offset_resolution: SymbolicFieldOffsetResolution::Sequential,
+    };
+    fill_name(&mut field, field_name);
+    SymbolicFieldDefinition::Field { field: field }
+}
+
+pub machine SymbolicFieldDefinition::new_unassigned(
+    size_in_bytes: u64
+) -> SymbolicFieldDefinition {
+    SymbolicFieldDefinition::Unassigned { size_in_bytes: size_in_bytes }
+}
+
+pub machine SymbolicFieldDefinition::is_unassigned(&self) -> bool {
+    transition self {
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (true)
+        _ -> (false)
+    }
+}
+
+// Upstream `get_offset_resolution` — Unassigned entries are always
+// sequential (their size is their offset contribution).
+pub machine SymbolicFieldDefinition::get_offset_resolution(&self) -> SymbolicFieldOffsetResolution {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (field.offset_resolution)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            SymbolicFieldOffsetResolution::Sequential)
+    }
+}
+
+// Upstream `get_size_in_bytes`: defined fields take their container's total
+// size over the element size; unassigned fields are their byte span.
+pub machine SymbolicFieldDefinition::get_size_in_bytes(&self) -> u64 {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> at_field(field)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (size_in_bytes)
+    }
+    state at_field(&self, field: SymbolicDefinedField) -> u64 {
+        field.container_type.get_total_size_in_bytes(
+            field.data_type_ref.get_unit_size_in_bytes())
+    }
+}
+
+pub machine SymbolicFieldDefinition::get_data_type_ref(&self) -> DataTypeRef {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (
+            DataTypeRef::clone(&field.data_type_ref))
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            DataTypeRef::default())
+    }
+}
+
+// Upstream `get_valued_struct_field`: mints the default-valued field. The
+// registry lookups upstream runs (`get_default_value`, `get_struct_layout`)
+// all collapse to `DataValue::default()` when the registry lacks an entry —
+// the resolver/registry leg is named-deferred, so the port takes upstream's
+// own miss fallback directly. Callers skip Unassigned entries first, same
+// as upstream's iterator filter.
+pub machine SymbolicFieldDefinition::get_valued_struct_field(&self) -> ValuedStructField {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> defined(field)
+        _ -> (ValuedStructField::default())
+    }
+    state defined(&self, field: SymbolicDefinedField) -> ValuedStructField {
+        transition field.field_name_len <= 256 {
+            true -> fit(field)
+            false -> clamped(field)
+            _ -> clamped(field)
+        }
+    }
+    state fit(&self, field: SymbolicDefinedField) -> ValuedStructField {
+        ValuedStructField::new(
+            &field.field_name[0..field.field_name_len],
+            &ValuedStructFieldData::Value { value: DataValue::default() },
+            false)
+    }
+    state clamped(&self, field: SymbolicDefinedField) -> ValuedStructField {
+        ValuedStructField::new(
+            &field.field_name[0..256],
+            &ValuedStructFieldData::Value { value: DataValue::default() },
+            false)
+    }
+}
+
+// Clone machines — union members move on the case arm, so each case
+// rebuilds explicitly.
+pub machine SymbolicDefinedField::clone(source: &SymbolicDefinedField) -> SymbolicDefinedField {
+    transition source.field_name_len <= 256 {
+        true -> build(source, &source.field_name[0..source.field_name_len])
+        false -> build(source, &source.field_name[0..256])
+        _ -> build(source, &source.field_name[0..256])
+    }
+    state build(source: &SymbolicDefinedField, name: &[u8]) -> SymbolicDefinedField {
+        let mut copy: SymbolicDefinedField = SymbolicDefinedField {
+            field_name_len: 0,
+            data_type_ref: DataTypeRef::clone(&source.data_type_ref),
+            container_type: source.container_type,
+            count_resolution: source.count_resolution,
+            offset_resolution: source.offset_resolution,
+        };
+        fill_name(&mut copy, name);
+        copy
+    }
+}
+
+pub machine SymbolicFieldDefinition::clone(
+    source: &SymbolicFieldDefinition
+) -> SymbolicFieldDefinition {
+    transition source {
+        SymbolicFieldDefinition::Field { field } -> (
+            SymbolicFieldDefinition::Field { field: SymbolicDefinedField::clone(&field) })
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            SymbolicFieldDefinition::Unassigned { size_in_bytes: size_in_bytes })
+    }
+}
+
+machine fill_name(field: &mut SymbolicDefinedField, name: &[u8]) {
+    let mut position: u64 = 0;
+    transition { _ -> copy(field, name, position) }
+    state copy(field: &mut SymbolicDefinedField, name: &[u8], position: u64) {
+        transition position < name.len && position < 256 {
+            true -> step(field, name, position)
+            false -> done(field)
+        }
+    }
+    state step(field: &mut SymbolicDefinedField, name: &[u8], position: u64) {
+        field.field_name[position] = name[position];
+        field.field_name_len = position + 1;
+        transition { _ -> copy(field, name, position + 1) }
+    }
+    state done(field: &mut SymbolicDefinedField) {
+        field.field_name_len = field.field_name_len;
+    }
+}
