@@ -1,0 +1,379 @@
+module src::command_executors::memory_read_request_executor;
+
+use squalr_engine_api::src::commands::memory::read::memory_read_request::MemoryReadRequest;
+use squalr_engine_api::src::commands::memory::read::memory_read_response::MemoryReadResponse;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_api::src::structures::structs::valued_struct::ValuedStruct;
+use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructField;
+use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructFieldData;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::ReadWindowResult;
+
+// Port of command_executors/memory/read/memory_read_request_executor.rs:
+// with an opened process, build the symbolic struct's default valued
+// struct, resolve `address` against `module_name` when one is named, and
+// fill each field's value from memory. Without a process the response is
+// an empty valued struct and `success: false`.
+//
+// Named deviations:
+// - Upstream `read_struct` performs one byte-granular read and maps fields
+//   at their byte offsets; the supplied memory source is element-granular,
+//   so each field reads the u64 lane covering its offset and the lane's
+//   low bytes fill the field's value.
+// - Upstream logs the read unless suppressed; Omega has no log surface —
+//   `suppress_logging` is carried on the request, not acted on.
+pub data MemoryReadRequestExecutor {}
+
+pub machine MemoryReadRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    memory_read_request: &MemoryReadRequest
+) -> MemoryReadResponse
+crashes Abort
+{
+    let empty_module_name: [u8; 1] = [0];
+    let mut supplied_modules: [NormalizedModule; 8] = [
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0),
+        NormalizedModule::new(&empty_module_name[0..0], 0, 0)
+    ];
+    let supplied_module_count: u64 = engine_privileged_state.copy_supplied_modules(&mut supplied_modules);
+    transition engine_privileged_state.has_opened_process() {
+        true -> resolve(engine_privileged_state, memory_read_request, &supplied_modules, supplied_module_count)
+        false -> no_process(memory_read_request)
+        _ -> no_process(memory_read_request)
+    }
+
+    // Upstream's no-process arm: `ValuedStruct::new(SymbolicStructRef::new(
+    // String::new()), vec![])` — the empty default — and a failure flag.
+    state no_process(
+        memory_read_request: &MemoryReadRequest
+    ) -> MemoryReadResponse {
+        MemoryReadResponse::new(
+            ValuedStruct::default(), memory_read_request.get_address(), false)
+    }
+
+    // Module resolution: `resolve_module_address` — a named module resolves
+    // `address` as a module-relative offset; an unnamed request's address is
+    // already absolute; an absent module name fails the read (upstream's
+    // `module_address.is_some()` gate).
+    state resolve(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64
+    ) -> MemoryReadResponse {
+        transition memory_read_request.get_module_name().len == 0 {
+            true -> begin_read(
+                engine_privileged_state,
+                memory_read_request,
+                memory_read_request.get_address())
+            false -> find_module(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                0)
+            _ -> begin_read(
+                engine_privileged_state,
+                memory_read_request,
+                memory_read_request.get_address())
+        }
+    }
+    state find_module(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_index: u64
+    ) -> MemoryReadResponse {
+        transition module_index < module_count && module_index < 8 {
+            true -> compare_name(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index,
+                0)
+            false -> unresolved(memory_read_request)
+            _ -> unresolved(memory_read_request)
+        }
+    }
+    state unresolved(
+        memory_read_request: &MemoryReadRequest
+    ) -> MemoryReadResponse {
+        let definition: &SymbolicStructDefinition =
+            memory_read_request.get_symbolic_struct_definition();
+        MemoryReadResponse::new(
+            definition.get_default_valued_struct(),
+            memory_read_request.get_address(),
+            false)
+    }
+    state compare_name(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_index: u64,
+        name_position: u64
+    ) -> MemoryReadResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let target_name: &[u8] = memory_read_request.get_module_name();
+        let module_name: &[u8] = supplied_modules[module_index].get_module_name();
+        transition module_name.len == target_name.len {
+            true -> compare_byte(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index,
+                name_position)
+            false -> find_module(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index + 1)
+            _ -> find_module(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index + 1)
+        }
+    }
+    state compare_byte(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_index: u64,
+        name_position: u64
+    ) -> MemoryReadResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let target_name: &[u8] = memory_read_request.get_module_name();
+        transition name_position < target_name.len {
+            true -> byte_at(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index,
+                name_position)
+            false -> resolved(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_index)
+            _ -> resolved(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_index)
+        }
+    }
+    state byte_at(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_count: u64,
+        module_index: u64,
+        name_position: u64
+    ) -> MemoryReadResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let target_name: &[u8] = memory_read_request.get_module_name();
+        let module_name: &[u8] = supplied_modules[module_index].get_module_name();
+        transition module_name[name_position] == target_name[name_position] {
+            true -> compare_byte(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index,
+                name_position + 1)
+            false -> find_module(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index + 1)
+            _ -> find_module(
+                engine_privileged_state,
+                memory_read_request,
+                supplied_modules,
+                module_count,
+                module_index + 1)
+        }
+    }
+    state resolved(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        supplied_modules: &[NormalizedModule; 8],
+        module_index: u64
+    ) -> MemoryReadResponse
+    requires 0 <= module_index && module_index < 8;
+    {
+        let absolute: u64 = ((supplied_modules[module_index].get_base_address()
+            as u64 in Saturating)
+            + (memory_read_request.get_address() as u64 in Saturating)) as u64;
+        transition { _ -> begin_read(
+            engine_privileged_state,
+            memory_read_request,
+            absolute) }
+    }
+
+    // Field fill: one u64 lane per field at the field's layout offset,
+    // stored as the field's value bytes; a failed lane fails the whole
+    // read (upstream `read_struct` fails on any read failure).
+    state begin_read(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        base_address: u64
+    ) -> MemoryReadResponse {
+        let definition: &SymbolicStructDefinition =
+            memory_read_request.get_symbolic_struct_definition();
+        let mut valued: ValuedStruct = definition.get_default_valued_struct();
+        transition { _ -> read_fields(
+            engine_privileged_state,
+            memory_read_request,
+            &mut valued,
+            base_address,
+            0,
+            true) }
+    }
+    state read_fields(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        valued: &mut ValuedStruct,
+        base_address: u64,
+        field_index: u64,
+        all_succeeded: bool
+    ) -> MemoryReadResponse {
+        let definition: &SymbolicStructDefinition =
+            memory_read_request.get_symbolic_struct_definition();
+        transition field_index < definition.get_field_count() {
+            true -> read_field(
+                engine_privileged_state,
+                memory_read_request,
+                valued,
+                base_address,
+                field_index,
+                all_succeeded)
+            false -> answer(memory_read_request, valued, all_succeeded)
+            _ -> answer(memory_read_request, valued, all_succeeded)
+        }
+    }
+    state read_field(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        valued: &mut ValuedStruct,
+        base_address: u64,
+        field_index: u64,
+        all_succeeded: bool
+    ) -> MemoryReadResponse {
+        let definition: &SymbolicStructDefinition =
+            memory_read_request.get_symbolic_struct_definition();
+        let field_offset: u64 = definition.get_field_offset(field_index);
+        let field_address: u64 = ((base_address as u64 in Saturating)
+            + (field_offset as u64 in Saturating)) as u64;
+        let read_result: ReadWindowResult = engine_privileged_state
+            .get_supplied_memory_source()
+            .try_read_window(field_address, 8);
+        transition read_result.succeeded {
+            true -> store_field(
+                engine_privileged_state,
+                memory_read_request,
+                valued,
+                base_address,
+                field_index,
+                all_succeeded,
+                read_result.window.get_element(0))
+            false -> read_fields(
+                engine_privileged_state,
+                memory_read_request,
+                valued,
+                base_address,
+                field_index + 1,
+                false)
+            _ -> read_fields(
+                engine_privileged_state,
+                memory_read_request,
+                valued,
+                base_address,
+                field_index + 1,
+                false)
+        }
+    }
+    state store_field(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        memory_read_request: &MemoryReadRequest,
+        valued: &mut ValuedStruct,
+        base_address: u64,
+        field_index: u64,
+        all_succeeded: bool,
+        element: u64
+    ) -> MemoryReadResponse {
+        let definition: &SymbolicStructDefinition =
+            memory_read_request.get_symbolic_struct_definition();
+        let mut field: ValuedStructField = valued.get_field_at(field_index);
+        let data_type_ref: DataTypeRef =
+            definition.get_field(field_index).get_data_type_ref();
+        let value_bytes: [u8; 8] = element_to_bytes(element);
+        let value: DataValue = DataValue::new(&data_type_ref, &value_bytes[0..8]);
+        field.set_field_data(&ValuedStructFieldData::Value { value: value });
+        valued.set_field_at(field_index, &field);
+        transition { _ -> read_fields(
+            engine_privileged_state,
+            memory_read_request,
+            valued,
+            base_address,
+            field_index + 1,
+            all_succeeded) }
+    }
+    state answer(
+        memory_read_request: &MemoryReadRequest,
+        valued: &mut ValuedStruct,
+        all_succeeded: bool
+    ) -> MemoryReadResponse {
+        MemoryReadResponse::new(
+            ValuedStruct::clone(valued),
+            memory_read_request.get_address(),
+            all_succeeded)
+    }
+}
+
+// One u64 lane to its little-endian byte lane — `acc % 256` spelled as
+// `acc - (acc / 256) * 256` to stay on plain arithmetic.
+machine element_to_bytes(element: u64) -> [u8; 8] {
+    let mut bytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+    transition { _ -> each(&mut bytes, element, 0) }
+    state each(bytes: &mut [u8; 8], acc: u64, position: u64) -> [u8; 8] {
+        transition position < 8 {
+            true -> step(bytes, acc, position)
+            false -> done(bytes)
+            _ -> done(bytes)
+        }
+    }
+    state step(bytes: &mut [u8; 8], acc: u64, position: u64) -> [u8; 8]
+    requires 0 <= position && position < 8;
+    {
+        let quotient: u64 = ((acc as u64 in Trapping) / (256 as u64 in Trapping)) as u64;
+        let byte: u64 = ((acc as u64 in Wrapping)
+            - ((quotient as u64 in Wrapping) * (256 as u64 in Wrapping))) as u64;
+        bytes[position] = byte as u8;
+        transition { _ -> each(bytes, quotient, position + 1) }
+    }
+    state done(bytes: &mut [u8; 8]) -> [u8; 8] {
+        transition { _ -> ([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]) }
+    }
+}
