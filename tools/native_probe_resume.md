@@ -161,14 +161,21 @@ is_process_alive) is therefore fully ported at source level;
    `TimeHost` provider that does not exist anywhere), fenced by the same
    Omega wave items. Update (2026-09-23, swarm): between `b5ac760ff4` and
    `a951e7882a` this package stopped *checking* at all —
-   `data LinuxMemoryQueryer { host: Service<FilesystemHost> }` now reports
+   `data LinuxMemoryQueryer { host: Service<FilesystemHost> }` reported
    "field `host` references unknown generic type `Service`" and every
    `host.open/open_at/close/seek/read` call "does not resolve" (57
-   diagnostics across targets-native); `omega update`/lock re-review cannot
-   pass it, which parks the `pin/a951e7882a` lane and the probe retry alike.
-   Under investigation as a toolchain regression alongside the check-mode
-   post-Stage-05 cost jump on FsHost-bound packages (same surface, same
-   window).
+   diagnostics across targets-native); `omega update`/lock re-review could
+   not pass it, which parked the `pin/a951e7882a` lane and the probe retry
+   alike. **CLEARED (2026-09-28, swarm):** the field was respelled to
+   `Binding<FilesystemHost>` and `squalr-engine-targets-native --check` is
+   green again (54 files, zero diagnostics) on bundle omega-0.1.0-swarm-8a94858
+   — the unresolution regression is gone. What remains of blocker 2 is only
+   the provider mint itself: the canonical FilesystemHost leaf table mints
+   rows only for linux_x86_64 scalar-positional syscalls, so
+   `open`/`open_at`/`read`/`seek`/`canonicalize` (path/slice carriers) and
+   `errno` resolve to zero provider rows at terminal-authority review, and
+   non-linux targets mint no rows at all (`_ => &[]`); `TimeHost` still has
+   no provider.
 
 ### Resume steps (unchanged, with the new precondition)
 
