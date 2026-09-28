@@ -22,33 +22,37 @@ use src::conversions::conversion_error::ConversionResult;
 pub data BaseSystemConversions {}
 
 // Radix parse carrier — Rust's Result<u64, ParseIntError> collapsed to
-// Failed|Value since the caller-visible error is one ParseError case.
-pub data RadixParse {
-    case Failed;
-    case Value(value: u64);
+// a [copy] record since the caller-visible error is one ParseError case:
+// `ok` replaces the union tag (Failed == ok:false, value:0). A union-typed
+// local bound from a call cannot serve as a transition scrutinee — its
+// affine drop on the conditional edges is unaccounted — so the carrier
+// stays scalar-shaped and callers transition on `parsed.ok`.
+pub data RadixParse [copy] {
+    ok: bool;
+    value: u64;
 }
 
-pub data DigitParse {
-    case Invalid;
-    case Digit(digit: u64);
+pub data DigitParse [copy] {
+    ok: bool;
+    digit: u64;
 }
 
 // Rust's char::to_digit(36): '0'-'9', 'a'-'z', 'A'-'Z'.
 machine digit_value(byte: u8) -> DigitParse {
     transition byte >= 48 && byte <= 57 {
-        true -> (DigitParse::Digit { digit: ((byte as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64 })
+        true -> (DigitParse { ok: true, digit: ((byte as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64 })
         false -> letter_lower(byte)
     }
     state letter_lower(byte: u8) -> DigitParse {
         transition byte >= 97 && byte <= 122 {
-            true -> (DigitParse::Digit { digit: ((byte as u64 in Wrapping) - (87 as u64 in Wrapping)) as u64 })
+            true -> (DigitParse { ok: true, digit: ((byte as u64 in Wrapping) - (87 as u64 in Wrapping)) as u64 })
             false -> letter_upper(byte)
         }
     }
     state letter_upper(byte: u8) -> DigitParse {
         transition byte >= 65 && byte <= 90 {
-            true -> (DigitParse::Digit { digit: ((byte as u64 in Wrapping) - (55 as u64 in Wrapping)) as u64 })
-            false -> (DigitParse::Invalid)
+            true -> (DigitParse { ok: true, digit: ((byte as u64 in Wrapping) - (55 as u64 in Wrapping)) as u64 })
+            false -> (DigitParse { ok: false, digit: 0 })
         }
     }
 }
@@ -95,7 +99,7 @@ pub machine BaseSystemConversions::parse_radix_window(
 ) -> RadixParse {
     transition base >= 2 && base <= 36 {
         true -> sign(text, start, end, base)
-        false -> (RadixParse::Failed)
+        false -> (RadixParse { ok: false, value: 0 })
     }
     state sign(text: &[u8], start: u64, end: u64, base: u64) -> RadixParse {
         transition start < end {
@@ -137,9 +141,9 @@ pub machine BaseSystemConversions::parse_radix_window(
         saw_digit: bool
     ) -> RadixParse {
         let digit_parse: DigitParse = digit_value(text[position]);
-        transition digit_parse {
-            DigitParse::Digit { digit } -> accumulate(text, position, end, base, value, digit)
-            DigitParse::Invalid -> (RadixParse::Failed)
+        transition digit_parse.ok {
+            true -> accumulate(text, position, end, base, value, digit_parse.digit)
+            _ -> (RadixParse { ok: false, value: 0 })
         }
     }
     state accumulate(
@@ -157,13 +161,13 @@ pub machine BaseSystemConversions::parse_radix_window(
         let next_value: u64 = ((((value as u64 in Wrapping) * (base as u64 in Wrapping)) as u64 in Wrapping) + (digit_value as u64 in Wrapping)) as u64;
         transition value <= limit {
             true -> digits(text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, base, next_value, true)
-            false -> (RadixParse::Failed)
+            false -> (RadixParse { ok: false, value: 0 })
         }
     }
     state finish(value: u64, saw_digit: bool) -> RadixParse {
         transition saw_digit {
-            true -> (RadixParse::Value { value: value })
-            false -> (RadixParse::Failed)
+            true -> (RadixParse { ok: true, value: value })
+            false -> (RadixParse { ok: false, value: 0 })
         }
     }
 }
@@ -359,9 +363,9 @@ pub machine BaseSystemConversions::convert_to_base(
     }
     state parse(text: &[u8], start: u64, end: u64, from_base: u64, to_base: u64, out: &mut [u8]) -> ConversionResult {
         let parsed: RadixParse = BaseSystemConversions::parse_radix_window(text, start, end, from_base);
-        transition parsed {
-            RadixParse::Value { value } -> emit(value, to_base, out)
-            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        transition parsed.ok {
+            true -> emit(parsed.value, to_base, out)
+            _ -> (ConversionResult::Error { error: ConversionError::ParseError })
         }
     }
     state emit(value: u64, to_base: u64, out: &mut [u8]) -> ConversionResult {
@@ -392,9 +396,9 @@ pub machine BaseSystemConversions::convert_to_address(
     }
     state parse(text: &[u8], start: u64, end: u64, from_base: u64, out: &mut [u8]) -> ConversionResult {
         let parsed: RadixParse = BaseSystemConversions::parse_radix_window(text, start, end, from_base);
-        transition parsed {
-            RadixParse::Value { value } -> width(value, out)
-            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        transition parsed.ok {
+            true -> width(parsed.value, out)
+            _ -> (ConversionResult::Error { error: ConversionError::ParseError })
         }
     }
     state width(value: u64, out: &mut [u8]) -> ConversionResult {
@@ -437,9 +441,9 @@ pub machine BaseSystemConversions::convert_to_bytes(
     }
     state parse(cleaned: &[u8], cleaned_len: u64, from_base: u64, out: &mut [u8]) -> ConversionResult {
         let parsed: RadixParse = BaseSystemConversions::parse_radix_window(cleaned, 0, cleaned_len, from_base);
-        transition parsed {
-            RadixParse::Value { value } -> measure(value, 0, out)
-            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        transition parsed.ok {
+            true -> measure(parsed.value, 0, out)
+            _ -> (ConversionResult::Error { error: ConversionError::ParseError })
         }
     }
     // First nonzero byte position scanning most-significant byte first.
@@ -528,9 +532,9 @@ pub machine BaseSystemConversions::convert_to_primitive_aligned_bytes(
         out: &mut [u8]
     ) -> ConversionResult {
         let parsed: RadixParse = BaseSystemConversions::parse_radix_window(cleaned, 0, cleaned_len, from_base);
-        transition parsed {
-            RadixParse::Value { value } -> bound(value, is_big_endian, primitive_size, max_value, out)
-            RadixParse::Failed -> (ConversionResult::Error { error: ConversionError::ParseError })
+        transition parsed.ok {
+            true -> bound(parsed.value, is_big_endian, primitive_size, max_value, out)
+            _ -> (ConversionResult::Error { error: ConversionError::ParseError })
         }
     }
     state bound(

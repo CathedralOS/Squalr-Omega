@@ -36,6 +36,22 @@ pub data DeanonymizeResult {
     case Bytes(count: u64);
 }
 
+// A union-typed local cannot serve as a transition scrutinee, so callers
+// hoist these predicates before dispatching on the outcome.
+pub machine DeanonymizeResult::is_bytes(&self) -> bool {
+    transition self {
+        DeanonymizeResult::Bytes { count } -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine DeanonymizeResult::byte_count(&self) -> u64 {
+    transition self {
+        DeanonymizeResult::Bytes { count } -> (count)
+        _ -> (0)
+    }
+}
+
 // Upstream's Result<AnonymousValueString, DataTypeError>.
 pub data AnonymizeResult {
     case Error(error: DataTypeError);
@@ -127,10 +143,31 @@ pub machine PrimitiveDataTypeNumeric::deanonymize(
         let value_len: u64 = anonymous_value_string.copy_anonymous_value_string(&mut value_text);
         let container: ContainerType = anonymous_value_string.get_container_type();
         let format: AnonymousValueStringFormat = anonymous_value_string.get_anonymous_value_string_format();
-        transition container {
-            ContainerType::Array -> find_part(&value_text, 0, value_len, format, is_big_endian, element_size, is_signed, out, 0, 0)
-            ContainerType::ArrayFixed { length } -> count_fixed(&value_text, 0, value_len, length, format, is_big_endian, element_size, is_signed, out)
-            _ -> single(&value_text, value_len, format, is_big_endian, element_size, is_signed, out)
+        // A union-typed local cannot be a transition scrutinee — the kind
+        // predicates hoist the dispatch onto copy bools.
+        let is_array: bool = container.is_array();
+        transition is_array {
+            true -> find_part(&value_text, 0, value_len, format, is_big_endian, element_size, is_signed, out, 0, 0)
+            false -> not_array(container, &value_text, value_len, format, is_big_endian, element_size, is_signed, out)
+            _ -> not_array(container, &value_text, value_len, format, is_big_endian, element_size, is_signed, out)
+        }
+    }
+    state not_array(
+        container: ContainerType,
+        text: &[u8],
+        value_len: u64,
+        format: AnonymousValueStringFormat,
+        is_big_endian: bool,
+        element_size: u64,
+        is_signed: bool,
+        out: &mut [u8]
+    ) -> DeanonymizeResult {
+        let is_fixed: bool = container.is_array_fixed();
+        let fixed_length: u64 = container.array_fixed_length();
+        transition is_fixed {
+            true -> count_fixed(text, 0, value_len, fixed_length, format, is_big_endian, element_size, is_signed, out)
+            false -> single(text, value_len, format, is_big_endian, element_size, is_signed, out)
+            _ -> single(text, value_len, format, is_big_endian, element_size, is_signed, out)
         }
     }
     state single(
@@ -370,9 +407,12 @@ pub machine PrimitiveDataTypeNumeric::deanonymize(
         written: u64
     ) -> DeanonymizeResult {
         let parsed: DeanonymizeResult = deanonymize_single(text, part_start, part_end, format, is_big_endian, element_size, is_signed, out, written);
-        transition parsed {
-            DeanonymizeResult::Bytes { count } -> parse_parts(text, part_end, end, format, is_big_endian, element_size, is_signed, out, ((written as u64 in Wrapping) + (count as u64 in Wrapping)) as u64)
-            DeanonymizeResult::Error { error } -> (DeanonymizeResult::Error { error: error })
+        let is_bytes: bool = parsed.is_bytes();
+        let written_next: u64 = ((written as u64 in Wrapping) + (parsed.byte_count() as u64 in Wrapping)) as u64;
+        transition is_bytes {
+            true -> parse_parts(text, part_end, end, format, is_big_endian, element_size, is_signed, out, written_next)
+            false -> (parsed)
+            _ -> (parsed)
         }
     }
     // ArrayFixed entry: count parts first, gated on the expected length.
@@ -449,9 +489,12 @@ machine deanonymize_single(
             maximum,
             &mut primitive_bytes
         );
-        transition converted {
-            ConversionResult::Ok { count } -> check_width(count, primitive_bytes, element_size, out, out_position)
-            ConversionResult::Error { error } -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        let converted_ok: bool = converted.is_ok();
+        let converted_count: u64 = converted.ok_count();
+        transition converted_ok {
+            true -> check_width(converted_count, primitive_bytes, element_size, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+            _ -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
         }
     }
     state via_hexadecimal(
@@ -475,9 +518,12 @@ machine deanonymize_single(
             maximum,
             &mut primitive_bytes
         );
-        transition converted {
-            ConversionResult::Ok { count } -> check_width(count, primitive_bytes, element_size, out, out_position)
-            ConversionResult::Error { error } -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+        let converted_ok: bool = converted.is_ok();
+        let converted_count: u64 = converted.ok_count();
+        transition converted_ok {
+            true -> check_width(converted_count, primitive_bytes, element_size, out, out_position)
+            false -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
+            _ -> (DeanonymizeResult::Error { error: DataTypeError::ParseError })
         }
     }
     // Upstream asserts value_bytes.len >= primitive_size after the aligned

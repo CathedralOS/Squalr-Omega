@@ -25,10 +25,11 @@ pub data ContainerTypeParse [copy] {
 }
 
 // Module-private carrier for u64::from_str results — Optional is unmatchable
-// inside the package too.
+// inside the package too. A [copy] record carrier — a union-typed local
+// cannot serve as a transition scrutinee on this toolchain level.
 data U64Parse [copy] {
-    case Refused;
-    case Parsed(value: u64);
+    ok: bool;
+    value: u64;
 }
 
 // Upstream `Default`.
@@ -51,6 +52,29 @@ pub machine ContainerType::get_pointer_size(&self) -> Optional<PointerScanPointe
         ContainerType::None -> (Optional::None)
         ContainerType::Array -> (Optional::None)
         ContainerType::ArrayFixed { length } -> (Optional::None)
+    }
+}
+
+// Kind accessors — a union-typed local bound from a call cannot serve as a
+// transition scrutinee, so callers hoist these predicates instead.
+pub machine ContainerType::is_array(&self) -> bool {
+    transition self {
+        ContainerType::Array -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine ContainerType::is_array_fixed(&self) -> bool {
+    transition self {
+        ContainerType::ArrayFixed { length } -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine ContainerType::array_fixed_length(&self) -> u64 {
+    transition self {
+        ContainerType::ArrayFixed { length } -> (length)
+        _ -> (0)
     }
 }
 
@@ -154,7 +178,7 @@ machine mul10_add(value: u64 in Saturating, digit: u64 in Saturating) -> u64 {
 machine parse_u64_window(text: &[u8], start: u64, end: u64) -> U64Parse {
     transition start < end && start < text.len {
         true -> head(text, start, end, text[start])
-        false -> (U64Parse::Refused)
+        false -> (U64Parse { ok: false, value: 0 })
     }
     state head(text: &[u8], start: u64, end: u64, byte: u8) -> U64Parse {
         transition byte == 43 {
@@ -167,7 +191,7 @@ machine parse_u64_window(text: &[u8], start: u64, end: u64) -> U64Parse {
     state plus(text: &[u8], cursor: u64, end: u64) -> U64Parse {
         transition cursor < end {
             true -> digits(text, cursor, end, 0)
-            false -> (U64Parse::Refused)
+            false -> (U64Parse { ok: false, value: 0 })
         }
     }
     state digits(text: &[u8], at: u64, end: u64, value: u64) -> U64Parse {
@@ -179,7 +203,7 @@ machine parse_u64_window(text: &[u8], start: u64, end: u64) -> U64Parse {
     state digit(text: &[u8], at: u64, end: u64, value: u64, byte: u8) -> U64Parse {
         transition byte >= 48 && byte <= 57 {
             true -> accumulate(text, at, end, value, (byte - 48) as u64)
-            false -> (U64Parse::Refused)
+            false -> (U64Parse { ok: false, value: 0 })
         }
     }
     // checked_mul(10) then checked_add(digit): u64::MAX is
@@ -187,14 +211,14 @@ machine parse_u64_window(text: &[u8], start: u64, end: u64) -> U64Parse {
     // value <= 1844674407370955161, with digit <= 5 on the boundary.
     state accumulate(text: &[u8], at: u64, end: u64, value: u64, digit: u64) -> U64Parse {
         transition value > 1844674407370955161 || (value == 1844674407370955161 && digit > 5) {
-            true -> (U64Parse::Refused)
+            true -> (U64Parse { ok: false, value: 0 })
             false -> digits(text, at + 1, end, mul10_add(value as u64 in Saturating, digit as u64 in Saturating))
         }
     }
     state finish(at: u64, end: u64, value: u64) -> U64Parse {
         transition at == end {
-            true -> (U64Parse::Parsed { value: value })
-            false -> (U64Parse::Refused)
+            true -> (U64Parse { ok: true, value: value })
+            false -> (U64Parse { ok: false, value: 0 })
         }
     }
 }
@@ -307,9 +331,10 @@ pub machine ContainerType::from_str_window(
     state pointer_size(text: &[u8], inner: u64, close: u64, end: u64) -> ContainerTypeParse {
         let size: PointerScanPointerSizeParse =
             PointerScanPointerSize::from_str_window(text, inner, close);
-        transition size {
-            PointerScanPointerSizeParse::Parsed { value } -> after_pointer(text, close, end, value)
-            PointerScanPointerSizeParse::Refused -> (ContainerTypeParse::Refused)
+        transition size.ok {
+            true -> after_pointer(text, close, end, size.value)
+            false -> (ContainerTypeParse::Refused)
+            _ -> (ContainerTypeParse::Refused)
         }
     }
     // Any bytes after ')' decide array-ness, exactly as upstream's suffix
@@ -386,10 +411,11 @@ pub machine ContainerType::from_str_window(
     state pointer_window(text: &[u8], start: u64, last: u64,
                          pointer_size: PointerScanPointerSize) -> ContainerTypeParse {
         let count: U64Parse = parse_u64_window(text, start + 1, last);
-        transition count {
-            U64Parse::Parsed { value } -> (ContainerTypeParse::Parsed {
-                value: ContainerType::PointerArrayFixed { pointer_size: pointer_size, length: value } })
-            U64Parse::Refused -> (ContainerTypeParse::Refused)
+        transition count.ok {
+            true -> (ContainerTypeParse::Parsed {
+                value: ContainerType::PointerArrayFixed { pointer_size: pointer_size, length: count.value } })
+            false -> (ContainerTypeParse::Refused)
+            _ -> (ContainerTypeParse::Refused)
         }
     }
     // '[...]' without a pointer: '[]' -> Array, '[n]' -> ArrayFixed.
@@ -431,10 +457,11 @@ pub machine ContainerType::from_str_window(
     }
     state array_window(text: &[u8], start: u64, last: u64) -> ContainerTypeParse {
         let count: U64Parse = parse_u64_window(text, start + 1, last);
-        transition count {
-            U64Parse::Parsed { value } -> (ContainerTypeParse::Parsed {
-                value: ContainerType::ArrayFixed { length: value } })
-            U64Parse::Refused -> (ContainerTypeParse::Refused)
+        transition count.ok {
+            true -> (ContainerTypeParse::Parsed {
+                value: ContainerType::ArrayFixed { length: count.value } })
+            false -> (ContainerTypeParse::Refused)
+            _ -> (ContainerTypeParse::Refused)
         }
     }
 }
