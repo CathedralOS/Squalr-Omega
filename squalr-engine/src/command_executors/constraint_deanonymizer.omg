@@ -3,6 +3,7 @@ module src::command_executors::constraint_deanonymizer;
 use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ScanConstraintSet;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::data_types::floating_point_tolerance::FloatingPointTolerance;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
 use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
 use squalr_engine_api::src::structures::scanning::comparisons::scan_function_scalar::ScanFunctionScalar;
@@ -37,8 +38,10 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
     // Upstream builds one `ScanConstraintBuilder` per executor call (holding
     // symbol registry + floating point tolerance); the port's builder keeps
     // the tolerance only — type facts ride on DataTypeRef.
+    let floating_point_tolerance: FloatingPointTolerance =
+        FloatingPointTolerance::default();
     let builder: ScanConstraintBuilder =
-        ScanConstraintBuilder::new(FloatingPointTolerance::default());
+        ScanConstraintBuilder::new(floating_point_tolerance);
     let mut plan_list: TypePlanList = TypePlanList::empty();
     transition { _ -> each(&mut plan_list, &builder, scan_constraints, data_type_ref, memory_alignment, 0) }
 
@@ -101,20 +104,27 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
             operand_value,
             unit_size_in_bytes,
             unit_size_in_bytes);
+        let scalar_function: ScanFunctionScalar =
+            ScanConstraintFinalized::build_scan_function_scalar(scan_compare_type);
         let mut plan: SnapshotFilterElementScanPlan = SnapshotFilterElementScanPlan::new(
             scan_compare_type,
             operand_value,
             unit_size_in_bytes,
             true,
-            ScanConstraintFinalized::build_scan_function_scalar(scan_compare_type),
+            scalar_function,
             memory_alignment);
+        let built_is_floating_point: bool = data_type_ref.is_floating_point();
+        let built_prefers_type_scanner: bool = data_type_ref.prefers_type_scanner();
+        let built_has_mask: bool = built.has_mask();
+        let built_mask_value: u64 = built.get_mask_value();
+        let built_result_container_type: ContainerType = built.get_result_container_type();
         plan.set_scan_profile(
             periodicity,
-            data_type_ref.is_floating_point(),
-            data_type_ref.prefers_type_scanner(),
-            built.has_mask(),
-            built.get_mask_value(),
-            built.get_result_container_type());
+            built_is_floating_point,
+            built_prefers_type_scanner,
+            built_has_mask,
+            built_mask_value,
+            built_result_container_type);
         // The scalar leg's plan-type rule: a present current window makes
         // the filter scannable scalar-iteratively (upstream's byte-array and
         // vector specializations land with their own legs; scalar covers the
@@ -172,8 +182,9 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
         unit_size_in_bytes: u64
     ) {
         let pattern_bytes: &[u8] = pattern.get_pattern_bytes();
+        let pattern_len: u64 = pattern.get_pattern_len();
         let operand_value: u64 =
-            pack_bytes_le_u64(pattern_bytes, pattern.get_pattern_len());
+            pack_bytes_le_u64(pattern_bytes, pattern_len);
         transition pattern.has_mask() {
             true -> pattern_mask_pack(
                 plan_list, builder, scan_constraints, pattern,
@@ -203,8 +214,9 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
         operand_value: u64
     ) {
         let mask_bytes: &[u8] = pattern.get_mask_bytes();
+        let mask_len: u64 = pattern.get_mask_len();
         let mask_value: u64 =
-            pack_bytes_le_u64(mask_bytes, pattern.get_mask_len());
+            pack_bytes_le_u64(mask_bytes, mask_len);
         transition { _ -> pattern_fill(
             plan_list, builder, scan_constraints, pattern,
             data_type_ref, memory_alignment, position,
@@ -233,14 +245,19 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
             memory_alignment);
         // Byte-array scans carry no scalar compare function — the flag marks
         // the pattern carrier so scanners read the byte span instead.
+        let pattern_periodicity: u64 = ScanConstraintFinalized::calculate_periodicity(
+            scan_compare_type, operand_value, unit_size_in_bytes, unit_size_in_bytes);
+        let is_floating_point: bool = data_type_ref.is_floating_point();
+        let prefers_type_scanner: bool = data_type_ref.prefers_type_scanner();
+        let pattern_has_mask: bool = pattern.has_mask();
+        let pattern_result_container_type: ContainerType = pattern.get_result_container_type();
         plan.set_scan_profile(
-            ScanConstraintFinalized::calculate_periodicity(
-                scan_compare_type, operand_value, unit_size_in_bytes, unit_size_in_bytes),
-            data_type_ref.is_floating_point(),
-            data_type_ref.prefers_type_scanner(),
-            pattern.has_mask(),
+            pattern_periodicity,
+            is_floating_point,
+            prefers_type_scanner,
+            pattern_has_mask,
             mask_value,
-            pattern.get_result_container_type());
+            pattern_result_container_type);
         let pattern_bytes: &[u8] = pattern.get_pattern_bytes();
         let mask_bytes: &[u8] = pattern.get_mask_bytes();
         let wrote_pattern: bool =
@@ -267,7 +284,10 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
         position: u64
     ) {
         let mut stored: SnapshotFilterElementScanPlan = plan;
-        stored.set_planned_scan_type(planned_byte_array_scan_type(pattern.has_mask()));
+        let pattern_has_mask: bool = pattern.has_mask();
+        let planned_scan_type: PlannedScanType =
+            planned_byte_array_scan_type(pattern_has_mask);
+        stored.set_planned_scan_type(planned_scan_type);
         let pushed: bool = plan_list.push(&stored);
         transition { _ -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position) }
     }
