@@ -5,12 +5,14 @@ use squalr_engine_api::src::commands::memory::read::memory_read_response::Memory
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::data_values::data_value::DataValue;
 use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
 use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
 use squalr_engine_api::src::structures::structs::valued_struct::ValuedStruct;
 use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructField;
 use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructFieldData;
 use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
 use squalr_engine_session::src::os::supplied_memory_source::ReadWindowResult;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
 
 // Port of command_executors/memory/read/memory_read_request_executor.rs:
 // with an opened process, build the symbolic struct's default valued
@@ -56,8 +58,9 @@ crashes Abort
     state no_process(
         memory_read_request: &MemoryReadRequest
     ) -> MemoryReadResponse {
-        MemoryReadResponse::new(
-            ValuedStruct::default(), memory_read_request.get_address(), false)
+        let empty_valued: ValuedStruct = ValuedStruct::default();
+        let address: u64 = memory_read_request.get_address();
+        MemoryReadResponse::new(empty_valued, address, false)
     }
 
     // Module resolution: `resolve_module_address` — a named module resolves
@@ -70,11 +73,12 @@ crashes Abort
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64
     ) -> MemoryReadResponse {
+        let address: u64 = memory_read_request.get_address();
         transition memory_read_request.get_module_name().len == 0 {
             true -> begin_read(
                 engine_privileged_state,
                 memory_read_request,
-                memory_read_request.get_address())
+                address)
             false -> find_module(
                 engine_privileged_state,
                 memory_read_request,
@@ -84,7 +88,7 @@ crashes Abort
             _ -> begin_read(
                 engine_privileged_state,
                 memory_read_request,
-                memory_read_request.get_address())
+                address)
         }
     }
     state find_module(
@@ -93,7 +97,9 @@ crashes Abort
         supplied_modules: &[NormalizedModule; 8],
         module_count: u64,
         module_index: u64
-    ) -> MemoryReadResponse {
+    ) -> MemoryReadResponse
+    requires 0 <= module_index && module_index <= 8;
+    {
         transition module_index < module_count && module_index < 8 {
             true -> compare_name(
                 engine_privileged_state,
@@ -111,10 +117,9 @@ crashes Abort
     ) -> MemoryReadResponse {
         let definition: &SymbolicStructDefinition =
             memory_read_request.get_symbolic_struct_definition();
-        MemoryReadResponse::new(
-            definition.get_default_valued_struct(),
-            memory_read_request.get_address(),
-            false)
+        let default_valued: ValuedStruct = definition.get_default_valued_struct();
+        let address: u64 = memory_read_request.get_address();
+        MemoryReadResponse::new(default_valued, address, false)
     }
     state compare_name(
         engine_privileged_state: &mut EnginePrivilegedState,
@@ -193,7 +198,7 @@ crashes Abort
     {
         let target_name: &[u8] = memory_read_request.get_module_name();
         let module_name: &[u8] = supplied_modules[module_index].get_module_name();
-        transition module_name[name_position] == target_name[name_position] {
+        transition name_position < module_name.len && name_position < target_name.len && module_name[name_position] == target_name[name_position] {
             true -> compare_byte(
                 engine_privileged_state,
                 memory_read_request,
@@ -224,8 +229,8 @@ crashes Abort
     requires 0 <= module_index && module_index < 8;
     {
         let absolute: u64 = ((supplied_modules[module_index].get_base_address()
-            as u64 in Saturating)
-            + (memory_read_request.get_address() as u64 in Saturating)) as u64;
+            as u64 in Wrapping)
+            + (memory_read_request.get_address() as u64 in Wrapping)) as u64;
         transition { _ -> begin_read(
             engine_privileged_state,
             memory_read_request,
@@ -242,12 +247,14 @@ crashes Abort
     ) -> MemoryReadResponse {
         let definition: &SymbolicStructDefinition =
             memory_read_request.get_symbolic_struct_definition();
+        let field_count: u64 = definition.get_field_count();
         let mut valued: ValuedStruct = definition.get_default_valued_struct();
         transition { _ -> read_fields(
             engine_privileged_state,
             memory_read_request,
-            &mut valued,
+            valued,
             base_address,
+            field_count,
             0,
             true) }
     }
@@ -256,17 +263,19 @@ crashes Abort
         memory_read_request: &MemoryReadRequest,
         valued: &mut ValuedStruct,
         base_address: u64,
+        field_count: u64,
         field_index: u64,
         all_succeeded: bool
-    ) -> MemoryReadResponse {
-        let definition: &SymbolicStructDefinition =
-            memory_read_request.get_symbolic_struct_definition();
-        transition field_index < definition.get_field_count() {
+    ) -> MemoryReadResponse
+    requires 0 <= field_index && field_index <= field_count;
+    {
+        transition field_index < field_count {
             true -> read_field(
                 engine_privileged_state,
                 memory_read_request,
                 valued,
                 base_address,
+                field_count,
                 field_index,
                 all_succeeded)
             false -> answer(memory_read_request, valued, all_succeeded)
@@ -278,31 +287,37 @@ crashes Abort
         memory_read_request: &MemoryReadRequest,
         valued: &mut ValuedStruct,
         base_address: u64,
+        field_count: u64,
         field_index: u64,
         all_succeeded: bool
-    ) -> MemoryReadResponse {
+    ) -> MemoryReadResponse
+    requires 0 <= field_index && field_index < field_count;
+    {
         let definition: &SymbolicStructDefinition =
             memory_read_request.get_symbolic_struct_definition();
         let field_offset: u64 = definition.get_field_offset(field_index);
-        let field_address: u64 = ((base_address as u64 in Saturating)
-            + (field_offset as u64 in Saturating)) as u64;
-        let read_result: ReadWindowResult = engine_privileged_state
-            .get_supplied_memory_source()
-            .try_read_window(field_address, 8);
+        let field_address: u64 = ((base_address as u64 in Wrapping)
+            + (field_offset as u64 in Wrapping)) as u64;
+        let source: &SuppliedMemorySource =
+            engine_privileged_state.get_supplied_memory_source();
+        let read_result: ReadWindowResult = source.try_read_window(field_address, 8);
+        let element: u64 = read_result.window.get_element(0);
         transition read_result.succeeded {
             true -> store_field(
                 engine_privileged_state,
                 memory_read_request,
                 valued,
                 base_address,
+                field_count,
                 field_index,
                 all_succeeded,
-                read_result.window.get_element(0))
+                element)
             false -> read_fields(
                 engine_privileged_state,
                 memory_read_request,
                 valued,
                 base_address,
+                field_count,
                 field_index + 1,
                 false)
             _ -> read_fields(
@@ -310,6 +325,7 @@ crashes Abort
                 memory_read_request,
                 valued,
                 base_address,
+                field_count,
                 field_index + 1,
                 false)
         }
@@ -319,15 +335,19 @@ crashes Abort
         memory_read_request: &MemoryReadRequest,
         valued: &mut ValuedStruct,
         base_address: u64,
+        field_count: u64,
         field_index: u64,
         all_succeeded: bool,
         element: u64
-    ) -> MemoryReadResponse {
+    ) -> MemoryReadResponse
+    requires 0 <= field_index && field_index < field_count;
+    {
         let definition: &SymbolicStructDefinition =
             memory_read_request.get_symbolic_struct_definition();
         let mut field: ValuedStructField = valued.get_field_at(field_index);
-        let data_type_ref: DataTypeRef =
-            definition.get_field(field_index).get_data_type_ref();
+        let field_definition: &SymbolicFieldDefinition =
+            definition.get_field(field_index);
+        let data_type_ref: DataTypeRef = field_definition.get_data_type_ref();
         let value_bytes: [u8; 8] = element_to_bytes(element);
         let value: DataValue = DataValue::new(&data_type_ref, &value_bytes[0..8]);
         field.set_field_data(&ValuedStructFieldData::Value { value: value });
@@ -337,6 +357,7 @@ crashes Abort
             memory_read_request,
             valued,
             base_address,
+            field_count,
             field_index + 1,
             all_succeeded) }
     }
@@ -345,10 +366,9 @@ crashes Abort
         valued: &mut ValuedStruct,
         all_succeeded: bool
     ) -> MemoryReadResponse {
-        MemoryReadResponse::new(
-            ValuedStruct::clone(valued),
-            memory_read_request.get_address(),
-            all_succeeded)
+        let answered_valued: ValuedStruct = ValuedStruct::clone(valued);
+        let address: u64 = memory_read_request.get_address();
+        MemoryReadResponse::new(answered_valued, address, all_succeeded)
     }
 }
 
@@ -370,7 +390,7 @@ machine element_to_bytes(element: u64) -> [u8; 8] {
         let quotient: u64 = ((acc as u64 in Trapping) / (256 as u64 in Trapping)) as u64;
         let byte: u64 = ((acc as u64 in Wrapping)
             - ((quotient as u64 in Wrapping) * (256 as u64 in Wrapping))) as u64;
-        bytes[position] = byte as u8;
+        bytes[position] = ((byte as u8 in Wrapping) as u8);
         transition { _ -> each(bytes, quotient, position + 1) }
     }
     state done(bytes: &mut [u8; 8]) -> [u8; 8] {
