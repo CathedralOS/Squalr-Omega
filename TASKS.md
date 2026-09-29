@@ -51,3 +51,15 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   `canonicalize` (path/slice carriers) and non-linux targets resolve to zero
   provider rows at terminal-authority review — residual evidence and resume
   steps live in `tools/native_probe_resume.md`.
+- **TRACKABLE-TASKS-EXECUTOR.** (new-scope) The trackable_tasks command surface
+  (list/cancel request/response pairs and the genuinely-empty responses) is
+  ported. The manager + dispatcher + executor half is blocked on two unresolved
+  port choices: (a) storing `TrackableTask<'a>` inside `EnginePrivilegedState`
+  forces an `'a` on the state — a ~304-site respell across session/engine/tests;
+  the alternative is storing an owned handle form instead of a borrowing task.
+  (b) no `WaitWake` boundary-trait implementation exists in the omega library or
+  the port, so nothing can mint `TrackableTask::create`'s substrate — decide
+  whether the substrate comes from a per-target provider implementation or from
+  an app-owned polling model. Land the PrivilegedCommand/Response arms,
+  dispatcher arm and executors together once both are decided; unreachable arms
+  or fake-success bodies are not acceptable substitutes.
