@@ -1,0 +1,164 @@
+module src::command_executors::scan_supplied_bytes_request_executor;
+
+use squalr_engine_api::src::commands::scan::supplied_bytes::scan_supplied_bytes_request::ScanSuppliedBytesRequest;
+use squalr_engine_api::src::commands::scan::supplied_bytes::scan_supplied_bytes_response::ScanSuppliedBytesResponse;
+use squalr_engine_api::src::structures::scan_results::scan_results_metadata::ScanResultsMetadata;
+use squalr_engine_api::src::structures::settings::scan_settings::ScanSettings;
+use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
+use squalr_engine_api::src::structures::scanning::memory_read_mode::MemoryReadMode;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
+use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
+use squalr_engine_scanning::src::scanners::scan_control::ScanControl;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
+use src::command_executors::constraint_deanonymizer::ConstraintDeanonymizer;
+use src::command_executors::element_scanner::ElementScannerDriver;
+use src::command_executors::scan_results_metadata_collector::ScanResultsMetadataCollector;
+use src::command_executors::snapshot_region_builder::SnapshotRegionBuilder;
+use src::command_executors::snapshot_value_collector::SnapshotValueCollector;
+
+// Executor for `ScanCommand::SuppliedBytes` — a port-local command (upstream
+// has none; its byte-source scans flow through ElementScan over a live
+// target). The request's byte payload stands in for the opened process's
+// memory: it seeds the supplied-memory source at a fixed page-aligned base
+// (4096 — the fixture base the engine's test seam already uses), the fresh
+// snapshot is built from the supplied page bounds, then the same
+// deanonymize → collect → scan → metadata pipeline as `ElementScanRequest`
+// runs unmodified. Response shape mirrors `ElementScanResponse`.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ScanSuppliedBytesRequestExecutor {}
+
+pub machine ScanSuppliedBytesRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    request: &ScanSuppliedBytesRequest
+) -> ScanSuppliedBytesResponse
+crashes Abort
+{
+    transition { _ -> seed(engine_privileged_state, request) }
+
+    // Install the request's byte payload as the supplied memory source and
+    // mark the captured target opened — every downstream executor reads the
+    // supplied source as the live target's memory.
+    state seed(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ScanSuppliedBytesRequest
+    ) -> ScanSuppliedBytesResponse {
+        let bytes: &[u8] = request.get_supplied_bytes();
+        let source: SuppliedMemorySource = SuppliedMemorySource::of_bytes(4096, bytes);
+        engine_privileged_state.set_supplied_memory_source(source);
+        engine_privileged_state.set_opened_process_fixture(0);
+        engine_privileged_state.clear_freeze_list();
+        transition { _ -> bounds(engine_privileged_state, request) }
+    }
+
+    // Upstream scan-new walk: supplied page bounds → merged snapshot regions
+    // → installed snapshot.
+    state bounds(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ScanSuppliedBytesRequest
+    ) -> ScanSuppliedBytesResponse {
+        let mut builder: SnapshotRegionBuilder = SnapshotRegionBuilder::new();
+        let mut snapshot: Snapshot = Snapshot::new();
+        SnapshotRegionBuilder::fill_from_supplied_source(
+            &mut builder,
+            engine_privileged_state.get_supplied_memory_source());
+        SnapshotRegionBuilder::fill_snapshot(&builder, &mut snapshot);
+        engine_privileged_state.set_snapshot(snapshot);
+        transition { _ -> plan(engine_privileged_state, request) }
+    }
+
+    state plan(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ScanSuppliedBytesRequest
+    ) -> ScanSuppliedBytesResponse {
+        let settings: ScanSettings = engine_privileged_state.get_scan_settings();
+        let memory_alignment: MemoryAlignment = settings.get_memory_alignment();
+        let memory_read_mode: MemoryReadMode = settings.get_memory_read_mode();
+        let single_threaded: bool = settings.get_is_single_threaded_scan();
+        let mut plan: ElementScanPlan = ElementScanPlan::new(
+            memory_alignment,
+            memory_read_mode,
+            single_threaded);
+        transition { _ -> deanonymize(engine_privileged_state, request, plan, settings, 0) }
+    }
+
+    state deanonymize(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ScanSuppliedBytesRequest,
+        plan: ElementScanPlan,
+        settings: ScanSettings,
+        type_index: u64
+    ) -> ScanSuppliedBytesResponse {
+        transition type_index < request.get_data_type_ref_count() {
+            true -> build_type(engine_privileged_state, request, plan, settings, type_index)
+            false -> collect(engine_privileged_state, plan, settings)
+            _ -> collect(engine_privileged_state, plan, settings)
+        }
+    }
+
+    state build_type(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ScanSuppliedBytesRequest,
+        plan: ElementScanPlan,
+        settings: ScanSettings,
+        type_index: u64
+    ) -> ScanSuppliedBytesResponse {
+        let data_type_ref: DataTypeRef = request.get_data_type_ref(type_index);
+        let memory_alignment: MemoryAlignment = settings.get_memory_alignment();
+        let plan_list: TypePlanList = ConstraintDeanonymizer::build_type_plan_list(
+            &request.scan_constraints,
+            &data_type_ref,
+            memory_alignment);
+        let mut carried: ElementScanPlan = plan;
+        let pushed: bool = carried.push_type_plans(&data_type_ref, &plan_list);
+        transition { _ -> deanonymize(
+            engine_privileged_state, request, carried, settings,
+            ((type_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // Upstream reads live values unless MemoryReadMode::Skip — the supplied
+    // source answers the read for the captured byte image.
+    state collect(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        plan: ElementScanPlan,
+        settings: ScanSettings
+    ) -> ScanSuppliedBytesResponse {
+        transition plan.get_memory_read_mode() {
+            MemoryReadMode::ReadBeforeScan -> read(engine_privileged_state, plan)
+            MemoryReadMode::Skip -> scan(engine_privileged_state, plan)
+            _ -> scan(engine_privileged_state, plan)
+        }
+    }
+
+    state read(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        plan: ElementScanPlan
+    ) -> ScanSuppliedBytesResponse {
+        SnapshotValueCollector::collect_all_regions(&mut engine_privileged_state);
+        transition { _ -> scan(engine_privileged_state, plan) }
+    }
+
+    state scan(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        plan: ElementScanPlan
+    ) -> ScanSuppliedBytesResponse {
+        let mut scan_control: ScanControl = ScanControl::new(false);
+        let mut carried_plan: ElementScanPlan = plan;
+        let metadata: ScanResultsMetadata = ElementScannerDriver::scan_snapshot(
+            engine_privileged_state.borrow_snapshot_mut(), &mut carried_plan, &mut scan_control);
+        transition { _ -> finish(engine_privileged_state) }
+    }
+
+    // Same response-time metadata collection as the element-scan executor.
+    state finish(
+        engine_privileged_state: &mut EnginePrivilegedState
+    ) -> ScanSuppliedBytesResponse {
+        let collected: ScanResultsMetadata = ScanResultsMetadataCollector::collect(engine_privileged_state);
+        ScanSuppliedBytesResponse {
+            success: true,
+            scan_results_metadata: collected,
+        }
+    }
+}
