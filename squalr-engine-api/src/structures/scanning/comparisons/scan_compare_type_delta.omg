@@ -1,5 +1,12 @@
 module src::structures::scanning::comparisons::scan_compare_type_delta;
 
+use src::structures::scanning::comparisons::scan_compare_type::arithmetic_shift_right_u64;
+use src::structures::scanning::comparisons::scan_compare_type::effective_shift_u64;
+use src::structures::scanning::comparisons::scan_compare_type::element_width_mask_u64;
+use src::structures::scanning::comparisons::scan_compare_type::sign_extend_u64;
+use src::structures::scanning::comparisons::scan_compare_type::signed_divide_u64;
+use src::structures::scanning::comparisons::scan_compare_type::signed_remainder_u64;
+
 // Port of ScanCompareTypeDelta: each case checks `current == previous <op> delta`
 // under the data type's wrapping arithmetic (upstream ScalarComparisonsInteger
 // uses WrappingAdd/Sub/Mul/Div/Rem/Shl/Shr and bitwise ops). `u64 in Wrapping`
@@ -36,5 +43,239 @@ pub machine ScanCompareTypeDelta::compare(
         ScanCompareTypeDelta::LogicalAndByX -> (current_value == ((previous & delta) as u64))
         ScanCompareTypeDelta::LogicalOrByX -> (current_value == ((previous | delta) as u64))
         ScanCompareTypeDelta::LogicalXorByX -> (current_value == ((previous ^ delta) as u64))
+    }
+}
+
+// Upstream refuses the constraint at compare construction when the divisor
+// is zero (`delta_value == PrimitiveType::default()` -> `None`).
+pub machine ScanCompareTypeDelta::requires_nonzero_delta(&self) -> bool {
+    transition self {
+        ScanCompareTypeDelta::DividedByX -> (true)
+        ScanCompareTypeDelta::ModuloByX -> (true)
+        _ -> (false)
+    }
+}
+
+// The typed compare: every operand masks to element width and every result
+// wraps at element width — upstream evaluates `previous <op> delta` on
+// PrimitiveType-width words and compares it against the typed current load.
+// Add/subtract/multiply and the logical ops are bit-sign-agnostic, so a
+// masked u64 word is exactly the per-type wrap; divide/modulo keep signed
+// truncation semantics for signed types and shift-right is arithmetic for
+// signed types, plain logical for unsigned. Shift distance is `delta mod
+// (8*element_size)`, matching upstream's amount-masking `shl`/`shr`.
+pub machine ScanCompareTypeDelta::compare_typed(
+    &self,
+    current_value: u64,
+    previous_value: u64,
+    delta_value: u64,
+    is_signed: bool,
+    element_size_in_bytes: u64
+) -> bool {
+    let width_mask: u64 = element_width_mask_u64(element_size_in_bytes);
+    let current_masked: u64 = ((current_value as u64 in Wrapping)
+        & (width_mask as u64 in Wrapping)) as u64;
+    let previous_masked: u64 = ((previous_value as u64 in Wrapping)
+        & (width_mask as u64 in Wrapping)) as u64;
+    let delta_masked: u64 = ((delta_value as u64 in Wrapping)
+        & (width_mask as u64 in Wrapping)) as u64;
+    let previous_wrapped: u64 in Wrapping = previous_masked as u64 in Wrapping;
+    let delta_wrapped: u64 in Wrapping = delta_masked as u64 in Wrapping;
+    transition self {
+        ScanCompareTypeDelta::IncreasedByX -> (current_masked ==
+            (((previous_wrapped + delta_wrapped)
+                & (width_mask as u64 in Wrapping)) as u64))
+        ScanCompareTypeDelta::DecreasedByX -> (current_masked ==
+            (((previous_wrapped - delta_wrapped)
+                & (width_mask as u64 in Wrapping)) as u64))
+        ScanCompareTypeDelta::MultipliedByX -> (current_masked ==
+            (((previous_wrapped * delta_wrapped)
+                & (width_mask as u64 in Wrapping)) as u64))
+        ScanCompareTypeDelta::DividedByX -> divided(
+            current_masked, previous_masked, delta_masked,
+            is_signed, element_size_in_bytes, width_mask)
+        ScanCompareTypeDelta::ModuloByX -> modulo(
+            current_masked, previous_masked, delta_masked,
+            is_signed, element_size_in_bytes, width_mask)
+        ScanCompareTypeDelta::ShiftLeftByX -> shifted_left(
+            current_masked, previous_masked, delta_masked,
+            element_size_in_bytes, width_mask)
+        ScanCompareTypeDelta::ShiftRightByX -> shifted_right(
+            current_masked, previous_masked, delta_masked,
+            is_signed, element_size_in_bytes, width_mask)
+        ScanCompareTypeDelta::LogicalAndByX -> (current_masked ==
+            ((previous_wrapped & delta_wrapped) as u64))
+        ScanCompareTypeDelta::LogicalOrByX -> (current_masked ==
+            ((previous_wrapped | delta_wrapped) as u64))
+        ScanCompareTypeDelta::LogicalXorByX -> (current_masked ==
+            ((previous_wrapped ^ delta_wrapped) as u64))
+    }
+
+    state divided(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        is_signed: bool,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        // Zero divisor is unreachable — construction refuses it upstream
+        // and the plan drops the scalar function — the guard keeps the
+        // machine's own division honest regardless.
+        transition delta_masked == 0 {
+            true -> (current_masked == 0)
+            false -> divide_by(current_masked, previous_masked,
+                delta_masked, is_signed, element_size_in_bytes, width_mask)
+            _ -> divide_by(current_masked, previous_masked,
+                delta_masked, is_signed, element_size_in_bytes, width_mask)
+        }
+    }
+    state divide_by(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        is_signed: bool,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        transition is_signed {
+            true -> divide_signed(current_masked, previous_masked,
+                delta_masked, element_size_in_bytes, width_mask)
+            false -> (current_masked == (((previous_masked / delta_masked)
+                as u64 in Wrapping) & (width_mask as u64 in Wrapping)) as u64)
+            _ -> (current_masked == (((previous_masked / delta_masked)
+                as u64 in Wrapping) & (width_mask as u64 in Wrapping)) as u64)
+        }
+    }
+    state divide_signed(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        let extended_previous: u64 =
+            sign_extend_u64(previous_masked, element_size_in_bytes);
+        let extended_delta: u64 =
+            sign_extend_u64(delta_masked, element_size_in_bytes);
+        let quotient_extended: u64 =
+            signed_divide_u64(extended_previous, extended_delta);
+        let quotient: u64 = ((quotient_extended as u64 in Wrapping)
+            & (width_mask as u64 in Wrapping)) as u64;
+        (current_masked == quotient)
+    }
+
+    state modulo(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        is_signed: bool,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        transition delta_masked == 0 {
+            true -> (current_masked == 0)
+            false -> modulo_by(current_masked, previous_masked,
+                delta_masked, is_signed, element_size_in_bytes, width_mask)
+            _ -> modulo_by(current_masked, previous_masked,
+                delta_masked, is_signed, element_size_in_bytes, width_mask)
+        }
+    }
+    state modulo_by(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        is_signed: bool,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        transition is_signed {
+            true -> modulo_signed(current_masked, previous_masked,
+                delta_masked, element_size_in_bytes, width_mask)
+            false -> (current_masked == (((previous_masked % delta_masked)
+                as u64 in Wrapping) & (width_mask as u64 in Wrapping)) as u64)
+            _ -> (current_masked == (((previous_masked % delta_masked)
+                as u64 in Wrapping) & (width_mask as u64 in Wrapping)) as u64)
+        }
+    }
+    state modulo_signed(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        let extended_previous: u64 =
+            sign_extend_u64(previous_masked, element_size_in_bytes);
+        let extended_delta: u64 =
+            sign_extend_u64(delta_masked, element_size_in_bytes);
+        let remainder_extended: u64 =
+            signed_remainder_u64(extended_previous, extended_delta);
+        let remainder: u64 = ((remainder_extended as u64 in Wrapping)
+            & (width_mask as u64 in Wrapping)) as u64;
+        (current_masked == remainder)
+    }
+
+    state shifted_left(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        let shift: u64 =
+            effective_shift_u64(delta_masked, element_size_in_bytes);
+        let previous_wrapped: u64 in Wrapping = previous_masked as u64 in Wrapping;
+        let shift_wrapped: u64 in Wrapping = shift as u64 in Wrapping;
+        let shifted: u64 = (((previous_wrapped << shift_wrapped)
+            & (width_mask as u64 in Wrapping)) as u64);
+        (current_masked == shifted)
+    }
+
+    state shifted_right(
+        current_masked: u64,
+        previous_masked: u64,
+        delta_masked: u64,
+        is_signed: bool,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        let shift: u64 =
+            effective_shift_u64(delta_masked, element_size_in_bytes);
+        transition is_signed {
+            true -> shift_right_signed(current_masked, previous_masked,
+                shift, element_size_in_bytes, width_mask)
+            false -> shift_right_unsigned(current_masked, previous_masked,
+                shift, width_mask)
+            _ -> shift_right_unsigned(current_masked, previous_masked,
+                shift, width_mask)
+        }
+    }
+    state shift_right_unsigned(
+        current_masked: u64,
+        previous_masked: u64,
+        shift: u64,
+        width_mask: u64
+    ) -> bool {
+        let previous_wrapped: u64 in Wrapping = previous_masked as u64 in Wrapping;
+        let shift_wrapped: u64 in Wrapping = shift as u64 in Wrapping;
+        let shifted: u64 = (((previous_wrapped >> shift_wrapped)
+            & (width_mask as u64 in Wrapping)) as u64);
+        (current_masked == shifted)
+    }
+    state shift_right_signed(
+        current_masked: u64,
+        previous_masked: u64,
+        shift: u64,
+        element_size_in_bytes: u64,
+        width_mask: u64
+    ) -> bool {
+        let extended_previous: u64 =
+            sign_extend_u64(previous_masked, element_size_in_bytes);
+        let shifted_extended: u64 =
+            arithmetic_shift_right_u64(extended_previous, shift);
+        let shifted: u64 = ((shifted_extended as u64 in Wrapping)
+            & (width_mask as u64 in Wrapping)) as u64;
+        (current_masked == shifted)
     }
 }
