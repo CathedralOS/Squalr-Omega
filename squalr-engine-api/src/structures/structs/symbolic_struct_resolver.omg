@@ -1,0 +1,3387 @@
+module src::structures::structs::symbolic_struct_resolver;
+
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::memory::symbolic_pointer_chain::PointerChainSymbol;
+use src::structures::memory::symbolic_pointer_chain::SymbolicLinkOffset;
+use src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use src::structures::memory::symbolic_pointer_chain::symbolic_pointer_chain_apply_pointer_offset;
+use src::structures::structs::owned_symbolic_pointer_chain::OwnedSymbolicPointerChain;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldCountResolution;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldOffsetResolution;
+use src::structures::structs::symbolic_field_definition::SymbolicResolverRefMatch;
+use src::structures::structs::symbolic_field_definition::SymbolicUnassignedSize;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverCallbacks;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverEvaluationResult;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverLookupResult;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverSizeResult;
+use src::structures::structs::symbolic_resolver_definition::SymbolicResolverDefinition;
+use src::structures::structs::symbolic_resolver_evaluation_error::SymbolicResolverEvaluationError;
+use src::structures::structs::symbolic_resolver_i128::ResolverI128;
+use src::structures::structs::symbolic_resolver_i128::ResolverI128Math;
+use src::structures::structs::symbolic_resolver_relative_symbol_path::SymbolicResolverRelativeSymbolPath;
+use src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+
+// Port of structures/structs/symbolic_struct_resolver.rs: multi-pass
+// symbolic struct-definition resolution. Upstream threads seven closures
+// through its curry wrappers; Omega folds that surface into the
+// `SymbolicStructResolverHooks` trait below — the deepest upstream wrapper
+// is the single entry point, and callers reproduce shallower wrappers by
+// returning the documented defaults (found:false / Failed Unknown*) from
+// the hooks they don't bind — the same convention as the resolver
+// evaluation leg.
+//
+// Bounded carriers throughout: upstream's `Vec<ResolvedSymbolicField>` is
+// [ResolvedSymbolicField;64]+count (the definition's own field bound),
+// `BTreeMap<String, i128>` scalar captures are a bounded sorted map
+// (64 entries), the resolver cycle stack is [ [u8;256];32 ]+count, and
+// `Option`/`Result` surfaces ride the flag/union carriers declared here.
+// Error texts are bounded [u8;256]+len spans — over-long texts truncate
+// at the bound (informational payload only, never structural).
+
+// Upstream `Result<Option<u64>, String>` — Resolved carries the Option.
+pub data SymbolicFieldValueResolution {
+    case Resolved(found: bool, value: u64);
+    case Failed(error: [u8; 256], error_len: u64);
+}
+
+// Upstream `Result<i128, String>` — Resolved carries the {lo, hi} pair.
+pub data SymbolicResolverValueResult {
+    case Resolved(value_lo: u64, value_hi: u64);
+    case Failed(error: [u8; 256], error_len: u64);
+}
+
+// Upstream `read_scalar_field`'s `Result<Option<i128>, String>` — Read
+// carries the Option's found flag plus the i128 pair when found.
+pub data SymbolicScalarReadResult {
+    case Read(found: bool, value_lo: u64, value_hi: u64);
+    case ReadFailed(error: [u8; 256], error_len: u64);
+}
+
+// Upstream `resolve_resolver_definition`'s `Option<SymbolicResolverDefinition>`.
+pub data SymbolicResolverDefinitionMatch {
+    found: bool;
+    resolver_definition: SymbolicResolverDefinition;
+}
+
+// Upstream `resolve_struct_definition`'s `Option<SymbolicStructDefinition>`.
+pub data SymbolicStructDefinitionMatch {
+    found: bool;
+    struct_definition: SymbolicStructDefinition;
+}
+
+// Upstream `Option<Result<bool, String>>` per-field activation slot —
+// has_result is the Option, ok/value the Result.
+pub data SymbolicActivationSlot {
+    has_result: bool;
+    ok: bool;
+    value: bool;
+    error: [u8; 256];
+    error_len: u64;
+}
+
+// Upstream `Result<(&SymbolicFieldDefinition, u64), _>` — the borrow folds
+// to a field position the caller resolves back through get_field.
+pub data SymbolicFieldMatch [copy] {
+    found: bool;
+    field_position: u64;
+    field_offset: u64;
+}
+
+// Upstream `Option<u64>` projection used by the static-size helper.
+pub data SymbolicSizeResult [copy] {
+    found: bool;
+    size_in_bytes: u64;
+}
+
+// The evaluated union-variant activation list — upstream `Vec<...>`,
+// bounded to the definition's own field bound.
+pub data SymbolicFieldActivationList {
+    items: [ResolvedSymbolicFieldVariantActivation; 64];
+    count: u64;
+}
+
+// Upstream `ResolvedSymbolicFieldVariantActivation`.
+pub data ResolvedSymbolicFieldVariantActivation {
+    case Active;
+    case Inactive;
+    case Ambiguous;
+    case Unspecified;
+    case NotApplicable;
+    case Unresolved(reason: [u8; 256], reason_len: u64);
+}
+
+// Upstream `ResolvedSymbolicFieldStatus`.
+pub data ResolvedSymbolicFieldStatus {
+    case Ready;
+    case Unresolved(reason: [u8; 256], reason_len: u64);
+    case Clamped(actual_element_count: u64, displayed_element_count: u64, reason: [u8; 256], reason_len: u64);
+}
+
+// Upstream `ResolvedSymbolicField`.
+pub data ResolvedSymbolicField {
+    field_name: [u8; 256];
+    field_name_len: u64;
+    data_type_ref: DataTypeRef;
+    container_type: ContainerType;
+    has_offset_in_bytes: bool;
+    offset_in_bytes: u64;
+    has_element_count: bool;
+    element_count: u64;
+    has_displayed_element_count: bool;
+    displayed_element_count: u64;
+    has_size_in_bytes: bool;
+    size_in_bytes: u64;
+    variant_activation: ResolvedSymbolicFieldVariantActivation;
+    status: ResolvedSymbolicFieldStatus;
+}
+
+// Upstream `ResolvedSymbolicStruct` — `fields` bounds at the
+// definition's own 64-field arena.
+pub data ResolvedSymbolicStruct {
+    symbol_namespace: [u8; 256];
+    symbol_namespace_len: u64;
+    fields: [ResolvedSymbolicField; 64];
+    field_count: u64;
+}
+
+// Upstream `SymbolicStructResolverOptions`.
+pub data SymbolicStructResolverOptions {
+    max_dynamic_array_preview_elements: u64;
+    evaluate_union_variant_activations: bool;
+}
+
+// The upstream closure surface — `resolve_type_size_in_bytes`,
+// `read_scalar_field`, `resolve_resolver_definition`,
+// `resolve_struct_definition`, `resolve_global_symbol_field`, and the two
+// pointer-chain resolvers — as a single trait boundary. The upstream
+// `SymbolicPointerChain` borrow-view params carry as
+// `&OwnedSymbolicPointerChain` (the owned carrier is the only chain type
+// storable across the resolver-definition arena).
+pub trait SymbolicStructResolverHooks {
+    machine resolve_type_size_in_bytes(
+        &mut self,
+        data_type_ref: &DataTypeRef
+    ) -> SymbolicResolverSizeResult;
+
+    machine read_scalar_field(
+        &mut self,
+        field_definition: &SymbolicFieldDefinition,
+        field_offset_in_bytes: u64,
+        field_size_in_bytes: u64
+    ) -> SymbolicScalarReadResult;
+
+    machine resolve_resolver_definition(
+        &mut self,
+        resolver_id: &[u8]
+    ) -> SymbolicResolverDefinitionMatch;
+
+    machine resolve_struct_definition(
+        &mut self,
+        data_type_ref: &DataTypeRef
+    ) -> SymbolicStructDefinitionMatch;
+
+    machine resolve_global_symbol_field(
+        &mut self,
+        module_name: &[u8],
+        symbol_path: &SymbolicResolverRelativeSymbolPath
+    ) -> SymbolicResolverEvaluationResult;
+
+    machine resolve_relative_pointer_chain(
+        &mut self,
+        pointer_chain: &OwnedSymbolicPointerChain
+    ) -> SymbolicResolverEvaluationResult;
+
+    machine resolve_global_pointer_chain(
+        &mut self,
+        pointer_chain: &OwnedSymbolicPointerChain
+    ) -> SymbolicResolverEvaluationResult;
+}
+
+pub machine ResolvedSymbolicStruct::new(
+    symbol_namespace: &[u8],
+    fields: &[ResolvedSymbolicField]
+) -> ResolvedSymbolicStruct {
+    let mut resolved: ResolvedSymbolicStruct = ResolvedSymbolicStruct {
+        symbol_namespace_len: 0,
+        field_count: 0,
+    };
+    let written: u64 = copy_resolver_span(resolved.symbol_namespace, symbol_namespace);
+    resolved.symbol_namespace_len = written;
+    transition {
+        _ -> copy_fields(resolved, fields, 0)
+    }
+    state copy_fields(resolved: ResolvedSymbolicStruct, fields: &[ResolvedSymbolicField], position: u64) -> ResolvedSymbolicStruct {
+        transition position < fields.len && position < 64 {
+            true -> add_field(resolved, fields, position)
+            false -> (resolved)
+        }
+    }
+    state add_field(resolved: ResolvedSymbolicStruct, fields: &[ResolvedSymbolicField], position: u64) -> ResolvedSymbolicStruct
+        requires position < fields.len && position < 64
+    {
+        let mut out: ResolvedSymbolicStruct = resolved;
+        let added: bool = out.add_field(&fields[position]);
+        transition {
+            _ -> copy_fields(out, fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+pub machine ResolvedSymbolicStruct::add_field(&mut self, field: &ResolvedSymbolicField) -> bool {
+    transition self.field_count < 64 {
+        true -> store(field)
+        false -> refuse()
+    }
+    state store(&mut self, field: &ResolvedSymbolicField) -> bool {
+        let position: u64 = self.field_count;
+        transition position < 64 {
+            true -> commit(field, position)
+            false -> refuse()
+        }
+    }
+    state commit(&mut self, field: &ResolvedSymbolicField, position: u64) -> bool
+        requires position < 64
+    {
+        self.fields[position] = ResolvedSymbolicField::clone(field);
+        self.field_count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+    state refuse() -> bool {
+        (false)
+    }
+}
+
+pub machine ResolvedSymbolicStruct::get_symbol_namespace(&self) -> &[u8] {
+    transition self.symbol_namespace_len <= 256 {
+        true -> (&self.symbol_namespace[0..self.symbol_namespace_len])
+        false -> (&self.symbol_namespace[0..256])
+        _ -> (&self.symbol_namespace[0..256])
+    }
+}
+
+// Upstream `get_fields` — &[..] folds to count + position get.
+pub machine ResolvedSymbolicStruct::get_field_count(&self) -> u64 {
+    self.field_count
+}
+
+pub machine ResolvedSymbolicStruct::get_field(&self, position: u64) -> &ResolvedSymbolicField {
+    transition position < self.field_count && position < 64 {
+        true -> at(position)
+        false -> (self.head())
+        _ -> (self.head())
+    }
+    state at(&self, position: u64) -> &ResolvedSymbolicField
+        requires 0 <= position && position < 64
+    {
+        &self.fields[position]
+    }
+}
+
+machine ResolvedSymbolicStruct::head(&self) -> &ResolvedSymbolicField {
+    &self.fields[0]
+}
+
+pub machine ResolvedSymbolicField::new(
+    field_name: &[u8],
+    data_type_ref: DataTypeRef,
+    container_type: ContainerType,
+    offset_in_bytes: SymbolicOptionalValue,
+    element_count: SymbolicOptionalValue,
+    displayed_element_count: SymbolicOptionalValue,
+    size_in_bytes: SymbolicOptionalValue,
+    variant_activation: ResolvedSymbolicFieldVariantActivation,
+    status: ResolvedSymbolicFieldStatus
+) -> ResolvedSymbolicField {
+    let mut field: ResolvedSymbolicField = ResolvedSymbolicField {
+        field_name_len: 0,
+        data_type_ref: data_type_ref,
+        container_type: container_type,
+        has_offset_in_bytes: offset_in_bytes.found,
+        offset_in_bytes: offset_in_bytes.value,
+        has_element_count: element_count.found,
+        element_count: element_count.value,
+        has_displayed_element_count: displayed_element_count.found,
+        displayed_element_count: displayed_element_count.value,
+        has_size_in_bytes: size_in_bytes.found,
+        size_in_bytes: size_in_bytes.value,
+        variant_activation: variant_activation,
+        status: status,
+    };
+    let written: u64 = copy_resolver_span(field.field_name, field_name);
+    field.field_name_len = written;
+    field
+}
+
+// Upstream Option<u64> on the resolved-field ctor surface.
+pub data SymbolicOptionalValue [copy] {
+    found: bool;
+    value: u64;
+}
+
+pub machine ResolvedSymbolicField::get_field_name(&self) -> &[u8] {
+    transition self.field_name_len <= 256 {
+        true -> (&self.field_name[0..self.field_name_len])
+        false -> (&self.field_name[0..256])
+        _ -> (&self.field_name[0..256])
+    }
+}
+
+pub machine ResolvedSymbolicField::get_data_type_ref(&self) -> &DataTypeRef {
+    &self.data_type_ref
+}
+
+pub machine ResolvedSymbolicField::get_container_type(&self) -> ContainerType {
+    self.container_type
+}
+
+pub machine ResolvedSymbolicField::get_offset_in_bytes(&self) -> SymbolicOptionalValue {
+    SymbolicOptionalValue { found: self.has_offset_in_bytes, value: self.offset_in_bytes }
+}
+
+pub machine ResolvedSymbolicField::get_element_count(&self) -> SymbolicOptionalValue {
+    SymbolicOptionalValue { found: self.has_element_count, value: self.element_count }
+}
+
+pub machine ResolvedSymbolicField::get_displayed_element_count(&self) -> SymbolicOptionalValue {
+    SymbolicOptionalValue { found: self.has_displayed_element_count, value: self.displayed_element_count }
+}
+
+pub machine ResolvedSymbolicField::get_size_in_bytes(&self) -> SymbolicOptionalValue {
+    SymbolicOptionalValue { found: self.has_size_in_bytes, value: self.size_in_bytes }
+}
+
+pub machine ResolvedSymbolicField::get_status(&self) -> &ResolvedSymbolicFieldStatus {
+    &self.status
+}
+
+pub machine ResolvedSymbolicField::get_variant_activation(&self) -> &ResolvedSymbolicFieldVariantActivation {
+    &self.variant_activation
+}
+
+pub machine ResolvedSymbolicField::clone(source: &ResolvedSymbolicField) -> ResolvedSymbolicField {
+    transition source.field_name_len <= 256 {
+        true -> build(&source.field_name[0..source.field_name_len], source)
+        false -> build(&source.field_name[0..256], source)
+        _ -> build(&source.field_name[0..256], source)
+    }
+    state build(field_name: &[u8], source: &ResolvedSymbolicField) -> ResolvedSymbolicField {
+        ResolvedSymbolicField::new(
+            field_name,
+            DataTypeRef::clone(&source.data_type_ref),
+            source.container_type,
+            SymbolicOptionalValue { found: source.has_offset_in_bytes, value: source.offset_in_bytes },
+            SymbolicOptionalValue { found: source.has_element_count, value: source.element_count },
+            SymbolicOptionalValue { found: source.has_displayed_element_count, value: source.displayed_element_count },
+            SymbolicOptionalValue { found: source.has_size_in_bytes, value: source.size_in_bytes },
+            ResolvedSymbolicFieldVariantActivation::clone(&source.variant_activation),
+            ResolvedSymbolicFieldStatus::clone(&source.status))
+    }
+}
+
+pub machine ResolvedSymbolicField::clone_from(&mut self, source: &ResolvedSymbolicField) {
+    let cloned: ResolvedSymbolicField = ResolvedSymbolicField::clone(source);
+    self = cloned;
+}
+
+// Upstream `is_active`/`is_inactive`/`is_specified`.
+pub machine ResolvedSymbolicFieldVariantActivation::is_active(&self) -> bool {
+    transition self {
+        ResolvedSymbolicFieldVariantActivation::Active -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine ResolvedSymbolicFieldVariantActivation::is_inactive(&self) -> bool {
+    transition self {
+        ResolvedSymbolicFieldVariantActivation::Inactive -> (true)
+        ResolvedSymbolicFieldVariantActivation::Ambiguous -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine ResolvedSymbolicFieldVariantActivation::is_specified(&self) -> bool {
+    transition self {
+        ResolvedSymbolicFieldVariantActivation::Unspecified -> (false)
+        ResolvedSymbolicFieldVariantActivation::NotApplicable -> (false)
+        _ -> (true)
+    }
+}
+
+pub machine ResolvedSymbolicFieldVariantActivation::clone(
+    source: &ResolvedSymbolicFieldVariantActivation
+) -> ResolvedSymbolicFieldVariantActivation {
+    transition source {
+        ResolvedSymbolicFieldVariantActivation::Active -> (
+            ResolvedSymbolicFieldVariantActivation::Active)
+        ResolvedSymbolicFieldVariantActivation::Inactive -> (
+            ResolvedSymbolicFieldVariantActivation::Inactive)
+        ResolvedSymbolicFieldVariantActivation::Ambiguous -> (
+            ResolvedSymbolicFieldVariantActivation::Ambiguous)
+        ResolvedSymbolicFieldVariantActivation::Unspecified -> (
+            ResolvedSymbolicFieldVariantActivation::Unspecified)
+        ResolvedSymbolicFieldVariantActivation::NotApplicable -> (
+            ResolvedSymbolicFieldVariantActivation::NotApplicable)
+        ResolvedSymbolicFieldVariantActivation::Unresolved { reason, reason_len } -> (
+            ResolvedSymbolicFieldVariantActivation::Unresolved { reason: reason, reason_len: reason_len })
+    }
+}
+
+pub machine ResolvedSymbolicFieldVariantActivation::clone_from(
+    &mut self,
+    source: &ResolvedSymbolicFieldVariantActivation
+) {
+    let cloned: ResolvedSymbolicFieldVariantActivation = ResolvedSymbolicFieldVariantActivation::clone(source);
+    self = cloned;
+}
+
+// Upstream Ready/Unresolved/Clamped — the Clamped reason is upstream's
+// `format!("Dynamic array count exceeds preview limit of {}.")` text.
+pub machine ResolvedSymbolicFieldStatus::is_ready(&self) -> bool {
+    transition self {
+        ResolvedSymbolicFieldStatus::Ready -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine ResolvedSymbolicFieldStatus::clone(
+    source: &ResolvedSymbolicFieldStatus
+) -> ResolvedSymbolicFieldStatus {
+    transition source {
+        ResolvedSymbolicFieldStatus::Ready -> (
+            ResolvedSymbolicFieldStatus::Ready)
+        ResolvedSymbolicFieldStatus::Unresolved { reason, reason_len } -> (
+            ResolvedSymbolicFieldStatus::Unresolved { reason: reason, reason_len: reason_len })
+        ResolvedSymbolicFieldStatus::Clamped { actual_element_count, displayed_element_count, reason, reason_len } -> (
+            ResolvedSymbolicFieldStatus::Clamped {
+                actual_element_count: actual_element_count,
+                displayed_element_count: displayed_element_count,
+                reason: reason,
+                reason_len: reason_len })
+    }
+}
+
+pub machine ResolvedSymbolicFieldStatus::clone_from(
+    &mut self,
+    source: &ResolvedSymbolicFieldStatus
+) {
+    let cloned: ResolvedSymbolicFieldStatus = ResolvedSymbolicFieldStatus::clone(source);
+    self = cloned;
+}
+
+pub machine SymbolicStructResolverOptions::new(
+    max_dynamic_array_preview_elements: u64
+) -> SymbolicStructResolverOptions {
+    SymbolicStructResolverOptions {
+        max_dynamic_array_preview_elements: max_dynamic_array_preview_elements,
+        evaluate_union_variant_activations: false,
+    }
+}
+
+pub machine SymbolicStructResolverOptions::default() -> SymbolicStructResolverOptions {
+    SymbolicStructResolverOptions::new(256)
+}
+
+pub machine SymbolicStructResolverOptions::get_max_dynamic_array_preview_elements(&self) -> u64 {
+    self.max_dynamic_array_preview_elements
+}
+
+pub machine SymbolicStructResolverOptions::get_evaluate_union_variant_activations(&self) -> bool {
+    self.evaluate_union_variant_activations
+}
+
+pub machine SymbolicStructResolverOptions::with_evaluate_union_variant_activations(
+    mut self,
+    evaluate_union_variant_activations: bool
+) -> SymbolicStructResolverOptions {
+    self.evaluate_union_variant_activations = evaluate_union_variant_activations;
+    self
+}
+
+// Shared bounded-span copy — writes text into `out`, returns the width
+// (truncated at the 256-byte bound).
+machine copy_resolver_span(out: &mut [u8; 256], text: &[u8]) -> u64 {
+    transition {
+        _ -> copy(out, text, 0)
+    }
+    state copy(out: &mut [u8; 256], text: &[u8], position: u64) -> u64 {
+        transition position < text.len && position < 256 {
+            true -> store(out, text, position)
+            false -> (position)
+        }
+    }
+    state store(out: &mut [u8; 256], text: &[u8], position: u64) -> u64
+        requires position < text.len && position < 256
+    {
+        out[position] = text[position];
+        transition {
+            _ -> copy(out, text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// The per-resolution local context — upstream threads
+// `&BTreeMap<String, i128>` scalar captures plus `&mut Vec<String>`
+// resolver_stack through RefCell-wrapped closures created inside
+// `evaluate_i128_resolver`. Omega has no closures capturing borrowable
+// locals, so the context is a record holding `&mut Hooks` beside the
+// capture map, the cycle stack and the cloned root struct definition; it
+// satisfies SymbolicResolverCallbacks so the landed
+// `evaluate_with_symbol_fields_and_pointer_chains` resolves relative
+// paths back through this file's machinery. Upstream gives a fresh empty
+// resolver_stack to each top-level field resolution; the stack here lives
+// on the context and is balanced by push/pop around each evaluate call,
+// so it is empty at every top-level resolution just like upstream.
+pub data SymbolicStructResolverLocalContext<'a> {
+    hooks: &'a mut SymbolicStructResolverHooks;
+    scalar_names: [[u8; 256]; 64];
+    scalar_name_lens: [u64; 64];
+    scalar_value_los: [u64; 64];
+    scalar_value_his: [u64; 64];
+    scalar_count: u64;
+    resolver_ids: [[u8; 256]; 32];
+    resolver_id_lens: [u64; 32];
+    resolver_stack_count: u64;
+    root_struct_definition: SymbolicStructDefinition;
+}
+
+pub machine SymbolicStructResolverLocalContext::new<'a>(
+    hooks: &'a mut SymbolicStructResolverHooks,
+    root_struct_definition: &SymbolicStructDefinition
+) -> SymbolicStructResolverLocalContext<'a> {
+    let mut context: SymbolicStructResolverLocalContext = SymbolicStructResolverLocalContext {
+        hooks: hooks,
+        scalar_count: 0,
+        resolver_stack_count: 0,
+        root_struct_definition: SymbolicStructDefinition::clone(root_struct_definition),
+    };
+    context
+}
+
+// SymbolicResolverCallbacks::lookup_local_field — BTreeMap::get.
+pub machine SymbolicStructResolverLocalContext::lookup_local_field(
+    &mut self,
+    field_name: &[u8]
+) -> SymbolicResolverLookupResult
+satisfies SymbolicResolverCallbacks::lookup_local_field
+{
+    transition {
+        _ -> scan(field_name, 0)
+    }
+    state scan(&mut self, field_name: &[u8], position: u64) -> SymbolicResolverLookupResult {
+        transition position < 64 && position < self.scalar_count {
+            true -> compare(field_name, position)
+            false -> (SymbolicResolverLookupResult { found: false, value_lo: 0, value_hi: 0 })
+        }
+    }
+    state compare(&mut self, field_name: &[u8], position: u64) -> SymbolicResolverLookupResult
+        requires position < 64 && position < self.scalar_count
+    {
+        let stored_len: u64 = self.scalar_name_lens[position];
+        transition position < 64 && position < self.scalar_count && stored_len == field_name.len && stored_len <= 256 && field_name.len <= 256 {
+            true -> compare_bytes(field_name, position, 0)
+            false -> scan_next(field_name, position)
+        }
+    }
+    state compare_bytes(&mut self, field_name: &[u8], position: u64, cursor: u64) -> SymbolicResolverLookupResult
+        requires position < 64 && position < self.scalar_count && cursor <= 256
+    {
+        transition position < 64 && position < self.scalar_count && cursor < field_name.len && cursor < self.scalar_name_lens[position] && cursor < 256 && self.scalar_name_lens[position] <= 256 {
+            true -> check_byte(field_name, position, cursor)
+            false -> hit_or_miss(position, cursor, field_name)
+        }
+    }
+    state check_byte(&mut self, field_name: &[u8], position: u64, cursor: u64) -> SymbolicResolverLookupResult
+        requires position < 64 && position < self.scalar_count && cursor < field_name.len && cursor < self.scalar_name_lens[position] && cursor < 256 && self.scalar_name_lens[position] <= 256
+    {
+        let next_cursor: u64 = ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition position < 64 && position < self.scalar_count && cursor < 256 && cursor < self.scalar_name_lens[position] && next_cursor <= 256 && self.scalar_names[position][cursor] == field_name[cursor] {
+            true -> compare_bytes(field_name, position, next_cursor)
+            false -> scan_next(field_name, position)
+        }
+    }
+    state hit_or_miss(&mut self, position: u64, cursor: u64, field_name: &[u8]) -> SymbolicResolverLookupResult {
+        // Exhausted the name span with all bytes equal → hit; a shorter
+        // stored name with equal prefix is also a hit upstream (the loop
+        // terminates when cursor reaches either bound).
+        transition position < 64 && position < self.scalar_count && cursor == field_name.len {
+            true -> hit(position)
+            false -> check_prefix(position, cursor, field_name)
+        }
+    }
+    state check_prefix(&mut self, position: u64, cursor: u64, field_name: &[u8]) -> SymbolicResolverLookupResult {
+        transition position < 64 && position < self.scalar_count && self.scalar_name_lens[position] == cursor {
+            true -> hit(position)
+            false -> miss()
+        }
+    }
+    state miss(&mut self) -> SymbolicResolverLookupResult {
+        (SymbolicResolverLookupResult { found: false, value_lo: 0, value_hi: 0 })
+    }
+    state hit(&mut self, position: u64) -> SymbolicResolverLookupResult
+        requires position < 64 && position < self.scalar_count
+    {
+        (SymbolicResolverLookupResult {
+            found: true,
+            value_lo: self.scalar_value_los[position],
+            value_hi: self.scalar_value_his[position],
+        })
+    }
+    state scan_next(&mut self, field_name: &[u8], position: u64) -> SymbolicResolverLookupResult {
+        transition {
+            _ -> scan(field_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// SymbolicResolverCallbacks::resolve_type_size_in_bytes — delegate to the
+// outer hooks.
+pub machine SymbolicStructResolverLocalContext::resolve_type_size_in_bytes(
+    &mut self,
+    data_type_ref: &DataTypeRef
+) -> SymbolicResolverSizeResult
+satisfies SymbolicResolverCallbacks::resolve_type_size_in_bytes
+{
+        (hooks.resolve_type_size_in_bytes(data_type_ref))
+}
+
+// SymbolicResolverCallbacks::resolve_relative_symbol_field — the file's
+// relative-path walker over this context (scalar map, stack, root def).
+pub machine SymbolicStructResolverLocalContext::resolve_relative_symbol_field(
+    &mut self,
+    symbol_path: &SymbolicResolverRelativeSymbolPath
+) -> SymbolicResolverEvaluationResult
+satisfies SymbolicResolverCallbacks::resolve_relative_symbol_field
+{
+    resolve_relative_symbol_path_value(self, symbol_path)
+}
+
+// SymbolicResolverCallbacks::resolve_global_symbol_field — outer hook.
+pub machine SymbolicStructResolverLocalContext::resolve_global_symbol_field(
+    &mut self,
+    module_name: &[u8],
+    symbol_path: &SymbolicResolverRelativeSymbolPath
+) -> SymbolicResolverEvaluationResult
+satisfies SymbolicResolverCallbacks::resolve_global_symbol_field
+{
+    self.hooks.resolve_global_symbol_field(module_name, symbol_path)
+}
+
+// SymbolicResolverCallbacks::resolve_relative_pointer_chain — the file's
+// symbol-to-offset chain resolver, then the outer relative hook.
+pub machine SymbolicStructResolverLocalContext::resolve_relative_pointer_chain(
+    &mut self,
+    pointer_chain: &OwnedSymbolicPointerChain
+) -> SymbolicResolverEvaluationResult
+satisfies SymbolicResolverCallbacks::resolve_relative_pointer_chain
+{
+    resolve_relative_pointer_chain_value(self, pointer_chain)
+}
+
+// SymbolicResolverCallbacks::resolve_global_pointer_chain — outer hook.
+pub machine SymbolicStructResolverLocalContext::resolve_global_pointer_chain(
+    &mut self,
+    pointer_chain: &OwnedSymbolicPointerChain
+) -> SymbolicResolverEvaluationResult
+satisfies SymbolicResolverCallbacks::resolve_global_pointer_chain
+{
+        (hooks.resolve_global_pointer_chain(pointer_chain))
+}
+
+// Upstream `scalar_values_by_field_name.insert(name, value)` returning
+// whether the stored value changed (Some(prev) != value || absent).
+// Bounded 64-entry map — a full map reports false (no update) rather
+// than silently dropping a name upstream would have stored.
+pub machine SymbolicStructResolverLocalContext::set_scalar(
+    &mut self,
+    field_name: &[u8],
+    value_lo: u64,
+    value_hi: u64
+) -> bool {
+    transition {
+        _ -> find(field_name, value_lo, value_hi, 0)
+    }
+    state find(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64, position: u64) -> bool {
+        transition position < 64 && position < self.scalar_count {
+            true -> name_compare(field_name, value_lo, value_hi, position)
+            false -> insert_new(field_name, value_lo, value_hi)
+        }
+    }
+    state name_compare(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64, position: u64) -> bool
+        requires position < 64 && position < self.scalar_count
+    {
+        let stored_len: u64 = self.scalar_name_lens[position];
+        transition stored_len == field_name.len && stored_len <= 256 && field_name.len <= 256 {
+            true -> name_bytes(field_name, value_lo, value_hi, position, 0)
+            false -> find_next(field_name, value_lo, value_hi, position)
+        }
+    }
+    state name_bytes(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64, position: u64, cursor: u64) -> bool
+        requires position < 64 && position < self.scalar_count && cursor <= 256
+    {
+        transition position < 64 && position < self.scalar_count && cursor < field_name.len && cursor < self.scalar_name_lens[position] && cursor < 256 && self.scalar_name_lens[position] <= 256 {
+            true -> byte_check(field_name, value_lo, value_hi, position, cursor)
+            false -> maybe_update(position, value_lo, value_hi, cursor, field_name)
+        }
+    }
+    state maybe_update(&mut self, position: u64, value_lo: u64, value_hi: u64, cursor: u64, field_name: &[u8]) -> bool {
+        transition position < 64 && position < self.scalar_count && cursor == field_name.len {
+            true -> update(position, value_lo, value_hi)
+            false -> check_prefix(position, value_lo, value_hi, cursor, field_name)
+        }
+    }
+    state check_prefix(&mut self, position: u64, value_lo: u64, value_hi: u64, cursor: u64, field_name: &[u8]) -> bool {
+        transition position < 64 && position < self.scalar_count && self.scalar_name_lens[position] == cursor {
+            true -> update(position, value_lo, value_hi)
+            false -> (false)
+        }
+    }
+    state byte_check(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64, position: u64, cursor: u64) -> bool
+        requires position < 64 && position < self.scalar_count && cursor < field_name.len && cursor < self.scalar_name_lens[position] && cursor < 256 && self.scalar_name_lens[position] <= 256
+    {
+        let next_cursor: u64 = ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition position < 64 && position < self.scalar_count && cursor < 256 && cursor < self.scalar_name_lens[position] && next_cursor <= 256 && self.scalar_names[position][cursor] == field_name[cursor] {
+            true -> name_bytes(field_name, value_lo, value_hi, position, next_cursor)
+            false -> find_next(field_name, value_lo, value_hi, position)
+        }
+    }
+    state update(&mut self, position: u64, value_lo: u64, value_hi: u64) -> bool
+        requires position < 64 && position < self.scalar_count
+    {
+        let changed: bool = self.scalar_value_los[position] != value_lo || self.scalar_value_his[position] != value_hi;
+        self.scalar_value_los[position] = value_lo;
+        self.scalar_value_his[position] = value_hi;
+        (changed)
+    }
+    state insert_new(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64) -> bool {
+        transition self.scalar_count < 64 && field_name.len <= 256 {
+            true -> append(field_name, value_lo, value_hi)
+            false -> (false)
+        }
+    }
+    state append(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64) -> bool
+        requires self.scalar_count < 64
+    {
+        let position: u64 = self.scalar_count;
+        transition position < 64 && field_name.len <= 256 {
+            true -> write_entry(field_name, value_lo, value_hi, position)
+            false -> (false)
+        }
+    }
+    state write_entry(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64, position: u64) -> bool
+        requires position < 64
+    {
+        let written: u64 = copy_resolver_span(self.scalar_names[position], field_name);
+        self.scalar_name_lens[position] = written;
+        self.scalar_value_los[position] = value_lo;
+        self.scalar_value_his[position] = value_hi;
+        self.scalar_count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+    state find_next(&mut self, field_name: &[u8], value_lo: u64, value_hi: u64, position: u64) -> bool {
+        transition {
+            _ -> find(field_name, value_lo, value_hi, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `resolver_stack.iter().any(|stacked| stacked == resolver_id)`.
+pub machine SymbolicStructResolverLocalContext::resolver_stack_contains(
+    &self,
+    resolver_id: &[u8]
+) -> bool {
+    transition {
+        _ -> scan(resolver_id, 0)
+    }
+    state scan(&self, resolver_id: &[u8], position: u64) -> bool {
+        transition position < 32 && position < self.resolver_stack_count {
+            true -> compare(resolver_id, position)
+            false -> (false)
+        }
+    }
+    state compare(&self, resolver_id: &[u8], position: u64) -> bool
+        requires position < 32 && position < self.resolver_stack_count
+    {
+        let stored_len: u64 = self.resolver_id_lens[position];
+        transition position < 32 && position < self.resolver_stack_count && stored_len == resolver_id.len && stored_len <= 256 && resolver_id.len <= 256 {
+            true -> compare_bytes(resolver_id, position, 0)
+            false -> scan_next(resolver_id, position)
+        }
+    }
+    state compare_bytes(&self, resolver_id: &[u8], position: u64, cursor: u64) -> bool
+        requires position < 32 && position < self.resolver_stack_count && cursor <= 256
+    {
+        transition position < 32 && position < self.resolver_stack_count && cursor < resolver_id.len && cursor < self.resolver_id_lens[position] && cursor < 256 && self.resolver_id_lens[position] <= 256 {
+            true -> check_byte(resolver_id, position, cursor)
+            false -> (true)
+        }
+    }
+    state check_byte(&self, resolver_id: &[u8], position: u64, cursor: u64) -> bool
+        requires position < 32 && position < self.resolver_stack_count && cursor < resolver_id.len && cursor < self.resolver_id_lens[position] && cursor < 256 && self.resolver_id_lens[position] <= 256
+    {
+        let next_cursor: u64 = ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition position < 32 && position < self.resolver_stack_count && cursor < 256 && cursor < self.resolver_id_lens[position] && next_cursor <= 256 && self.resolver_ids[position][cursor] == resolver_id[cursor] {
+            true -> compare_bytes(resolver_id, position, next_cursor)
+            false -> scan_next(resolver_id, position)
+        }
+    }
+    state scan_next(&self, resolver_id: &[u8], position: u64) -> bool {
+        transition {
+            _ -> scan(resolver_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `resolver_stack.push` — bounded 32-deep (the cycle guard makes
+// deeper stacks unreachable anyway: an id already on the stack errors).
+pub machine SymbolicStructResolverLocalContext::resolver_stack_push(
+    &mut self,
+    resolver_id: &[u8]
+) -> bool {
+    transition self.resolver_stack_count < 32 && resolver_id.len <= 256 {
+        true -> push(resolver_id)
+        false -> (false)
+    }
+    state push(&mut self, resolver_id: &[u8]) -> bool
+        requires self.resolver_stack_count < 32
+    {
+        let position: u64 = self.resolver_stack_count;
+        transition position < 32 && resolver_id.len <= 256 {
+            true -> write(resolver_id, position)
+            false -> (false)
+        }
+    }
+    state write(&mut self, resolver_id: &[u8], position: u64) -> bool
+        requires position < 32
+    {
+        let written: u64 = copy_resolver_span(self.resolver_ids[position], resolver_id);
+        self.resolver_id_lens[position] = written;
+        self.resolver_stack_count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+// Upstream `resolver_stack.pop`.
+pub machine SymbolicStructResolverLocalContext::resolver_stack_pop(&mut self) {
+    transition self.resolver_stack_count > 0 {
+        true -> shrink()
+        false -> done()
+    }
+    state shrink(&mut self) {
+        self.resolver_stack_count = ((self.resolver_stack_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+    }
+    state done(&mut self) {
+        self.resolver_stack_count = self.resolver_stack_count;
+    }
+}
+
+// The captured scalar count (upstream map.len() — diagnostic surface).
+pub machine SymbolicStructResolverLocalContext::get_scalar_count(&self) -> u64 {
+    self.scalar_count
+}
+
+pub machine SymbolicStructResolverLocalContext::get_root_struct_definition(&self) -> &SymbolicStructDefinition {
+    &self.root_struct_definition
+}
+
+// Upstream `resolve_named_field_offset_in_struct`'s
+// `Result<(&SymbolicFieldDefinition, u64), SymbolicResolverEvaluationError>`
+// — Matched carries the field's position inside its struct plus the
+// resolved offset; the caller borrows the field back via get_field.
+pub data SymbolicNamedFieldMatch {
+    case Matched(field_position: u64, field_offset: u64);
+    case Failed(error: SymbolicResolverEvaluationError);
+}
+
+// The deepest upstream wrapper — `resolve_symbolic_struct_definition_
+// with_resolvers_and_symbol_fields_and_relative_pointer_chains` — is the
+// single Omega entry point. The five shallower wrappers only rebind
+// closure defaults; here the caller's hooks impl returns the documented
+// defaults (found:false / Failed(Unknown*)) for hooks it doesn't bind,
+// which reproduces each shallower layer exactly.
+pub machine resolve_symbolic_struct_definition<'a>(
+    symbolic_struct_definition: &SymbolicStructDefinition,
+    hooks: &mut SymbolicStructResolverHooks,
+    options: &SymbolicStructResolverOptions
+) -> ResolvedSymbolicStruct {
+    let mut context: SymbolicStructResolverLocalContext =
+        SymbolicStructResolverLocalContext::new(hooks, symbolic_struct_definition);
+    let mut resolved: ResolvedSymbolicStruct = ResolvedSymbolicStruct {
+        symbol_namespace_len: 0,
+        field_count: 0,
+    };
+    let namespace: &[u8] = symbolic_struct_definition.get_symbol_namespace();
+    let written: u64 = copy_resolver_span(resolved.symbol_namespace, namespace);
+    resolved.symbol_namespace_len = written;
+    // Upstream `resolve_pass_count = fields.len().saturating_add(1).max(1)`
+    // — field_count < 64, so saturating_add/max collapse to count + 1.
+    let resolve_pass_count: u64 = ((symbolic_struct_definition.get_field_count() as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+    transition {
+        _ -> run_pass(0, resolve_pass_count, symbolic_struct_definition, &mut context, options, &mut resolved)
+    }
+    state run_pass(
+        pass_index: u64,
+        resolve_pass_count: u64,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct
+    ) -> ResolvedSymbolicStruct {
+        transition pass_index < resolve_pass_count {
+            true -> one_pass(pass_index, resolve_pass_count, symbolic_struct_definition, context, options, resolved)
+            false -> finish(resolved)
+        }
+    }
+    state one_pass(
+        pass_index: u64,
+        resolve_pass_count: u64,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct
+    ) -> ResolvedSymbolicStruct {
+        let did_update: bool = resolve_symbolic_struct_definition_pass(
+            symbolic_struct_definition, context, options, resolved);
+        transition did_update {
+            true -> run_pass(((pass_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, resolve_pass_count, symbolic_struct_definition, context, options, resolved)
+            false -> finish(resolved)
+        }
+    }
+    state finish(resolved: &mut ResolvedSymbolicStruct) -> ResolvedSymbolicStruct {
+        let view: &ResolvedSymbolicStruct = resolved;
+        (ResolvedSymbolicStruct::clone(view))
+    }
+}
+
+// Whole-value copy — `Clone::clone`; fields clone element-wise.
+pub machine ResolvedSymbolicStruct::clone(source: &ResolvedSymbolicStruct) -> ResolvedSymbolicStruct {
+    let mut copy: ResolvedSymbolicStruct = ResolvedSymbolicStruct {
+        symbol_namespace_len: 0,
+        field_count: 0,
+    };
+    let written: u64 = copy_resolver_span(copy.symbol_namespace, source.get_symbol_namespace());
+    copy.symbol_namespace_len = written;
+    transition {
+        _ -> copy_fields(source, copy, 0)
+    }
+    state copy_fields(source: &ResolvedSymbolicStruct, copy: ResolvedSymbolicStruct, position: u64) -> ResolvedSymbolicStruct {
+        transition position < source.field_count && position < 64 {
+            true -> one(source, copy, position)
+            false -> (copy)
+        }
+    }
+    state one(source: &ResolvedSymbolicStruct, copy: ResolvedSymbolicStruct, position: u64) -> ResolvedSymbolicStruct
+        requires position < 64 && position < source.field_count
+    {
+        let mut out: ResolvedSymbolicStruct = copy;
+        let added: bool = out.add_field(&source.fields[position]);
+        transition {
+            _ -> copy_fields(source, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+pub machine ResolvedSymbolicStruct::clone_from(&mut self, source: &ResolvedSymbolicStruct) {
+    let cloned: ResolvedSymbolicStruct = ResolvedSymbolicStruct::clone(source);
+    self = cloned;
+}
+
+// Upstream `resolve_symbolic_struct_definition_pass` — one resolution
+// sweep: variant activations first, then per-field
+// offset/count/display/unit-size/status/size, sequential-offset
+// tracking, and scalar capture. Returns whether any capture updated the
+// scalar map (upstream's `did_update_scalar_value` loop-break signal).
+machine resolve_symbolic_struct_definition_pass<'a>(
+    symbolic_struct_definition: &SymbolicStructDefinition,
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    options: &SymbolicStructResolverOptions,
+    resolved: &mut ResolvedSymbolicStruct
+) -> bool {
+    // Rebuild the field list from scratch — upstream replaces
+    // `resolved_fields` with each pass's output.
+    resolved.field_count = 0;
+    let activations: SymbolicFieldActivationList = pick_variant_activations(
+        symbolic_struct_definition, context, options);
+    transition {
+        _ -> scan_fields(symbolic_struct_definition, context, options, resolved, &activations, 0, false, 0)
+    }
+    state scan_fields(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64
+    ) -> bool {
+        transition field_position < symbolic_struct_definition.get_field_count() && field_position < 64 {
+            true -> one_field(symbolic_struct_definition, context, options, resolved, activations, field_position, did_update, next_sequential_offset)
+            false -> (did_update)
+        }
+    }
+    state one_field(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64
+    ) -> bool
+        requires field_position < 64 && field_position < symbolic_struct_definition.get_field_count()
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            symbolic_struct_definition.get_field(field_position);
+        transition field_definition.is_unassigned() {
+            true -> skip_unassigned(symbolic_struct_definition, context, options, resolved, activations, field_position, did_update, next_sequential_offset)
+            false -> resolve_field(symbolic_struct_definition, field_definition, context, options, resolved, activations, field_position, did_update, next_sequential_offset)
+        }
+    }
+    state skip_unassigned(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64
+    ) -> bool
+        requires field_position < 64 && field_position < symbolic_struct_definition.get_field_count()
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            symbolic_struct_definition.get_field(field_position);
+        let size_match: SymbolicUnassignedSize = field_definition.get_unassigned_size_in_bytes();
+        let next_offset: u64 = ((next_sequential_offset as u64 in Saturating) + (size_match.size_in_bytes as u64 in Saturating)) as u64;
+        transition {
+            _ -> scan_fields(symbolic_struct_definition, context, options, resolved, activations, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, did_update, next_offset)
+        }
+    }
+    state resolve_field(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        field_definition: &SymbolicFieldDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64
+    ) -> bool
+        requires field_position < 64
+    {
+        let field_offset_result: SymbolicFieldValueResolution = resolve_field_offset(
+            symbolic_struct_definition, field_definition, next_sequential_offset, context);
+        let element_count_result: SymbolicFieldValueResolution = resolve_field_element_count(
+            symbolic_struct_definition, field_definition, context);
+        let display_element_count_result: SymbolicFieldValueResolution = resolve_field_display_element_count(
+            symbolic_struct_definition, field_definition, &element_count_result, context);
+        let data_type_ref: &DataTypeRef = field_definition.get_data_type_ref();
+        let unit_size_in_bytes: SymbolicResolverSizeResult =
+            call_type_size(context, data_type_ref);
+        let mut field_status: ResolvedSymbolicFieldStatus = build_field_status(
+            &field_offset_result, &element_count_result, &display_element_count_result, unit_size_in_bytes.found);
+        // Upstream: display ok-flatten, min-clamp against storage count,
+        // then min-clamp against the preview limit.
+        let raw_display: SymbolicOptionalValue = resolution_ok_flatten(&display_element_count_result);
+        let storage_count: SymbolicOptionalValue = resolution_ok_flatten(&element_count_result);
+        let display_element_count: SymbolicOptionalValue = clamp_display_to_storage(raw_display, storage_count);
+        let preview_limit: u64 = options.get_max_dynamic_array_preview_elements();
+        let displayed_element_count: SymbolicOptionalValue = clamp_to_preview(display_element_count, preview_limit);
+        transition {
+            _ -> check_clamp(symbolic_struct_definition, field_definition, context, options, resolved, activations, field_position, did_update, next_sequential_offset, field_offset_result, element_count_result, unit_size_in_bytes, display_element_count, displayed_element_count, field_status)
+        }
+    }
+    state check_clamp(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        field_definition: &SymbolicFieldDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64,
+        field_offset_result: SymbolicFieldValueResolution,
+        element_count_result: SymbolicFieldValueResolution,
+        unit_size_in_bytes: SymbolicResolverSizeResult,
+        display_element_count: SymbolicOptionalValue,
+        displayed_element_count: SymbolicOptionalValue,
+        field_status: ResolvedSymbolicFieldStatus
+    ) -> bool
+        requires field_position < 64
+    {
+        // Upstream: display > displayed under a Ready status produces the
+        // Clamped variant with the preview-limit reason text.
+        transition display_element_count.found && displayed_element_count.found && display_element_count.value > displayed_element_count.value && field_status.is_ready() {
+            true -> clamp_it(symbolic_struct_definition, field_definition, context, options, resolved, activations, field_position, did_update, next_sequential_offset, field_offset_result, element_count_result, unit_size_in_bytes, display_element_count, displayed_element_count)
+            false -> finish_field(symbolic_struct_definition, field_definition, context, options, resolved, activations, field_position, did_update, next_sequential_offset, field_offset_result, element_count_result, unit_size_in_bytes, display_element_count, displayed_element_count, field_status)
+        }
+    }
+    state clamp_it(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        field_definition: &SymbolicFieldDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64,
+        field_offset_result: SymbolicFieldValueResolution,
+        element_count_result: SymbolicFieldValueResolution,
+        unit_size_in_bytes: SymbolicResolverSizeResult,
+        display_element_count: SymbolicOptionalValue,
+        displayed_element_count: SymbolicOptionalValue
+    ) -> bool
+        requires field_position < 64
+    {
+        let preview_limit: u64 = options.get_max_dynamic_array_preview_elements();
+        let mut reason: [u8; 256];
+        let reason_len: u64 = write_clamp_reason(&mut reason, preview_limit);
+        let status: ResolvedSymbolicFieldStatus = ResolvedSymbolicFieldStatus::Clamped {
+            actual_element_count: display_element_count.value,
+            displayed_element_count: displayed_element_count.value,
+            reason: reason,
+            reason_len: reason_len,
+        };
+        transition {
+            _ -> finish_field(symbolic_struct_definition, field_definition, context, options, resolved, activations, field_position, did_update, next_sequential_offset, field_offset_result, element_count_result, unit_size_in_bytes, display_element_count, displayed_element_count, status)
+        }
+    }
+    state finish_field(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        field_definition: &SymbolicFieldDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64,
+        field_offset_result: SymbolicFieldValueResolution,
+        element_count_result: SymbolicFieldValueResolution,
+        unit_size_in_bytes: SymbolicResolverSizeResult,
+        display_element_count: SymbolicOptionalValue,
+        displayed_element_count: SymbolicOptionalValue,
+        field_status: ResolvedSymbolicFieldStatus
+    ) -> bool
+        requires field_position < 64
+    {
+        // field_size = unit_size.and_then(|u| count.ok().flatten()
+        //     .and_then(|c| resolve_field_size_in_bytes(field, u, c)))
+        let field_size_in_bytes: SymbolicOptionalValue = compute_field_size(
+            field_definition, unit_size_in_bytes, &element_count_result);
+        let field_offset: SymbolicOptionalValue = resolution_ok_flatten(&field_offset_result);
+        // Upstream: next_sequential_offset = max(offset.saturating_add(size)).
+        let next_offset: u64 = advance_sequential(next_sequential_offset, field_offset, field_size_in_bytes);
+        let captured: bool = maybe_capture_scalar_field_value(
+            field_definition, field_offset, field_size_in_bytes, context);
+        let updated: bool = did_update || captured;
+        transition {
+            _ -> push_field(symbolic_struct_definition, field_definition, context, options, resolved, activations, field_position, updated, next_offset, element_count_result, field_offset, displayed_element_count, field_size_in_bytes, field_status)
+        }
+    }
+    state push_field(
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        field_definition: &SymbolicFieldDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        options: &SymbolicStructResolverOptions,
+        resolved: &mut ResolvedSymbolicStruct,
+        activations: &SymbolicFieldActivationList,
+        field_position: u64,
+        did_update: bool,
+        next_sequential_offset: u64,
+        element_count_result: SymbolicFieldValueResolution,
+        field_offset: SymbolicOptionalValue,
+        displayed_element_count: SymbolicOptionalValue,
+        field_size_in_bytes: SymbolicOptionalValue,
+        field_status: ResolvedSymbolicFieldStatus
+    ) -> bool
+        requires field_position < 64
+    {
+        let activation: ResolvedSymbolicFieldVariantActivation = pick_activation(activations, field_position);
+        let field_name: &[u8] = field_definition.get_field_name();
+        let field_type: &DataTypeRef = field_definition.get_data_type_ref();
+        let container: ContainerType = field_definition.get_container_type();
+        let storage_count: SymbolicOptionalValue = resolution_ok_flatten(&element_count_result);
+        let field_data_type: DataTypeRef = DataTypeRef::clone(field_type);
+        let resolved_field: ResolvedSymbolicField = ResolvedSymbolicField::new(
+            field_name,
+            field_data_type,
+            container,
+            field_offset,
+            storage_count,
+            displayed_element_count,
+            field_size_in_bytes,
+            activation,
+            field_status);
+        let added: bool = resolved.add_field(&resolved_field);
+        transition {
+            _ -> scan_fields(symbolic_struct_definition, context, options, resolved, activations, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, did_update, next_sequential_offset)
+        }
+    }
+}
+
+// Upstream's zip — the activation list is built with exactly field_count
+// entries; this picks by position (cloned, since the array can't move).
+machine pick_activation(
+    activations: &SymbolicFieldActivationList,
+    field_position: u64
+) -> ResolvedSymbolicFieldVariantActivation {
+    transition field_position < activations.count && field_position < 64 {
+        true -> at(activations, field_position)
+        false -> (ResolvedSymbolicFieldVariantActivation::NotApplicable)
+        _ -> (ResolvedSymbolicFieldVariantActivation::NotApplicable)
+    }
+    state at(activations: &SymbolicFieldActivationList, field_position: u64) -> ResolvedSymbolicFieldVariantActivation
+        requires field_position < 64 && field_position < activations.count
+    {
+        (ResolvedSymbolicFieldVariantActivation::clone(&activations.items[field_position]))
+    }
+}
+
+// Upstream `if options.get_evaluate_union_variant_activations()` pick.
+machine pick_variant_activations<'a>(
+    symbolic_struct_definition: &SymbolicStructDefinition,
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    options: &SymbolicStructResolverOptions
+) -> SymbolicFieldActivationList {
+    transition options.get_evaluate_union_variant_activations() {
+        true -> (resolve_union_variant_activations(symbolic_struct_definition, context))
+        false -> (inactive_union_variant_activations(symbolic_struct_definition))
+        _ -> (inactive_union_variant_activations(symbolic_struct_definition))
+    }
+}
+
+// Upstream `resolve_union_variant_activations`: non-union layouts get
+// NotApplicable per field; union layouts evaluate each field's
+// active_when resolver (absent → None slot), then classify.
+machine resolve_union_variant_activations<'a>(
+    root_struct_definition: &SymbolicStructDefinition,
+    context: &mut SymbolicStructResolverLocalContext<'a>
+) -> SymbolicFieldActivationList {
+    transition root_struct_definition.get_layout_kind().is_union() {
+        true -> evaluate_activations(root_struct_definition, context)
+        false -> (fill_activations(root_struct_definition.get_field_count(), false))
+        _ -> (fill_activations(root_struct_definition.get_field_count(), false))
+    }
+}
+
+// NotApplicable per field (non-union) — the `is_union` branch also lands
+// here with is_union=true for the Unspecified fill.
+machine inactive_union_variant_activations(
+    root_struct_definition: &SymbolicStructDefinition
+) -> SymbolicFieldActivationList {
+    (fill_activations(root_struct_definition.get_field_count(), root_struct_definition.get_layout_kind().is_union()))
+}
+
+// `is_union` picks Unspecified (upstream's inactive path) vs
+// NotApplicable (upstream's non-union path).
+machine fill_activations(field_count: u64, is_union: bool) -> SymbolicFieldActivationList {
+    let mut list: SymbolicFieldActivationList = SymbolicFieldActivationList { count: 0 };
+    transition {
+        _ -> fill(list, 0, field_count, is_union)
+    }
+    state fill(list: SymbolicFieldActivationList, position: u64, field_count: u64, is_union: bool) -> SymbolicFieldActivationList {
+        transition position < field_count && position < 64 {
+            true -> one(list, position, field_count, is_union)
+            false -> (list)
+        }
+    }
+    state one(list: SymbolicFieldActivationList, position: u64, field_count: u64, is_union: bool) -> SymbolicFieldActivationList
+        requires position < 64
+    {
+        let mut out: SymbolicFieldActivationList = list;
+        transition is_union {
+            true -> store_unspecified(out, position, field_count)
+            false -> store_na(out, position, field_count)
+        }
+    }
+    state store_unspecified(list: SymbolicFieldActivationList, position: u64, field_count: u64) -> SymbolicFieldActivationList
+        requires position < 64
+    {
+        let mut out: SymbolicFieldActivationList = list;
+        out.items[position] = ResolvedSymbolicFieldVariantActivation::Unspecified;
+        out.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> fill(out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, field_count, false)
+        }
+    }
+    state store_na(list: SymbolicFieldActivationList, position: u64, field_count: u64) -> SymbolicFieldActivationList
+        requires position < 64
+    {
+        let mut out: SymbolicFieldActivationList = list;
+        out.items[position] = ResolvedSymbolicFieldVariantActivation::NotApplicable;
+        out.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> fill(out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, field_count, false)
+        }
+    }
+}
+
+// Union-layout activation eval — slot per field (None when the field has
+// no active_when resolver), then upstream's classify: all-None →
+// Unspecified; single Some(Ok(true)) → Active; multiple → Ambiguous;
+// Some(Ok(false))/None → Inactive; Some(Err) → Unresolved{reason}.
+machine evaluate_activations<'a>(
+    root_struct_definition: &SymbolicStructDefinition,
+    context: &mut SymbolicStructResolverLocalContext<'a>
+) -> SymbolicFieldActivationList {
+    let mut slots: SymbolicActivationSlots = SymbolicActivationSlots { count: 0 };
+    transition {
+        _ -> build_slots(root_struct_definition, context, &mut slots, 0)
+    }
+    state build_slots(
+        root_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        slots: &mut SymbolicActivationSlots,
+        field_position: u64
+    ) -> SymbolicFieldActivationList {
+        transition field_position < root_struct_definition.get_field_count() && field_position < 64 {
+            true -> one_slot(root_struct_definition, context, slots, field_position)
+            false -> classify(root_struct_definition, slots)
+        }
+    }
+    state one_slot(
+        root_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        slots: &mut SymbolicActivationSlots,
+        field_position: u64
+    ) -> SymbolicFieldActivationList
+        requires field_position < 64 && field_position < root_struct_definition.get_field_count()
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            root_struct_definition.get_field(field_position);
+        let active_when: SymbolicResolverRefMatch = field_definition.get_active_when_resolver();
+        transition active_when.found {
+            true -> evaluate_slot(root_struct_definition, context, slots, field_position, &active_when)
+            false -> store_absent(slots, root_struct_definition, context, field_position)
+        }
+    }
+    state evaluate_slot(
+        root_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        slots: &mut SymbolicActivationSlots,
+        field_position: u64,
+        active_when: &SymbolicResolverRefMatch
+    ) -> SymbolicFieldActivationList
+        requires field_position < 64 && field_position < root_struct_definition.get_field_count()
+    {
+        let result: SymbolicResolverValueResult = evaluate_i128_resolver(
+            context, active_when.resolver_ref.get_resolver_id());
+        transition result {
+            SymbolicResolverValueResult::Resolved { value_lo, value_hi } -> store_value(slots, root_struct_definition, context, field_position, value_lo, value_hi)
+            SymbolicResolverValueResult::Failed { error, error_len } -> store_failed(slots, root_struct_definition, context, field_position, error, error_len)
+        }
+    }
+    state store_value(
+        slots: &mut SymbolicActivationSlots,
+        root_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        field_position: u64,
+        value_lo: u64,
+        value_hi: u64
+    ) -> SymbolicFieldActivationList
+        requires field_position < 64 && field_position < root_struct_definition.get_field_count()
+    {
+        // Upstream `.map(|value| value != 0)` — nonzero i128 is active.
+        let is_active: bool = value_lo != 0 || value_hi != 0;
+        slots.set(field_position, true, true, is_active, (" "), 0);
+        transition {
+            _ -> build_slots(root_struct_definition, context, slots, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_failed(
+        slots: &mut SymbolicActivationSlots,
+        root_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        field_position: u64,
+        error: [u8; 256],
+        error_len: u64
+    ) -> SymbolicFieldActivationList
+        requires field_position < 64 && field_position < root_struct_definition.get_field_count()
+    {
+        slots.set(field_position, true, false, false, error, error_len);
+        transition {
+            _ -> build_slots(root_struct_definition, context, slots, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_absent(
+        slots: &mut SymbolicActivationSlots,
+        root_struct_definition: &SymbolicStructDefinition,
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        field_position: u64
+    ) -> SymbolicFieldActivationList
+        requires field_position < 64
+    {
+        slots.set(field_position, false, false, false, (" "), 0);
+        transition {
+            _ -> build_slots(root_struct_definition, context, slots, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state classify(
+        root_struct_definition: &SymbolicStructDefinition,
+        slots: &mut SymbolicActivationSlots
+    ) -> SymbolicFieldActivationList {
+        let all_absent: bool = slots.all_absent();
+        let active_count: u64 = slots.count_active();
+        transition all_absent {
+            true -> (fill_activations(root_struct_definition.get_field_count(), true))
+            false -> map_slots(slots, active_count)
+        }
+    }
+    state map_slots(
+        slots: &mut SymbolicActivationSlots,
+        active_count: u64
+    ) -> SymbolicFieldActivationList {
+        let mut list: SymbolicFieldActivationList = SymbolicFieldActivationList { count: 0 };
+        transition {
+            _ -> map_slots_inner(slots, &mut list, active_count, 0)
+        }
+    }
+
+    state map_slots_inner(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList {
+        transition position < slots.count && position < 64 {
+            true -> map_one(slots, list, active_count, position)
+            false -> emit_slots(list)
+        }
+    }
+    state map_one(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count
+    {
+        transition {
+            _ -> classify_slot(slots, list, active_count, position)
+        }
+    }
+    state classify_slot(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count
+    {
+        let has_result: bool = slots.has_result[position];
+        let ok: bool = slots.ok[position];
+        let value: bool = slots.value[position];
+        transition has_result {
+            true -> classify_ok(slots, list, active_count, position, ok, value)
+            false -> store_inactive(slots, list, active_count, position)
+        }
+    }
+    state classify_ok(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64, ok: bool, value: bool) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count
+    {
+        transition ok {
+            true -> classify_value(slots, list, active_count, position, value)
+            false -> store_unresolved(slots, list, active_count, position)
+        }
+    }
+    state classify_value(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64, value: bool) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count
+    {
+        transition value {
+            true -> check_single(slots, list, active_count, position)
+            false -> store_inactive(slots, list, active_count, position)
+        }
+    }
+    state check_single(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count
+    {
+        transition active_count == 1 {
+            true -> store_active(slots, list, active_count, position)
+            false -> store_ambiguous(slots, list, active_count, position)
+        }
+    }
+    state store_active(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64
+    {
+        list.items[position] = ResolvedSymbolicFieldVariantActivation::Active;
+        list.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> map_slots_inner(slots, list, active_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_ambiguous(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64
+    {
+        list.items[position] = ResolvedSymbolicFieldVariantActivation::Ambiguous;
+        list.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> map_slots_inner(slots, list, active_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_inactive(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64
+    {
+        list.items[position] = ResolvedSymbolicFieldVariantActivation::Inactive;
+        list.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> map_slots_inner(slots, list, active_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_unresolved(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count
+    {
+        transition position < 64 && position < slots.count && slots.error_lens[position] <= 256 {
+            true -> copy_reason(slots, list, active_count, position)
+            false -> copy_reason_clamped(slots, list, active_count, position)
+        }
+    }
+    state copy_reason(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count && slots.error_lens[position] <= 256
+    {
+        let mut reason: [u8; 256];
+        let written: u64 = copy_resolver_span(reason, &slots.errors[position][0..slots.error_lens[position]]);
+        list.items[position] = ResolvedSymbolicFieldVariantActivation::Unresolved { reason: reason, reason_len: written };
+        list.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> map_slots_inner(slots, list, active_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state copy_reason_clamped(slots: &mut SymbolicActivationSlots, list: &mut SymbolicFieldActivationList, active_count: u64, position: u64) -> SymbolicFieldActivationList
+        requires position < 64 && position < slots.count
+    {
+        let mut reason: [u8; 256];
+        let written: u64 = copy_resolver_span(reason, &slots.errors[position][0..256]);
+        list.items[position] = ResolvedSymbolicFieldVariantActivation::Unresolved { reason: reason, reason_len: written };
+        list.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> map_slots_inner(slots, list, active_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state emit_slots(list: &mut SymbolicFieldActivationList) -> SymbolicFieldActivationList {
+        (SymbolicFieldActivationList::clone_of(list))
+    }
+}
+
+
+// The slot table — Option<Result<bool,String>> per field.
+pub data SymbolicActivationSlots {
+    has_result: [bool; 64];
+    ok: [bool; 64];
+    value: [bool; 64];
+    errors: [[u8; 256]; 64];
+    error_lens: [u64; 64];
+    count: u64;
+}
+
+pub machine SymbolicActivationSlots::set(
+    &mut self,
+    position: u64,
+    has_result: bool,
+    ok: bool,
+    value: bool,
+    error: &[u8],
+    error_len: u64
+) {
+    transition position < 64 {
+        true -> write(position, has_result, ok, value, error, error_len)
+        false -> done()
+    }
+    state write(&mut self, position: u64, has_result: bool, ok: bool, value: bool, error: &[u8], error_len: u64)
+        requires position < 64
+    {
+        self.has_result[position] = has_result;
+        self.ok[position] = ok;
+        self.value[position] = value;
+        let written: u64 = copy_resolver_span(self.errors[position], error);
+        self.error_lens[position] = written;
+        transition position + 1 > self.count {
+            true -> bump(position)
+            false -> done()
+        }
+    }
+    state bump(&mut self, position: u64)
+        requires position < 64
+    {
+        self.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    }
+    state done(&mut self) {
+        self.count = self.count;
+    }
+}
+
+pub machine SymbolicActivationSlots::all_absent(&self) -> bool {
+    transition {
+        _ -> scan(0)
+    }
+    state scan(&self, position: u64) -> bool {
+        transition position < self.count && position < 64 {
+            true -> check(position)
+            false -> (true)
+        }
+    }
+    state check(&self, position: u64) -> bool
+        requires position < 64 && position < self.count
+    {
+        transition self.has_result[position] {
+            true -> (false)
+            false -> scan(((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+pub machine SymbolicActivationSlots::count_active(&self) -> u64 {
+    transition {
+        _ -> scan(0, 0)
+    }
+    state scan(&self, position: u64, active_count: u64) -> u64 {
+        transition position < self.count && position < 64 {
+            true -> check(position, active_count)
+            false -> (active_count)
+        }
+    }
+    state check(&self, position: u64, active_count: u64) -> u64
+        requires position < 64 && position < self.count
+    {
+        transition self.has_result[position] && self.ok[position] && self.value[position] {
+            true -> scan(((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((active_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> scan(((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, active_count)
+        }
+    }
+}
+
+pub machine SymbolicFieldActivationList::clone_of(
+    source: &SymbolicFieldActivationList
+) -> SymbolicFieldActivationList {
+    let mut copy: SymbolicFieldActivationList = SymbolicFieldActivationList { count: 0 };
+    transition {
+        _ -> copy(copy, source, 0)
+    }
+    state copy(copy: SymbolicFieldActivationList, source: &SymbolicFieldActivationList, position: u64) -> SymbolicFieldActivationList {
+        transition position < source.count && position < 64 {
+            true -> one(copy, source, position)
+            false -> (copy)
+        }
+    }
+    state one(copy: SymbolicFieldActivationList, source: &SymbolicFieldActivationList, position: u64) -> SymbolicFieldActivationList
+        requires position < 64 && position < source.count
+    {
+        let mut out: SymbolicFieldActivationList = copy;
+        out.items[position] = ResolvedSymbolicFieldVariantActivation::clone(&source.items[position]);
+        out.count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_one(out, source, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state copy_one(copy: SymbolicFieldActivationList, source: &SymbolicFieldActivationList, position: u64) -> SymbolicFieldActivationList {
+        transition position < source.count && position < 64 {
+            true -> one(copy, source, position)
+            false -> (copy)
+        }
+    }
+}
+
+// Upstream `resolve_field_offset` — Sequential maps to 0 under a union
+// root layout and to `next_sequential_offset` otherwise; Static carries
+// its literal; Resolver evaluates through the resolver-definition hooks.
+machine resolve_field_offset<'a>(
+    root_struct_definition: &SymbolicStructDefinition,
+    field_definition: &SymbolicFieldDefinition,
+    next_sequential_offset: u64,
+    context: &mut SymbolicStructResolverLocalContext<'a>
+) -> SymbolicFieldValueResolution {
+    let offset_resolution: SymbolicFieldOffsetResolution = field_definition.get_offset_resolution();
+    transition offset_resolution {
+        SymbolicFieldOffsetResolution::Sequential -> sequential(root_struct_definition, next_sequential_offset)
+        SymbolicFieldOffsetResolution::Static { offset_in_bytes } -> (
+            SymbolicFieldValueResolution::Resolved { found: true, value: offset_in_bytes })
+        SymbolicFieldOffsetResolution::Resolver { resolver_id, resolver_id_len } -> evaluate(context, offset_resolution)
+    }
+    state sequential(root_struct_definition: &SymbolicStructDefinition, next_sequential_offset: u64) -> SymbolicFieldValueResolution {
+        transition root_struct_definition.get_layout_kind().is_union() {
+            true -> (SymbolicFieldValueResolution::Resolved { found: true, value: 0 })
+            false -> (SymbolicFieldValueResolution::Resolved { found: true, value: next_sequential_offset })
+            _ -> (SymbolicFieldValueResolution::Resolved { found: true, value: next_sequential_offset })
+        }
+    }
+    state evaluate(context: &mut SymbolicStructResolverLocalContext<'a>, offset_resolution: SymbolicFieldOffsetResolution) -> SymbolicFieldValueResolution {
+        let resolver_id: &[u8] = offset_resolution.get_resolver_id();
+        transition resolver_id.len <= 256 {
+            true -> call(context, resolver_id)
+            false -> call(context, &resolver_id[0..256])
+            _ -> call(context, &resolver_id[0..256])
+        }
+    }
+    state call(context: &mut SymbolicStructResolverLocalContext<'a>, resolver_id: &[u8]) -> SymbolicFieldValueResolution {
+        (evaluate_u64_resolver(context, resolver_id))
+    }
+}
+
+// Upstream `resolve_field_element_count` — Resolver evaluates; Inferred
+// derives from the container (fixed→count, dynamic→None, scalar→1).
+machine resolve_field_element_count<'a>(
+    root_struct_definition: &SymbolicStructDefinition,
+    field_definition: &SymbolicFieldDefinition,
+    context: &mut SymbolicStructResolverLocalContext<'a>
+) -> SymbolicFieldValueResolution {
+    let count_resolution: SymbolicFieldCountResolution = field_definition.get_count_resolution();
+    transition count_resolution.is_inferred() {
+        true -> infer(field_definition)
+        false -> evaluate(context, count_resolution)
+    }
+    state infer(field_definition: &SymbolicFieldDefinition) -> SymbolicFieldValueResolution {
+        let container_type: ContainerType = field_definition.get_container_type();
+        transition container_type {
+            ContainerType::ArrayFixed { length } -> (
+                SymbolicFieldValueResolution::Resolved { found: true, value: length })
+            ContainerType::PointerArrayFixed { pointer_size, length } -> (
+                SymbolicFieldValueResolution::Resolved { found: true, value: length })
+            ContainerType::Array -> (
+                SymbolicFieldValueResolution::Resolved { found: false, value: 0 })
+            ContainerType::PointerArray { pointer_size } -> (
+                SymbolicFieldValueResolution::Resolved { found: false, value: 0 })
+            ContainerType::None -> (
+                SymbolicFieldValueResolution::Resolved { found: true, value: 1 })
+            ContainerType::Pointer { pointer_size } -> (
+                SymbolicFieldValueResolution::Resolved { found: true, value: 1 })
+            _ -> (SymbolicFieldValueResolution::Resolved { found: false, value: 0 })
+        }
+    }
+    state evaluate(context: &mut SymbolicStructResolverLocalContext<'a>, count_resolution: SymbolicFieldCountResolution) -> SymbolicFieldValueResolution {
+        let resolver_id: &[u8] = count_resolution.get_resolver_id();
+        transition resolver_id.len <= 256 {
+            true -> call(context, resolver_id)
+            false -> call(context, &resolver_id[0..256])
+            _ -> call(context, &resolver_id[0..256])
+        }
+    }
+    state call(context: &mut SymbolicStructResolverLocalContext<'a>, resolver_id: &[u8]) -> SymbolicFieldValueResolution {
+        (evaluate_u64_resolver(context, resolver_id))
+    }
+}
+
+// Upstream `resolve_field_display_element_count` — Inferred clones the
+// storage count result; Resolver evaluates.
+machine resolve_field_display_element_count<'a>(
+    root_struct_definition: &SymbolicStructDefinition,
+    field_definition: &SymbolicFieldDefinition,
+    element_count_result: &SymbolicFieldValueResolution,
+    context: &mut SymbolicStructResolverLocalContext<'a>
+) -> SymbolicFieldValueResolution {
+    let display_count_resolution: SymbolicFieldCountResolution = field_definition.get_display_count_resolution();
+    transition display_count_resolution.is_inferred() {
+        true -> clone_result(element_count_result)
+        false -> evaluate(context, display_count_resolution)
+    }
+    state clone_result(element_count_result: &SymbolicFieldValueResolution) -> SymbolicFieldValueResolution {
+        (clone_field_value_resolution(element_count_result))
+    }
+    state evaluate(context: &mut SymbolicStructResolverLocalContext<'a>, display_count_resolution: SymbolicFieldCountResolution) -> SymbolicFieldValueResolution {
+        let resolver_id: &[u8] = display_count_resolution.get_resolver_id();
+        transition resolver_id.len <= 256 {
+            true -> call(context, resolver_id)
+            false -> call(context, &resolver_id[0..256])
+            _ -> call(context, &resolver_id[0..256])
+        }
+    }
+    state call(context: &mut SymbolicStructResolverLocalContext<'a>, resolver_id: &[u8]) -> SymbolicFieldValueResolution {
+        (evaluate_u64_resolver(context, resolver_id))
+    }
+}
+
+machine clone_field_value_resolution(
+    source: &SymbolicFieldValueResolution
+) -> SymbolicFieldValueResolution {
+    transition source {
+        SymbolicFieldValueResolution::Resolved { found, value } -> (
+            SymbolicFieldValueResolution::Resolved { found: found, value: value })
+        SymbolicFieldValueResolution::Failed { error, error_len } -> (
+            SymbolicFieldValueResolution::Failed { error: error, error_len: error_len })
+    }
+}
+
+// Upstream `evaluate_u64_resolver` — evaluate, then `u64::try_from`:
+// hi != 0 covers both the negative (sign-extended) and too-large cases
+// and produces upstream's format text.
+machine evaluate_u64_resolver<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    resolver_id: &[u8]
+) -> SymbolicFieldValueResolution {
+    let result: SymbolicResolverValueResult = evaluate_i128_resolver(context, resolver_id);
+    transition result {
+        SymbolicResolverValueResult::Resolved { value_lo, value_hi } -> convert(value_lo, value_hi, resolver_id)
+        SymbolicResolverValueResult::Failed { error, error_len } -> (
+            SymbolicFieldValueResolution::Failed { error: error, error_len: error_len })
+    }
+    state convert(value_lo: u64, value_hi: u64, resolver_id: &[u8]) -> SymbolicFieldValueResolution {
+        transition value_hi == 0 {
+            true -> (SymbolicFieldValueResolution::Resolved { found: true, value: value_lo })
+            false -> too_large(value_lo, value_hi, resolver_id)
+        }
+    }
+    state too_large(value_lo: u64, value_hi: u64, resolver_id: &[u8]) -> SymbolicFieldValueResolution {
+        let mut error: [u8; 256];
+        let error_len: u64 = write_oversize_reason(&mut error, resolver_id, value_lo, value_hi);
+        (SymbolicFieldValueResolution::Failed { error: error, error_len: error_len })
+    }
+}
+
+// Upstream `evaluate_i128_resolver` — cycle check, resolve_definition,
+// push, evaluate through the context's SymbolicResolverCallbacks impl
+// (which carries scalar map + stack + root def, replacing upstream's
+// RefCell-wrapped closures), pop, format the error.
+machine evaluate_i128_resolver<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    resolver_id: &[u8]
+) -> SymbolicResolverValueResult {
+    transition context.resolver_stack_contains(resolver_id) {
+        true -> cycle(resolver_id)
+        false -> lookup(context, resolver_id)
+    }
+    state cycle(resolver_id: &[u8]) -> SymbolicResolverValueResult {
+        // Upstream: ResolverCycle(resolver_id).to_string() →
+        // "Resolver cycle detected at `id`."
+        let mut error: [u8; 256];
+        let error_len: u64 = write_cycle_reason(&mut error, resolver_id);
+        (SymbolicResolverValueResult::Failed { error: error, error_len: error_len })
+    }
+    state lookup(context: &mut SymbolicStructResolverLocalContext<'a>, resolver_id: &[u8]) -> SymbolicResolverValueResult {
+        let matched: SymbolicResolverDefinitionMatch = call_resolve_resolver_definition(context, resolver_id);
+        transition matched.found {
+            true -> evaluate_def(context, resolver_id, &matched)
+            false -> unknown(resolver_id)
+        }
+    }
+    state unknown(resolver_id: &[u8]) -> SymbolicResolverValueResult {
+        // Upstream: `Unknown resolver `id`.`
+        let mut error: [u8; 256];
+        let error_len: u64 = write_unknown_resolver(&mut error, resolver_id);
+        (SymbolicResolverValueResult::Failed { error: error, error_len: error_len })
+    }
+    state evaluate_def(context: &mut SymbolicStructResolverLocalContext<'a>, resolver_id: &[u8], matched: &SymbolicResolverDefinitionMatch) -> SymbolicResolverValueResult {
+        let pushed: bool = context.resolver_stack_push(resolver_id);
+        transition pushed {
+            true -> run(context, matched)
+            false -> overflow(resolver_id)
+        }
+    }
+    state run(context: &mut SymbolicStructResolverLocalContext<'a>, matched: &SymbolicResolverDefinitionMatch) -> SymbolicResolverValueResult {
+        let result: SymbolicResolverEvaluationResult =
+            matched.resolver_definition.evaluate_with_symbol_fields_and_pointer_chains(context);
+        context.resolver_stack_pop();
+        transition result {
+            SymbolicResolverEvaluationResult::Resolved { value_lo, value_hi } -> (
+                SymbolicResolverValueResult::Resolved { value_lo: value_lo, value_hi: value_hi })
+            SymbolicResolverEvaluationResult::Failed { error } -> fail_text(&error)
+        }
+    }
+    // Upstream `.map_err(format_resolver_error)` — the error union's
+    // Display text, bounded.
+    state fail_text(error: &SymbolicResolverEvaluationError) -> SymbolicResolverValueResult {
+        let mut text: [u8; 256];
+        let text_len: u64 = write_evaluation_error_text(error, &mut text);
+        (SymbolicResolverValueResult::Failed { error: text, error_len: text_len })
+    }
+    state overflow(resolver_id: &[u8]) -> SymbolicResolverValueResult {
+        // Bounded-stack refusal — the cycle guard makes a >32 stack
+        // unreachable upstream; the refusal reports the same surface.
+        let mut error: [u8; 256];
+        let error_len: u64 = write_cycle_reason(&mut error, resolver_id);
+        (SymbolicResolverValueResult::Failed { error: error, error_len: error_len })
+    }
+}
+
+// Upstream `resolve_relative_symbol_path_value` — walk the path links
+// against the context's root struct: Offset links apply a signed offset
+// to the running base (terminal offset → error), Symbol links resolve a
+// named field offset inside the current struct definition; terminal
+// symbol links read the scalar through the read_scalar_field hook and
+// non-terminal links descend into resolve_struct_definition.
+machine resolve_relative_symbol_path_value<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    symbol_path: &SymbolicResolverRelativeSymbolPath
+) -> SymbolicResolverEvaluationResult {
+    transition symbol_path.is_empty() {
+        true -> empty_path(symbol_path)
+        false -> walk_start(context, symbol_path)
+    }
+    state empty_path(symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult {
+        // Upstream: UnknownRelativeSymbolPath(symbol_path.to_string()).
+        (SymbolicResolverEvaluationResult::Failed {
+            error: path_error(symbol_path) })
+    }
+    state walk_start(context: &mut SymbolicStructResolverLocalContext<'a>, symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult {
+        // current_struct_definition starts as the context's root clone.
+        let root: &SymbolicStructDefinition = context.get_root_struct_definition();
+        let current: SymbolicStructDefinition = SymbolicStructDefinition::clone(root);
+        transition {
+            _ -> walk_links(context, symbol_path, current, 0, 0)
+        }
+    }
+    state walk_links(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult {
+        let chain: &OwnedSymbolicPointerChain = symbol_path.get_pointer_chain();
+        transition link_position < chain.link_count && link_position < 64 {
+            true -> read_link(context, symbol_path, current_struct_definition, link_position, current_base_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state fallthrough(symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult {
+        (SymbolicResolverEvaluationResult::Failed {
+            error: path_error(symbol_path) })
+    }
+    state read_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let chain: &OwnedSymbolicPointerChain = symbol_path.get_pointer_chain();
+        let link_count: u64 = chain.link_count;
+        transition link_position < link_count {
+            true -> have_link(context, symbol_path, current_struct_definition, link_position, current_base_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state have_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let chain: &OwnedSymbolicPointerChain = symbol_path.get_pointer_chain();
+        let link_count: u64 = chain.link_count;
+        transition link_position < link_count {
+            true -> got_link(context, symbol_path, current_struct_definition, link_position, current_base_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state got_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let chain: &OwnedSymbolicPointerChain = symbol_path.get_pointer_chain();
+        let link_count: u64 = chain.link_count;
+        transition link_position < chain.link_count && link_position < 64 {
+            true -> have_link_value(context, symbol_path, current_struct_definition, link_position, current_base_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state have_link_value(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let chain: &OwnedSymbolicPointerChain = symbol_path.get_pointer_chain();
+        let link_count: u64 = chain.link_count;
+        transition link_position < chain.link_count && link_position < 64 {
+            true -> apply_link(context, symbol_path, current_struct_definition, link_position, current_base_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state apply_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let chain: &OwnedSymbolicPointerChain = symbol_path.get_pointer_chain();
+        let link_count: u64 = chain.link_count;
+        transition link_position < chain.link_count && link_position < 64 {
+            true -> link_read(context, symbol_path, current_struct_definition, link_position, current_base_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state link_read(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let chain: &OwnedSymbolicPointerChain = symbol_path.get_pointer_chain();
+        transition link_position < chain.link_count && link_position < 64 {
+            true -> link_loaded(context, symbol_path, chain, current_struct_definition, link_position, current_base_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state link_loaded(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        chain: &OwnedSymbolicPointerChain,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < chain.link_count && link_position < 64
+    {
+        let link_count: u64 = chain.link_count;
+        let link: SymbolicPointerChainLink = chain.get_link(link_position);
+        let is_terminal_link: bool = ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 == link_count;
+        transition link {
+            SymbolicPointerChainLink::Offset { offset } -> offset_link(context, symbol_path, current_struct_definition, link_position, current_base_offset, offset, is_terminal_link)
+            SymbolicPointerChainLink::Symbol { symbol } -> symbol_link(context, symbol_path, current_struct_definition, link_position, current_base_offset, symbol, is_terminal_link)
+        }
+    }
+    state offset_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64,
+        offset: i64,
+        is_terminal_link: bool
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        // Upstream `apply_signed_offset` → SymbolicPointerChain::
+        // apply_pointer_offset (checked add/sub).
+        let applied: Optional<u64> = symbolic_pointer_chain_apply_pointer_offset(current_base_offset, offset);
+        transition applied {
+            Optional::Some { value } -> offset_applied(context, symbol_path, current_struct_definition, link_position, value, is_terminal_link)
+            Optional::None -> (SymbolicResolverEvaluationResult::Failed { error: path_error(symbol_path) })
+        }
+    }
+    state offset_applied(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        resolved_base_offset: u64,
+        is_terminal_link: bool
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        transition is_terminal_link {
+            true -> terminal_offset(symbol_path)
+            false -> walk_links(context, symbol_path, current_struct_definition, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, resolved_base_offset)
+        }
+    }
+    state terminal_offset(symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult {
+        // Upstream: "<path> ends at an offset instead of a scalar field."
+        let mut text: [u8; 256];
+        let text_len: u64 = write_path_suffix_error(symbol_path, &mut text, (" ends at an offset instead of a scalar field."));
+        (SymbolicResolverEvaluationResult::Failed {
+            error: SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+                symbol_path: text,
+                symbol_path_len: text_len } })
+    }
+    state symbol_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        link_position: u64,
+        current_base_offset: u64,
+        symbol: PointerChainSymbol,
+        is_terminal_link: bool
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let field_name: &[u8] = read_symbol_name(symbol);
+        let matched: SymbolicNamedFieldMatch = resolve_named_field_offset_in_struct(
+            context, symbol_path, field_name, &current_struct_definition);
+        transition matched {
+            SymbolicNamedFieldMatch::Matched { field_position, field_offset } -> matched_field(context, symbol_path, current_struct_definition, field_position, field_offset, current_base_offset, is_terminal_link, link_position)
+            SymbolicNamedFieldMatch::Failed { error } -> (SymbolicResolverEvaluationResult::Failed { error: error })
+        }
+    }
+    state matched_field(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        field_position: u64,
+        field_offset: u64,
+        current_base_offset: u64,
+        is_terminal_link: bool,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult {
+        let resolved_field_offset: u64 = ((current_base_offset as u64 in Saturating) + (field_offset as u64 in Saturating)) as u64;
+        transition is_terminal_link {
+            true -> terminal_symbol(context, symbol_path, current_struct_definition, field_position, resolved_field_offset)
+            false -> descend(context, symbol_path, current_struct_definition, field_position, resolved_field_offset, link_position)
+        }
+    }
+    state terminal_symbol(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        field_position: u64,
+        resolved_field_offset: u64
+    ) -> SymbolicResolverEvaluationResult {
+        let current_view: &SymbolicStructDefinition = &current_struct_definition;
+        transition field_position < current_view.field_count && field_position < 64 {
+            true -> terminal_read(context, symbol_path, current_view, field_position, resolved_field_offset)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state terminal_read(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        resolved_field_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires field_position < 64 && field_position < current_struct_definition.field_count
+    {
+        let field_definition: &SymbolicFieldDefinition = current_struct_definition.get_field(field_position);
+        let container_type: ContainerType = field_definition.get_container_type();
+        transition container_type {
+            ContainerType::None -> read_scalar(context, symbol_path, field_definition, resolved_field_offset)
+            _ -> not_scalar(symbol_path)
+        }
+    }
+    state not_scalar(symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult {
+        // Upstream: "<path> is not a scalar field."
+        let mut text: [u8; 256];
+        let text_len: u64 = write_path_suffix_error(symbol_path, &mut text, (" is not a scalar field."));
+        (SymbolicResolverEvaluationResult::Failed {
+            error: SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+                symbol_path: text,
+                symbol_path_len: text_len } })
+    }
+    state read_scalar(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        field_definition: &SymbolicFieldDefinition,
+        resolved_field_offset: u64
+    ) -> SymbolicResolverEvaluationResult {
+        let data_type_ref: &DataTypeRef = field_definition.get_data_type_ref();
+        let size_match: SymbolicResolverSizeResult =
+            call_type_size(context, data_type_ref);
+        transition size_match.found {
+            true -> read_field(context, symbol_path, field_definition, resolved_field_offset, size_match.size_in_bytes)
+            false -> unknown_size(symbol_path, field_definition)
+        }
+    }
+    state unknown_size(
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        field_definition: &SymbolicFieldDefinition
+    ) -> SymbolicResolverEvaluationResult {
+        // Upstream: UnknownTypeSize(data_type_ref.to_string()) — the id
+        // span carries the type name.
+        let mut type_text: [u8; 256];
+        let type_len: u64 = copy_resolver_span(type_text, field_definition.get_data_type_ref().get_data_type_id());
+        (SymbolicResolverEvaluationResult::Failed {
+            error: SymbolicResolverEvaluationError::UnknownTypeSize {
+                data_type: type_text,
+                data_type_len: type_len } })
+    }
+    state read_field(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        field_definition: &SymbolicFieldDefinition,
+        resolved_field_offset: u64,
+        field_size_in_bytes: u64
+    ) -> SymbolicResolverEvaluationResult {
+        let read: SymbolicScalarReadResult =
+            call_read_scalar(context, field_definition, resolved_field_offset, field_size_in_bytes);
+        transition read {
+            SymbolicScalarReadResult::Read { found, value_lo, value_hi } -> read_done(symbol_path, found, value_lo, value_hi)
+            SymbolicScalarReadResult::ReadFailed { error, error_len } -> read_failed(error, error_len)
+        }
+    }
+    state read_done(
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        found: bool,
+        value_lo: u64,
+        value_hi: u64
+    ) -> SymbolicResolverEvaluationResult {
+        transition found {
+            true -> (SymbolicResolverEvaluationResult::Resolved { value_lo: value_lo, value_hi: value_hi })
+            false -> (SymbolicResolverEvaluationResult::Failed { error: path_error(symbol_path) })
+        }
+    }
+    state read_failed(error: [u8; 256], error_len: u64) -> SymbolicResolverEvaluationResult {
+        // Upstream: .map_err(UnknownRelativeSymbolPath) — the read
+        // failure's own text becomes the path error payload.
+        transition error_len <= 256 {
+            true -> emit_read_failed(error, error_len)
+            false -> emit_read_failed(error, 256)
+        }
+    }
+    state emit_read_failed(error: [u8; 256], error_len: u64) -> SymbolicResolverEvaluationResult {
+        (SymbolicResolverEvaluationResult::Failed {
+            error: SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+                symbol_path: error,
+                symbol_path_len: error_len } })
+    }
+    state descend(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_struct_definition: SymbolicStructDefinition,
+        field_position: u64,
+        resolved_field_offset: u64,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult {
+        let current_view: &SymbolicStructDefinition = &current_struct_definition;
+        transition field_position < current_view.field_count && field_position < 64 {
+            true -> descend_lookup(context, symbol_path, current_view, field_position, resolved_field_offset, link_position)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state descend_lookup(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        current_view: &SymbolicStructDefinition,
+        field_position: u64,
+        resolved_field_offset: u64,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires field_position < 64 && field_position < current_view.field_count && link_position < 64
+    {
+        let field_definition: &SymbolicFieldDefinition = current_view.get_field(field_position);
+        let data_type_ref: &DataTypeRef = field_definition.get_data_type_ref();
+        let next_match: SymbolicStructDefinitionMatch =
+            call_resolve_struct_definition(context, data_type_ref);
+        transition next_match.found {
+            true -> descend_into(context, symbol_path, &next_match, resolved_field_offset, link_position)
+            false -> fallthrough(symbol_path)
+        }
+    }
+    state descend_into(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        next_match: &SymbolicStructDefinitionMatch,
+        resolved_field_offset: u64,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        // Upstream: current_struct_definition = resolved clone; walk
+        // continues at the next link with the new base offset.
+        let next_struct: SymbolicStructDefinition =
+            SymbolicStructDefinition::clone(&next_match.struct_definition);
+        transition {
+            _ -> walk_links(context, symbol_path, next_struct, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, resolved_field_offset)
+        }
+    }
+}
+
+// Upstream `resolve_named_field_offset_in_struct` — scan the struct's
+// fields for `symbol_path_segment`: Unassigned advances the sequential
+// offset; a Named field resolves its offset (resolver arms evaluate
+// through the context); a name match reports the field position +
+// offset; otherwise the field's static size advances the sequential
+// walk. Errors prefix "<path>: <inner>" into the path error text.
+machine resolve_named_field_offset_in_struct<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    symbol_path: &SymbolicResolverRelativeSymbolPath,
+    symbol_path_segment: &[u8],
+    current_struct_definition: &SymbolicStructDefinition
+) -> SymbolicNamedFieldMatch {
+    transition {
+        _ -> scan(context, symbol_path, symbol_path_segment, current_struct_definition, 0, 0)
+    }
+    state scan(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        symbol_path_segment: &[u8],
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        next_sequential_offset: u64
+    ) -> SymbolicNamedFieldMatch {
+        transition field_position < current_struct_definition.field_count && field_position < 64 {
+            true -> one(context, symbol_path, symbol_path_segment, current_struct_definition, field_position, next_sequential_offset)
+            false -> miss(symbol_path)
+        }
+    }
+    state miss(symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicNamedFieldMatch {
+        (SymbolicNamedFieldMatch::Failed { error: path_error(symbol_path) })
+    }
+    state one(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        symbol_path_segment: &[u8],
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        next_sequential_offset: u64
+    ) -> SymbolicNamedFieldMatch
+        requires field_position < 64 && field_position < current_struct_definition.field_count
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            current_struct_definition.get_field(field_position);
+        transition field_definition.is_unassigned() {
+            true -> skip(context, symbol_path, symbol_path_segment, current_struct_definition, field_position, next_sequential_offset)
+            false -> resolve(context, symbol_path, symbol_path_segment, current_struct_definition, field_position, next_sequential_offset)
+        }
+    }
+    state skip(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        symbol_path_segment: &[u8],
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        next_sequential_offset: u64
+    ) -> SymbolicNamedFieldMatch
+        requires field_position < 64 && field_position < current_struct_definition.field_count
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            current_struct_definition.get_field(field_position);
+        let size_match: SymbolicUnassignedSize = field_definition.get_unassigned_size_in_bytes();
+        let next_offset: u64 = ((next_sequential_offset as u64 in Saturating) + (size_match.size_in_bytes as u64 in Saturating)) as u64;
+        transition {
+            _ -> scan(context, symbol_path, symbol_path_segment, current_struct_definition, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next_offset)
+        }
+    }
+    state resolve(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        symbol_path_segment: &[u8],
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        next_sequential_offset: u64
+    ) -> SymbolicNamedFieldMatch
+        requires field_position < 64 && field_position < current_struct_definition.field_count
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            current_struct_definition.get_field(field_position);
+        let offset_result: SymbolicFieldValueResolution = resolve_field_offset(
+            current_struct_definition, field_definition, next_sequential_offset, context);
+        transition offset_result {
+            SymbolicFieldValueResolution::Resolved { found, value } -> resolved_offset(context, symbol_path, symbol_path_segment, current_struct_definition, field_position, next_sequential_offset, found, value)
+            SymbolicFieldValueResolution::Failed { error, error_len } -> offset_failed(symbol_path, error, error_len)
+        }
+    }
+    state offset_failed(
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        error: [u8; 256],
+        error_len: u64
+    ) -> SymbolicNamedFieldMatch {
+        // Upstream: UnknownRelativeSymbolPath("<path>: <inner>").
+        let mut text: [u8; 256];
+        transition error_len <= 256 {
+            true -> wrapped(symbol_path, text, &error[0..error_len])
+            false -> wrapped(symbol_path, text, &error[0..256])
+        }
+    }
+    state wrapped(symbol_path: &SymbolicResolverRelativeSymbolPath, buffer: [u8; 256], inner: &[u8]) -> SymbolicNamedFieldMatch {
+        let mut text: [u8; 256] = buffer;
+        let text_len: u64 = write_path_prefix_error(symbol_path, &mut text, inner);
+        (SymbolicNamedFieldMatch::Failed {
+            error: SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+                symbol_path: text,
+                symbol_path_len: text_len } })
+    }
+    state resolved_offset(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        symbol_path_segment: &[u8],
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        next_sequential_offset: u64,
+        found: bool,
+        field_offset: u64
+    ) -> SymbolicNamedFieldMatch
+        requires field_position < 64 && field_position < current_struct_definition.field_count
+    {
+        // Upstream `.ok_or_else(|| UnknownRelativeSymbolPath(path))` —
+        // an unresolved (None) offset fails the whole lookup.
+        transition found {
+            true -> check_name(context, symbol_path, symbol_path_segment, current_struct_definition, field_position, next_sequential_offset, field_offset)
+            false -> miss(symbol_path)
+        }
+    }
+    state check_name(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        symbol_path_segment: &[u8],
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        next_sequential_offset: u64,
+        field_offset: u64
+    ) -> SymbolicNamedFieldMatch
+        requires field_position < 64 && field_position < current_struct_definition.field_count
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            current_struct_definition.get_field(field_position);
+        let name_matches: bool = spans_equal(field_definition.get_field_name(), symbol_path_segment);
+        transition name_matches {
+            true -> (SymbolicNamedFieldMatch::Matched { field_position: field_position, field_offset: field_offset })
+            false -> advance(context, symbol_path, symbol_path_segment, current_struct_definition, field_position, next_sequential_offset, field_offset)
+        }
+    }
+    state advance(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        symbol_path: &SymbolicResolverRelativeSymbolPath,
+        symbol_path_segment: &[u8],
+        current_struct_definition: &SymbolicStructDefinition,
+        field_position: u64,
+        next_sequential_offset: u64,
+        field_offset: u64
+    ) -> SymbolicNamedFieldMatch
+        requires field_position < 64 && field_position < current_struct_definition.field_count
+    {
+        let field_definition: &SymbolicFieldDefinition =
+            current_struct_definition.get_field(field_position);
+        let size: SymbolicSizeResult = resolve_field_static_size_in_bytes(field_definition, context);
+        let next_offset: u64 = advance_sequential(next_sequential_offset,
+            SymbolicOptionalValue { found: true, value: field_offset },
+            SymbolicOptionalValue { found: size.found, value: size.size_in_bytes });
+        transition {
+            _ -> scan(context, symbol_path, symbol_path_segment, current_struct_definition, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next_offset)
+        }
+    }
+}
+
+// Upstream `resolve_relative_pointer_chain_value` — rewrite Symbol links
+// to their resolved field offsets (each via a from_dot_path view for the
+// named-offset walker), rebuild an absolute chain, and hand it to the
+// outer resolve_relative_pointer_chain hook.
+machine resolve_relative_pointer_chain_value<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    pointer_chain: &OwnedSymbolicPointerChain
+) -> SymbolicResolverEvaluationResult {
+    let mut resolved_links: OwnedSymbolicPointerChain =
+        OwnedSymbolicPointerChain::new((""), pointer_chain.get_pointer_size());
+    transition {
+        _ -> rewrite_links(context, pointer_chain, resolved_links, 0)
+    }
+    state rewrite_links(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult {
+        transition link_position < pointer_chain.link_count && link_position < 64 {
+            true -> rewrite_one(context, pointer_chain, resolved_links, link_position)
+            false -> call_hook(context, resolved_links)
+        }
+    }
+    state rewrite_one(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        transition link_position < pointer_chain.link_count && link_position < 64 {
+            true -> load_link(context, pointer_chain, resolved_links, link_position)
+            false -> call_hook(context, resolved_links)
+        }
+    }
+    state load_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        transition link_position < pointer_chain.link_count && link_position < 64 {
+            true -> use_link(context, pointer_chain, resolved_links, link_position)
+            false -> call_hook(context, resolved_links)
+        }
+    }
+    state use_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let link: SymbolicPointerChainLink = pointer_chain.get_link(link_position);
+        transition link {
+            SymbolicPointerChainLink::Offset { offset } -> keep_offset(context, pointer_chain, resolved_links, link_position, offset)
+            SymbolicPointerChainLink::Symbol { symbol } -> resolve_symbol_link(context, pointer_chain, resolved_links, link_position, symbol)
+        }
+    }
+    state keep_offset(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64,
+        offset: i64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let mut out: OwnedSymbolicPointerChain = resolved_links;
+        let added: bool = out.add_link(SymbolicPointerChainLink::new_offset(offset));
+        transition added {
+            true -> rewrite_links(context, pointer_chain, out, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> rewrite_links(context, pointer_chain, out, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state resolve_symbol_link(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64,
+        symbol: PointerChainSymbol
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let field_name: &[u8] = read_symbol_name(symbol);
+        let as_path: SymbolicResolverRelativeSymbolPath =
+            SymbolicResolverRelativeSymbolPath::from_dot_path(field_name);
+        let root_view: &SymbolicStructDefinition = context.get_root_struct_definition();
+        let root: SymbolicStructDefinition =
+            SymbolicStructDefinition::clone(root_view);
+        let matched: SymbolicNamedFieldMatch = resolve_named_field_offset_in_struct(
+            context, &as_path, field_name, &root);
+        transition matched {
+            SymbolicNamedFieldMatch::Matched { field_position, field_offset } -> to_offset(context, pointer_chain, resolved_links, link_position, field_offset)
+            SymbolicNamedFieldMatch::Failed { error } -> (SymbolicResolverEvaluationResult::Failed { error: error })
+        }
+    }
+    state to_offset(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64,
+        field_offset: u64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        // Upstream i64::try_from(field_offset) — the high bit refuses.
+        let signed: i64 = ((field_offset as i64 in Wrapping) as i64);
+        transition signed >= 0 && ((signed as u64 in Wrapping) as u64) == field_offset {
+            true -> store_offset(context, pointer_chain, resolved_links, link_position, signed)
+            false -> unknown_chain(pointer_chain)
+        }
+    }
+    state store_offset(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        pointer_chain: &OwnedSymbolicPointerChain,
+        resolved_links: OwnedSymbolicPointerChain,
+        link_position: u64,
+        signed: i64
+    ) -> SymbolicResolverEvaluationResult
+        requires link_position < 64
+    {
+        let mut out: OwnedSymbolicPointerChain = resolved_links;
+        let added: bool = out.add_link(SymbolicPointerChainLink::new_offset(signed));
+        transition added {
+            true -> rewrite_links(context, pointer_chain, out, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> rewrite_links(context, pointer_chain, out, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state unknown_chain(pointer_chain: &OwnedSymbolicPointerChain) -> SymbolicResolverEvaluationResult {
+        // Upstream: UnknownRelativePointerChain(chain.to_string()).
+        let mut text: [u8; 256];
+        let text_len: u64 = write_chain_text(pointer_chain, &mut text);
+        (SymbolicResolverEvaluationResult::Failed {
+            error: SymbolicResolverEvaluationError::UnknownRelativePointerChain {
+                symbol_path: text,
+                symbol_path_len: text_len } })
+    }
+    state call_hook(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        resolved_links: OwnedSymbolicPointerChain
+    ) -> SymbolicResolverEvaluationResult {
+        // Upstream: new_absolute(resolved_links, pointer_size) → the
+        // outer resolve_relative_pointer_chain closure.
+        (call_resolve_relative_pointer_chain(context, &resolved_links))
+    }
+}
+
+// Upstream `resolve_field_static_size_in_bytes` — size derivable without
+// a resolved element count (fixed containers use their declared length).
+machine resolve_field_static_size_in_bytes<'a>(
+    field_definition: &SymbolicFieldDefinition,
+    context: &mut SymbolicStructResolverLocalContext<'a>
+) -> SymbolicSizeResult {
+    let data_type_ref: &DataTypeRef = field_definition.get_data_type_ref();
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    let unit_size: SymbolicResolverSizeResult =
+        call_type_size(context, data_type_ref);
+    transition unit_size.found {
+        true -> by_container(field_definition, unit_size.size_in_bytes)
+        false -> (SymbolicSizeResult { found: false, size_in_bytes: 0 })
+    }
+    state by_container(field_definition: &SymbolicFieldDefinition, unit_size: u64) -> SymbolicSizeResult {
+        let container_type: ContainerType = field_definition.get_container_type();
+        transition container_type {
+            ContainerType::ArrayFixed { length } -> sized(field_definition, unit_size, length)
+            ContainerType::PointerArrayFixed { pointer_size, length } -> sized(field_definition, unit_size, length)
+            ContainerType::None -> sized(field_definition, unit_size, 1)
+            ContainerType::Pointer { pointer_size } -> sized(field_definition, unit_size, 1)
+            ContainerType::Array -> (SymbolicSizeResult { found: false, size_in_bytes: 0 })
+            ContainerType::PointerArray { pointer_size } -> (SymbolicSizeResult { found: false, size_in_bytes: 0 })
+            _ -> (SymbolicSizeResult { found: false, size_in_bytes: 0 })
+        }
+    }
+    state sized(field_definition: &SymbolicFieldDefinition, unit_size: u64, element_count: u64) -> SymbolicSizeResult {
+        (resolve_field_size_in_bytes(field_definition, unit_size, element_count))
+    }
+}
+
+// Upstream `resolve_field_size_in_bytes` — Pointer reports its declared
+// pointer size; Pointer*Array* are pointer_size × element_count;
+// None/Array/ArrayFixed are unit_size × element_count.
+machine resolve_field_size_in_bytes(
+    field_definition: &SymbolicFieldDefinition,
+    unit_size_in_bytes: u64,
+    element_count: u64
+) -> SymbolicSizeResult {
+    let container_type: ContainerType = field_definition.get_container_type();
+    transition container_type {
+        ContainerType::Pointer { pointer_size } -> (
+            SymbolicSizeResult { found: true, size_in_bytes: pointer_size.get_size_in_bytes() })
+        ContainerType::PointerArray { pointer_size } -> mul(pointer_size.get_size_in_bytes(), element_count)
+        ContainerType::PointerArrayFixed { pointer_size, length } -> mul(pointer_size.get_size_in_bytes(), element_count)
+        ContainerType::None -> mul(unit_size_in_bytes, element_count)
+        ContainerType::Array -> mul(unit_size_in_bytes, element_count)
+        ContainerType::ArrayFixed { length } -> mul(unit_size_in_bytes, element_count)
+        _ -> (SymbolicSizeResult { found: false, size_in_bytes: 0 })
+    }
+    state mul(left: u64, right: u64) -> SymbolicSizeResult {
+        // checked_mul — the Wrapping-domain product compared back is the
+        // port's checked multiply.
+        let product: u64 = ((left as u64 in Wrapping) * (right as u64 in Wrapping)) as u64;
+        transition right == 0 || product / right == left {
+            true -> (SymbolicSizeResult { found: true, size_in_bytes: product })
+            false -> (SymbolicSizeResult { found: false, size_in_bytes: 0 })
+        }
+    }
+}
+
+// Upstream `build_field_status` — first Err wins in offset/count/
+// display order, missing unit size → "Type size is unknown.", else Ready.
+machine build_field_status(
+    field_offset_result: &SymbolicFieldValueResolution,
+    element_count_result: &SymbolicFieldValueResolution,
+    display_element_count_result: &SymbolicFieldValueResolution,
+    unit_size_found: bool
+) -> ResolvedSymbolicFieldStatus {
+    transition field_offset_result {
+        SymbolicFieldValueResolution::Failed { error, error_len } -> unresolved(error, error_len)
+        _ -> check_count(element_count_result, display_element_count_result, unit_size_found)
+    }
+    state check_count(
+        element_count_result: &SymbolicFieldValueResolution,
+        display_element_count_result: &SymbolicFieldValueResolution,
+        unit_size_found: bool
+    ) -> ResolvedSymbolicFieldStatus {
+        transition element_count_result {
+            SymbolicFieldValueResolution::Failed { error, error_len } -> unresolved(error, error_len)
+            _ -> check_display(display_element_count_result, unit_size_found)
+        }
+    }
+    state check_display(
+        display_element_count_result: &SymbolicFieldValueResolution,
+        unit_size_found: bool
+    ) -> ResolvedSymbolicFieldStatus {
+        transition display_element_count_result {
+            SymbolicFieldValueResolution::Failed { error, error_len } -> unresolved(error, error_len)
+            _ -> check_size(unit_size_found)
+        }
+    }
+    state check_size(unit_size_found: bool) -> ResolvedSymbolicFieldStatus {
+        transition unit_size_found {
+            true -> (ResolvedSymbolicFieldStatus::Ready)
+            false -> unknown_type()
+        }
+    }
+    state unknown_type() -> ResolvedSymbolicFieldStatus {
+        let mut reason: [u8; 256];
+        let reason_len: u64 = copy_resolver_span(reason, ("Type size is unknown."));
+        (ResolvedSymbolicFieldStatus::Unresolved { reason: reason, reason_len: reason_len })
+    }
+    state unresolved(error: [u8; 256], error_len: u64) -> ResolvedSymbolicFieldStatus {
+        transition error_len <= 256 {
+            true -> build(error, error_len)
+            false -> build(error, 256)
+        }
+    }
+    state build(error: [u8; 256], error_len: u64) -> ResolvedSymbolicFieldStatus {
+        (ResolvedSymbolicFieldStatus::Unresolved { reason: error, reason_len: error_len })
+    }
+}
+
+// Upstream `maybe_capture_scalar_field_value` — only named, inferred-
+// count, scalar (container None) fields with resolved offset+size get
+// read; the bool reports whether the map value changed.
+machine maybe_capture_scalar_field_value<'a>(
+    field_definition: &SymbolicFieldDefinition,
+    field_offset: SymbolicOptionalValue,
+    field_size_in_bytes: SymbolicOptionalValue,
+    context: &mut SymbolicStructResolverLocalContext<'a>
+) -> bool {
+    let name: &[u8] = field_definition.get_field_name();
+    let count_resolution: SymbolicFieldCountResolution = field_definition.get_count_resolution();
+    let container_type: ContainerType = field_definition.get_container_type();
+    transition {
+        _ -> gate(name, count_resolution, container_type, field_definition, field_offset, field_size_in_bytes, context)
+    }
+    state gate(
+        name: &[u8],
+        count_resolution: SymbolicFieldCountResolution,
+        container_type: ContainerType,
+        field_definition: &SymbolicFieldDefinition,
+        field_offset: SymbolicOptionalValue,
+        field_size_in_bytes: SymbolicOptionalValue,
+        context: &mut SymbolicStructResolverLocalContext<'a>
+    ) -> bool {
+        transition name.len == 0 || !count_resolution.is_inferred() {
+            true -> (false)
+            false -> check_container(container_type, field_definition, field_offset, field_size_in_bytes, name, context)
+        }
+    }
+    state check_container(
+        container_type: ContainerType,
+        field_definition: &SymbolicFieldDefinition,
+        field_offset: SymbolicOptionalValue,
+        field_size_in_bytes: SymbolicOptionalValue,
+        name: &[u8],
+        context: &mut SymbolicStructResolverLocalContext<'a>
+    ) -> bool {
+        transition container_type {
+            ContainerType::None -> check_options(field_definition, field_offset, field_size_in_bytes, name, context)
+            _ -> (false)
+        }
+    }
+    state check_options(
+        field_definition: &SymbolicFieldDefinition,
+        field_offset: SymbolicOptionalValue,
+        field_size_in_bytes: SymbolicOptionalValue,
+        name: &[u8],
+        context: &mut SymbolicStructResolverLocalContext<'a>
+    ) -> bool {
+        transition field_offset.found && field_size_in_bytes.found {
+            true -> read(field_definition, field_offset, field_size_in_bytes, name, context)
+            false -> (false)
+        }
+    }
+    state read(
+        field_definition: &SymbolicFieldDefinition,
+        field_offset: SymbolicOptionalValue,
+        field_size_in_bytes: SymbolicOptionalValue,
+        name: &[u8],
+        context: &mut SymbolicStructResolverLocalContext<'a>
+    ) -> bool {
+        let read: SymbolicScalarReadResult =
+            call_read_scalar(context, field_definition, field_offset.value, field_size_in_bytes.value);
+        transition read {
+            SymbolicScalarReadResult::Read { found, value_lo, value_hi } -> store(context, name, found, value_lo, value_hi)
+            SymbolicScalarReadResult::ReadFailed { error, error_len } -> (false)
+        }
+    }
+    state store(
+        context: &mut SymbolicStructResolverLocalContext<'a>,
+        name: &[u8],
+        found: bool,
+        value_lo: u64,
+        value_hi: u64
+    ) -> bool {
+        transition found {
+            true -> (context.set_scalar(name, value_lo, value_hi))
+            false -> (false)
+        }
+    }
+}
+
+// --- Helper machines for the pass + walkers ----------------------------
+
+// Upstream `result.as_ref().ok().flatten()` on Result<Option<u64>,_>.
+machine resolution_ok_flatten(
+    result: &SymbolicFieldValueResolution
+) -> SymbolicOptionalValue {
+    transition result {
+        SymbolicFieldValueResolution::Resolved { found, value } -> (
+            SymbolicOptionalValue { found: found, value: value })
+        SymbolicFieldValueResolution::Failed { error, error_len } -> (
+            SymbolicOptionalValue { found: false, value: 0 })
+    }
+}
+
+// Upstream: display_result.ok().flatten().map(|d| count.ok().flatten()
+//     .map(|s| d.min(s)).unwrap_or(d)).
+machine clamp_display_to_storage(
+    display_element_count: SymbolicOptionalValue,
+    storage_count: SymbolicOptionalValue
+) -> SymbolicOptionalValue {
+    transition display_element_count.found {
+        true -> clamp(display_element_count, storage_count)
+        false -> (SymbolicOptionalValue { found: false, value: 0 })
+    }
+    state clamp(display_element_count: SymbolicOptionalValue, storage_count: SymbolicOptionalValue) -> SymbolicOptionalValue {
+        transition storage_count.found {
+            true -> pick_min(display_element_count, storage_count)
+            false -> (display_element_count)
+        }
+    }
+    state pick_min(display_element_count: SymbolicOptionalValue, storage_count: SymbolicOptionalValue) -> SymbolicOptionalValue {
+        transition display_element_count.value < storage_count.value {
+            true -> (display_element_count)
+            false -> (storage_count)
+        }
+    }
+}
+
+// Upstream `.map(|c| c.min(max_dynamic_array_preview_elements))`.
+machine clamp_to_preview(
+    element_count: SymbolicOptionalValue,
+    preview_limit: u64
+) -> SymbolicOptionalValue {
+    transition element_count.found {
+        true -> clamp(element_count, preview_limit)
+        false -> (SymbolicOptionalValue { found: false, value: 0 })
+    }
+    state clamp(element_count: SymbolicOptionalValue, preview_limit: u64) -> SymbolicOptionalValue {
+        transition element_count.value < preview_limit {
+            true -> (element_count)
+            false -> (SymbolicOptionalValue { found: true, value: preview_limit })
+        }
+    }
+}
+
+// Upstream: `next_sequential_offset = max(offset.saturating_add(size))`
+// when both resolved.
+machine advance_sequential(
+    next_sequential_offset: u64,
+    field_offset: SymbolicOptionalValue,
+    field_size_in_bytes: SymbolicOptionalValue
+) -> u64 {
+    transition field_offset.found && field_size_in_bytes.found {
+        true -> advance(next_sequential_offset, field_offset.value, field_size_in_bytes.value)
+        false -> (next_sequential_offset)
+    }
+    state advance(next_sequential_offset: u64, field_offset: u64, field_size_in_bytes: u64) -> u64 {
+        let span: u64 = ((field_offset as u64 in Saturating) + (field_size_in_bytes as u64 in Saturating)) as u64;
+        transition span > next_sequential_offset {
+            true -> (span)
+            false -> (next_sequential_offset)
+        }
+    }
+}
+
+// Upstream: `unit_size.and_then(|u| count.ok().flatten().and_then(|c|
+// resolve_field_size_in_bytes(field, u, c)))`.
+machine compute_field_size(
+    field_definition: &SymbolicFieldDefinition,
+    unit_size_in_bytes: SymbolicResolverSizeResult,
+    element_count_result: &SymbolicFieldValueResolution
+) -> SymbolicOptionalValue {
+    transition unit_size_in_bytes.found {
+        true -> with_count(field_definition, unit_size_in_bytes.size_in_bytes, element_count_result)
+        false -> (SymbolicOptionalValue { found: false, value: 0 })
+    }
+    state with_count(
+        field_definition: &SymbolicFieldDefinition,
+        unit_size: u64,
+        element_count_result: &SymbolicFieldValueResolution
+    ) -> SymbolicOptionalValue {
+        let count: SymbolicOptionalValue = resolution_ok_flatten(element_count_result);
+        transition count.found {
+            true -> size(field_definition, unit_size, count.value)
+            false -> (SymbolicOptionalValue { found: false, value: 0 })
+        }
+    }
+    state size(field_definition: &SymbolicFieldDefinition, unit_size: u64, element_count: u64) -> SymbolicOptionalValue {
+        let result: SymbolicSizeResult = resolve_field_size_in_bytes(field_definition, unit_size, element_count);
+        (SymbolicOptionalValue { found: result.found, value: result.size_in_bytes })
+    }
+}
+
+// Symbol link → name span (destructure of the [copy] chain link).
+machine read_symbol_name(symbol: PointerChainSymbol) -> &[u8] {
+    transition symbol.symbol_name_len <= 256 {
+        true -> (&symbol.symbol_name[0..symbol.symbol_name_len])
+        false -> (&symbol.symbol_name[0..256])
+        _ -> (&symbol.symbol_name[0..256])
+    }
+}
+
+// Byte-span equality for the named-field walker.
+machine spans_equal(left: &[u8], right: &[u8]) -> bool {
+    transition left.len == right.len {
+        true -> compare(left, right, 0)
+        false -> (false)
+    }
+    state compare(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> check(left, right, position)
+            false -> (true)
+        }
+    }
+    state check(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] == right[position] {
+            true -> compare(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+        }
+    }
+}
+
+// --- Error text writers (upstream format!/Display surfaces, bounded) ---
+
+// "Resolver `<id>` resolved to negative or too-large value `<i128>`."
+machine write_oversize_reason(out: &mut [u8; 256], resolver_id: &[u8], value_lo: u64, value_hi: u64) -> u64 {
+    let mut written: u64 = copy_resolver_span(out, ("Resolver `"));
+    let id_len: u64 = copy_resolver_span_at(out, written, resolver_id);
+    written = id_len;
+    written = copy_resolver_span_at(out, written, ("` resolved to negative or too-large value `"));
+    let value: ResolverI128 = ResolverI128 { lo: value_lo, hi: value_hi };
+    written = write_i128_decimal(&value, out, written);
+    copy_resolver_span_at(out, written, ("`."))
+}
+
+// "Resolver cycle detected at `<id>`."
+machine write_cycle_reason(out: &mut [u8; 256], resolver_id: &[u8]) -> u64 {
+    let mut written: u64 = copy_resolver_span(out, ("Resolver cycle detected at `"));
+    written = copy_resolver_span_at(out, written, resolver_id);
+    copy_resolver_span_at(out, written, ("`."))
+}
+
+// "Unknown resolver `<id>`."
+machine write_unknown_resolver(out: &mut [u8; 256], resolver_id: &[u8]) -> u64 {
+    let mut written: u64 = copy_resolver_span(out, ("Unknown resolver `"));
+    written = copy_resolver_span_at(out, written, resolver_id);
+    copy_resolver_span_at(out, written, ("`."))
+}
+
+// "Dynamic array count exceeds preview limit of <n>."
+machine write_clamp_reason(out: &mut [u8; 256], preview_limit: u64) -> u64 {
+    let mut written: u64 = copy_resolver_span(out, ("Dynamic array count exceeds preview limit of "));
+    written = write_u64_decimal(preview_limit, out, written);
+    copy_resolver_span_at(out, written, ("."))
+}
+
+// UnknownRelativeSymbolPath(symbol_path.to_string()) — path display text.
+machine path_error(symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationError {
+    let mut text: [u8; 256];
+    let text_len: u64 = symbol_path.display_text(&mut text);
+    SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+        symbol_path: text,
+        symbol_path_len: text_len }
+}
+
+// "<path><suffix>" — the terminal-offset and not-scalar messages.
+machine write_path_suffix_error(
+    symbol_path: &SymbolicResolverRelativeSymbolPath,
+    out: &mut [u8; 256],
+    suffix: &[u8]
+) -> u64 {
+    let written: u64 = symbol_path.display_text(out);
+    copy_resolver_span_at(out, written, suffix)
+}
+
+// "<path>: <inner>" — named-field-offset errors wrap the inner reason.
+machine write_path_prefix_error(
+    symbol_path: &SymbolicResolverRelativeSymbolPath,
+    out: &mut [u8; 256],
+    inner: &[u8]
+) -> u64 {
+    let mut written: u64 = symbol_path.display_text(out);
+    written = copy_resolver_span_at(out, written, (": "));
+    copy_resolver_span_at(out, written, inner)
+}
+
+// OwnedSymbolicPointerChain display — module + link list; upstream's
+// `to_string()` produces "module:link.link"/offset-decorated text; the
+// port writes the link display sequence into `out`.
+machine write_chain_text(pointer_chain: &OwnedSymbolicPointerChain, out: &mut [u8; 256]) -> u64 {
+    let module_name: &[u8] = pointer_chain.get_module_name();
+    let mut written: u64 = copy_resolver_span(out, module_name);
+    transition written > 0 && pointer_chain.get_link_count() > 0 {
+        true -> sep(out, written)
+        false -> links(pointer_chain, out, written, 0)
+    }
+    state sep(out: &mut [u8; 256], written: u64) -> u64 {
+        transition written < 256 {
+            true -> store_sep(out, written)
+            false -> (written)
+        }
+    }
+    state store_sep(out: &mut [u8; 256], written: u64) -> u64
+        requires written < 256
+    {
+        out[written] = 58;
+        (written)
+    }
+    state links(pointer_chain: &OwnedSymbolicPointerChain, out: &mut [u8; 256], written: u64, link_position: u64) -> u64 {
+        transition link_position < pointer_chain.link_count && link_position < 64 {
+            true -> write_link(pointer_chain, out, written, link_position)
+            false -> (written)
+        }
+    }
+    state write_link(pointer_chain: &OwnedSymbolicPointerChain, out: &mut [u8; 256], written: u64, link_position: u64) -> u64
+        requires link_position < 64
+    {
+        transition link_position < pointer_chain.link_count && link_position < 64 {
+            true -> write_link_body(pointer_chain, out, written, link_position)
+            false -> (written)
+        }
+    }
+    state write_link_body(pointer_chain: &OwnedSymbolicPointerChain, out: &mut [u8; 256], written: u64, link_position: u64) -> u64
+        requires link_position < 64
+    {
+        let link: SymbolicPointerChainLink = pointer_chain.get_link(link_position);
+        let mut scratch: [u8; 512];
+        let link_len: u64 = link.display_text(&mut scratch);
+        transition link_len <= 512 {
+            true -> copy_link(pointer_chain, out, written, link_position, &scratch[0..link_len])
+            false -> copy_link(pointer_chain, out, written, link_position, &scratch[0..512])
+        }
+    }
+    state copy_link(pointer_chain: &OwnedSymbolicPointerChain, out: &mut [u8; 256], written: u64, link_position: u64, text: &[u8]) -> u64
+        requires link_position < 64
+    {
+        let next: u64 = copy_resolver_span_at(out, written, text);
+        transition {
+            _ -> links(pointer_chain, out, next, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// SymbolicResolverEvaluationError's Display — format_resolver_error's
+// `error.to_string()`. Payloads are bounded spans; interpolation is
+// literal + payload writes at a running offset.
+machine write_evaluation_error_text(
+    error: &SymbolicResolverEvaluationError,
+    out: &mut [u8; 256]
+) -> u64 {
+    transition error {
+        SymbolicResolverEvaluationError::UnknownLocalField { field_name, field_name_len } -> (
+            wrap_backtick(out, ("Unknown local field `"), &field_name[0..field_name_len]))
+        SymbolicResolverEvaluationError::UnknownRelativeSymbolPath { symbol_path, symbol_path_len } -> (
+            wrap_backtick(out, ("Unknown relative symbol path `"), &symbol_path[0..symbol_path_len]))
+        SymbolicResolverEvaluationError::UnknownGlobalSymbolPath { symbol_path, symbol_path_len } -> (
+            wrap_backtick(out, ("Unknown global symbol path `"), &symbol_path[0..symbol_path_len]))
+        SymbolicResolverEvaluationError::AmbiguousGlobalSymbolPath { symbol_path, symbol_path_len } -> (
+            wrap_backtick(out, ("Ambiguous global symbol path `"), &symbol_path[0..symbol_path_len]))
+        SymbolicResolverEvaluationError::UnknownRelativePointerChain { symbol_path, symbol_path_len } -> (
+            wrap_backtick(out, ("Unknown relative pointer chain `"), &symbol_path[0..symbol_path_len]))
+        SymbolicResolverEvaluationError::UnknownGlobalPointerChain { symbol_path, symbol_path_len } -> (
+            wrap_backtick(out, ("Unknown global pointer chain `"), &symbol_path[0..symbol_path_len]))
+        SymbolicResolverEvaluationError::UnknownTypeSize { data_type, data_type_len } -> (
+            wrap_backtick(out, ("Unknown size for type `"), &data_type[0..data_type_len]))
+        SymbolicResolverEvaluationError::ResolverCycle { resolver_id, resolver_id_len } -> (
+            wrap_backtick(out, ("Resolver cycle detected at `"), &resolver_id[0..resolver_id_len]))
+        SymbolicResolverEvaluationError::DivisionByZero -> (
+            copy_resolver_span(out, ("Division by zero.")))
+        SymbolicResolverEvaluationError::InvalidShiftAmount { shift_amount_lo, shift_amount_hi } -> (
+            shift_text(out, shift_amount_lo, shift_amount_hi))
+        SymbolicResolverEvaluationError::ArithmeticOverflow -> (
+            copy_resolver_span(out, ("Arithmetic overflow.")))
+        _ -> (copy_resolver_span(out, ("Resolver evaluation error.")))
+    }
+}
+
+machine wrap_backtick(out: &mut [u8; 256], prefix: &[u8], payload: &[u8]) -> u64 {
+    let mut written: u64 = copy_resolver_span(out, prefix);
+    written = copy_resolver_span_at(out, written, payload);
+    copy_resolver_span_at(out, written, ("`."))
+}
+
+machine shift_text(out: &mut [u8; 256], shift_amount_lo: u64, shift_amount_hi: u64) -> u64 {
+    let mut written: u64 = copy_resolver_span(out, ("Invalid shift amount `"));
+    written = write_u64_decimal(shift_amount_lo, out, written);
+    copy_resolver_span_at(out, written, ("`."))
+}
+
+// Bounded span copy at a running offset (returns the new offset).
+machine copy_resolver_span_at(out: &mut [u8; 256], written: u64, text: &[u8]) -> u64 {
+    transition {
+        _ -> copy(out, written, text, 0)
+    }
+    state copy(out: &mut [u8; 256], written: u64, text: &[u8], position: u64) -> u64 {
+        transition position < text.len && written < 256 {
+            true -> store(out, written, text, position)
+            false -> (written)
+        }
+    }
+    state store(out: &mut [u8; 256], written: u64, text: &[u8], position: u64) -> u64
+        requires position < text.len && written < 256
+    {
+        out[written] = text[position];
+        transition {
+            _ -> copy(out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Decimal digit carrier — iterative digit collection (little-endian)
+// sized to i128's 39-digit bound.
+pub data DecimalDigits {
+    digits: [u8; 40];
+    count: u64;
+}
+
+machine write_u64_decimal(value: u64, out: &mut [u8; 256], written: u64) -> u64 {
+    let mut collected: DecimalDigits = DecimalDigits { count: 0 };
+    transition {
+        _ -> collect(collected, value, out, written)
+    }
+    state collect(collected: DecimalDigits, value: u64, out: &mut [u8; 256], written: u64) -> u64 {
+        transition collected.count < 40 && value != 0 {
+            true -> digit(collected, value, out, written)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state digit(collected: DecimalDigits, value: u64, out: &mut [u8; 256], written: u64) -> u64
+        requires collected.count < 40 && value != 0
+    {
+        let quotient: u64 = value / 10;
+        let digit: u64 = ((value as u64 in Wrapping) - ((quotient as u64 in Wrapping) * (10 as u64 in Wrapping))) as u64;
+        transition digit < 10 && collected.count < 40 {
+            true -> store(collected, quotient, out, written, digit)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state store(collected: DecimalDigits, quotient: u64, out: &mut [u8; 256], written: u64, digit: u64) -> u64
+        requires collected.count < 40 && digit < 10
+    {
+        transition collected.count < 40 {
+            true -> store_digit(collected, quotient, out, written, digit)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state store_digit(collected: DecimalDigits, quotient: u64, out: &mut [u8; 256], written: u64, digit: u64) -> u64
+        requires collected.count < 40 && digit < 10
+    {
+        let mut out_digits: DecimalDigits = collected;
+        out_digits.digits[collected.count] = ((48 as u64 in Wrapping) + (digit as u64 in Wrapping)) as u8;
+        out_digits.count = ((collected.count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> collect(out_digits, quotient, out, written)
+        }
+    }
+    state emit(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64) -> u64 {
+        transition position < collected.count && collected.count <= 40 && written < 256 {
+            true -> put(collected, out, written, position)
+            false -> finish(collected, out, written, position)
+        }
+    }
+    state put(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64) -> u64
+        requires position < collected.count && written < 256 && collected.count <= 40
+    {
+        let back: u64 = ((collected.count as u64 in Wrapping) - (1 as u64 in Wrapping) - (position as u64 in Wrapping)) as u64;
+        transition back < 40 && written < 256 && position < collected.count && collected.count <= 40 {
+            true -> write_digit(collected, out, written, position, back)
+            false -> (written)
+        }
+    }
+    state write_digit(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64, back: u64) -> u64
+        requires back < 40 && written < 256 && position < collected.count && collected.count <= 40
+    {
+        out[written] = collected.digits[back];
+        transition {
+            _ -> emit(collected, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64) -> u64 {
+        transition position == 0 && collected.count == 0 {
+            true -> zero(out, written)
+            false -> (written)
+        }
+    }
+    state zero(out: &mut [u8; 256], written: u64) -> u64 {
+        transition written < 256 {
+            true -> commit_zero(out, written)
+            false -> (written)
+        }
+    }
+    state commit_zero(out: &mut [u8; 256], written: u64) -> u64
+        requires written < 256
+    {
+        out[written] = 48;
+        (((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+    }
+}
+
+// Signed decimal for the {lo, hi} pair — magnitude + optional '-'.
+machine write_i128_decimal(value: &ResolverI128, out: &mut [u8; 256], written: u64) -> u64 {
+    transition value.is_negative() {
+        true -> negative(value, out, written)
+        false -> (write_i128_magnitude(value, out, written))
+    }
+    state negative(value: &ResolverI128, out: &mut [u8; 256], written: u64) -> u64 {
+        transition written < 256 {
+            true -> write_minus(value, out, written)
+            false -> (written)
+        }
+    }
+    state write_minus(value: &ResolverI128, out: &mut [u8; 256], written: u64) -> u64
+        requires written < 256
+    {
+        out[written] = 45;
+        let magnitude: ResolverI128 = value.magnitude();
+        (write_i128_magnitude(&magnitude, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64))
+    }
+}
+
+// Magnitude-only i128 decimal — iterative div/rem by 10 into the digit
+// carrier (checked_div/checked_rem on a positive magnitude; rem.lo < 10).
+machine write_i128_magnitude(value: &ResolverI128, out: &mut [u8; 256], written: u64) -> u64 {
+    let mut collected: DecimalDigits = DecimalDigits { count: 0 };
+    transition {
+        _ -> collect(collected, value, out, written)
+    }
+    state collect(collected: DecimalDigits, value: &ResolverI128, out: &mut [u8; 256], written: u64) -> u64 {
+        transition collected.count < 40 && !value.is_zero() {
+            true -> divide(collected, value, out, written)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state divide(collected: DecimalDigits, value: &ResolverI128, out: &mut [u8; 256], written: u64) -> u64
+        requires collected.count < 40
+    {
+        let ten: ResolverI128 = ResolverI128::from_u64(10);
+        let division: ResolverI128Math = value.checked_div(&ten);
+        transition division.ok {
+            true -> rem(collected, value, out, written, division.value, ten)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state rem(collected: DecimalDigits, value: &ResolverI128, out: &mut [u8; 256], written: u64, quotient: ResolverI128, ten: ResolverI128) -> u64
+        requires collected.count < 40
+    {
+        let remainder: ResolverI128Math = value.checked_rem(&ten);
+        transition remainder.ok && collected.count < 40 {
+            true -> store(collected, out, written, quotient, remainder.value.lo)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state store(collected: DecimalDigits, out: &mut [u8; 256], written: u64, quotient: ResolverI128, digit: u64) -> u64
+        requires collected.count < 40
+    {
+        transition digit < 10 && collected.count < 40 {
+            true -> push(collected, out, written, quotient, digit)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state push(collected: DecimalDigits, out: &mut [u8; 256], written: u64, quotient: ResolverI128, digit: u64) -> u64
+        requires collected.count < 40 && digit < 10
+    {
+        transition collected.count < 40 {
+            true -> push_digit(collected, out, written, quotient, digit)
+            false -> emit(collected, out, written, 0)
+        }
+    }
+    state push_digit(collected: DecimalDigits, out: &mut [u8; 256], written: u64, quotient: ResolverI128, digit: u64) -> u64
+        requires collected.count < 40 && digit < 10
+    {
+        let mut out_digits: DecimalDigits = collected;
+        out_digits.digits[collected.count] = ((48 as u64 in Wrapping) + (digit as u64 in Wrapping)) as u8;
+        out_digits.count = ((collected.count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> collect(out_digits, &quotient, out, written)
+        }
+    }
+    state emit(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64) -> u64 {
+        transition position < collected.count && collected.count <= 40 && written < 256 {
+            true -> put(collected, out, written, position)
+            false -> finish(collected, out, written, position)
+        }
+    }
+    state put(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64) -> u64
+        requires position < collected.count && written < 256 && collected.count <= 40
+    {
+        let back: u64 = ((collected.count as u64 in Wrapping) - (1 as u64 in Wrapping) - (position as u64 in Wrapping)) as u64;
+        transition back < 40 && written < 256 && position < collected.count && collected.count <= 40 {
+            true -> write_digit(collected, out, written, position, back)
+            false -> (written)
+        }
+    }
+    state write_digit(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64, back: u64) -> u64
+        requires back < 40 && written < 256 && position < collected.count && collected.count <= 40
+    {
+        out[written] = collected.digits[back];
+        transition {
+            _ -> emit(collected, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(collected: DecimalDigits, out: &mut [u8; 256], written: u64, position: u64) -> u64 {
+        transition position == 0 && collected.count == 0 {
+            true -> zero(out, written)
+            false -> (written)
+        }
+    }
+    state zero(out: &mut [u8; 256], written: u64) -> u64 {
+        transition written < 256 {
+            true -> commit_zero(out, written)
+            false -> (written)
+        }
+    }
+    state commit_zero(out: &mut [u8; 256], written: u64) -> u64
+        requires written < 256
+    {
+        out[written] = 48;
+        (((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+    }
+}
+
+// --- Hook call helpers --------------------------------------------------
+// Each `context.hooks` call lives in a leaf machine so the `&mut` field
+// reborrow ends inside it — never held across a state that passes the
+// owning context onward.
+
+machine call_type_size<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    data_type_ref: &DataTypeRef
+) -> SymbolicResolverSizeResult {
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    (hooks.resolve_type_size_in_bytes(data_type_ref))
+}
+
+machine call_read_scalar<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    field_definition: &SymbolicFieldDefinition,
+    offset_in_bytes: u64,
+    size_in_bytes: u64
+) -> SymbolicScalarReadResult {
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    (hooks.read_scalar_field(field_definition, offset_in_bytes, size_in_bytes))
+}
+
+machine call_resolve_resolver_definition<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    resolver_id: &[u8]
+) -> SymbolicResolverDefinitionMatch {
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    (hooks.resolve_resolver_definition(resolver_id))
+}
+
+machine call_resolve_struct_definition<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    data_type_ref: &DataTypeRef
+) -> SymbolicStructDefinitionMatch {
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    (hooks.resolve_struct_definition(data_type_ref))
+}
+
+machine call_resolve_relative_pointer_chain<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    pointer_chain: &OwnedSymbolicPointerChain
+) -> SymbolicResolverEvaluationResult {
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    (hooks.resolve_relative_pointer_chain(pointer_chain))
+}
+
+machine call_resolve_global_symbol_field<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    symbol_path: &[u8],
+    relative_symbol_path: &SymbolicResolverRelativeSymbolPath
+) -> SymbolicResolverEvaluationResult {
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    (hooks.resolve_global_symbol_field(symbol_path, relative_symbol_path))
+}
+
+machine call_resolve_global_pointer_chain<'a>(
+    context: &mut SymbolicStructResolverLocalContext<'a>,
+    pointer_chain: &OwnedSymbolicPointerChain
+) -> SymbolicResolverEvaluationResult {
+    let hooks: &mut SymbolicStructResolverHooks = context.hooks;
+    (hooks.resolve_global_pointer_chain(pointer_chain))
+}
