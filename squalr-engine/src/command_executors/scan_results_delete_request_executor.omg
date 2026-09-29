@@ -3,6 +3,8 @@ module src::command_executors::scan_results_delete_request_executor;
 use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultRefList;
 use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultsDeleteRequest;
 use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_response::ScanResultsDeleteResponse;
+use squalr_engine_api::src::events::engine_event::EngineEvent;
+use squalr_engine_api::src::events::scan_results::updated::scan_results_updated_event::ScanResultsUpdatedEvent;
 use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
 use squalr_engine_api::src::structures::snapshots::deleted_scan_result_index_set::DeletedScanResultIndexSet;
 use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
@@ -13,8 +15,8 @@ use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
 // result index as deleted on the snapshot tombstone set and report how
 // many fresh marks landed. Upstream's write-lock failure arm folds into
 // the `has_opened_process` gate here (the port's snapshot is owned, not
-// RwLock'd); upstream's ScanResultsUpdatedEvent has no event surface in
-// the port yet — a named deviation.
+// RwLock'd). Upstream emits `ScanResultsUpdatedEvent { is_new_scan: false }`
+// only when at least one result was deleted — same gate on `apply`.
 pub data ScanResultsDeleteRequestExecutor {}
 
 pub machine ScanResultsDeleteRequestExecutor::execute(
@@ -70,6 +72,23 @@ crashes Abort
     ) -> ScanResultsDeleteResponse {
         let snapshot: &mut Snapshot = engine_privileged_state.borrow_snapshot_mut();
         let deleted_result_count: u64 = snapshot.delete_scan_results(deleted_scan_result_indices);
+        transition deleted_result_count > 0 {
+            true -> emit(engine_privileged_state, requested_result_count, deleted_result_count)
+            false -> (ScanResultsDeleteResponse::of(requested_result_count, deleted_result_count))
+            _ -> (ScanResultsDeleteResponse::of(requested_result_count, deleted_result_count))
+        }
+    }
+
+    // Upstream `emit_event(ScanResultsUpdatedEvent { is_new_scan: false })`
+    // — fires only on the deleted>0 arm above.
+    state emit(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        requested_result_count: u64,
+        deleted_result_count: u64
+    ) -> ScanResultsDeleteResponse {
+        let updated: ScanResultsUpdatedEvent = ScanResultsUpdatedEvent::new(false);
+        let event: EngineEvent = updated.to_engine_event();
+        _ = engine_privileged_state.emit_event(&event);
         transition { _ -> (ScanResultsDeleteResponse::of(requested_result_count, deleted_result_count)) }
     }
 }
