@@ -1,0 +1,486 @@
+module src::structures::structs::symbolic_resolver_i128;
+
+// i128 emulation for the symbolic resolver — upstream's evaluator is
+// `i128`-typed and there is no 128-bit primitive in this pin, so values
+// carry as {lo, hi} two's-complement u64 pairs preserving the exact bit
+// pattern. All arithmetic is Wrapping-domain with explicit overflow
+// detection matching Rust's checked_* i128 semantics.
+pub data ResolverI128 [copy] {
+    lo: u64;
+    hi: u64;
+}
+
+// Result of a checked i128 op — `ok: false` means upstream's checked_*
+// returned None (overflow on add/sub/mul/div/rem; the caller maps it to
+// ArithmeticOverflow).
+pub data ResolverI128Math [copy] {
+    ok: bool;
+    value: ResolverI128;
+}
+
+// Quotient+remainder pair for division.
+pub data ResolverI128Div [copy] {
+    quotient: ResolverI128;
+    remainder: ResolverI128;
+}
+
+pub machine ResolverI128::from_u64(value: u64) -> ResolverI128 {
+    (ResolverI128 { lo: value, hi: 0 })
+}
+
+// Upstream `i128::from(i64)` — sign-extended.
+pub machine ResolverI128::from_i64(value: i64) -> ResolverI128 {
+    let bits: u64 = ((value as u64 in Wrapping) as u64);
+    transition (value < 0) {
+        true -> (ResolverI128 { lo: bits, hi: 18446744073709551615 })
+        false -> (ResolverI128 { lo: bits, hi: 0 })
+        _ -> (ResolverI128 { lo: bits, hi: 0 })
+    }
+}
+
+// Upstream `i128::from(bool)` — 1/0.
+pub machine ResolverI128::from_bool(value: bool) -> ResolverI128 {
+    transition value {
+        true -> (ResolverI128 { lo: 1, hi: 0 })
+        false -> (ResolverI128 { lo: 0, hi: 0 })
+        _ -> (ResolverI128 { lo: 0, hi: 0 })
+    }
+}
+
+pub machine ResolverI128::is_negative(&self) -> bool {
+    let hi_signed: i64 = ((self.hi as i64 in Wrapping) as i64);
+    (hi_signed < 0)
+}
+
+pub machine ResolverI128::is_zero(&self) -> bool {
+    (self.hi == 0 && self.lo == 0)
+}
+
+// Signed three-way compare — hi words compare signed, lo words unsigned.
+pub machine ResolverI128::compare(&self, other: &ResolverI128) -> i64 {
+    let left_hi: i64 = ((self.hi as i64 in Wrapping) as i64);
+    let right_hi: i64 = ((other.hi as i64 in Wrapping) as i64);
+    transition left_hi < right_hi {
+        true -> ((-1))
+        false -> high_equal(left_hi, right_hi, other)
+        _ -> high_equal(left_hi, right_hi, other)
+    }
+    state high_equal(&self, left_hi: i64, right_hi: i64, other: &ResolverI128) -> i64 {
+        transition left_hi > right_hi {
+            true -> (1)
+            false -> compare_lo(other)
+            _ -> compare_lo(other)
+        }
+    }
+    state compare_lo(&self, other: &ResolverI128) -> i64 {
+        transition self.lo < other.lo {
+            true -> ((-1))
+            false -> lo_done(other)
+            _ -> lo_done(other)
+        }
+    }
+    state lo_done(&self, other: &ResolverI128) -> i64 {
+        transition self.lo > other.lo {
+            true -> (1)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+}
+
+pub machine ResolverI128::equal_to(&self, other: &ResolverI128) -> bool {
+    (self.hi == other.hi && self.lo == other.lo)
+}
+
+// Two's-complement negation on the pair.
+pub machine ResolverI128::negate(&self) -> ResolverI128 {
+    let lo_r: u64 = ((0 as u64 in Wrapping) - (self.lo as u64 in Wrapping)) as u64;
+    transition (self.lo != 0) {
+        true -> negate_hi_borrow(lo_r)
+        false -> negate_hi_plain(lo_r)
+        _ -> negate_hi_plain(lo_r)
+    }
+    state negate_hi_borrow(&self, lo_r: u64) -> ResolverI128 {
+        let hi_r: u64 = ((((0 as u64 in Wrapping) - (self.hi as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        (ResolverI128 { lo: lo_r, hi: hi_r })
+    }
+    state negate_hi_plain(&self, lo_r: u64) -> ResolverI128 {
+        let hi_r: u64 = ((0 as u64 in Wrapping) - (self.hi as u64 in Wrapping)) as u64;
+        (ResolverI128 { lo: lo_r, hi: hi_r })
+    }
+}
+
+// Two's-complement magnitude (upstream `unsigned_abs` shape).
+pub machine ResolverI128::magnitude(&self) -> ResolverI128 {
+    let negative: bool = self.is_negative();
+    transition negative {
+        true -> apply_negative()
+        false -> (ResolverI128 { lo: self.lo, hi: self.hi })
+        _ -> (ResolverI128 { lo: self.lo, hi: self.hi })
+    }
+    state apply_negative(&self) -> ResolverI128 {
+        let negated: ResolverI128 = self.negate();
+        (negated)
+    }
+}
+
+// Upstream `checked_add`: mod-2^128 add + sign-overflow detect.
+pub machine ResolverI128::checked_add(&self, other: &ResolverI128) -> ResolverI128Math {
+    let lo_r: u64 = ((self.lo as u64 in Wrapping) + (other.lo as u64 in Wrapping)) as u64;
+    transition (lo_r < self.lo) {
+        true -> carry(other, lo_r)
+        false -> no_carry(other, lo_r)
+        _ -> no_carry(other, lo_r)
+    }
+    state carry(&self, other: &ResolverI128, lo_r: u64) -> ResolverI128Math {
+        let hi_r: u64 = ((((self.hi as u64 in Wrapping) + (other.hi as u64 in Wrapping)) as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let outcome: ResolverI128Math = check_add_overflow(self, other, lo_r, hi_r);
+        (outcome)
+    }
+    state no_carry(&self, other: &ResolverI128, lo_r: u64) -> ResolverI128Math {
+        let hi_r: u64 = ((self.hi as u64 in Wrapping) + (other.hi as u64 in Wrapping)) as u64;
+        let outcome: ResolverI128Math = check_add_overflow(self, other, lo_r, hi_r);
+        (outcome)
+    }
+}
+
+// Upstream `checked_sub` — borrow subtract + sign-overflow detect.
+pub machine ResolverI128::checked_sub(&self, other: &ResolverI128) -> ResolverI128Math {
+    let lo_r: u64 = ((self.lo as u64 in Wrapping) - (other.lo as u64 in Wrapping)) as u64;
+    transition (self.lo < other.lo) {
+        true -> borrow(other, lo_r)
+        false -> no_borrow(other, lo_r)
+        _ -> no_borrow(other, lo_r)
+    }
+    state borrow(&self, other: &ResolverI128, lo_r: u64) -> ResolverI128Math {
+        let hi_r: u64 = ((((self.hi as u64 in Wrapping) - (other.hi as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let outcome: ResolverI128Math = check_sub_overflow(self, other, lo_r, hi_r);
+        (outcome)
+    }
+    state no_borrow(&self, other: &ResolverI128, lo_r: u64) -> ResolverI128Math {
+        let hi_r: u64 = ((self.hi as u64 in Wrapping) - (other.hi as u64 in Wrapping)) as u64;
+        let outcome: ResolverI128Math = check_sub_overflow(self, other, lo_r, hi_r);
+        (outcome)
+    }
+}
+
+// add: overflow iff same operand signs and the result sign differs.
+machine check_add_overflow(left: &ResolverI128, right: &ResolverI128, lo_r: u64, hi_r: u64) -> ResolverI128Math {
+    let left_negative: bool = (((left.hi as i64 in Wrapping) as i64) < 0);
+    let right_negative: bool = (((right.hi as i64 in Wrapping) as i64) < 0);
+    let result_negative: bool = (((hi_r as i64 in Wrapping) as i64) < 0);
+    transition (left_negative == right_negative && result_negative != left_negative) {
+        true -> (ResolverI128Math { ok: false, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+        false -> (ResolverI128Math { ok: true, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+        _ -> (ResolverI128Math { ok: true, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+    }
+}
+
+// sub: overflow iff different operand signs and the result sign differs
+// from the left operand.
+machine check_sub_overflow(left: &ResolverI128, right: &ResolverI128, lo_r: u64, hi_r: u64) -> ResolverI128Math {
+    let left_negative: bool = (((left.hi as i64 in Wrapping) as i64) < 0);
+    let right_negative: bool = (((right.hi as i64 in Wrapping) as i64) < 0);
+    let result_negative: bool = (((hi_r as i64 in Wrapping) as i64) < 0);
+    transition (left_negative != right_negative && result_negative != left_negative) {
+        true -> (ResolverI128Math { ok: false, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+        false -> (ResolverI128Math { ok: true, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+        _ -> (ResolverI128Math { ok: true, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+    }
+}
+
+// mulhi_u64 — the high 64 bits of a 64x64 product via 32-bit limbs.
+machine mulhi_u64(x: u64, y: u64) -> u64 {
+    let x0: u64 = ((x as u64 in Wrapping) & (4294967295 as u64 in Wrapping)) as u64;
+    let x1: u64 = ((x as u64 in Wrapping) >> (32 as u64 in Wrapping)) as u64;
+    let y0: u64 = ((y as u64 in Wrapping) & (4294967295 as u64 in Wrapping)) as u64;
+    let y1: u64 = ((y as u64 in Wrapping) >> (32 as u64 in Wrapping)) as u64;
+    let w0: u64 = ((x0 as u64 in Wrapping) * (y0 as u64 in Wrapping)) as u64;
+    let w1: u64 = ((x1 as u64 in Wrapping) * (y0 as u64 in Wrapping)) as u64;
+    let w2: u64 = ((x0 as u64 in Wrapping) * (y1 as u64 in Wrapping)) as u64;
+    let w3: u64 = ((x1 as u64 in Wrapping) * (y1 as u64 in Wrapping)) as u64;
+    let middle: u64 = ((w1 as u64 in Wrapping) + (w2 as u64 in Wrapping)) as u64;
+    let middle_carry: u64 = (middle < w1) as u64;
+    let middle_hi: u64 = ((middle as u64 in Wrapping) >> (32 as u64 in Wrapping)) as u64;
+    let middle_lo: u64 = ((middle as u64 in Wrapping) & (4294967295 as u64 in Wrapping)) as u64;
+    let w0_hi: u64 = ((w0 as u64 in Wrapping) >> (32 as u64 in Wrapping)) as u64;
+    let lower_sum: u64 = ((w0_hi as u64 in Wrapping) + (middle_lo as u64 in Wrapping)) as u64;
+    let lower_carry: u64 = ((lower_sum as u64 in Wrapping) >> (32 as u64 in Wrapping)) as u64;
+    let hi_sum: u64 = ((w3 as u64 in Wrapping) + (middle_hi as u64 in Wrapping)) as u64;
+    let carry_sum: u64 = ((middle_carry as u64 in Wrapping) << (32 as u64 in Wrapping)) as u64;
+    let with_carry: u64 = ((hi_sum as u64 in Wrapping) + (carry_sum as u64 in Wrapping)) as u64;
+    (((with_carry as u64 in Wrapping) + (lower_carry as u64 in Wrapping)) as u64)
+}
+
+// Upstream `checked_mul` — magnitude multiply with a 127-bit range check
+// (the -2^127 boundary is allowed when the result sign is negative).
+pub machine ResolverI128::checked_mul(&self, other: &ResolverI128) -> ResolverI128Math {
+    let left_negative: bool = self.is_negative();
+    let right_negative: bool = other.is_negative();
+    let negative_result: bool = left_negative != right_negative;
+    let left_magnitude: ResolverI128 = self.magnitude();
+    let right_magnitude: ResolverI128 = other.magnitude();
+    (magnitude_mul(left_magnitude, right_magnitude, negative_result))
+}
+
+// Unsigned 128x128 -> checked 128 product; applies `negative_result` sign.
+machine magnitude_mul(left: ResolverI128, right: ResolverI128, negative_result: bool) -> ResolverI128Math {
+    transition {
+        _ -> check_hi_hi(left, right, negative_result)
+    }
+    // hi*hi lands above bit 127 entirely — nonzero means overflow.
+    state check_hi_hi(left: ResolverI128, right: ResolverI128, negative_result: bool) -> ResolverI128Math {
+        let hi_hi: u64 = ((left.hi as u64 in Wrapping) * (right.hi as u64 in Wrapping)) as u64;
+        transition hi_hi != 0 {
+            true -> (ResolverI128Math { ok: false, value: (ResolverI128 { lo: 0, hi: 0 }) })
+            false -> partial_products(left, right, negative_result)
+            _ -> partial_products(left, right, negative_result)
+        }
+    }
+    state partial_products(left: ResolverI128, right: ResolverI128, negative_result: bool) -> ResolverI128Math {
+        let lo_lo_hi: u64 = mulhi_u64(left.lo, right.lo);
+        let hi_lo: u64 = ((left.hi as u64 in Wrapping) * (right.lo as u64 in Wrapping)) as u64;
+        let lo_hi: u64 = ((left.lo as u64 in Wrapping) * (right.hi as u64 in Wrapping)) as u64;
+        let t1: u64 = ((lo_lo_hi as u64 in Wrapping) + (hi_lo as u64 in Wrapping)) as u64;
+        let carry1: bool = t1 < lo_lo_hi;
+        let hi_r: u64 = ((t1 as u64 in Wrapping) + (lo_hi as u64 in Wrapping)) as u64;
+        let carry2: bool = hi_r < t1;
+        transition (carry1 || carry2) {
+            true -> (ResolverI128Math { ok: false, value: (ResolverI128 { lo: 0, hi: 0 }) })
+            false -> range_check(left, right, hi_r, negative_result)
+            _ -> range_check(left, right, hi_r, negative_result)
+        }
+    }
+    // Magnitude must fit 127 bits; the negative sign permits the
+    // magnitude == 2^127 edge exactly (i128::MIN).
+    state range_check(left: ResolverI128, right: ResolverI128, hi_r: u64, negative_result: bool) -> ResolverI128Math {
+        let lo_r: u64 = ((left.lo as u64 in Wrapping) * (right.lo as u64 in Wrapping)) as u64;
+        let hi_signed: i64 = ((hi_r as i64 in Wrapping) as i64);
+        let fits_positive: bool = hi_signed >= 0;
+        let is_min_edge: bool = (hi_r == 9223372036854775808 && lo_r == 0);
+        transition (!negative_result && !fits_positive) || (negative_result && !fits_positive && !is_min_edge) {
+            true -> (ResolverI128Math { ok: false, value: (ResolverI128 { lo: 0, hi: 0 }) })
+            false -> apply_sign(lo_r, hi_r, negative_result)
+            _ -> apply_sign(lo_r, hi_r, negative_result)
+        }
+    }
+    state apply_sign(lo_r: u64, hi_r: u64, negative_result: bool) -> ResolverI128Math {
+        transition negative_result {
+            true -> negate_product(lo_r, hi_r)
+            false -> (ResolverI128Math { ok: true, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+            _ -> (ResolverI128Math { ok: true, value: (ResolverI128 { lo: lo_r, hi: hi_r }) })
+        }
+    }
+    state negate_product(lo_r: u64, hi_r: u64) -> ResolverI128Math {
+        let magnitude: ResolverI128 = (ResolverI128 { lo: lo_r, hi: hi_r });
+        let negated: ResolverI128 = magnitude.negate();
+        (ResolverI128Math { ok: true, value: negated })
+    }
+}
+
+// Unsigned 128/128 binary long division -> (quotient, remainder)
+// magnitude pair; the caller applies signs. Iterates 128 bits.
+machine magnitude_div_rem(dividend: ResolverI128, divisor: ResolverI128) -> ResolverI128Div {
+    transition {
+        _ -> step(dividend, divisor, (ResolverI128 { lo: 0, hi: 0 }), (ResolverI128 { lo: 0, hi: 0 }), 128)
+    }
+    // bit_index counts down 128..1; the consumed bit is bit_index - 1.
+    state step(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, bit_index: u64) -> ResolverI128Div {
+        transition bit_index > 0 {
+            true -> shift_in(dividend, divisor, quotient, remainder, bit_index)
+            false -> (ResolverI128Div { quotient: quotient, remainder: remainder })
+        }
+    }
+    // remainder = (remainder << 1) | dividend bit (bit_index - 1).
+    state shift_in(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, bit_index: u64) -> ResolverI128Div {
+        let consumed: u64 = ((bit_index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let rem_lo_shifted: u64 = ((remainder.lo as u64 in Wrapping) << (1 as u64 in Wrapping)) as u64;
+        let rem_hi_shifted: u64 = ((((remainder.hi as u64 in Wrapping) << (1 as u64 in Wrapping)) as u64 in Wrapping) | (((remainder.lo as u64 in Wrapping) >> (63 as u64 in Wrapping)) as u64 in Wrapping)) as u64;
+        transition consumed < 64 {
+            true -> low_bit(dividend, divisor, quotient, rem_lo_shifted, rem_hi_shifted, bit_index, consumed)
+            false -> high_bit(dividend, divisor, quotient, rem_lo_shifted, rem_hi_shifted, bit_index, consumed)
+        }
+    }
+    state low_bit(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, rem_lo: u64, rem_hi: u64, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        let bit: u64 = ((((dividend.lo as u64 in Wrapping) >> (consumed as u64 in Wrapping)) as u64 in Wrapping) & (1 as u64 in Wrapping)) as u64;
+        let rem_lo_in: u64 = ((rem_lo as u64 in Wrapping) | (bit as u64 in Wrapping)) as u64;
+        transition {
+            _ -> subtract_if(dividend, divisor, quotient, (ResolverI128 { lo: rem_lo_in, hi: rem_hi }), bit_index, consumed)
+        }
+    }
+    state high_bit(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, rem_lo: u64, rem_hi: u64, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        let shift: u64 = ((consumed as u64 in Wrapping) - (64 as u64 in Wrapping)) as u64;
+        let bit: u64 = ((((dividend.hi as u64 in Wrapping) >> (shift as u64 in Wrapping)) as u64 in Wrapping) & (1 as u64 in Wrapping)) as u64;
+        let rem_lo_in: u64 = ((rem_lo as u64 in Wrapping) | (bit as u64 in Wrapping)) as u64;
+        transition {
+            _ -> subtract_if(dividend, divisor, quotient, (ResolverI128 { lo: rem_lo_in, hi: rem_hi }), bit_index, consumed)
+        }
+    }
+    // if remainder >= divisor: remainder -= divisor; quotient |= 1 << consumed.
+    state subtract_if(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        let ordering: i64 = remainder.compare(&divisor);
+        transition ordering >= 0 {
+            true -> do_subtract(dividend, divisor, quotient, remainder, bit_index, consumed)
+            false -> step(dividend, divisor, quotient, remainder, ((bit_index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state do_subtract(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        let rem_lo_r: u64 = ((remainder.lo as u64 in Wrapping) - (divisor.lo as u64 in Wrapping)) as u64;
+        transition (remainder.lo < divisor.lo) {
+            true -> rem_borrow(dividend, divisor, quotient, remainder, rem_lo_r, bit_index, consumed)
+            false -> rem_plain(dividend, divisor, quotient, remainder, rem_lo_r, bit_index, consumed)
+        }
+    }
+    state rem_borrow(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, rem_lo_r: u64, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        // rem_hi - divisor.hi - 1 == rem_hi + (0 - divisor.hi) - 1 mod 2^64.
+        let rem_hi_r: u64 = ((((remainder.hi as u64 in Wrapping) + (((0 as u64 in Wrapping) - (divisor.hi as u64 in Wrapping)) as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> set_quotient_bit(dividend, divisor, quotient, (ResolverI128 { lo: rem_lo_r, hi: rem_hi_r }), bit_index, consumed)
+        }
+    }
+    state rem_plain(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, rem_lo_r: u64, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        let rem_hi_r: u64 = ((remainder.hi as u64 in Wrapping) - (divisor.hi as u64 in Wrapping)) as u64;
+        transition {
+            _ -> set_quotient_bit(dividend, divisor, quotient, (ResolverI128 { lo: rem_lo_r, hi: rem_hi_r }), bit_index, consumed)
+        }
+    }
+    state set_quotient_bit(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        transition consumed < 64 {
+            true -> set_low_bit(dividend, divisor, quotient, remainder, bit_index, consumed)
+            false -> set_high_bit(dividend, divisor, quotient, remainder, bit_index, consumed)
+        }
+    }
+    state set_low_bit(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        let mask: u64 = ((1 as u64 in Wrapping) << (consumed as u64 in Wrapping)) as u64;
+        let q_lo: u64 = ((quotient.lo as u64 in Wrapping) | (mask as u64 in Wrapping)) as u64;
+        transition {
+            _ -> step(dividend, divisor, (ResolverI128 { lo: q_lo, hi: quotient.hi }), remainder, ((bit_index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state set_high_bit(dividend: ResolverI128, divisor: ResolverI128, quotient: ResolverI128, remainder: ResolverI128, bit_index: u64, consumed: u64) -> ResolverI128Div {
+        let shift: u64 = ((consumed as u64 in Wrapping) - (64 as u64 in Wrapping)) as u64;
+        let mask: u64 = ((1 as u64 in Wrapping) << (shift as u64 in Wrapping)) as u64;
+        let q_hi: u64 = ((quotient.hi as u64 in Wrapping) | (mask as u64 in Wrapping)) as u64;
+        transition {
+            _ -> step(dividend, divisor, (ResolverI128 { lo: quotient.lo, hi: q_hi }), remainder, ((bit_index as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `checked_div` — signed divide on magnitudes; the only
+// overflow is MIN / -1 (quotient 2^127).
+pub machine ResolverI128::checked_div(&self, other: &ResolverI128) -> ResolverI128Math {
+    let left_negative: bool = self.is_negative();
+    let right_negative: bool = other.is_negative();
+    let negative_result: bool = left_negative != right_negative;
+    let left_magnitude: ResolverI128 = self.magnitude();
+    let right_magnitude: ResolverI128 = other.magnitude();
+    let division: ResolverI128Div = magnitude_div_rem(left_magnitude, right_magnitude);
+    (check_quotient_range(division, negative_result))
+}
+
+// Upstream `checked_rem` — remainder takes the dividend's sign.
+pub machine ResolverI128::checked_rem(&self, other: &ResolverI128) -> ResolverI128Math {
+    let left_negative: bool = self.is_negative();
+    let left_magnitude: ResolverI128 = self.magnitude();
+    let right_magnitude: ResolverI128 = other.magnitude();
+    let division: ResolverI128Div = magnitude_div_rem(left_magnitude, right_magnitude);
+    transition left_negative {
+        true -> negate_remainder(division)
+        false -> (ResolverI128Math { ok: true, value: division.remainder })
+        _ -> (ResolverI128Math { ok: true, value: division.remainder })
+    }
+    state negate_remainder(&self, division: ResolverI128Div) -> ResolverI128Math {
+        let negated: ResolverI128 = division.remainder.negate();
+        (ResolverI128Math { ok: true, value: negated })
+    }
+}
+
+// Quotient fits unless it is exactly 2^127 on a positive result (the
+// MIN/-1 residue — a magnitude of 2^127 IS representable when negative).
+machine check_quotient_range(division: ResolverI128Div, negative_result: bool) -> ResolverI128Math {
+    transition {
+        _ -> check(division, negative_result)
+    }
+    state check(division: ResolverI128Div, negative_result: bool) -> ResolverI128Math {
+        let is_edge: bool = (division.quotient.hi == 9223372036854775808 && division.quotient.lo == 0);
+        transition (is_edge && !negative_result) {
+            true -> (ResolverI128Math { ok: false, value: division.quotient })
+            false -> apply_sign(division, negative_result)
+            _ -> apply_sign(division, negative_result)
+        }
+    }
+    state apply_sign(division: ResolverI128Div, negative_result: bool) -> ResolverI128Math {
+        transition negative_result {
+            true -> negate(division)
+            false -> (ResolverI128Math { ok: true, value: division.quotient })
+            _ -> (ResolverI128Math { ok: true, value: division.quotient })
+        }
+    }
+    state negate(division: ResolverI128Div) -> ResolverI128Math {
+        let negated: ResolverI128 = division.quotient.negate();
+        (ResolverI128Math { ok: true, value: negated })
+    }
+}
+
+// Upstream `checked_shl` — the shift amount is already proven < 128 by
+// the caller's InvalidShiftAmount gate.
+pub machine ResolverI128::shift_left(&self, shift_amount: u64) -> ResolverI128 {
+    transition shift_amount == 0 {
+        true -> (ResolverI128 { lo: self.lo, hi: self.hi })
+        false -> pick_shift(shift_amount)
+    }
+    state pick_shift(&self, shift_amount: u64) -> ResolverI128 {
+        transition shift_amount < 64 {
+            true -> small_shift(shift_amount)
+            false -> big_shift(shift_amount)
+        }
+    }
+    state small_shift(&self, shift_amount: u64) -> ResolverI128 {
+        let lo_r: u64 = ((self.lo as u64 in Wrapping) << (shift_amount as u64 in Wrapping)) as u64;
+        let inv: u64 = ((64 as u64 in Wrapping) - (shift_amount as u64 in Wrapping)) as u64;
+        let carried: u64 = ((self.lo as u64 in Wrapping) >> (inv as u64 in Wrapping)) as u64;
+        let hi_r: u64 = ((((self.hi as u64 in Wrapping) << (shift_amount as u64 in Wrapping)) as u64 in Wrapping) | (carried as u64 in Wrapping)) as u64;
+        (ResolverI128 { lo: lo_r, hi: hi_r })
+    }
+    state big_shift(&self, shift_amount: u64) -> ResolverI128 {
+        let amount: u64 = ((shift_amount as u64 in Wrapping) - (64 as u64 in Wrapping)) as u64;
+        let hi_r: u64 = ((self.lo as u64 in Wrapping) << (amount as u64 in Wrapping)) as u64;
+        (ResolverI128 { lo: 0, hi: hi_r })
+    }
+}
+
+// Upstream `checked_shr` — arithmetic shift on the signed hi word.
+pub machine ResolverI128::shift_right(&self, shift_amount: u64) -> ResolverI128 {
+    transition shift_amount == 0 {
+        true -> (ResolverI128 { lo: self.lo, hi: self.hi })
+        false -> pick_shift(shift_amount)
+    }
+    state pick_shift(&self, shift_amount: u64) -> ResolverI128 {
+        transition shift_amount < 64 {
+            true -> small_shift(shift_amount)
+            false -> big_shift(shift_amount)
+        }
+    }
+    state small_shift(&self, shift_amount: u64) -> ResolverI128 {
+        let lo_r: u64 = ((self.lo as u64 in Wrapping) >> (shift_amount as u64 in Wrapping)) as u64;
+        let inv: u64 = ((64 as u64 in Wrapping) - (shift_amount as u64 in Wrapping)) as u64;
+        let crossed: u64 = ((self.hi as u64 in Wrapping) << (inv as u64 in Wrapping)) as u64;
+        let lo_final: u64 = ((lo_r as u64 in Wrapping) | (crossed as u64 in Wrapping)) as u64;
+        let hi_signed: i64 = ((self.hi as i64 in Wrapping) as i64);
+        let hi_r_signed: i64 = ((hi_signed as i64 in Wrapping) >> (shift_amount as u64 in Wrapping)) as i64;
+        (ResolverI128 { lo: lo_final, hi: ((hi_r_signed as u64 in Wrapping) as u64) })
+    }
+    state big_shift(&self, shift_amount: u64) -> ResolverI128 {
+        let amount: u64 = ((shift_amount as u64 in Wrapping) - (64 as u64 in Wrapping)) as u64;
+        let hi_signed: i64 = ((self.hi as i64 in Wrapping) as i64);
+        let hi_r_signed: i64 = ((hi_signed as i64 in Wrapping) >> (amount as u64 in Wrapping)) as i64;
+        let hi_r: u64 = ((hi_r_signed as u64 in Wrapping) as u64);
+        let negative: bool = self.is_negative();
+        transition negative {
+            true -> (ResolverI128 { lo: hi_r, hi: 18446744073709551615 })
+            false -> (ResolverI128 { lo: hi_r, hi: 0 })
+            _ -> (ResolverI128 { lo: hi_r, hi: 0 })
+        }
+    }
+}
