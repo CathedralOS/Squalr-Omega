@@ -1,0 +1,111 @@
+module src::command_executors::scan_result_enricher;
+
+use squalr_engine_api::src::registries::freeze_list::freeze_list_registry::FreezeListRegistry;
+use squalr_engine_api::src::structures::memory::normalized_module::ModuleAddressDisplay;
+use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
+use squalr_engine_api::src::structures::scan_results::scan_result_enriched::ScanResultEnriched;
+use squalr_engine_api::src::structures::scan_results::scan_result_valued::ScanResultValued;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+
+// Port of the shared per-result enrichment block inside upstream's
+// query/list/refresh scan-results executors (each executor inlines the same
+// ~40 lines — the one shared helper upstream factors is
+// `resolve_module_address_display`). Given a stored `ScanResultValued`:
+//   1. `memory_query.address_to_module(address, &modules)` — first module
+//      whose normalized region contains the address wins; module_name comes
+//      back with `module_offset = address - base_address`. Unresolved keeps
+//      upstream's defaults (empty name, offset = address,
+//      ModuleAddressDisplay::ModuleRelative).
+//   2. `resolve_module_address_display` — upstream re-finds a module by
+//      case-insensitive name + containment; the containing module already
+//      satisfies that lookup, so its own display field answers directly
+//      (folded, equivalent).
+//   3. `freeze_list_registry.is_address_frozen(&Pointer::new(module_offset,
+//      [], module_name))` — the registry's keyed machine takes the pair
+//      directly, matching upstream's pointer key semantics.
+pub data ScanResultEnricher {}
+
+pub machine ScanResultEnricher::enrich(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    valued_result: ScanResultValued
+) -> ScanResultEnriched {
+    let address: u64 = valued_result.get_address();
+    // Two overlapping shared borrows (upstream's `modules` + registry reads
+    // are both shared); `engine_privileged_state` itself does not cross into
+    // the loop states because a derived borrow is live.
+    let modules: &[NormalizedModule] = engine_privileged_state.get_supplied_modules();
+    let registry: &FreezeListRegistry = engine_privileged_state.get_freeze_list_registry();
+    transition { _ -> resolve(modules, registry, valued_result, address, 0) }
+
+    state resolve(
+        modules: &[NormalizedModule],
+        registry: &FreezeListRegistry,
+        valued_result: ScanResultValued,
+        address: u64,
+        position: u64
+    ) -> ScanResultEnriched {
+        transition position < modules.len {
+            true -> probe(modules, registry, valued_result, address, position)
+            false -> unresolved(modules, registry, valued_result, address)
+            _ -> unresolved(modules, registry, valued_result, address)
+        }
+    }
+
+    state probe(
+        modules: &[NormalizedModule],
+        registry: &FreezeListRegistry,
+        valued_result: ScanResultValued,
+        address: u64,
+        position: u64
+    ) -> ScanResultEnriched {
+        transition modules[position].contains_address(address) {
+            true -> found(modules, registry, valued_result, address, position)
+            false -> resolve(modules, registry, valued_result, address, position + 1)
+            _ -> resolve(modules, registry, valued_result, address, position + 1)
+        }
+    }
+
+    state found(
+        modules: &[NormalizedModule],
+        registry: &FreezeListRegistry,
+        valued_result: ScanResultValued,
+        address: u64,
+        position: u64
+    ) -> ScanResultEnriched {
+        let module_name: &[u8] = modules[position].get_module_name();
+        // Reached only under the probe state's contains_address guard, so
+        // base <= address always holds — the Saturating domain is the
+        // codebase's domain opt-in for that proof gap (never clamps).
+        let module_offset: u64 =
+            ((address as u64 in Saturating)
+                - (modules[position].get_base_address() as u64 in Saturating)) as u64;
+        let module_address_display: ModuleAddressDisplay =
+            modules[position].get_module_address_display();
+        let is_frozen: bool = registry.is_address_frozen(module_offset, module_name);
+        ScanResultEnriched::new(
+            valued_result,
+            module_name,
+            module_offset,
+            module_address_display,
+            is_frozen)
+    }
+
+    state unresolved(
+        modules: &[NormalizedModule],
+        registry: &FreezeListRegistry,
+        valued_result: ScanResultValued,
+        address: u64
+    ) -> ScanResultEnriched {
+        // Upstream's defaults for a result with no containing module: empty
+        // module name, module_offset = the absolute address, ModuleRelative
+        // display; the freeze probe still runs on that (offset, "") key.
+        let empty_name: &[u8] = ("");
+        let is_frozen: bool = registry.is_address_frozen(address, empty_name);
+        ScanResultEnriched::new(
+            valued_result,
+            empty_name,
+            address,
+            ModuleAddressDisplay::ModuleRelative,
+            is_frozen)
+    }
+}
