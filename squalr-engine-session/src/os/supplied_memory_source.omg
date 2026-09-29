@@ -115,6 +115,112 @@ pub machine SuppliedMemorySource::get_region_count(&self) -> u64 {
     self.region_count
 }
 
+// Supplied-bytes scan adapter: install a caller-supplied byte span as the
+// captured target's memory. One supplied byte lands per u64 element lane at
+// stride 1 (the byte-array and u8-scanner element contract — wider units read
+// elements at their own stride, the capture-stride binding documented on
+// `read_current_elements`). The span chunks across the region bound
+// (4 × 1024 elements = the 4096-byte request bound, contiguous bases so the
+// snapshot builder merges them into one region with page-boundary
+// tombstones). Bytes past the bound are not installed — the request's own
+// 4096 bound makes that unreachable.
+pub machine SuppliedMemorySource::of_bytes(
+    base_address: u64,
+    bytes: &[u8]
+) -> SuppliedMemorySource {
+    transition { _ -> region_each(SuppliedMemorySource::empty(), base_address, bytes, 0) }
+
+    state region_each(
+        source: SuppliedMemorySource,
+        base_address: u64,
+        bytes: &[u8],
+        region_index: u64
+    ) -> SuppliedMemorySource {
+        let byte_offset: u64 = ((region_index as u64 in Saturating)
+            * (1024 as u64 in Saturating)) as u64;
+        transition region_index < 4 && byte_offset < bytes.len {
+            true -> element_each(source, base_address, bytes, region_index, byte_offset, ElementWindow::empty(), 0)
+            false -> (source)
+            _ -> (source)
+        }
+    }
+
+    state element_each(
+        source: SuppliedMemorySource,
+        base_address: u64,
+        bytes: &[u8],
+        region_index: u64,
+        byte_offset: u64,
+        window: ElementWindow,
+        element_index: u64
+    ) -> SuppliedMemorySource {
+        let byte_index: u64 = ((byte_offset as u64 in Saturating)
+            + (element_index as u64 in Saturating)) as u64;
+        transition element_index < 1024 && byte_index < bytes.len {
+            true -> element_store(source, base_address, bytes, region_index, byte_offset, window, element_index, byte_index)
+            false -> region_store(source, base_address, bytes, region_index, byte_offset, window)
+            _ -> region_store(source, base_address, bytes, region_index, byte_offset, window)
+        }
+    }
+
+    state element_store(
+        source: SuppliedMemorySource,
+        base_address: u64,
+        bytes: &[u8],
+        region_index: u64,
+        byte_offset: u64,
+        window: ElementWindow,
+        element_index: u64,
+        byte_index: u64
+    ) -> SuppliedMemorySource
+        requires byte_index < bytes.len;
+    {
+        let mut carried: ElementWindow = window;
+        let byte_value: u64 = bytes[byte_index] as u64;
+        let pushed: bool = carried.push_element(byte_value);
+        transition { _ -> element_each(
+            source, base_address, bytes, region_index, byte_offset, carried,
+            ((element_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state region_store(
+        source: SuppliedMemorySource,
+        base_address: u64,
+        bytes: &[u8],
+        region_index: u64,
+        byte_offset: u64,
+        window: ElementWindow
+    ) -> SuppliedMemorySource {
+        let mut carried: SuppliedMemorySource = source;
+        transition region_index < 4 {
+            true -> commit(carried, base_address, bytes, region_index, byte_offset, window)
+            false -> (carried)
+            _ -> (carried)
+        }
+    }
+
+    state commit(
+        carried: SuppliedMemorySource,
+        base_address: u64,
+        bytes: &[u8],
+        region_index: u64,
+        byte_offset: u64,
+        window: ElementWindow
+    ) -> SuppliedMemorySource
+        requires 0 <= region_index && region_index < 4;
+    {
+        let region_base: u64 = ((base_address as u64 in Saturating)
+            + (byte_offset as u64 in Saturating)) as u64;
+        let mut stored: SuppliedMemorySource = carried;
+        stored.regions[region_index] = SuppliedRegion::of_window(region_base, window, 1);
+        stored.region_count = ((region_index as u64 in Wrapping)
+            + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> region_each(
+            stored, base_address, bytes,
+            ((region_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
 // Fixture-side readability toggle — see `SuppliedRegion::set_readable`.
 pub machine SuppliedMemorySource::set_region_readable(&mut self, position: u64, readable: bool) {
     transition position < self.region_count && position < 4 {
