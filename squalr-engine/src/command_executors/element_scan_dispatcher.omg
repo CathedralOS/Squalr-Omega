@@ -9,8 +9,11 @@ use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filte
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::ElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::snapshot_filter_element_scan_plan::SnapshotFilterElementScanPlan;
 use squalr_engine_api::src::structures::scanning::plans::element_scan::element_scan_plan::TypePlanList;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type::PlannedScanType;
+use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_scan_type_scalar::PlannedScanTypeScalar;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::SnapshotRegion;
 use squalr_engine_scanning::src::scanners::element_scan_runner::ElementScanRunner;
+use squalr_engine_scanning::src::scanners::scan_control::ScanControl;
 
 // Port of `ElementScanDispatcher::dispatch_scan` +
 // `dispatch_scan_for_snapshot_filter_collection` (single-threaded leg). Per
@@ -26,7 +29,8 @@ pub machine ElementScanChainDispatcher::dispatch_collection(
     snapshot_region: &SnapshotRegion,
     collection: &SnapshotRegionFilterCollection,
     element_scan_plan: &ElementScanPlan,
-    plan_list: &TypePlanList
+    plan_list: &TypePlanList,
+    scan_control: &mut ScanControl
 ) -> SnapshotRegionFilterCollection
 crashes Abort
 {
@@ -35,20 +39,21 @@ crashes Abort
     let rv: u64 = collection.get_result_value_size_in_bytes();
     let out: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(dtr, ma, rv);
     transition { _ -> each_filter(
-        snapshot_region, collection, element_scan_plan, plan_list, out, 0) }
+        snapshot_region, collection, element_scan_plan, plan_list, scan_control, out, 0) }
 
     state each_filter(
         snapshot_region: &SnapshotRegion,
         collection: &SnapshotRegionFilterCollection,
         element_scan_plan: &ElementScanPlan,
         plan_list: &TypePlanList,
+        scan_control: &mut ScanControl,
         out: SnapshotRegionFilterCollection,
         filter_index: u64
     ) -> SnapshotRegionFilterCollection
     {
         transition filter_index < collection.get_filter_count() {
             true -> chain(
-                snapshot_region, collection, element_scan_plan, plan_list, out, filter_index)
+                snapshot_region, collection, element_scan_plan, plan_list, scan_control, out, filter_index)
             false -> (out)
         }
     }
@@ -61,6 +66,7 @@ crashes Abort
         collection: &SnapshotRegionFilterCollection,
         element_scan_plan: &ElementScanPlan,
         plan_list: &TypePlanList,
+        scan_control: &mut ScanControl,
         out: SnapshotRegionFilterCollection,
         filter_index: u64
     ) -> SnapshotRegionFilterCollection
@@ -73,11 +79,11 @@ crashes Abort
             stage_dtr, stage_ma, stage_rv);
         let seeded: bool = stage.push_filter(&filter);
         let survived: SnapshotRegionFilterCollection = ElementScanChainDispatcher::run_chain(
-            snapshot_region, stage, collection, element_scan_plan, plan_list, 0);
+            snapshot_region, stage, collection, element_scan_plan, plan_list, scan_control, 0);
         let merged: SnapshotRegionFilterCollection = ElementScanChainDispatcher::append_filters(
             out, &survived, 0);
         transition { _ -> each_filter(
-            snapshot_region, collection, element_scan_plan, plan_list, merged, ((filter_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+            snapshot_region, collection, element_scan_plan, plan_list, scan_control, merged, ((filter_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
 }
 
@@ -88,12 +94,13 @@ pub machine ElementScanChainDispatcher::run_chain(
     collection: &SnapshotRegionFilterCollection,
     element_scan_plan: &ElementScanPlan,
     plan_list: &TypePlanList,
+    scan_control: &mut ScanControl,
     plan_index: u64
 ) -> SnapshotRegionFilterCollection
 crashes Abort
 {
     transition plan_index < plan_list.get_plan_count() && stage.get_filter_count() > 0 {
-        true -> apply(snapshot_region, stage, collection, element_scan_plan, plan_list, plan_index)
+        true -> apply(snapshot_region, stage, collection, element_scan_plan, plan_list, scan_control, plan_index)
         _ -> (stage)
     }
 
@@ -103,6 +110,7 @@ crashes Abort
         collection: &SnapshotRegionFilterCollection,
         element_scan_plan: &ElementScanPlan,
         plan_list: &TypePlanList,
+        scan_control: &mut ScanControl,
         plan_index: u64
     ) -> SnapshotRegionFilterCollection
     {
@@ -113,9 +121,9 @@ crashes Abort
         let empty_collection: SnapshotRegionFilterCollection = SnapshotRegionFilterCollection::empty(
             empty_dtr, empty_ma, empty_rv);
         let next_stage: SnapshotRegionFilterCollection = ElementScanChainDispatcher::apply_plan(
-            snapshot_region, &stage, collection, &plan, 0, empty_collection);
+            snapshot_region, &stage, collection, &plan, element_scan_plan, scan_control, 0, empty_collection);
         transition { _ -> continue(
-            snapshot_region, next_stage, collection, element_scan_plan, plan_list, ((plan_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+            snapshot_region, next_stage, collection, element_scan_plan, plan_list, scan_control, ((plan_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
 
     state continue(
@@ -124,11 +132,12 @@ crashes Abort
         collection: &SnapshotRegionFilterCollection,
         element_scan_plan: &ElementScanPlan,
         plan_list: &TypePlanList,
+        scan_control: &mut ScanControl,
         next_plan_index: u64
     ) -> SnapshotRegionFilterCollection
     {
         ElementScanChainDispatcher::run_chain(
-            snapshot_region, stage, collection, element_scan_plan, plan_list, next_plan_index)
+            snapshot_region, stage, collection, element_scan_plan, plan_list, scan_control, next_plan_index)
     }
 }
 
@@ -139,13 +148,15 @@ pub machine ElementScanChainDispatcher::apply_plan(
     stage: &SnapshotRegionFilterCollection,
     collection: &SnapshotRegionFilterCollection,
     plan: &SnapshotFilterElementScanPlan,
+    element_scan_plan: &ElementScanPlan,
+    scan_control: &mut ScanControl,
     filter_index: u64,
     next_stage: SnapshotRegionFilterCollection
 ) -> SnapshotRegionFilterCollection
 crashes Abort
 {
     transition filter_index < stage.get_filter_count() {
-        true -> scan(snapshot_region, stage, collection, plan, filter_index, next_stage)
+        true -> scan(snapshot_region, stage, collection, plan, element_scan_plan, scan_control, filter_index, next_stage)
         _ -> (next_stage)
     }
 
@@ -154,6 +165,8 @@ crashes Abort
         stage: &SnapshotRegionFilterCollection,
         collection: &SnapshotRegionFilterCollection,
         plan: &SnapshotFilterElementScanPlan,
+        element_scan_plan: &ElementScanPlan,
+        scan_control: &mut ScanControl,
         filter_index: u64,
         next_stage: SnapshotRegionFilterCollection
     ) -> SnapshotRegionFilterCollection
@@ -191,10 +204,141 @@ crashes Abort
             &mut scan_plan);
         let emitted: SnapshotRegionFilterCollection = ElementScanRunner::run_region(
             snapshot_region, &filter, &scan_plan, &dtr);
+        // Upstream `dispatch_scan_for_snapshot_filter`: with the debug flag
+        // set, a scalar-iterative reference scan validates the specialized
+        // scanner's output for this (filter, constraint) pair.
+        ElementScanChainDispatcher::perform_debug_scan(
+            snapshot_region, &filter, &scan_plan, element_scan_plan, &dtr,
+            &emitted, scan_control);
         let merged: SnapshotRegionFilterCollection = ElementScanChainDispatcher::append_filters(
             next_stage, &emitted, 0);
         transition { _ -> apply_plan(
-            snapshot_region, stage, collection, plan, ((filter_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, merged) }
+            snapshot_region, stage, collection, plan, element_scan_plan, scan_control,
+            ((filter_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, merged) }
+    }
+}
+
+// Upstream `perform_debug_scan`: re-run the region through the scalar
+// iterative scanner on the SAME (rule-mapped) plan and compare — the way
+// complex scanner implementations get unit-tested on real-world data.
+// Each disagreement is one upstream `log::error!`; the port counts them on
+// ScanControl (the owned-model carrier — the engine has no log sink).
+// upstream gate order: debug flag at the call site, ByteArray plans exempt
+// inside the function.
+pub machine ElementScanChainDispatcher::perform_debug_scan(
+    snapshot_region: &SnapshotRegion,
+    snapshot_region_filter: &SnapshotRegionFilter,
+    plan: &SnapshotFilterElementScanPlan,
+    element_scan_plan: &ElementScanPlan,
+    data_type_ref: &DataTypeRef,
+    comparison: &SnapshotRegionFilterCollection,
+    scan_control: &mut ScanControl
+)
+crashes Abort
+{
+    transition element_scan_plan.get_debug_perform_validation_scan() {
+        true -> kind_gate(snapshot_region, snapshot_region_filter, plan, data_type_ref, comparison, scan_control)
+        false -> done()
+        _ -> done()
+    }
+
+    state kind_gate(
+        snapshot_region: &SnapshotRegion,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        data_type_ref: &DataTypeRef,
+        comparison: &SnapshotRegionFilterCollection,
+        scan_control: &mut ScanControl
+    ) {
+        transition plan.get_planned_scan_type() {
+            PlannedScanType::ByteArray { scan_type } -> done()
+            _ -> reference(snapshot_region, snapshot_region_filter, plan, data_type_ref, comparison, scan_control)
+        }
+    }
+
+    state reference(
+        snapshot_region: &SnapshotRegion,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        plan: &SnapshotFilterElementScanPlan,
+        data_type_ref: &DataTypeRef,
+        comparison: &SnapshotRegionFilterCollection,
+        scan_control: &mut ScanControl
+    ) {
+        // Upstream hands the same plan to ScannerScalarIterative — the
+        // planned scan type is a dispatch field, not scanner input — so a
+        // scratch clone forces the scalar pick here.
+        let mut reference_plan: SnapshotFilterElementScanPlan =
+            SnapshotFilterElementScanPlan::clone(plan);
+        reference_plan.set_planned_scan_type(PlannedScanType::Scalar {
+            scan_type: PlannedScanTypeScalar::ScalarIterative });
+        let reference_collection: SnapshotRegionFilterCollection = ElementScanRunner::run_region(
+            snapshot_region, snapshot_region_filter, &reference_plan, data_type_ref);
+        let reference_count: u64 = reference_collection.get_filter_count();
+        let comparison_count: u64 = comparison.get_filter_count();
+        transition reference_count != comparison_count {
+            true -> mismatch_count(comparison, &reference_collection, scan_control)
+            false -> compare_each(comparison, &reference_collection, scan_control, 0)
+            _ -> compare_each(comparison, &reference_collection, scan_control, 0)
+        }
+    }
+
+    // Upstream's length-mismatch `log::error!` — the index loop still runs
+    // over the shorter count (cmp::min), so both checks stay.
+    state mismatch_count(
+        comparison: &SnapshotRegionFilterCollection,
+        reference: &SnapshotRegionFilterCollection,
+        scan_control: &mut ScanControl
+    ) {
+        scan_control.note_debug_mismatch();
+        transition { _ -> compare_each(comparison, reference, scan_control, 0) }
+    }
+
+    state compare_each(
+        comparison: &SnapshotRegionFilterCollection,
+        reference: &SnapshotRegionFilterCollection,
+        scan_control: &mut ScanControl,
+        position: u64
+    ) {
+        let comparison_count: u64 = comparison.get_filter_count();
+        let reference_count: u64 = reference.get_filter_count();
+        transition position < comparison_count && position < reference_count {
+            true -> compare_one(comparison, reference, scan_control, position)
+            false -> done()
+        }
+    }
+
+    // Upstream's per-index `debug_filter != filter` — SnapshotRegionFilter
+    // equality is (base_address, region_size); a mismatch logs once and
+    // breaks.
+    state compare_one(
+        comparison: &SnapshotRegionFilterCollection,
+        reference: &SnapshotRegionFilterCollection,
+        scan_control: &mut ScanControl,
+        position: u64
+    ) {
+        let expected: SnapshotRegionFilter = reference.get_filter(position);
+        let found: SnapshotRegionFilter = comparison.get_filter(position);
+        let expected_base: u64 = expected.get_base_address();
+        let expected_size: u64 = expected.get_region_size();
+        let found_base: u64 = found.get_base_address();
+        let found_size: u64 = found.get_region_size();
+        transition expected_base == found_base && expected_size == found_size {
+            true -> compare_each(
+                comparison, reference, scan_control,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> mismatch_index(scan_control)
+            _ -> mismatch_index(scan_control)
+        }
+    }
+
+    state mismatch_index(
+        scan_control: &mut ScanControl
+    ) {
+        scan_control.note_debug_mismatch();
+        transition { _ -> done() }
+    }
+
+    state done() {
     }
 }
 
