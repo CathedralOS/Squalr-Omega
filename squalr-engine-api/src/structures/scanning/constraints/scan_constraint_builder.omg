@@ -633,6 +633,29 @@ machine ScanConstraintBuilder::nibble_mask(nibble: WildcardNibble) -> u8 {
     }
 }
 
+// Packs `bytes[0..count]` big-endian into u64 — the operand's numeric word
+// for a big-endian element type: the stored bytes are already MSB-first, so
+// the accumulation folds `acc*256 + byte` and the low `count` bytes of the
+// word are the value the element slot carries (same convention
+// `load_element`'s big-endian arm produces).
+machine ScanConstraintBuilder::pack_bytes_be(bytes: &[u8], count: u64) -> u64 {
+    transition { _ -> pack(bytes, count, 0, 0) }
+    state pack(bytes: &[u8], count: u64, at: u64, acc: u64) -> u64 {
+        transition at < count && at < bytes.len {
+            true -> one(bytes, count, at, acc)
+            false -> (acc)
+        }
+    }
+    state one(bytes: &[u8], count: u64, at: u64, acc: u64) -> u64
+    {
+        let byte: u64 = bytes[at] as u64;
+        transition { _ -> pack(bytes, count,
+            ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+            ((acc as u64 in Wrapping) * (256 as u64 in Wrapping)
+                + (byte as u64 in Wrapping)) as u64) }
+    }
+}
+
 // Packs `bytes[0..count]` little-endian into u64 — the same byte order
 // `ScanConstraint`'s `operand_value` uses.
 machine ScanConstraintBuilder::pack_bytes_le(bytes: &[u8], count: u64) -> u64 {
@@ -663,6 +686,20 @@ machine pow256(at: u64) -> u64 {
                 step + 1, at)
             false -> (acc)
         }
+    }
+}
+
+// Endianness pick for the operand pack — typed elements compare as
+// numerics, so LE packs byte[i] at position i and BE folds MSB-first.
+machine ScanConstraintBuilder::pack_for_endianness(
+    bytes: &[u8],
+    count: u64,
+    is_big_endian: bool
+) -> u64 {
+    transition is_big_endian {
+        true -> (ScanConstraintBuilder::pack_bytes_be(bytes, count))
+        false -> (ScanConstraintBuilder::pack_bytes_le(bytes, count))
+        _ -> (ScanConstraintBuilder::pack_bytes_le(bytes, count))
     }
 }
 
@@ -1938,8 +1975,14 @@ pub machine ScanConstraintBuilder::build<'a>(
     ) -> ScanConstraintBuild<'a>
         requires count <= 8 && count <= bytes.len
     {
-        let operand: u64 =
-            ScanConstraintBuilder::pack_bytes_le(bytes, count);
+        // The operand word is the numeric value — big-endian elements store
+        // their bytes MSB-first, so the pack follows the type's endianness
+        // (upstream loads the data value as the *be primitive; on the u64
+        // slot model the operand and the element slot must agree in
+        // numeric form).
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let operand: u64 = ScanConstraintBuilder::pack_for_endianness(
+            bytes, count, big_endian);
         let cloned: DataTypeRef = DataTypeRef::clone(data_type_ref);
         let compare_type: ScanCompareType =
             anonymous_scan_constraint.get_scan_compare_type();

@@ -34,6 +34,269 @@ pub machine ScanCompareType::compare(
     }
 }
 
+// The typed dispatch — the port of upstream's per-data-type closure selection
+// (`ScalarComparisonsInteger<PrimitiveType>` and its big-endian sibling).
+// Element slots and the operand word carry a value's numeric form in their
+// low `element_size_in_bytes`, so:
+//   * equality is element-width bit equality — identical for signed and
+//     unsigned types and for the big-endian variants (upstream's
+//     "no endian byte swap required" arm),
+//   * ordering is unsigned order on the masked value for unsigned types and
+//     sign-extended order for signed types,
+//   * delta arithmetic wraps at element width, mirroring upstream's
+//     per-primitive Wrapping* / plain operator calls at PrimitiveType width.
+// `is_floating_point` keeps the raw bit-pattern compare for this leg —
+// upstream's float tolerance + partial-order semantics is the named
+// float-compare follow-up.
+pub machine ScanCompareType::compare_typed(
+    &self,
+    current_value: u64,
+    previous_value: u64,
+    operand_value: u64,
+    is_signed: bool,
+    is_floating_point: bool,
+    element_size_in_bytes: u64
+) -> bool {
+    transition is_floating_point {
+        true -> (self.compare(current_value, previous_value, operand_value))
+        false -> typed(current_value, previous_value, operand_value,
+            is_signed, element_size_in_bytes, self)
+        _ -> typed(current_value, previous_value, operand_value,
+            is_signed, element_size_in_bytes, self)
+    }
+    state typed(
+        current_value: u64,
+        previous_value: u64,
+        operand_value: u64,
+        is_signed: bool,
+        element_size_in_bytes: u64,
+        compare_type: ScanCompareType
+    ) -> bool {
+        transition compare_type {
+            ScanCompareType::Immediate { compare_type } -> (
+                compare_type.compare_typed(
+                    current_value, operand_value, is_signed, element_size_in_bytes)
+            )
+            ScanCompareType::Relative { compare_type } -> (
+                compare_type.compare_typed(
+                    current_value, previous_value, is_signed, element_size_in_bytes)
+            )
+            ScanCompareType::Delta { compare_type } -> (
+                compare_type.compare_typed(
+                    current_value, previous_value, operand_value,
+                    is_signed, element_size_in_bytes)
+            )
+        }
+    }
+}
+
+// Upstream refuses the divide/modulo-by-zero delta constraint at compare
+// construction (`delta_value == PrimitiveType::default()` -> `None` from
+// `get_compare_divided_by` / `get_compare_modulo_by`), which removes the
+// whole scalar function for that constraint.
+pub machine ScanCompareType::requires_nonzero_delta(&self) -> bool {
+    transition self {
+        ScanCompareType::Delta { compare_type } -> (
+            compare_type.requires_nonzero_delta())
+        _ -> (false)
+    }
+}
+
+// Low `element_size_in_bytes` byte mask — element-width bit identity. Width
+// zero or >= 8 yields the full u64 (slots are never wider).
+pub machine element_width_mask_u64(element_size_in_bytes: u64) -> u64 {
+    transition element_size_in_bytes >= 1 && element_size_in_bytes < 8 {
+        true -> narrow(element_size_in_bytes)
+        false -> (((0 as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64)
+        _ -> (((0 as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64)
+    }
+    state narrow(element_size_in_bytes: u64) -> u64
+        requires element_size_in_bytes >= 1 && element_size_in_bytes < 8
+    {
+        let bits: u64 = ((element_size_in_bytes as u64 in Wrapping)
+            * (8 as u64 in Wrapping)) as u64;
+        let full_place: u64 = ((1 as u64 in Wrapping)
+            << (bits as u64 in Wrapping)) as u64;
+        (((full_place as u64 in Saturating) - (1 as u64 in Saturating)) as u64)
+    }
+}
+
+// Sign-extend the low `element_size_in_bytes` of `value` across the full u64.
+// An already-sign-extended value is left alone (its low `8*size` bits are the
+// value either way), so raw-zero-extended and pre-extended slots normalize to
+// the same i64 bit pattern.
+pub machine sign_extend_u64(value: u64, element_size_in_bytes: u64) -> u64 {
+    transition element_size_in_bytes >= 1 && element_size_in_bytes < 8 {
+        true -> narrow(value, element_size_in_bytes)
+        false -> (value)
+        _ -> (value)
+    }
+    state narrow(value: u64, element_size_in_bytes: u64) -> u64
+        requires element_size_in_bytes >= 1 && element_size_in_bytes < 8
+    {
+        let bits: u64 = ((element_size_in_bytes as u64 in Wrapping)
+            * (8 as u64 in Wrapping)) as u64;
+        let sign_bit_index: u64 = ((bits as u64 in Saturating)
+            - (1 as u64 in Saturating)) as u64;
+        let sign_place: u64 = ((1 as u64 in Wrapping)
+            << (sign_bit_index as u64 in Wrapping)) as u64;
+        let full_place: u64 = ((1 as u64 in Wrapping)
+            << (bits as u64 in Wrapping)) as u64;
+        transition sign_place <= value && value < full_place {
+            true -> (((value as u64 in Wrapping)
+                - (full_place as u64 in Wrapping)) as u64)
+            false -> (value)
+            _ -> (value)
+        }
+    }
+}
+
+// Signed less-than as unsigned less-than: biasing both operands by 2^63
+// flips the sign bit, a monotonic map from i64 order onto u64 order.
+pub machine signed_less_u64(extended_left: u64, extended_right: u64) -> bool {
+    let bias: u64 = ((1 as u64 in Wrapping) << (63 as u64 in Wrapping)) as u64;
+    let biased_left: u64 = ((extended_left as u64 in Wrapping)
+        + (bias as u64 in Wrapping)) as u64;
+    let biased_right: u64 = ((extended_right as u64 in Wrapping)
+        + (bias as u64 in Wrapping)) as u64;
+    biased_left < biased_right
+}
+
+// Wrapping two's-complement negation — `0 - value` mod 2^64.
+pub machine negate_wrapping_u64(value: u64) -> u64 {
+    (((0 as u64 in Wrapping) - (value as u64 in Wrapping)) as u64)
+}
+
+// The typed shift distance — upstream applies `shl`/`shr` at PrimitiveType
+// width, which masks the amount to `delta mod (8*element_size)`.
+pub machine effective_shift_u64(shift_value: u64, element_size_in_bytes: u64) -> u64 {
+    let bits: u64 = ((element_size_in_bytes as u64 in Wrapping)
+        * (8 as u64 in Wrapping)) as u64;
+    transition bits == 0 {
+        true -> (0)
+        false -> (((shift_value as u64 in Wrapping)
+            % (bits as u64 in Wrapping)) as u64)
+        _ -> (0)
+    }
+}
+
+// Signed truncating division on sign-extended words via magnitudes —
+// `sign(a)^sign(b)` scales `|a|/|b|`; division by zero is refused upstream
+// at construction, so a zero divisor yields 0 here as the unreachable-safe
+// answer.
+pub machine signed_divide_u64(dividend_extended: u64, divisor_extended: u64) -> u64 {
+    transition divisor_extended == 0 {
+        true -> (0)
+        false -> gate(dividend_extended, divisor_extended)
+        _ -> (0)
+    }
+    state gate(dividend_extended: u64, divisor_extended: u64) -> u64 {
+        let high_bit: u64 = ((1 as u64 in Wrapping)
+            << (63 as u64 in Wrapping)) as u64;
+        transition dividend_extended >= high_bit {
+            true -> dividend_negative(dividend_extended, divisor_extended, high_bit)
+            false -> divisor_gate(dividend_extended, divisor_extended, high_bit)
+            _ -> divisor_gate(dividend_extended, divisor_extended, high_bit)
+        }
+    }
+    state dividend_negative(
+        dividend_extended: u64,
+        divisor_extended: u64,
+        high_bit: u64
+    ) -> u64 {
+        let dividend_magnitude: u64 = negate_wrapping_u64(dividend_extended);
+        transition divisor_extended >= high_bit {
+            true -> emit(dividend_magnitude,
+                negate_wrapping_u64(divisor_extended), false)
+            false -> emit(dividend_magnitude, divisor_extended, true)
+            _ -> emit(dividend_magnitude, divisor_extended, true)
+        }
+    }
+    state divisor_gate(
+        dividend_extended: u64,
+        divisor_extended: u64,
+        high_bit: u64
+    ) -> u64 {
+        transition divisor_extended >= high_bit {
+            true -> emit(dividend_extended,
+                negate_wrapping_u64(divisor_extended), true)
+            false -> emit(dividend_extended, divisor_extended, false)
+            _ -> emit(dividend_extended, divisor_extended, false)
+        }
+    }
+    state emit(
+        dividend_magnitude: u64,
+        divisor_magnitude: u64,
+        negate: bool
+    ) -> u64 {
+        let quotient: u64 = dividend_magnitude / divisor_magnitude;
+        transition negate {
+            true -> (negate_wrapping_u64(quotient))
+            false -> (quotient)
+            _ -> (quotient)
+        }
+    }
+}
+
+// Signed remainder keeps the dividend's sign (Rust `%` truncates toward zero)
+// — `sign(a) * (|a| mod |b|)`; a zero divisor yields 0 (refused upstream at
+// construction).
+pub machine signed_remainder_u64(dividend_extended: u64, divisor_extended: u64) -> u64 {
+    transition divisor_extended == 0 {
+        true -> (0)
+        false -> gate(dividend_extended, divisor_extended)
+        _ -> (0)
+    }
+    state gate(dividend_extended: u64, divisor_extended: u64) -> u64 {
+        let high_bit: u64 = ((1 as u64 in Wrapping)
+            << (63 as u64 in Wrapping)) as u64;
+        let dividend_magnitude: u64 =
+            magnitude_of_extended(dividend_extended, high_bit);
+        let divisor_magnitude: u64 =
+            magnitude_of_extended(divisor_extended, high_bit);
+        let remainder: u64 = dividend_magnitude % divisor_magnitude;
+        transition dividend_extended >= high_bit {
+            true -> (negate_wrapping_u64(remainder))
+            false -> (remainder)
+            _ -> (remainder)
+        }
+    }
+}
+
+// |x| of a sign-extended word — negate only when the sign bit reads set.
+pub machine magnitude_of_extended(extended: u64, high_bit: u64) -> u64 {
+    transition extended >= high_bit {
+        true -> (negate_wrapping_u64(extended))
+        false -> (extended)
+        _ -> (extended)
+    }
+}
+
+// Arithmetic shift right on a sign-extended word — complement before the
+// logical shift so sign bits fill from the top; complement again after.
+// `shift_amount` is already width-masked by the caller.
+pub machine arithmetic_shift_right_u64(value_extended: u64, shift_amount: u64) -> u64 {
+    let high_bit: u64 = ((1 as u64 in Wrapping)
+        << (63 as u64 in Wrapping)) as u64;
+    transition value_extended >= high_bit {
+        true -> negative(value_extended, shift_amount)
+        false -> (((value_extended as u64 in Wrapping)
+            >> (shift_amount as u64 in Wrapping)) as u64)
+        _ -> (((value_extended as u64 in Wrapping)
+            >> (shift_amount as u64 in Wrapping)) as u64)
+    }
+    state negative(value_extended: u64, shift_amount: u64) -> u64 {
+        let max_u64: u64 = (((0 as u64 in Wrapping)
+            - (1 as u64 in Wrapping)) as u64);
+        let complemented: u64 = ((max_u64 as u64 in Wrapping)
+            ^ (value_extended as u64 in Wrapping)) as u64;
+        let shifted: u64 = ((complemented as u64 in Wrapping)
+            >> (shift_amount as u64 in Wrapping)) as u64;
+        (((max_u64 as u64 in Wrapping)
+            ^ (shifted as u64 in Wrapping)) as u64)
+    }
+}
+
 // Upstream `FromStr`: the parse result, with `Invalid` first so an untouched
 // value reads as failure (the OpenResult zero-case convention). Upstream's
 // `ParseScanCompareTypeError` is a unit struct whose only payload is the
