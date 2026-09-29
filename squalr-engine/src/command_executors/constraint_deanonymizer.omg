@@ -1,6 +1,7 @@
 module src::command_executors::constraint_deanonymizer;
 
 use squalr_engine_api::src::commands::scan::element_scan::element_scan_request::ScanConstraintSet;
+use squalr_engine_api::src::registries::scan_rules::element_scan_rule_registry::ElementScanRuleRegistry;
 use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
 use squalr_engine_api::src::structures::data_types::floating_point_tolerance::FloatingPointTolerance;
 use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
@@ -27,6 +28,17 @@ use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_sca
 // wildcard arrays, multi-element scalars) and lands on the plan's pattern
 // carriers — patterns up to 8 bytes additionally pack into `operand_value`
 // for the u64 fast path the byte-array scanners read.
+//
+// Upstream then folds `get_scan_parameters_rule_registry()` over the built
+// constraints before `ScanConstraintFinalized::new` — RuleMapToPrimitiveType
+// (array-of-bytes at primitive width -> u8/u16be/u32be/u64be) and
+// RuleMapUnsignedGreaterThanZeroToNotEqual (unsigned non-float `> 0` on a
+// zero operand -> `!= 0`). The registry applies each rule to each element
+// independently, so per-constraint application inside this build loop is
+// the same rewrite, applied in upstream's `built_in_rules` declaration
+// order. `rule_scalar`/`rule_pattern` are that fold; a retyped
+// `BuiltPattern` scalarizes onto the scalar plan path the way upstream's
+// finalized treats the retyped constraint.
 // Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
 pub data ConstraintDeanonymizer {}
 
@@ -73,20 +85,216 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
         let built: ScanConstraintBuild<'a> =
             builder.build(&constraint, data_type_ref);
         transition built {
-            ScanConstraintBuild::Built { value } -> plan_scalar(
+            ScanConstraintBuild::Built { value } -> rule_scalar(
                 plan_list, builder, scan_constraints, value,
                 data_type_ref, memory_alignment, position)
-            ScanConstraintBuild::BuiltPattern { value } -> plan_pattern(
+            ScanConstraintBuild::BuiltPattern { value } -> rule_pattern(
                 plan_list, builder, scan_constraints, value,
                 data_type_ref, memory_alignment, position)
             _ -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position)
         }
     }
 
+    // Upstream's parameter-rule fold between `build` and finalize — the
+    // registry applies RuleMapToPrimitiveType then
+    // RuleMapUnsignedGreaterThanZeroToNotEqual (built_in_rules declaration
+    // order) to the built scalar constraint.
+    state rule_scalar(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        built: ScanConstraint<'a>,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let mut rewritten: ScanConstraint<'a> = built;
+        ElementScanRuleRegistry::apply_parameter_rule_scalar(
+            &mut rewritten, "u8", "u16be", "u32be", "u64be");
+        transition { _ -> plan_scalar(
+            plan_list, builder, scan_constraints, rewritten,
+            data_type_ref, memory_alignment, position) }
+    }
+
+    // The same fold on the pattern carrier — the primitive retype reports
+    // whether it fired: a {1,2,4,8}-byte pattern that remapped to a
+    // primitive goes down the scalar plan path like upstream's finalized
+    // sees the retyped constraint; anything else keeps the byte-array plan.
+    state rule_pattern(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let mut rewritten: PatternScanConstraint = pattern;
+        let scalarize: bool = ElementScanRuleRegistry::apply_parameter_rule_pattern(
+            &mut rewritten, "u8", "u16be", "u32be", "u64be");
+        transition scalarize {
+            true -> pattern_scalarize(
+                plan_list, builder, scan_constraints, rewritten,
+                data_type_ref, memory_alignment, position)
+            false -> plan_pattern(
+                plan_list, builder, scan_constraints, rewritten,
+                data_type_ref, memory_alignment, position)
+            _ -> plan_pattern(
+                plan_list, builder, scan_constraints, rewritten,
+                data_type_ref, memory_alignment, position)
+        }
+    }
+
+    // A retyped pattern becomes a scalar-carrier constraint: upstream's
+    // `ScanConstraintFinalized` sees the new primitive ref, the same byte
+    // operand, and the same mask. `operand_value`/`mask_value` pack the
+    // pattern's own spans — identical bytes, so the scalar plan compares
+    // the same span upstream's retyped scalar does.
+    state pattern_scalarize(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let pattern_bytes: &[u8] = pattern.get_pattern_bytes();
+        let pattern_len: u64 = pattern.get_pattern_len();
+        let operand_value: u64 =
+            pack_bytes_le_u64(pattern_bytes, pattern_len);
+        transition pattern.has_mask() {
+            true -> scalarize_mask(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position, operand_value)
+            false -> scalarize_emit(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position, operand_value, 0)
+            _ -> scalarize_emit(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position, operand_value, 0)
+        }
+    }
+
+    state scalarize_mask(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        operand_value: u64
+    ) {
+        let mask_bytes: &[u8] = pattern.get_mask_bytes();
+        let mask_len: u64 = pattern.get_mask_len();
+        let mask_value: u64 =
+            pack_bytes_le_u64(mask_bytes, mask_len);
+        transition { _ -> scalarize_emit(
+            plan_list, builder, scan_constraints, pattern,
+            data_type_ref, memory_alignment, position, operand_value, mask_value) }
+    }
+
+    // The emit reads the pattern's own ref — the new primitive after the
+    // retype — so unit size, signedness, float, preference and container
+    // all follow the remap exactly as upstream's registry reads do.
+    state scalarize_emit(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        operand_value: u64,
+        mask_value: u64
+    ) {
+        let new_ref: DataTypeRef = pattern.get_data_type_ref();
+        let pattern_len: u64 = pattern.get_pattern_len();
+        let scan_compare_type: ScanCompareType = pattern.get_scan_compare_type();
+        let has_mask: bool = pattern.has_mask();
+        let signed: bool = new_ref.is_signed();
+        let floating: bool = new_ref.is_floating_point();
+        let prefer: bool = new_ref.prefers_type_scanner();
+        let container: ContainerType = new_ref.get_result_container_type();
+        transition has_mask {
+            true -> scalarize_masked(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                new_ref, pattern_len, scan_compare_type, operand_value,
+                mask_value, signed, floating, prefer, container)
+            false -> scalarize_plain(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                new_ref, pattern_len, scan_compare_type, operand_value,
+                signed, floating, prefer, container)
+            _ -> scalarize_plain(
+                plan_list, builder, scan_constraints, pattern,
+                data_type_ref, memory_alignment, position,
+                new_ref, pattern_len, scan_compare_type, operand_value,
+                signed, floating, prefer, container)
+        }
+    }
+
+    state scalarize_masked(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        new_ref: DataTypeRef,
+        pattern_len: u64,
+        scan_compare_type: ScanCompareType,
+        operand_value: u64,
+        mask_value: u64,
+        signed: bool,
+        floating: bool,
+        prefer: bool,
+        container: ContainerType
+    ) {
+        let mut scalar: ScanConstraint<'a> = ScanConstraint::new_masked(
+            new_ref, scan_compare_type, operand_value, pattern_len,
+            mask_value, signed, floating, prefer);
+        scalar.set_result_container_type(container);
+        transition { _ -> plan_scalar(
+            plan_list, builder, scan_constraints, scalar,
+            data_type_ref, memory_alignment, position) }
+    }
+
+    state scalarize_plain(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        pattern: PatternScanConstraint,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64,
+        new_ref: DataTypeRef,
+        pattern_len: u64,
+        scan_compare_type: ScanCompareType,
+        operand_value: u64,
+        signed: bool,
+        floating: bool,
+        prefer: bool,
+        container: ContainerType
+    ) {
+        let mut scalar: ScanConstraint<'a> = ScanConstraint::new(
+            new_ref, scan_compare_type, operand_value, pattern_len,
+            signed, floating, prefer);
+        scalar.set_result_container_type(container);
+        transition { _ -> plan_scalar(
+            plan_list, builder, scan_constraints, scalar,
+            data_type_ref, memory_alignment, position) }
+    }
+
     // The scalar plan: `operand_value`/`mask_value` are the built
     // constraint's u64-packed words; `result_container_type` reads off the
     // built constraint (the anonymous string's container — Array/ArrayFixed
-    // when the value text declared a collection).
+    // when the value text declared a collection). Element metrics read off
+    // the constraint's own ref — after a parameter-rule retype that is the
+    // primitive type, exactly what upstream's finalized reads.
     state plan_scalar(
         plan_list: &mut TypePlanList,
         builder: &ScanConstraintBuilder,
@@ -96,7 +304,8 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
         memory_alignment: MemoryAlignment,
         position: u64
     ) {
-        let unit_size_in_bytes: u64 = data_type_ref.get_unit_size_in_bytes();
+        let built_ref: DataTypeRef = built.get_data_type_ref();
+        let unit_size_in_bytes: u64 = built_ref.get_unit_size_in_bytes();
         let scan_compare_type: ScanCompareType = built.get_scan_compare_type();
         let operand_value: u64 = built.get_operand_value();
         let periodicity: u64 = ScanConstraintFinalized::calculate_periodicity(
@@ -113,8 +322,8 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
             true,
             scalar_function,
             memory_alignment);
-        let built_is_floating_point: bool = data_type_ref.is_floating_point();
-        let built_prefers_type_scanner: bool = data_type_ref.prefers_type_scanner();
+        let built_is_floating_point: bool = built.is_floating_point();
+        let built_prefers_type_scanner: bool = built.prefers_type_scanner();
         let built_has_mask: bool = built.has_mask();
         let built_mask_value: u64 = built.get_mask_value();
         let built_result_container_type: ContainerType = built.get_result_container_type();
@@ -125,13 +334,92 @@ pub machine ConstraintDeanonymizer::build_type_plan_list<'a>(
             built_has_mask,
             built_mask_value,
             built_result_container_type);
-        // The scalar leg's plan-type rule: a present current window makes
-        // the filter scannable scalar-iteratively (upstream's byte-array and
-        // vector specializations land with their own legs; scalar covers the
-        // same filter set, only less specialized).
-        plan.set_planned_scan_type(PlannedScanType::Scalar {
+        let operand_size_in_bytes: u64 = built.get_operand_size_in_bytes();
+        transition operand_size_in_bytes == unit_size_in_bytes {
+            true -> scalar_emit(
+                plan_list, builder, scan_constraints, plan,
+                data_type_ref, memory_alignment, position)
+            false -> scalar_span(
+                plan_list, builder, scan_constraints, plan, operand_value,
+                operand_size_in_bytes, data_type_ref, memory_alignment, position)
+            _ -> scalar_span(
+                plan_list, builder, scan_constraints, plan, operand_value,
+                operand_size_in_bytes, data_type_ref, memory_alignment, position)
+        }
+    }
+
+    // Multi-element array operands (`u8[3]`, `u16be[2]` — operand width !=
+    // element unit): the operand bytes ARE the scan span upstream's byte
+    // array gets from `get_value_bytes()`, so the plan's pattern carriers
+    // carry the unpacked span and the byte-array drain reads the true
+    // length instead of the unit width. The `<= 8` guard restates the
+    // scalar carrier's construction bound (`scalar_pack` packs at most a
+    // u64) so the span slice discharges honestly.
+    state scalar_span(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        plan: SnapshotFilterElementScanPlan,
+        operand_value: u64,
+        operand_size_in_bytes: u64,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let mut spanned: SnapshotFilterElementScanPlan = plan;
+        transition operand_size_in_bytes <= 8 {
+            true -> span_write(
+                plan_list, builder, scan_constraints, spanned,
+                operand_value, operand_size_in_bytes,
+                data_type_ref, memory_alignment, position)
+            false -> scalar_emit(
+                plan_list, builder, scan_constraints, spanned,
+                data_type_ref, memory_alignment, position)
+            _ -> scalar_emit(
+                plan_list, builder, scan_constraints, spanned,
+                data_type_ref, memory_alignment, position)
+        }
+    }
+
+    state span_write(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        plan: SnapshotFilterElementScanPlan,
+        operand_value: u64,
+        operand_size_in_bytes: u64,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let mut written: SnapshotFilterElementScanPlan = plan;
+        let mut span: [u8; 8];
+        unpack_le_u64(operand_value, operand_size_in_bytes, &mut span);
+        let wrote: bool =
+            written.set_pattern_bytes(&span[0..operand_size_in_bytes]);
+        transition { _ -> scalar_emit(
+            plan_list, builder, scan_constraints, written,
+            data_type_ref, memory_alignment, position) }
+    }
+
+    // The scalar leg's plan-type rule: a present current window makes
+    // the filter scannable scalar-iteratively (upstream's byte-array and
+    // vector specializations land with their own legs; scalar covers the
+    // same filter set, only less specialized). The dispatch-time filter
+    // rule re-picks the planned type against each live filter.
+    state scalar_emit(
+        plan_list: &mut TypePlanList,
+        builder: &ScanConstraintBuilder,
+        scan_constraints: &ScanConstraintSet,
+        plan: SnapshotFilterElementScanPlan,
+        data_type_ref: &DataTypeRef,
+        memory_alignment: MemoryAlignment,
+        position: u64
+    ) {
+        let mut stored: SnapshotFilterElementScanPlan = plan;
+        stored.set_planned_scan_type(PlannedScanType::Scalar {
             scan_type: PlannedScanTypeScalar::ScalarIterative });
-        let pushed: bool = plan_list.push(&plan);
+        let pushed: bool = plan_list.push(&stored);
         transition { _ -> next(plan_list, builder, scan_constraints, data_type_ref, memory_alignment, position) }
     }
 
@@ -351,6 +639,36 @@ machine pow256_u64(at: u64) -> u64 {
                 step + 1, at)
             false -> (acc)
         }
+    }
+}
+
+// The inverse of `pack_bytes_le_u64` — writes the packed word's low `count`
+// bytes little-endian into `out` (out-of-bounds writes refuse through the
+// `at < out.len` guard; a `count` wider than the destination writes only
+// what fits, like the pack side reading what exists).
+machine unpack_le_u64(value: u64, count: u64, out: &mut [u8]) {
+    transition { _ -> each(value, count, out, 0) }
+
+    state each(value: u64, count: u64, out: &mut [u8], at: u64) {
+        transition at < count && at < out.len && at < 8 {
+            true -> one(value, count, out, at)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state one(value: u64, count: u64, out: &mut [u8], at: u64)
+        requires at < out.len && at < 8
+    {
+        let place: u64 = pow256_u64(at);
+        let digit: u64 = ((value as u64 in Wrapping) / (place as u64 in Wrapping)) as u64;
+        let byte: u64 = digit % 256;
+        out[at] = byte as u8;
+        transition { _ -> each(value, count, out,
+            ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state done() {
     }
 }
 
