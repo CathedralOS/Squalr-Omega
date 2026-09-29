@@ -1,0 +1,398 @@
+module src::tasks::trackable_task_manager;
+
+use squalr_engine_api::src::structures::tasks::trackable_task::TrackableTask;
+use squalr_engine_api::src::structures::tasks::trackable_task_handle::TrackableTaskHandle;
+use omega::language::core::wait_wake;
+
+// Port of squalr-engine-session's structures/tasks/trackable_task_manager.rs
+// @568aa758 — upstream `tasks: Arc<RwLock<HashMap<String, Arc<TrackableTask>>>>`.
+// The map becomes a bounded 64-slot table: `TaskSlot` is the canonical
+// held-slot union (`Empty`/`Held`) so the array auto-initializes `Empty`
+// (upstream's absent key); a `Binding<WaitWake>` payload cannot have an
+// authored default and must live inside a case payload. `task_count` is
+// `HashMap::len`. Lookups keep upstream's `String` key equality via
+// `matches_task_identifier*`; identifier uniqueness is enforced by the
+// replace-on-match leg of `register_task` (upstream `HashMap::insert`
+// overwrites the same key).
+//
+// Upstream `Arc<RwLock<..>>` interior mutability has no single-owner analog;
+// mutation is the ordinary `&mut self` attachment here. Slot inspection that
+// destructures `self.tasks[i]` lives in leaf machines returning scalars —
+// the scrutinee borrow spans every downstream write, so `Held`/`Empty`
+// mutations sit behind boolean transitions after the borrow ends.
+
+// One table slot: `Empty` is an absent key, `Held` carries one live task.
+pub data TaskSlot {
+    case Empty;
+    case Held(task: TrackableTask);
+}
+
+// `Option<TrackableTaskHandle>` for `get_task_handle` — `has_handle` is the
+// Option discriminant; the handle's borrows track the carrier's lifetime.
+pub data TaskHandleCarrier<'a> {
+    has_handle: bool;
+    handle: TrackableTaskHandle<'a>;
+}
+
+pub data TrackableTaskManager {
+    tasks: [TaskSlot; 64];
+    task_count: u64;
+}
+
+pub machine TrackableTaskManager::new() -> TrackableTaskManager {
+    TrackableTaskManager {
+        task_count: 0
+    }
+}
+
+// Upstream `RwLock::read().unwrap().len()` — the live-key count.
+pub machine TrackableTaskManager::get_task_count(&self) -> u64 {
+    self.task_count
+}
+
+// Whether the slot holds a live task — the map's `contains_key` leg; the
+// scrutinee borrow ends inside this leaf.
+machine TrackableTaskManager::slot_is_held(&self, position: u64) -> bool
+requires position < 64;
+{
+    transition self.tasks[position] {
+        TaskSlot::Held { task } -> held()
+        _ -> (false)
+    }
+
+    state held(&self) -> bool {
+        true
+    }
+}
+
+// Whether the held task's identifier equals `needle` — upstream's map `get`
+// by `String` key; the scrutinee borrow ends inside this leaf.
+machine TrackableTaskManager::held_matches_identifier(
+    &self,
+    position: u64,
+    task_identifier: &[u8]
+) -> bool
+requires position < 64;
+{
+    transition self.tasks[position] {
+        TaskSlot::Held { task } -> matches(&task, task_identifier)
+        _ -> (false)
+    }
+
+    state matches(&self, task: &TrackableTask, task_identifier: &[u8]) -> bool {
+        task.matches_task_identifier(task_identifier)
+    }
+}
+
+// The same match task-versus-task — upstream's `insert` same-key check.
+machine TrackableTaskManager::held_matches_identifier_of(
+    &self,
+    position: u64,
+    trackable_task: &TrackableTask
+) -> bool
+requires position < 64;
+{
+    transition self.tasks[position] {
+        TaskSlot::Held { task } -> matches(&task, trackable_task)
+        _ -> (false)
+    }
+
+    state matches(&self, task: &TrackableTask, trackable_task: &TrackableTask) -> bool {
+        task.matches_task_identifier_of(trackable_task)
+    }
+}
+
+// `task.cancel()` on the held task — upstream `&self` cancel rides the
+// atomic-flag surface, so a shared payload borrow is enough; the scrutinee
+// borrow ends inside this leaf.
+machine TrackableTaskManager::cancel_held_task(&self, position: u64)
+requires position < 64;
+reaches WaitWake
+invokes WaitWake;
+{
+    transition self.tasks[position] {
+        TaskSlot::Held { task } -> cancel_one(&task)
+        _ -> done()
+    }
+
+    state cancel_one(&self, task: &TrackableTask)
+    {
+        task.cancel();
+    }
+
+    state done(&self) {
+    }
+}
+
+// Upstream `register_task`: `tasks.write().unwrap().insert(
+// task.get_task_identifier(), task)` — an already-registered identifier
+// overwrites in place (upstream's same-key replace); otherwise the first
+// dead slot takes it. A full table declines — upstream's map is
+// unbounded, so this is the bounded-table refusal, not truncation.
+pub machine TrackableTaskManager::register_task(
+    &mut self,
+    trackable_task: TrackableTask
+) -> bool {
+    transition { _ -> find_identifier(trackable_task, 0) }
+
+    state find_identifier(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        transition position < 64 {
+            true -> check_identifier(trackable_task, position)
+            _ -> find_dead_slot(trackable_task, 0)
+        }
+    }
+
+    state check_identifier(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        let found: bool = self.held_matches_identifier_of(position, &trackable_task);
+        transition found {
+            true -> replace(trackable_task, position)
+            _ -> scan_next_identifier(trackable_task, position)
+        }
+    }
+
+    state scan_next_identifier(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        transition {
+            _ -> find_identifier(
+                trackable_task,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state replace(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        self.tasks[position] = TaskSlot::Held { task: trackable_task };
+        true
+    }
+
+    state find_dead_slot(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        transition position < 64 {
+            true -> check_dead_slot(trackable_task, position)
+            _ -> (false)
+        }
+    }
+
+    state check_dead_slot(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        let held: bool = self.slot_is_held(position);
+        transition held {
+            false -> store_new(trackable_task, position)
+            _ -> scan_next_dead_slot(trackable_task, position)
+        }
+    }
+
+    state scan_next_dead_slot(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        transition {
+            _ -> find_dead_slot(
+                trackable_task,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state store_new(
+        &mut self,
+        trackable_task: TrackableTask,
+        position: u64
+    ) -> bool {
+        self.tasks[position] = TaskSlot::Held { task: trackable_task };
+        self.task_count = ((self.task_count as u64 in Saturating) + (1 as u64 in Saturating)) as u64;
+        true
+    }
+}
+
+// Upstream `unregister_task`: `tasks.write().unwrap().remove(
+// task_identifier)` — dead-slot the matching key; the count decrements
+// saturating like every bounded-arena bookkeeping respell.
+pub machine TrackableTaskManager::unregister_task(
+    &mut self,
+    task_identifier: &[u8]
+) {
+    transition { _ -> find(task_identifier, 0) }
+
+    state find(&mut self, task_identifier: &[u8], position: u64) {
+        transition position < 64 {
+            true -> check(task_identifier, position)
+            _ -> done()
+        }
+    }
+
+    state check(&mut self, task_identifier: &[u8], position: u64) {
+        let found: bool = self.held_matches_identifier(position, task_identifier);
+        transition found {
+            true -> remove(position)
+            _ -> next(task_identifier, position)
+        }
+    }
+
+    state next(&mut self, task_identifier: &[u8], position: u64) {
+        transition {
+            _ -> find(
+                task_identifier,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state remove(&mut self, position: u64) {
+        self.tasks[position] = TaskSlot::Empty { };
+        self.task_count = ((self.task_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition { _ -> done() }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// Upstream `cancel_task`: `tasks.read().unwrap().get(&task_identifier)`
+// then `task.cancel()` followed by `self.unregister_task(task_identifier)`
+// — the cancel+remove pair keeps `task_count` equal to upstream's
+// `HashMap::len` of live keys; misses stay no-ops. The write lands after
+// `cancel_held_task`'s internal payload borrow ends — the single-owner
+// equivalent of upstream's second `remove`.
+pub machine TrackableTaskManager::cancel_task(
+    &mut self,
+    task_identifier: &[u8]
+)
+reaches WaitWake
+invokes WaitWake;
+{
+    transition { _ -> find(task_identifier, 0) }
+
+    state find(&mut self, task_identifier: &[u8], position: u64) {
+        transition position < 64 {
+            true -> check(task_identifier, position)
+            _ -> done()
+        }
+    }
+
+    state check(&mut self, task_identifier: &[u8], position: u64) {
+        let found: bool = self.held_matches_identifier(position, task_identifier);
+        transition found {
+            true -> cancel_at(position)
+            _ -> next(task_identifier, position)
+        }
+    }
+
+    state next(&mut self, task_identifier: &[u8], position: u64) {
+        transition {
+            _ -> find(
+                task_identifier,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state cancel_at(&mut self, position: u64) {
+        self.cancel_held_task(position);
+        self.tasks[position] = TaskSlot::Empty { };
+        self.task_count = ((self.task_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition { _ -> done() }
+    }
+
+    state done(&mut self) {
+    }
+}
+
+// Upstream `get_task_handle`: `tasks.read().unwrap().get(&task_identifier)
+// .map(|task| task.get_task_handle())` — `has_handle` is the Option map.
+pub machine TrackableTaskManager::get_task_handle<'a>(
+    &self,
+    task_identifier: &[u8]
+) -> TaskHandleCarrier<'a> {
+    transition { _ -> find(task_identifier, 0) }
+
+    state find(&self, task_identifier: &[u8], position: u64) -> TaskHandleCarrier<'a> {
+        transition position < 64 {
+            true -> check(task_identifier, position)
+            _ -> miss()
+        }
+    }
+
+    state check(&self, task_identifier: &[u8], position: u64) -> TaskHandleCarrier<'a> {
+        let found: bool = self.held_matches_identifier(position, task_identifier);
+        transition found {
+            true -> present(position)
+            _ -> next(task_identifier, position)
+        }
+    }
+
+    state next(&self, task_identifier: &[u8], position: u64) -> TaskHandleCarrier<'a> {
+        transition {
+            _ -> find(
+                task_identifier,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state present(&self, position: u64) -> TaskHandleCarrier<'a> {
+        let carrier: TaskHandleCarrier<'a> = self.held_task_handle(position);
+        transition { _ -> (carrier) }
+    }
+
+    state miss(&self) -> TaskHandleCarrier<'a> {
+        TaskHandleCarrier {
+            has_handle: false,
+            handle: TrackableTaskHandle {
+                name: "",
+                progress: 0.0,
+                task_identifier: ""
+            }
+        }
+    }
+}
+
+// `tasks.get(key).map(|task| task.get_task_handle())` — the handle map over
+// the held task; the payload borrow's lifetime flows through `<'a>` to the
+// returned carrier.
+machine TrackableTaskManager::held_task_handle<'a>(
+    &self,
+    position: u64
+) -> TaskHandleCarrier<'a>
+requires position < 64;
+{
+    transition self.tasks[position] {
+        TaskSlot::Held { task } -> present(&task)
+        _ -> miss()
+    }
+
+    state present(&self, task: &'a TrackableTask) -> TaskHandleCarrier<'a> {
+        TaskHandleCarrier {
+            has_handle: true,
+            handle: task.get_task_handle()
+        }
+    }
+
+    state miss(&self) -> TaskHandleCarrier<'a> {
+        TaskHandleCarrier {
+            has_handle: false,
+            handle: TrackableTaskHandle {
+                name: "",
+                progress: 0.0,
+                task_identifier: ""
+            }
+        }
+    }
+}
