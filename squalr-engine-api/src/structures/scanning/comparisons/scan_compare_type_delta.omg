@@ -1,8 +1,17 @@
 module src::structures::scanning::comparisons::scan_compare_type_delta;
 
+use src::structures::data_types::floating_point_tolerance::FloatingPointTolerance;
 use src::structures::scanning::comparisons::scan_compare_type::arithmetic_shift_right_u64;
+use src::structures::scanning::comparisons::scan_compare_type::bits_to_f32;
+use src::structures::scanning::comparisons::scan_compare_type::bits_to_f64;
 use src::structures::scanning::comparisons::scan_compare_type::effective_shift_u64;
 use src::structures::scanning::comparisons::scan_compare_type::element_width_mask_u64;
+use src::structures::scanning::comparisons::scan_compare_type::f32_to_bits;
+use src::structures::scanning::comparisons::scan_compare_type::f64_to_bits;
+use src::structures::scanning::comparisons::scan_compare_type::float_abs_diff_le_tolerance_f32;
+use src::structures::scanning::comparisons::scan_compare_type::float_abs_diff_le_tolerance_f64;
+use src::structures::scanning::comparisons::scan_compare_type::float_mod_f32;
+use src::structures::scanning::comparisons::scan_compare_type::float_mod_f64;
 use src::structures::scanning::comparisons::scan_compare_type::sign_extend_u64;
 use src::structures::scanning::comparisons::scan_compare_type::signed_divide_u64;
 use src::structures::scanning::comparisons::scan_compare_type::signed_remainder_u64;
@@ -56,6 +65,20 @@ pub machine ScanCompareTypeDelta::requires_nonzero_delta(&self) -> bool {
     }
 }
 
+// Upstream's float ScalarComparable impls return `None` for these delta
+// kinds — the shift/logical ops have no float arithmetic (the plan drops
+// the scalar function the same way it drops a zero divisor).
+pub machine ScanCompareTypeDelta::requires_integer_delta(&self) -> bool {
+    transition self {
+        ScanCompareTypeDelta::ShiftLeftByX -> (true)
+        ScanCompareTypeDelta::ShiftRightByX -> (true)
+        ScanCompareTypeDelta::LogicalAndByX -> (true)
+        ScanCompareTypeDelta::LogicalOrByX -> (true)
+        ScanCompareTypeDelta::LogicalXorByX -> (true)
+        _ -> (false)
+    }
+}
+
 // The typed compare: every operand masks to element width and every result
 // wraps at element width — upstream evaluates `previous <op> delta` on
 // PrimitiveType-width words and compares it against the typed current load.
@@ -70,8 +93,136 @@ pub machine ScanCompareTypeDelta::compare_typed(
     previous_value: u64,
     delta_value: u64,
     is_signed: bool,
+    is_floating_point: bool,
+    floating_point_tolerance: FloatingPointTolerance,
     element_size_in_bytes: u64
 ) -> bool {
+    transition is_floating_point {
+        true -> float_typed(current_value, previous_value, delta_value,
+            floating_point_tolerance, element_size_in_bytes)
+        false -> integer_typed(current_value, previous_value, delta_value,
+            is_signed, element_size_in_bytes)
+        _ -> integer_typed(current_value, previous_value, delta_value,
+            is_signed, element_size_in_bytes)
+    }
+    // Upstream `ScalarComparisonsFloat` delta compares: the float target is
+    // `previous <op> delta` evaluated on decoded floats, and the check is
+    // `|current - target| <= tolerance`. The shift/logical kinds are
+    // unreachable here — the plan refuses them on floating-point types
+    // upstream (`ScalarComparable::None`) and they answer false locally.
+    state float_typed(
+        &self,
+        current_value: u64,
+        previous_value: u64,
+        delta_value: u64,
+        floating_point_tolerance: FloatingPointTolerance,
+        element_size_in_bytes: u64
+    ) -> bool {
+        let tolerance_bits: u64 =
+            floating_point_tolerance.get_value_bits(element_size_in_bytes);
+        transition element_size_in_bytes == 4 {
+            true -> float32_typed(
+                current_value, previous_value, delta_value, tolerance_bits)
+            false -> float64_typed(
+                current_value, previous_value, delta_value, tolerance_bits)
+            _ -> float64_typed(
+                current_value, previous_value, delta_value, tolerance_bits)
+        }
+    }
+    state float32_typed(
+        &self,
+        current_value: u64,
+        previous_value: u64,
+        delta_value: u64,
+        tolerance_bits: u64
+    ) -> bool {
+        let previous: f32 = bits_to_f32(previous_value);
+        let delta: f32 = bits_to_f32(delta_value);
+        transition self {
+            ScanCompareTypeDelta::IncreasedByX -> float32_target(
+                current_value, previous + delta, tolerance_bits)
+            ScanCompareTypeDelta::DecreasedByX -> float32_target(
+                current_value, previous - delta, tolerance_bits)
+            ScanCompareTypeDelta::MultipliedByX -> float32_target(
+                current_value, previous * delta, tolerance_bits)
+            ScanCompareTypeDelta::DividedByX -> float32_target(
+                current_value, previous / delta, tolerance_bits)
+            ScanCompareTypeDelta::ModuloByX -> float32_mod_target(
+                current_value, previous, delta, tolerance_bits)
+            _ -> (false)
+        }
+    }
+    state float32_target(
+        current_value: u64,
+        target: f32,
+        tolerance_bits: u64
+    ) -> bool {
+        let target_bits: u64 = f32_to_bits(target);
+        (float_abs_diff_le_tolerance_f32(
+            current_value, target_bits, tolerance_bits))
+    }
+    state float32_mod_target(
+        current_value: u64,
+        previous: f32,
+        delta: f32,
+        tolerance_bits: u64
+    ) -> bool {
+        let remainder: f32 = float_mod_f32(previous, delta);
+        let target_bits: u64 = f32_to_bits(remainder);
+        (float_abs_diff_le_tolerance_f32(
+            current_value, target_bits, tolerance_bits))
+    }
+    state float64_typed(
+        &self,
+        current_value: u64,
+        previous_value: u64,
+        delta_value: u64,
+        tolerance_bits: u64
+    ) -> bool {
+        let previous: f64 = bits_to_f64(previous_value);
+        let delta: f64 = bits_to_f64(delta_value);
+        transition self {
+            ScanCompareTypeDelta::IncreasedByX -> float64_target(
+                current_value, previous + delta, tolerance_bits)
+            ScanCompareTypeDelta::DecreasedByX -> float64_target(
+                current_value, previous - delta, tolerance_bits)
+            ScanCompareTypeDelta::MultipliedByX -> float64_target(
+                current_value, previous * delta, tolerance_bits)
+            ScanCompareTypeDelta::DividedByX -> float64_target(
+                current_value, previous / delta, tolerance_bits)
+            ScanCompareTypeDelta::ModuloByX -> float64_mod_target(
+                current_value, previous, delta, tolerance_bits)
+            _ -> (false)
+        }
+    }
+    state float64_target(
+        current_value: u64,
+        target: f64,
+        tolerance_bits: u64
+    ) -> bool {
+        let target_bits: u64 = f64_to_bits(target);
+        (float_abs_diff_le_tolerance_f64(
+            current_value, target_bits, tolerance_bits))
+    }
+    state float64_mod_target(
+        current_value: u64,
+        previous: f64,
+        delta: f64,
+        tolerance_bits: u64
+    ) -> bool {
+        let remainder: f64 = float_mod_f64(previous, delta);
+        let target_bits: u64 = f64_to_bits(remainder);
+        (float_abs_diff_le_tolerance_f64(
+            current_value, target_bits, tolerance_bits))
+    }
+    state integer_typed(
+        &self,
+        current_value: u64,
+        previous_value: u64,
+        delta_value: u64,
+        is_signed: bool,
+        element_size_in_bytes: u64
+    ) -> bool {
     let width_mask: u64 = element_width_mask_u64(element_size_in_bytes);
     let current_masked: u64 = ((current_value as u64 in Wrapping)
         & (width_mask as u64 in Wrapping)) as u64;
@@ -109,6 +260,7 @@ pub machine ScanCompareTypeDelta::compare_typed(
             ((previous_wrapped | delta_wrapped) as u64))
         ScanCompareTypeDelta::LogicalXorByX -> (current_masked ==
             ((previous_wrapped ^ delta_wrapped) as u64))
+    }
     }
 
     state divided(
