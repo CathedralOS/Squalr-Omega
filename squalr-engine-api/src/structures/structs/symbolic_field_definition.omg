@@ -1,7 +1,9 @@
 module src::structures::structs::symbolic_field_definition;
 
 use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
 use src::structures::data_values::container_type::ContainerType;
+use src::structures::structs::symbolic_resolver_ref::SymbolicResolverRef;
 use src::structures::data_values::data_value::DataValue;
 use src::structures::structs::valued_struct_field::ValuedStructField;
 use src::structures::structs::valued_struct_field::ValuedStructFieldData;
@@ -13,23 +15,20 @@ use src::structures::structs::valued_struct_field::ValuedStructFieldData;
 // - Upstream resolver references (`SymbolicResolverRef`,
 //   `SymbolicFieldCountResolution::Resolver`,
 //   `SymbolicFieldOffsetResolution::Resolver`, `active_when_resolver`) carry
-//   registry ids; the resolver trait and SymbolRegistry belong to the
-//   symbol-registry leg (see valued_struct.omg). The port keeps the resolver
-//   id as data so documents round-trip, and evaluates it through upstream's
-//   own non-resolver fallbacks: unresolved counts/offsets behave as
-//   Inferred/Sequential — matching what upstream produces when the registry
-//   lacks the resolver entry.
+//   bounded [u8;256]+len ids — the resolver machinery itself rides the
+//   symbol-resolution leg. Unassigned entries keep upstream's shape minus
+//   its serde-skipped placeholder data_type_ref (upstream defaults it).
 // - Strings fold to [u8;256]+len per the port's name convention.
 
-pub data SymbolicFieldCountResolution [copy] {
+pub data SymbolicFieldCountResolution {
     case Inferred;
-    case Resolver;
+    case Resolver(resolver_id: [u8; 256], resolver_id_len: u64);
 }
 
-pub data SymbolicFieldOffsetResolution [copy] {
+pub data SymbolicFieldOffsetResolution {
     case Sequential;
     case Static(offset_in_bytes: u64);
-    case Resolver;
+    case Resolver(resolver_id: [u8; 256], resolver_id_len: u64);
 }
 
 pub data SymbolicDefinedField {
@@ -38,7 +37,12 @@ pub data SymbolicDefinedField {
     data_type_ref: DataTypeRef;
     container_type: ContainerType;
     count_resolution: SymbolicFieldCountResolution;
+    display_count_resolution: SymbolicFieldCountResolution;
     offset_resolution: SymbolicFieldOffsetResolution;
+    has_active_when_resolver: bool;
+    active_when_resolver: SymbolicResolverRef;
+    has_display_format: bool;
+    display_format: AnonymousValueStringFormat;
 }
 
 pub data SymbolicFieldDefinition {
@@ -70,7 +74,12 @@ pub machine SymbolicFieldDefinition::new_defined(
         data_type_ref: DataTypeRef::clone(data_type_ref),
         container_type: container_type,
         count_resolution: SymbolicFieldCountResolution::Inferred,
+        display_count_resolution: SymbolicFieldCountResolution::Inferred,
         offset_resolution: SymbolicFieldOffsetResolution::Sequential,
+        has_active_when_resolver: false,
+        active_when_resolver: (SymbolicResolverRef { resolver_id_len: 0 }),
+        has_display_format: false,
+        display_format: AnonymousValueStringFormat::default(),
     };
     fill_name(&mut field, field_name);
     SymbolicFieldDefinition::Field { field: field }
@@ -89,14 +98,47 @@ pub machine SymbolicFieldDefinition::is_unassigned(&self) -> bool {
     }
 }
 
-// Upstream `get_offset_resolution` — Unassigned entries are always
-// sequential (their size is their offset contribution).
+// Upstream `get_offset_resolution` (&SymbolicFieldOffsetResolution) —
+// union borrows can't be shared, so the port rebuilds the case; Resolver
+// ids copy whole. Unassigned entries are always sequential (their size is
+// their offset contribution).
 pub machine SymbolicFieldDefinition::get_offset_resolution(&self) -> SymbolicFieldOffsetResolution {
     transition self {
-        SymbolicFieldDefinition::Field { field } -> (field.offset_resolution)
+        SymbolicFieldDefinition::Field { field } -> (
+            SymbolicFieldOffsetResolution::clone(&field.offset_resolution))
         SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
             SymbolicFieldOffsetResolution::Sequential)
     }
+}
+
+pub machine SymbolicFieldOffsetResolution::clone(source: &SymbolicFieldOffsetResolution) -> SymbolicFieldOffsetResolution {
+    transition source {
+        SymbolicFieldOffsetResolution::Sequential -> (
+            SymbolicFieldOffsetResolution::Sequential)
+        SymbolicFieldOffsetResolution::Static { offset_in_bytes } -> (
+            SymbolicFieldOffsetResolution::Static { offset_in_bytes: offset_in_bytes })
+        SymbolicFieldOffsetResolution::Resolver { resolver_id, resolver_id_len } -> (
+            SymbolicFieldOffsetResolution::Resolver { resolver_id: resolver_id, resolver_id_len: resolver_id_len })
+    }
+}
+
+pub machine SymbolicFieldOffsetResolution::clone_from(&mut self, source: &SymbolicFieldOffsetResolution) {
+    let cloned: SymbolicFieldOffsetResolution = SymbolicFieldOffsetResolution::clone(source);
+    self = cloned;
+}
+
+pub machine SymbolicFieldCountResolution::clone(source: &SymbolicFieldCountResolution) -> SymbolicFieldCountResolution {
+    transition source {
+        SymbolicFieldCountResolution::Inferred -> (
+            SymbolicFieldCountResolution::Inferred)
+        SymbolicFieldCountResolution::Resolver { resolver_id, resolver_id_len } -> (
+            SymbolicFieldCountResolution::Resolver { resolver_id: resolver_id, resolver_id_len: resolver_id_len })
+    }
+}
+
+pub machine SymbolicFieldCountResolution::clone_from(&mut self, source: &SymbolicFieldCountResolution) {
+    let cloned: SymbolicFieldCountResolution = SymbolicFieldCountResolution::clone(source);
+    self = cloned;
 }
 
 // Upstream `get_size_in_bytes`: defined fields take their container's total
@@ -166,8 +208,13 @@ pub machine SymbolicDefinedField::clone(source: &SymbolicDefinedField) -> Symbol
             field_name_len: 0,
             data_type_ref: DataTypeRef::clone(&source.data_type_ref),
             container_type: source.container_type,
-            count_resolution: source.count_resolution,
-            offset_resolution: source.offset_resolution,
+            count_resolution: SymbolicFieldCountResolution::clone(&source.count_resolution),
+            display_count_resolution: SymbolicFieldCountResolution::clone(&source.display_count_resolution),
+            offset_resolution: SymbolicFieldOffsetResolution::clone(&source.offset_resolution),
+            has_active_when_resolver: source.has_active_when_resolver,
+            active_when_resolver: SymbolicResolverRef::clone(&source.active_when_resolver),
+            has_display_format: source.has_display_format,
+            display_format: source.display_format,
         };
         fill_name(&mut copy, name);
         copy
@@ -208,4 +255,331 @@ machine fill_name(field: &mut SymbolicDefinedField, name: &[u8]) {
 pub machine SymbolicFieldDefinition::clone_from(&mut self, source: &SymbolicFieldDefinition) {
     let cloned: SymbolicFieldDefinition = SymbolicFieldDefinition::clone(source);
     self = cloned;
+}
+
+// Upstream `new` — the nameless field ctor.
+pub machine SymbolicFieldDefinition::new(
+    data_type_ref: DataTypeRef,
+    container_type: ContainerType
+) -> SymbolicFieldDefinition {
+    SymbolicFieldDefinition::new_named((""), data_type_ref, container_type)
+}
+
+// Upstream `new_named` — default (Inferred/Sequential) resolutions, no
+// resolver hooks or display format.
+pub machine SymbolicFieldDefinition::new_named(
+    field_name: &[u8],
+    data_type_ref: DataTypeRef,
+    container_type: ContainerType
+) -> SymbolicFieldDefinition {
+    SymbolicFieldDefinition::new_named_with_resolutions(
+        field_name,
+        data_type_ref,
+        container_type,
+        SymbolicFieldCountResolution::Inferred,
+        SymbolicFieldOffsetResolution::Sequential)
+}
+
+// Upstream `new_named_with_resolutions`.
+pub machine SymbolicFieldDefinition::new_named_with_resolutions(
+    field_name: &[u8],
+    data_type_ref: DataTypeRef,
+    container_type: ContainerType,
+    count_resolution: SymbolicFieldCountResolution,
+    offset_resolution: SymbolicFieldOffsetResolution
+) -> SymbolicFieldDefinition {
+    SymbolicFieldDefinition::new_named_with_resolutions_and_display_count(
+        field_name,
+        data_type_ref,
+        container_type,
+        count_resolution,
+        SymbolicFieldCountResolution::Inferred,
+        offset_resolution)
+}
+
+// Upstream `new_named_with_resolutions_and_display_count`.
+pub machine SymbolicFieldDefinition::new_named_with_resolutions_and_display_count(
+    field_name: &[u8],
+    data_type_ref: DataTypeRef,
+    container_type: ContainerType,
+    count_resolution: SymbolicFieldCountResolution,
+    display_count_resolution: SymbolicFieldCountResolution,
+    offset_resolution: SymbolicFieldOffsetResolution
+) -> SymbolicFieldDefinition {
+    transition field_name.len <= 256 {
+        true -> build(field_name, data_type_ref, container_type, count_resolution, display_count_resolution, offset_resolution)
+        false -> build(&field_name[0..256], data_type_ref, container_type, count_resolution, display_count_resolution, offset_resolution)
+        _ -> build(&field_name[0..256], data_type_ref, container_type, count_resolution, display_count_resolution, offset_resolution)
+    }
+    state build(
+        field_name: &[u8],
+        data_type_ref: DataTypeRef,
+        container_type: ContainerType,
+        count_resolution: SymbolicFieldCountResolution,
+        display_count_resolution: SymbolicFieldCountResolution,
+        offset_resolution: SymbolicFieldOffsetResolution
+    ) -> SymbolicFieldDefinition {
+        let mut field: SymbolicDefinedField = SymbolicDefinedField {
+            field_name_len: 0,
+            data_type_ref: data_type_ref,
+            container_type: container_type,
+            count_resolution: count_resolution,
+            display_count_resolution: display_count_resolution,
+            offset_resolution: offset_resolution,
+            has_active_when_resolver: false,
+            active_when_resolver: (SymbolicResolverRef { resolver_id_len: 0 }),
+            has_display_format: false,
+            display_format: AnonymousValueStringFormat::default(),
+        };
+        fill_name(&mut field, field_name);
+        (SymbolicFieldDefinition::Field { field: field })
+    }
+}
+
+
+// Upstream `SymbolicFieldCountResolution::new_resolver` — [u8;256]+len id.
+pub machine SymbolicFieldCountResolution::new_resolver(
+    resolver_id: &[u8]
+) -> SymbolicFieldCountResolution {
+    let mut built_id: [u8; 256];
+    let written: u64 = copy_name_text(built_id, resolver_id);
+    (SymbolicFieldCountResolution::Resolver { resolver_id: built_id, resolver_id_len: written })
+}
+
+// Upstream `SymbolicFieldOffsetResolution::new_static` / `new_resolver`.
+pub machine SymbolicFieldOffsetResolution::new_static(
+    offset_in_bytes: u64
+) -> SymbolicFieldOffsetResolution {
+    SymbolicFieldOffsetResolution::Static { offset_in_bytes: offset_in_bytes }
+}
+
+pub machine SymbolicFieldOffsetResolution::new_resolver(
+    resolver_id: &[u8]
+) -> SymbolicFieldOffsetResolution {
+    let mut built_id: [u8; 256];
+    let written: u64 = copy_name_text(built_id, resolver_id);
+    (SymbolicFieldOffsetResolution::Resolver { resolver_id: built_id, resolver_id_len: written })
+}
+
+// Upstream `as_resolver_id` — Option<&str> folds to `has_resolver_id`
+// plus `get_resolver_id` (empty span when not a Resolver case).
+pub machine SymbolicFieldCountResolution::has_resolver_id(&self) -> bool {
+    transition self {
+        SymbolicFieldCountResolution::Resolver { resolver_id, resolver_id_len } -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine SymbolicFieldCountResolution::get_resolver_id(&self) -> &[u8] {
+    transition self {
+        SymbolicFieldCountResolution::Resolver { resolver_id, resolver_id_len } -> (
+            &resolver_id[0..resolver_id_len])
+        _ -> ("")
+    }
+}
+
+pub machine SymbolicFieldOffsetResolution::has_resolver_id(&self) -> bool {
+    transition self {
+        SymbolicFieldOffsetResolution::Resolver { resolver_id, resolver_id_len } -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine SymbolicFieldOffsetResolution::get_resolver_id(&self) -> &[u8] {
+    transition self {
+        SymbolicFieldOffsetResolution::Resolver { resolver_id, resolver_id_len } -> (
+            &resolver_id[0..resolver_id_len])
+        _ -> ("")
+    }
+}
+
+// Upstream `get_field_name` — "" on Unassigned.
+pub machine SymbolicFieldDefinition::get_field_name(&self) -> &[u8] {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (
+            &field.field_name[0..field.field_name_len])
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> ("")
+    }
+}
+
+// Upstream `get_container_type` — Unassigned reports its size as a
+// fixed array of bytes.
+pub machine SymbolicFieldDefinition::get_container_type(&self) -> ContainerType {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (field.container_type)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            ContainerType::ArrayFixed { length: size_in_bytes })
+    }
+}
+
+// Upstream `get_count_resolution` / `get_display_count_resolution` —
+// Unassigned reports the shared Inferred constant; the port rebuilds it.
+pub machine SymbolicFieldDefinition::get_count_resolution(&self) -> SymbolicFieldCountResolution {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (
+            SymbolicFieldCountResolution::clone(&field.count_resolution))
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            SymbolicFieldCountResolution::Inferred)
+    }
+}
+
+pub machine SymbolicFieldDefinition::get_display_count_resolution(&self) -> SymbolicFieldCountResolution {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (
+            SymbolicFieldCountResolution::clone(&field.display_count_resolution))
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            SymbolicFieldCountResolution::Inferred)
+    }
+}
+
+// Upstream `get_active_when_resolver` — Option<&SymbolicResolverRef>
+// folds to has_/get_ plus a carrier for the resolver path.
+pub machine SymbolicFieldDefinition::has_active_when_resolver(&self) -> bool {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (field.has_active_when_resolver)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (false)
+    }
+}
+
+pub data SymbolicResolverRefMatch {
+    found: bool;
+    resolver_ref: SymbolicResolverRef;
+}
+
+pub machine SymbolicFieldDefinition::get_active_when_resolver(&self) -> SymbolicResolverRefMatch {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (match_field(&field))
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> absent()
+    }
+    state match_field(field: &SymbolicDefinedField) -> SymbolicResolverRefMatch {
+        transition field.has_active_when_resolver {
+            true -> present(field)
+            false -> absent()
+        }
+    }
+    state present(field: &SymbolicDefinedField) -> SymbolicResolverRefMatch {
+        (SymbolicResolverRefMatch { found: true, resolver_ref: SymbolicResolverRef::clone(&field.active_when_resolver) })
+    }
+    state absent() -> SymbolicResolverRefMatch {
+        (SymbolicResolverRefMatch { found: false, resolver_ref: (SymbolicResolverRef { resolver_id_len: 0 }) })
+    }
+}
+
+// Upstream `get_display_format` — Option folds to has_/get_.
+pub machine SymbolicFieldDefinition::has_display_format(&self) -> bool {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (field.has_display_format)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (false)
+    }
+}
+
+pub machine SymbolicFieldDefinition::get_display_format(&self) -> AnonymousValueStringFormat {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> (field.display_format)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            AnonymousValueStringFormat::default())
+    }
+}
+
+// Upstream `get_unassigned_size_in_bytes` — Option<u64> carrier.
+pub data SymbolicUnassignedSize [copy] {
+    found: bool;
+    size_in_bytes: u64;
+}
+
+pub machine SymbolicFieldDefinition::get_unassigned_size_in_bytes(&self) -> SymbolicUnassignedSize {
+    transition self {
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (
+            SymbolicUnassignedSize { found: true, size_in_bytes: size_in_bytes })
+        SymbolicFieldDefinition::Field { field } -> (
+            SymbolicUnassignedSize { found: false, size_in_bytes: 0 })
+    }
+}
+
+// Upstream `with_active_when_resolver` — Option<SymbolicResolverRef>;
+// passing a failed carrier leaves the field unset (upstream None).
+pub machine SymbolicFieldDefinition::with_active_when_resolver(
+    mut self,
+    active_when_resolver: SymbolicResolverRefMatch
+) -> SymbolicFieldDefinition {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> set(field, active_when_resolver)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (self)
+    }
+    state set(
+        field: SymbolicDefinedField,
+        active_when_resolver: SymbolicResolverRefMatch
+    ) -> SymbolicFieldDefinition {
+        let mut out: SymbolicDefinedField = field;
+        out.has_active_when_resolver = active_when_resolver.found;
+        out.active_when_resolver.clone_from(&active_when_resolver.resolver_ref);
+        (SymbolicFieldDefinition::Field { field: out })
+    }
+}
+
+// Upstream `with_display_format` — Option folds to found-flag carrier;
+// callers pass {found, display_format} (AnonymousValueStringFormat is
+// [copy] so the flag carries beside the value).
+pub data AnonymousValueStringFormatMatch [copy] {
+    found: bool;
+    display_format: AnonymousValueStringFormat;
+}
+
+pub machine SymbolicFieldDefinition::with_display_format(
+    mut self,
+    display_format: AnonymousValueStringFormatMatch
+) -> SymbolicFieldDefinition {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> set(field, display_format)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (self)
+    }
+    state set(
+        field: SymbolicDefinedField,
+        display_format: AnonymousValueStringFormatMatch
+    ) -> SymbolicFieldDefinition {
+        let mut out: SymbolicDefinedField = field;
+        out.has_display_format = display_format.found;
+        out.display_format = display_format.display_format;
+        (SymbolicFieldDefinition::Field { field: out })
+    }
+}
+
+// Upstream `with_offset_resolution`.
+pub machine SymbolicFieldDefinition::with_offset_resolution(
+    mut self,
+    offset_resolution: SymbolicFieldOffsetResolution
+) -> SymbolicFieldDefinition {
+    transition self {
+        SymbolicFieldDefinition::Field { field } -> set(field, offset_resolution)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (self)
+    }
+    state set(
+        field: SymbolicDefinedField,
+        offset_resolution: SymbolicFieldOffsetResolution
+    ) -> SymbolicFieldDefinition {
+        let mut out: SymbolicDefinedField = field;
+        out.offset_resolution.clone_from(&offset_resolution);
+        (SymbolicFieldDefinition::Field { field: out })
+    }
+}
+
+// Shared bounded-span copy for the resolver-id carriers.
+machine copy_name_text(out: &mut [u8; 256], text: &[u8]) -> u64 {
+    transition {
+        _ -> copy(out, text, 0)
+    }
+    state copy(out: &mut [u8; 256], text: &[u8], position: u64) -> u64 {
+        transition position < text.len && position < 256 {
+            true -> store(out, text, position)
+            false -> (position)
+        }
+    }
+    state store(out: &mut [u8; 256], text: &[u8], position: u64) -> u64
+        requires position < text.len && position < 256
+    {
+        out[position] = text[position];
+        transition {
+            _ -> copy(out, text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
 }
