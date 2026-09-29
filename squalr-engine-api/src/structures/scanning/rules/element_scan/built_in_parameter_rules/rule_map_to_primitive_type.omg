@@ -3,17 +3,22 @@ module src::structures::scanning::rules::element_scan::built_in_parameter_rules:
 use src::structures::data_types::data_type_ref::DataTypeRef;
 use src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
 use src::structures::scanning::constraints::scan_constraint::ScanConstraint;
+use src::structures::scanning::constraints::scan_constraint_builder::PatternScanConstraint;
 
 pub data RuleMapToPrimitiveType {}
 
-// Port of parameter_rule_map_to_primitive_type.rs: rewrites array-of-byte
-// constraints whose byte width is a primitive size into the matching
-// unsigned big-endian primitive (u8/u16be/u32be/u64be), which scans much
-// faster. Upstream resolves the default unit size through SymbolRegistry;
-// the scalar leg carries that as the constraint's `is_byte_array` flag — a
-// byte-array operand of primitive width is exactly the case upstream's
-// `size != default` check admits (named deviation until the registry and
-// the array-of-bytes data type are ported).
+// Port of parameter_rule_map_to_primitive_type.rs: rewrites
+// array-of-byte constraints whose byte width is a primitive size into the
+// matching unsigned big-endian primitive (u8/u16be/u32be/u64be), which
+// scans much faster. Upstream resolves the default unit size through
+// SymbolRegistry (`get_unit_size_in_bytes(data_type_ref)`); the port reads
+// the same fact off the carried `DataTypeRef` (the flattened registry).
+// Upstream's skip condition is `data_type_size == data_type_default_size &&
+// size in {1,2,4,8}` — scalar primitives at their canonical width, where a
+// remap would be meaningless or worse (e.g. `i16` -> `u16` would open a
+// signed->unsigned trap for the `>= 0` to `!= 0` optimizations). The rule
+// then dispatches on `data_type_size`: {8,4,2,1} remap, anything else is
+// left alone (three/five/six/seven-byte spans stay byte-array scans).
 //
 // The sized primitive ids are caller-lent byte text — upstream looks them
 // up statically (`DataTypeU8::get_data_type_id()` etc.); Omega records can
@@ -58,7 +63,12 @@ pub machine RuleMapToPrimitiveType::map_parameters<'a>(
         u64be_id: &'a [u8],
         index: u64
     ) {
-        transition scan_constraints[index].is_byte_array() && !scan_constraints[index].is_floating_point() {
+        let data_type_ref: DataTypeRef = scan_constraints[index].get_data_type_ref();
+        let default_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let data_type_size: u64 = scan_constraints[index].get_operand_size_in_bytes();
+        let canonical: bool = data_type_size == default_size
+            && (data_type_size == 1 || data_type_size == 2 || data_type_size == 4 || data_type_size == 8);
+        transition !scan_constraints[index].is_floating_point() && !canonical {
             true -> immediate(scan_constraints, u8_id, u16be_id, u32be_id, u64be_id, index)
             false -> advance(scan_constraints, u8_id, u16be_id, u32be_id, u64be_id, index)
             _ -> advance(scan_constraints, u8_id, u16be_id, u32be_id, u64be_id, index)
@@ -105,7 +115,8 @@ pub machine RuleMapToPrimitiveType::map_parameters<'a>(
         u64be_id: &'a [u8],
         index: u64
     ) {
-        scan_constraints[index].set_data_type_in_place(DataTypeRef::new(u64be_id));
+        let new_ref: DataTypeRef = DataTypeRef::new(u64be_id);
+        scan_constraints[index].set_data_type_in_place(new_ref);
         transition { _ -> advance(scan_constraints, u8_id, u16be_id, u32be_id, u64be_id, index) }
     }
 
@@ -117,7 +128,8 @@ pub machine RuleMapToPrimitiveType::map_parameters<'a>(
         u64be_id: &'a [u8],
         index: u64
     ) {
-        scan_constraints[index].set_data_type_in_place(DataTypeRef::new(u32be_id));
+        let new_ref: DataTypeRef = DataTypeRef::new(u32be_id);
+        scan_constraints[index].set_data_type_in_place(new_ref);
         transition { _ -> advance(scan_constraints, u8_id, u16be_id, u32be_id, u64be_id, index) }
     }
 
@@ -129,7 +141,8 @@ pub machine RuleMapToPrimitiveType::map_parameters<'a>(
         u64be_id: &'a [u8],
         index: u64
     ) {
-        scan_constraints[index].set_data_type_in_place(DataTypeRef::new(u16be_id));
+        let new_ref: DataTypeRef = DataTypeRef::new(u16be_id);
+        scan_constraints[index].set_data_type_in_place(new_ref);
         transition { _ -> advance(scan_constraints, u8_id, u16be_id, u32be_id, u64be_id, index) }
     }
 
@@ -141,7 +154,8 @@ pub machine RuleMapToPrimitiveType::map_parameters<'a>(
         u64be_id: &'a [u8],
         index: u64
     ) {
-        scan_constraints[index].set_data_type_in_place(DataTypeRef::new(u8_id));
+        let new_ref: DataTypeRef = DataTypeRef::new(u8_id);
+        scan_constraints[index].set_data_type_in_place(new_ref);
         transition { _ -> advance(scan_constraints, u8_id, u16be_id, u32be_id, u64be_id, index) }
     }
 
@@ -159,5 +173,157 @@ pub machine RuleMapToPrimitiveType::map_parameters<'a>(
     }
 
     state done() {
+    }
+}
+
+// The per-constraint application of `map_parameters` — upstream's fold
+// applies the rule to every element of the built `Vec<ScanConstraint>`
+// independently (each rule only mutates an element by its own fields), so
+// single-element application is the same rewrite. Callers that do not hold
+// a slice (the deanonymizer's built-constraint pipeline, the pointer
+// target's `vec![constraint]` upstream equivalent) use this entry.
+pub machine RuleMapToPrimitiveType::map_parameter<'a>(
+    scan_constraint: &mut ScanConstraint<'a>,
+    u8_id: &'a [u8],
+    u16be_id: &'a [u8],
+    u32be_id: &'a [u8],
+    u64be_id: &'a [u8]
+) {
+    transition { _ -> gate(scan_constraint, u8_id, u16be_id, u32be_id, u64be_id) }
+
+    state gate(
+        scan_constraint: &mut ScanConstraint<'a>,
+        u8_id: &'a [u8],
+        u16be_id: &'a [u8],
+        u32be_id: &'a [u8],
+        u64be_id: &'a [u8]
+    ) {
+        let data_type_ref: DataTypeRef = scan_constraint.get_data_type_ref();
+        let default_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let data_type_size: u64 = scan_constraint.get_operand_size_in_bytes();
+        let canonical: bool = data_type_size == default_size
+            && (data_type_size == 1 || data_type_size == 2 || data_type_size == 4 || data_type_size == 8);
+        transition !scan_constraint.is_floating_point() && !canonical {
+            true -> immediate(scan_constraint, u8_id, u16be_id, u32be_id, u64be_id)
+            false -> done()
+            _ -> done()
+        }
+    }
+
+    state immediate(
+        scan_constraint: &mut ScanConstraint<'a>,
+        u8_id: &'a [u8],
+        u16be_id: &'a [u8],
+        u32be_id: &'a [u8],
+        u64be_id: &'a [u8]
+    ) {
+        transition scan_constraint.get_scan_compare_type() {
+            ScanCompareType::Immediate { compare_type } -> sized(scan_constraint, u8_id, u16be_id, u32be_id, u64be_id)
+            _ -> done()
+        }
+    }
+
+    state sized(
+        scan_constraint: &mut ScanConstraint<'a>,
+        u8_id: &'a [u8],
+        u16be_id: &'a [u8],
+        u32be_id: &'a [u8],
+        u64be_id: &'a [u8]
+    ) {
+        let operand_size: u64 = scan_constraint.get_operand_size_in_bytes();
+        transition operand_size {
+            8 -> retype(scan_constraint, u64be_id)
+            4 -> retype(scan_constraint, u32be_id)
+            2 -> retype(scan_constraint, u16be_id)
+            1 -> retype(scan_constraint, u8_id)
+            _ -> done()
+        }
+    }
+
+    state retype(
+        scan_constraint: &mut ScanConstraint<'a>,
+        new_id: &'a [u8]
+    ) {
+        let new_ref: DataTypeRef = DataTypeRef::new(new_id);
+        scan_constraint.set_data_type_in_place(new_ref);
+        transition { _ -> done() }
+    }
+
+    state done() {
+    }
+}
+
+// The pattern-carrier application. Upstream runs this rule over every built
+// `ScanConstraint`, including multi-byte patterns: `data_type_size` there
+// is the pattern's full span, so only spans of {1,2,4,8} bytes can remap —
+// anything wider falls through the match arms untouched (a >8-byte pattern
+// provably keeps its own type). Returns whether the remap fired, so the
+// caller can route the now-primitive constraint down the scalar plan path
+// the way upstream's finalized does.
+pub machine RuleMapToPrimitiveType::map_parameter_pattern(
+    pattern: &mut PatternScanConstraint,
+    u8_id: &[u8],
+    u16be_id: &[u8],
+    u32be_id: &[u8],
+    u64be_id: &[u8]
+) -> bool {
+    transition { _ -> gate(pattern, u8_id, u16be_id, u32be_id, u64be_id) }
+
+    state gate(
+        pattern: &mut PatternScanConstraint,
+        u8_id: &[u8],
+        u16be_id: &[u8],
+        u32be_id: &[u8],
+        u64be_id: &[u8]
+    ) -> bool {
+        let data_type_ref: DataTypeRef = pattern.get_data_type_ref();
+        let default_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let data_type_size: u64 = pattern.get_size_in_bytes();
+        let canonical: bool = data_type_size == default_size
+            && (data_type_size == 1 || data_type_size == 2 || data_type_size == 4 || data_type_size == 8);
+        transition !pattern.is_floating_point() && !canonical {
+            true -> immediate(pattern, u8_id, u16be_id, u32be_id, u64be_id)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+
+    state immediate(
+        pattern: &mut PatternScanConstraint,
+        u8_id: &[u8],
+        u16be_id: &[u8],
+        u32be_id: &[u8],
+        u64be_id: &[u8]
+    ) -> bool {
+        transition pattern.get_scan_compare_type() {
+            ScanCompareType::Immediate { compare_type } -> sized(pattern, u8_id, u16be_id, u32be_id, u64be_id)
+            _ -> (false)
+        }
+    }
+
+    state sized(
+        pattern: &mut PatternScanConstraint,
+        u8_id: &[u8],
+        u16be_id: &[u8],
+        u32be_id: &[u8],
+        u64be_id: &[u8]
+    ) -> bool {
+        let data_type_size: u64 = pattern.get_size_in_bytes();
+        transition data_type_size {
+            8 -> retype(pattern, u64be_id)
+            4 -> retype(pattern, u32be_id)
+            2 -> retype(pattern, u16be_id)
+            1 -> retype(pattern, u8_id)
+            _ -> (false)
+        }
+    }
+
+    state retype(
+        pattern: &mut PatternScanConstraint,
+        new_id: &[u8]
+    ) -> bool {
+        let new_ref: DataTypeRef = DataTypeRef::new(new_id);
+        pattern.set_data_type_in_place(&new_ref);
+        (true)
     }
 }
