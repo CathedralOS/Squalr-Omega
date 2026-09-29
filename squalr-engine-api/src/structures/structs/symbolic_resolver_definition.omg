@@ -1,6 +1,16 @@
 module src::structures::structs::symbolic_resolver_definition;
 
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::structs::owned_symbolic_pointer_chain::OwnedSymbolicPointerChain;
+use src::structures::structs::symbolic_resolver_binary_operator::SymbolicResolverBinaryOperator;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverCallbacks;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverEvaluationResult;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverLookupResult;
+use src::structures::structs::symbolic_resolver_callbacks::SymbolicResolverSizeResult;
+use src::structures::structs::symbolic_resolver_evaluation_error::SymbolicResolverEvaluationError;
+use src::structures::structs::symbolic_resolver_i128::ResolverI128;
 use src::structures::structs::symbolic_resolver_node::SymbolicResolverNode;
+use src::structures::structs::symbolic_resolver_relative_symbol_path::SymbolicResolverRelativeSymbolPath;
 
 // Port of structures/structs/symbolic_resolver_definition.rs's
 // `SymbolicResolverDefinition` {root_node} — upstream's owned expression
@@ -100,4 +110,708 @@ pub machine SymbolicResolverDefinition::get_node(&self, position: u64) -> &Symbo
     requires position < self.node_count && position < 128
 {
     (&self.nodes[position])
+}
+
+// === Upstream evaluate machinery ===
+//
+// Upstream `SymbolicResolverNode::evaluate*` is recursive over the Box'd
+// tree. Recursion is proof-only in this pin, so evaluation runs as an
+// explicit post-order work-stack over the node arena — the same shape a
+// trampoline port would take. Work entries are phase-tagged positions:
+//   phase 0: evaluate node_index (leaves resolve now; compound nodes
+//            push their join/pick marker plus child evals)
+//   phase 1: join node_index — pop two values, run the node's operator
+//   phase 2: pick — pop the condition value, queue true/false child
+// Bounds: the node arena is 128 deep; a serialized traversal needs at
+// most ~2*128 live work entries (384 bound) and one value per node
+// (128 bound). Overruns refuse via Failed(ArithmeticOverflow) — the only
+// upstream behavior comparable to "capacity exhausted mid-eval" — and are
+// unreachable for well-formed arenas.
+
+pub data SymbolicResolverWorkEntry [copy] {
+    node_index: u64;
+    phase: u64;
+    aux_a: u64;
+    aux_b: u64;
+}
+
+// Upstream `evaluate` — the shallowest layer. The upstream wrapper plugs
+// Unknown* closures into the deeper hooks; here those defaults live in
+// the caller's SymbolicResolverCallbacks impl, so `evaluate` is the same
+// call as the deepest layer (see symbolic_resolver_callbacks.omg).
+pub machine SymbolicResolverDefinition::evaluate(&self, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+    (self.evaluate_with_relative_symbol_fields(resolver))
+}
+
+// Upstream's curried layers inject Unknown* closures for the hooks they
+// don't take. Omega folds every hook into the SymbolicResolverCallbacks
+// impl, so each wrapper is the same call — the caller's impl supplies
+// the shallower errors by returning Failed(Unknown*) for the hooks it
+// means to leave defaulted.
+pub machine SymbolicResolverDefinition::evaluate_with_relative_symbol_fields(&self, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+    (self.evaluate_with_symbol_fields(resolver))
+}
+
+pub machine SymbolicResolverDefinition::evaluate_with_symbol_fields(&self, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+    (self.evaluate_with_symbol_fields_and_pointer_chains(resolver))
+}
+
+pub machine SymbolicResolverDefinition::evaluate_with_symbol_fields_and_pointer_chains(
+    &self,
+    resolver: &mut SymbolicResolverCallbacks
+) -> SymbolicResolverEvaluationResult {
+    let mut work: [SymbolicResolverWorkEntry; 384];
+    let mut values: [ResolverI128; 128];
+    transition self.root_node_index < self.node_count && self.root_node_index < 128 {
+        true -> seed(&mut work, &mut values, resolver)
+        false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+    }
+    state seed(&self, work: &mut [SymbolicResolverWorkEntry; 384], values: &mut [ResolverI128; 128], resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult
+        requires self.root_node_index < self.node_count && self.root_node_index < 128
+    {
+        work[0] = (SymbolicResolverWorkEntry { node_index: self.root_node_index, phase: 0, aux_a: 0, aux_b: 0 });
+        transition {
+            _ -> run(&mut work, 1, &mut values, 0, resolver)
+        }
+    }
+    state run(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+        transition work_count > 0 && work_count <= 384 {
+            true -> dispatch(&mut work, work_count, &mut values, value_count, resolver)
+            false -> collect(&mut values, value_count)
+        }
+    }
+    state collect(&self, values: &mut [ResolverI128; 128], value_count: u64) -> SymbolicResolverEvaluationResult {
+        transition value_count > 0 && value_count <= 128 {
+            true -> read_top(&mut values, value_count)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state read_top(&self, values: &mut [ResolverI128; 128], value_count: u64) -> SymbolicResolverEvaluationResult
+        requires value_count > 0 && value_count <= 128
+    {
+        let top: u64 = ((value_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition top < 128 {
+            true -> take_top(values, top)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state take_top(&self, values: &mut [ResolverI128; 128], top: u64) -> SymbolicResolverEvaluationResult
+        requires top < 128
+    {
+        let result: ResolverI128 = values[top];
+        (SymbolicResolverEvaluationResult::Resolved { value_lo: result.lo, value_hi: result.hi })
+    }
+    state dispatch(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult
+        requires work_count > 0 && work_count <= 384
+    {
+        let top: u64 = ((work_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition top < 384 {
+            true -> read_entry(work, top, values, value_count, resolver)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state read_entry(&self, work: &mut [SymbolicResolverWorkEntry; 384], top: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult
+        requires top < 384
+    {
+        let entry: SymbolicResolverWorkEntry = work[top];
+        transition entry.phase == 0 {
+            true -> eval_entry(&mut work, top, entry, &mut values, value_count, resolver)
+            false -> dispatch_marker(&mut work, top, entry, &mut values, value_count, resolver)
+        }
+    }
+    state dispatch_marker(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+        transition entry.phase == 1 {
+            true -> join_entry(&mut work, work_count, entry, &mut values, value_count, resolver)
+            false -> pick_entry(&mut work, work_count, entry, &mut values, value_count, resolver)
+        }
+    }
+    // phase 0 — dispatch on the node's own case.
+    state eval_entry(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+        transition entry.node_index < self.node_count && entry.node_index < 128 {
+            true -> eval_node(&mut work, work_count, entry, &mut values, value_count, resolver)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state eval_node(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult
+        requires entry.node_index < self.node_count && entry.node_index < 128
+    {
+        let node: &SymbolicResolverNode = self.get_node(entry.node_index);
+        transition node {
+            SymbolicResolverNode::Literal { literal_lo, literal_hi } -> eval_literal(&mut work, work_count, &mut values, value_count, resolver, literal_lo, literal_hi)
+            SymbolicResolverNode::LocalField { field_name, field_name_len } -> eval_local(&mut work, work_count, &mut values, value_count, resolver, field_name, field_name_len)
+            SymbolicResolverNode::RelativeSymbolField { symbol_path } -> eval_relative_field(&mut work, work_count, &mut values, value_count, resolver, symbol_path)
+            SymbolicResolverNode::GlobalSymbolField { module_name, module_name_len, symbol_path } -> eval_global_field(&mut work, work_count, &mut values, value_count, resolver, module_name, module_name_len, symbol_path)
+            SymbolicResolverNode::RelativePointerChain { pointer_chain } -> eval_relative_chain(&mut work, work_count, &mut values, value_count, resolver, pointer_chain)
+            SymbolicResolverNode::GlobalPointerChain { pointer_chain } -> eval_global_chain(&mut work, work_count, &mut values, value_count, resolver, pointer_chain)
+            SymbolicResolverNode::TypeSize { data_type_ref } -> eval_type_size(&mut work, work_count, &mut values, value_count, resolver, data_type_ref)
+            SymbolicResolverNode::Binary { operator, left_node_index, right_node_index } -> queue_binary(&mut work, work_count, &mut values, value_count, resolver, entry.node_index, left_node_index, right_node_index)
+            SymbolicResolverNode::Conditional { condition_node_index, true_node_index, false_node_index } -> queue_conditional(&mut work, work_count, &mut values, value_count, resolver, condition_node_index, true_node_index, false_node_index)
+        }
+    }
+    state eval_literal(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, literal_lo: u64, literal_hi: u64) -> SymbolicResolverEvaluationResult {
+        transition value_count < 128 {
+            true -> push_literal(&mut work, work_count, &mut values, value_count, resolver, literal_lo, literal_hi)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state push_literal(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, literal_lo: u64, literal_hi: u64) -> SymbolicResolverEvaluationResult
+        requires value_count < 128
+    {
+        values[value_count] = (ResolverI128 { lo: literal_lo, hi: literal_hi });
+        transition {
+            _ -> run(&mut work, work_count, &mut values, ((value_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, resolver)
+        }
+    }
+    state eval_local(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, field_name: &[u8; 256], field_name_len: u64) -> SymbolicResolverEvaluationResult {
+        transition field_name_len <= 256 {
+            true -> lookup_local(work, work_count, values, value_count, resolver, field_name, field_name_len)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state lookup_local(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, field_name: &[u8; 256], field_name_len: u64) -> SymbolicResolverEvaluationResult
+        requires field_name_len <= 256
+    {
+        let looked_up: SymbolicResolverLookupResult = resolver.lookup_local_field(&field_name[0..field_name_len]);
+        transition looked_up.found {
+            true -> push_lookup(&mut work, work_count, &mut values, value_count, resolver, looked_up.value_lo, looked_up.value_hi)
+            false -> fail_local(&mut work, work_count, &mut values, value_count, resolver, field_name, field_name_len)
+        }
+    }
+    state push_lookup(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, value_lo: u64, value_hi: u64) -> SymbolicResolverEvaluationResult {
+        transition value_count < 128 {
+            true -> push_literal(&mut work, work_count, &mut values, value_count, resolver, value_lo, value_hi)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state fail_local(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, field_name: &[u8; 256], field_name_len: u64) -> SymbolicResolverEvaluationResult
+        requires field_name_len <= 256
+    {
+        let mut name_copy: [u8; 256];
+        let name_copy_len: u64 = resolver_copy_span(&mut name_copy, &field_name[0..field_name_len]);
+        (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::UnknownLocalField { field_name: name_copy, field_name_len: name_copy_len } })
+    }
+    state eval_relative_field(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult {
+        let outcome: SymbolicResolverEvaluationResult = resolver.resolve_relative_symbol_field(symbol_path);
+        transition outcome {
+            SymbolicResolverEvaluationResult::Resolved { value_lo, value_hi } -> push_lookup(&mut work, work_count, &mut values, value_count, resolver, value_lo, value_hi)
+            SymbolicResolverEvaluationResult::Failed { error } -> (SymbolicResolverEvaluationResult::Failed { error: error })
+        }
+    }
+    state eval_global_field(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, module_name: &[u8; 256], module_name_len: u64, symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult {
+        transition module_name_len <= 256 {
+            true -> lookup_global(work, work_count, values, value_count, resolver, module_name, module_name_len, symbol_path)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state lookup_global(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, module_name: &[u8; 256], module_name_len: u64, symbol_path: &SymbolicResolverRelativeSymbolPath) -> SymbolicResolverEvaluationResult
+        requires module_name_len <= 256
+    {
+        let outcome: SymbolicResolverEvaluationResult = resolver.resolve_global_symbol_field(&module_name[0..module_name_len], symbol_path);
+        transition outcome {
+            SymbolicResolverEvaluationResult::Resolved { value_lo, value_hi } -> push_lookup(&mut work, work_count, &mut values, value_count, resolver, value_lo, value_hi)
+            SymbolicResolverEvaluationResult::Failed { error } -> (SymbolicResolverEvaluationResult::Failed { error: error })
+        }
+    }
+    state eval_relative_chain(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, pointer_chain: &OwnedSymbolicPointerChain) -> SymbolicResolverEvaluationResult {
+        let outcome: SymbolicResolverEvaluationResult = resolver.resolve_relative_pointer_chain(pointer_chain);
+        transition outcome {
+            SymbolicResolverEvaluationResult::Resolved { value_lo, value_hi } -> push_lookup(&mut work, work_count, &mut values, value_count, resolver, value_lo, value_hi)
+            SymbolicResolverEvaluationResult::Failed { error } -> (SymbolicResolverEvaluationResult::Failed { error: error })
+        }
+    }
+    state eval_global_chain(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, pointer_chain: &OwnedSymbolicPointerChain) -> SymbolicResolverEvaluationResult {
+        let outcome: SymbolicResolverEvaluationResult = resolver.resolve_global_pointer_chain(pointer_chain);
+        transition outcome {
+            SymbolicResolverEvaluationResult::Resolved { value_lo, value_hi } -> push_lookup(&mut work, work_count, &mut values, value_count, resolver, value_lo, value_hi)
+            SymbolicResolverEvaluationResult::Failed { error } -> (SymbolicResolverEvaluationResult::Failed { error: error })
+        }
+    }
+    state eval_type_size(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, data_type_ref: &DataTypeRef) -> SymbolicResolverEvaluationResult {
+        let size: SymbolicResolverSizeResult = resolver.resolve_type_size_in_bytes(data_type_ref);
+        transition size.found {
+            true -> push_size(&mut work, work_count, &mut values, value_count, resolver, size.size_in_bytes)
+            false -> fail_type_size(&mut work, work_count, &mut values, value_count, resolver, data_type_ref)
+        }
+    }
+    state push_size(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, size_in_bytes: u64) -> SymbolicResolverEvaluationResult {
+        let widened: ResolverI128 = ResolverI128::from_u64(size_in_bytes);
+        transition {
+            _ -> push_lookup(&mut work, work_count, &mut values, value_count, resolver, widened.lo, widened.hi)
+        }
+    }
+    state fail_type_size(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, data_type_ref: &DataTypeRef) -> SymbolicResolverEvaluationResult {
+        let mut data_type: [u8; 256];
+        let data_type_len: u64 = resolver_copy_span(&mut data_type, data_type_ref.get_data_type_id());
+        (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::UnknownTypeSize { data_type: data_type, data_type_len: data_type_len } })
+    }
+    // Upstream evaluates left then right, then the operator. Work stack:
+    // JOIN marker first, then EVAL(right), then EVAL(left) on top.
+    state queue_binary(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, node_index: u64, left_node_index: u64, right_node_index: u64) -> SymbolicResolverEvaluationResult {
+        transition left_node_index < self.node_count && right_node_index < self.node_count && left_node_index < 128 && right_node_index < 128 && work_count < 384 && (((work_count as u64 in Wrapping) + (3 as u64 in Wrapping)) as u64) <= 384 {
+            true -> push_binary(&mut work, work_count, &mut values, value_count, resolver, node_index, left_node_index, right_node_index)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state push_binary(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, node_index: u64, left_node_index: u64, right_node_index: u64) -> SymbolicResolverEvaluationResult
+        requires work_count < 384 && (((work_count as u64 in Wrapping) + (3 as u64 in Wrapping)) as u64) <= 384
+    {
+        work[work_count] = (SymbolicResolverWorkEntry { node_index: node_index, phase: 1, aux_a: 0, aux_b: 0 });
+        let after_join: u64 = ((work_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition after_join < 384 {
+            true -> push_binary_right(&mut work, after_join, &mut values, value_count, resolver, node_index, left_node_index, right_node_index)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state push_binary_right(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, node_index: u64, left_node_index: u64, right_node_index: u64) -> SymbolicResolverEvaluationResult
+        requires work_count < 384
+    {
+        work[work_count] = (SymbolicResolverWorkEntry { node_index: right_node_index, phase: 0, aux_a: 0, aux_b: 0 });
+        let after_right: u64 = ((work_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition after_right < 384 {
+            true -> push_binary_left(&mut work, after_right, &mut values, value_count, resolver, node_index, left_node_index)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state push_binary_left(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, node_index: u64, left_node_index: u64) -> SymbolicResolverEvaluationResult
+        requires work_count < 384
+    {
+        work[work_count] = (SymbolicResolverWorkEntry { node_index: left_node_index, phase: 0, aux_a: 0, aux_b: 0 });
+        let after_left: u64 = ((work_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> run(&mut work, after_left, &mut values, value_count, resolver)
+        }
+    }
+    // PICK marker first, then EVAL(condition) on top.
+    state queue_conditional(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, condition_node_index: u64, true_node_index: u64, false_node_index: u64) -> SymbolicResolverEvaluationResult {
+        transition condition_node_index < self.node_count && condition_node_index < 128 && work_count < 384 && (((work_count as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64) <= 384 {
+            true -> push_conditional(&mut work, work_count, &mut values, value_count, resolver, condition_node_index, true_node_index, false_node_index)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state push_conditional(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, condition_node_index: u64, true_node_index: u64, false_node_index: u64) -> SymbolicResolverEvaluationResult
+        requires work_count < 384
+    {
+        work[work_count] = (SymbolicResolverWorkEntry { node_index: 0, phase: 2, aux_a: true_node_index, aux_b: false_node_index });
+        let after_pick: u64 = ((work_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition after_pick < 384 {
+            true -> push_condition_eval(&mut work, after_pick, &mut values, value_count, resolver, condition_node_index)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state push_condition_eval(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, condition_node_index: u64) -> SymbolicResolverEvaluationResult
+        requires work_count < 384
+    {
+        work[work_count] = (SymbolicResolverWorkEntry { node_index: condition_node_index, phase: 0, aux_a: 0, aux_b: 0 });
+        transition {
+            _ -> run(&mut work, ((work_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, &mut values, value_count, resolver)
+        }
+    }
+    // phase 1 — the marker's node_index re-reads its Binary arm's operator.
+    state join_entry(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+        transition entry.node_index < self.node_count && entry.node_index < 128 && value_count >= 2 && value_count <= 128 {
+            true -> join_node(&mut work, work_count, entry, &mut values, value_count, resolver)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state join_node(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult
+        requires entry.node_index < self.node_count && entry.node_index < 128 && value_count >= 2 && value_count <= 128
+    {
+        let node: &SymbolicResolverNode = self.get_node(entry.node_index);
+        transition node {
+            SymbolicResolverNode::Binary { operator, left_node_index, right_node_index } -> join_binary(&mut work, work_count, &mut values, value_count, resolver, operator)
+            _ -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    // Top of the value stack is the right operand (pushed last); below it
+    // is the left operand — upstream's `left.evaluate()?; right.evaluate()?`.
+    state join_binary(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, operator: SymbolicResolverBinaryOperator) -> SymbolicResolverEvaluationResult
+        requires value_count >= 2 && value_count <= 128
+    {
+        let right_index: u64 = ((value_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let left_index: u64 = ((value_count as u64 in Wrapping) - (2 as u64 in Wrapping)) as u64;
+        transition right_index < 128 && left_index < 128 {
+            true -> apply_operator(work, work_count, values, left_index, right_index, resolver, operator)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state apply_operator(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], left_index: u64, right_index: u64, resolver: &mut SymbolicResolverCallbacks, operator: SymbolicResolverBinaryOperator) -> SymbolicResolverEvaluationResult
+        requires left_index < 128 && right_index < 128
+    {
+        let right_value: ResolverI128 = values[right_index];
+        let left_value: ResolverI128 = values[left_index];
+        let outcome: SymbolicResolverEvaluationResult = operator.evaluate(&left_value, &right_value);
+        transition outcome {
+            SymbolicResolverEvaluationResult::Resolved { value_lo, value_hi } -> push_joined(&mut work, work_count, &mut values, left_index, resolver, value_lo, value_hi)
+            SymbolicResolverEvaluationResult::Failed { error } -> (SymbolicResolverEvaluationResult::Failed { error: error })
+        }
+    }
+    // The two operands collapse to one value at left_index's slot.
+    state push_joined(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, value_lo: u64, value_hi: u64) -> SymbolicResolverEvaluationResult
+        requires value_count < 128
+    {
+        values[value_count] = (ResolverI128 { lo: value_lo, hi: value_hi });
+        transition {
+            _ -> run(&mut work, work_count, &mut values, ((value_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, resolver)
+        }
+    }
+    // phase 2 — pop the condition, queue the selected branch.
+    state pick_entry(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult {
+        transition value_count > 0 && value_count <= 128 {
+            true -> pick_value(&mut work, work_count, entry, &mut values, value_count, resolver)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state pick_value(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult
+        requires value_count > 0 && value_count <= 128
+    {
+        let condition_index: u64 = ((value_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition condition_index < 128 {
+            true -> pick_condition(work, work_count, entry, values, condition_index, resolver)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state pick_condition(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, entry: SymbolicResolverWorkEntry, values: &mut [ResolverI128; 128], condition_index: u64, resolver: &mut SymbolicResolverCallbacks) -> SymbolicResolverEvaluationResult
+        requires condition_index < 128
+    {
+        let condition: ResolverI128 = values[condition_index];
+        let selected: u64 = pick_branch(condition, entry.aux_a, entry.aux_b);
+        transition selected < self.node_count && selected < 128 && work_count < 384 {
+            true -> push_selected(&mut work, work_count, &mut values, condition_index, resolver, selected)
+            false -> (SymbolicResolverEvaluationResult::Failed { error: SymbolicResolverEvaluationError::ArithmeticOverflow })
+        }
+    }
+    state push_selected(&self, work: &mut [SymbolicResolverWorkEntry; 384], work_count: u64, values: &mut [ResolverI128; 128], value_count: u64, resolver: &mut SymbolicResolverCallbacks, selected: u64) -> SymbolicResolverEvaluationResult
+        requires work_count < 384
+    {
+        work[work_count] = (SymbolicResolverWorkEntry { node_index: selected, phase: 0, aux_a: 0, aux_b: 0 });
+        transition {
+            _ -> run(&mut work, ((work_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, &mut values, value_count, resolver)
+        }
+    }
+}
+
+// Upstream `condition_value != 0` — nonzero lo or hi word.
+machine pick_branch(condition: ResolverI128, true_node_index: u64, false_node_index: u64) -> u64 {
+    transition condition.lo != 0 || condition.hi != 0 {
+        true -> (true_node_index)
+        false -> (false_node_index)
+    }
+}
+
+machine clone_field_list(fields: &SymbolicResolverLocalFieldList) -> SymbolicResolverLocalFieldList {
+    (SymbolicResolverLocalFieldList::clone_of(fields))
+}
+
+// First index in `fields` whose name is >= `field_name` (or count).
+machine find_slot(fields: &SymbolicResolverLocalFieldList, field_name: &[u8]) -> u64 {
+    transition {
+        _ -> scan(fields, field_name, 0)
+    }
+    state scan(fields: &SymbolicResolverLocalFieldList, field_name: &[u8], position: u64) -> u64 {
+        transition position < fields.field_name_count && position < 128 {
+            true -> compare_position(fields, field_name, position)
+            false -> (position)
+        }
+    }
+    state compare_position(fields: &SymbolicResolverLocalFieldList, field_name: &[u8], position: u64) -> u64
+        requires position < fields.field_name_count && position < 128
+    {
+        let stored_len: u64 = fields.field_name_lens[position];
+        transition stored_len <= 256 {
+            true -> compare_stored_name(fields, field_name, position, stored_len)
+            false -> (position)
+        }
+    }
+    state compare_stored_name(fields: &SymbolicResolverLocalFieldList, field_name: &[u8], position: u64, stored_len: u64) -> u64
+        requires position < fields.field_name_count && position < 128 && stored_len <= 256
+    {
+        let ordering: i64 = resolver_span_compare(&fields.field_names[position][0..stored_len], field_name);
+        transition ordering >= 0 {
+            true -> (position)
+            false -> scan(fields, field_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine resolver_copy_span(out: &mut [u8; 256], text: &[u8]) -> u64 {
+    transition {
+        _ -> copy(out, text, 0)
+    }
+    state copy(out: &mut [u8; 256], text: &[u8], position: u64) -> u64 {
+        transition position < text.len && position < 256 {
+            true -> store(out, text, position)
+            false -> (position)
+        }
+    }
+    state store(out: &mut [u8; 256], text: &[u8], position: u64) -> u64
+        requires position < text.len && position < 256
+    {
+        out[position] = text[position];
+        transition {
+            _ -> copy(out, text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `referenced_local_fields` — the LocalField names across the
+// whole node set, sorted + dedup'd. The arena IS the flattened tree, so
+// a linear scan visits exactly upstream's recursive set.
+pub data SymbolicResolverLocalFieldList {
+    field_names: [[u8; 256]; 128];
+    field_name_lens: [u64; 128];
+    field_name_count: u64;
+}
+
+pub machine SymbolicResolverLocalFieldList::default() -> SymbolicResolverLocalFieldList {
+    (SymbolicResolverLocalFieldList { field_name_count: 0 })
+}
+
+pub machine SymbolicResolverLocalFieldList::get_field_name_count(&self) -> u64 {
+    (self.field_name_count)
+}
+
+pub machine SymbolicResolverLocalFieldList::get_field_name(&self, position: u64) -> &[u8]
+    requires position < self.field_name_count && position < 128
+{
+    transition {
+        _ -> take_name(position)
+    }
+    state take_name(&self, position: u64) -> &[u8]
+        requires position < self.field_name_count && position < 128
+    {
+        let stored_len: u64 = self.field_name_lens[position];
+        transition stored_len <= 256 {
+            true -> slice_name(position, stored_len)
+            false -> empty_name(position)
+        }
+    }
+    state slice_name(&self, position: u64, stored_len: u64) -> &[u8]
+        requires position < self.field_name_count && position < 128 && stored_len <= 256
+    {
+        (&self.field_names[position][0..stored_len])
+    }
+    state empty_name(&self, position: u64) -> &[u8]
+        requires position < self.field_name_count && position < 128
+    {
+        // Unreachable — field_name_lens only ever holds copy_span results
+        // (<= 256); the empty prefix keeps the signature honest.
+        (&self.field_names[position][0..0])
+    }
+}
+
+pub machine SymbolicResolverLocalFieldList::clone_of(source: &SymbolicResolverLocalFieldList) -> SymbolicResolverLocalFieldList {
+    let mut result: SymbolicResolverLocalFieldList = SymbolicResolverLocalFieldList::default();
+    result.clone_from(source);
+    (result)
+}
+
+pub machine SymbolicResolverLocalFieldList::clone_from(&mut self, source: &SymbolicResolverLocalFieldList) {
+    self.field_name_count = source.field_name_count;
+    transition {
+        _ -> copy_names(source, 0)
+    }
+    state copy_names(&mut self, source: &SymbolicResolverLocalFieldList, position: u64) {
+        transition position < source.field_name_count && position < 128 {
+            true -> copy_name_at(source, position)
+            false -> finish_names(source)
+        }
+    }
+    state copy_name_at(&mut self, source: &SymbolicResolverLocalFieldList, position: u64)
+        requires position < source.field_name_count && position < 128
+    {
+        self.field_names[position] = source.field_names[position];
+        self.field_name_lens[position] = source.field_name_lens[position];
+        transition {
+            _ -> copy_names(source, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish_names(&mut self, source: &SymbolicResolverLocalFieldList) {
+        self.field_name_count = source.field_name_count;
+    }
+}
+
+pub machine SymbolicResolverDefinition::referenced_local_fields(&self) -> SymbolicResolverLocalFieldList {
+    let mut fields: SymbolicResolverLocalFieldList = SymbolicResolverLocalFieldList::default();
+    transition {
+        _ -> collect(&mut fields, 0)
+    }
+    state collect(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64) -> SymbolicResolverLocalFieldList {
+        transition position < self.node_count && position < 128 {
+            true -> collect_node(&mut fields, position)
+            false -> sort_fields(&mut fields)
+        }
+    }
+    state collect_node(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128
+    {
+        let node: &SymbolicResolverNode = self.get_node(position);
+        transition node {
+            SymbolicResolverNode::LocalField { field_name, field_name_len } -> insert_sorted(&mut fields, position, field_name, field_name_len)
+            _ -> collect(&mut fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Upstream collects then sort()+dedup(); inserting each name directly
+    // into sorted position and skipping equal neighbors produces the same
+    // ordered unique set.
+    state insert_sorted(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128
+    {
+        transition field_name_len <= 256 {
+            true -> locate_slot(&mut fields, position, field_name, field_name_len)
+            false -> collect(&mut fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state locate_slot(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256
+    {
+        let fields_view: &SymbolicResolverLocalFieldList = fields;
+        let slot: u64 = find_slot(fields_view, &field_name[0..field_name_len]);
+        transition slot < fields.field_name_count && slot < 128 {
+            true -> compare_slot(&mut fields, position, field_name, field_name_len, slot)
+            false -> append_field(&mut fields, position, field_name, field_name_len)
+        }
+    }
+    state compare_slot(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128
+    {
+        let stored_len: u64 = fields.field_name_lens[slot];
+        transition stored_len <= 256 && slot < fields.field_name_count {
+            true -> compare_stored(&mut fields, position, field_name, field_name_len, slot, stored_len)
+            false -> append_field(&mut fields, position, field_name, field_name_len)
+        }
+    }
+    state compare_stored(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64, stored_len: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128 && stored_len <= 256
+    {
+        let ordering: i64 = resolver_span_compare(&field_name[0..field_name_len], &fields.field_names[slot][0..stored_len]);
+        transition ordering == 0 {
+            true -> collect(&mut fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> shift_and_insert(&mut fields, position, field_name, field_name_len, slot)
+        }
+    }
+    state append_field(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256
+    {
+        let slot: u64 = fields.field_name_count;
+        transition slot < 128 {
+            true -> write_field(&mut fields, position, field_name, field_name_len, slot)
+            false -> collect(&mut fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state write_field(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128
+    {
+        let mut name: [u8; 256];
+        let name_len: u64 = resolver_copy_span(&mut name, &field_name[0..field_name_len]);
+        fields.field_names[slot] = name;
+        fields.field_name_lens[slot] = name_len;
+        fields.field_name_count = ((fields.field_name_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> collect(&mut fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Move entries [slot..count) up one and write the new name at slot.
+    state shift_and_insert(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128
+    {
+        let cursor: u64 = fields.field_name_count;
+        transition cursor < 128 && slot < cursor {
+            true -> shift_entries(&mut fields, position, field_name, field_name_len, slot, cursor)
+            false -> shift_blocked(&mut fields, position, field_name, field_name_len, slot, cursor)
+        }
+    }
+    // cursor >= 128 refuses; slot == cursor is a plain append at the tail.
+    state shift_blocked(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64, cursor: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128
+    {
+        transition cursor < 128 && slot == cursor {
+            true -> write_field(&mut fields, position, field_name, field_name_len, cursor)
+            false -> collect(&mut fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state shift_entries(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64, cursor: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128 && cursor < 128
+    {
+        transition cursor > slot {
+            true -> move_entry(&mut fields, position, field_name, field_name_len, slot, cursor)
+            false -> write_inserted(&mut fields, position, field_name, field_name_len, slot)
+        }
+    }
+    state move_entry(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64, cursor: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128 && cursor > slot && cursor < 128
+    {
+        let source_slot: u64 = ((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition source_slot < 128 {
+            true -> copy_entry(&mut fields, position, field_name, field_name_len, slot, cursor, source_slot)
+            false -> write_inserted(&mut fields, position, field_name, field_name_len, slot)
+        }
+    }
+    state copy_entry(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64, cursor: u64, source_slot: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128 && cursor < 128 && source_slot < 128
+    {
+        fields.field_names[cursor] = fields.field_names[source_slot];
+        fields.field_name_lens[cursor] = fields.field_name_lens[source_slot];
+        transition {
+            _ -> shift_entries(&mut fields, position, field_name, field_name_len, slot, source_slot)
+        }
+    }
+    state write_inserted(&self, fields: &mut SymbolicResolverLocalFieldList, position: u64, field_name: &[u8; 256], field_name_len: u64, slot: u64) -> SymbolicResolverLocalFieldList
+        requires position < self.node_count && position < 128 && field_name_len <= 256 && slot < 128
+    {
+        let mut name: [u8; 256];
+        let name_len: u64 = resolver_copy_span(&mut name, &field_name[0..field_name_len]);
+        fields.field_names[slot] = name;
+        fields.field_name_lens[slot] = name_len;
+        fields.field_name_count = ((fields.field_name_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> collect(&mut fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // The insert pass already maintained sorted order and dropped
+    // duplicates — the sort step is a no-op end marker.
+    state sort_fields(&self, fields: &mut SymbolicResolverLocalFieldList) -> SymbolicResolverLocalFieldList {
+        let fields_view: &SymbolicResolverLocalFieldList = fields;
+        (clone_field_list(fields_view))
+    }
+}
+
+// Rust `str` Ord — byte-lexicographic, shorter prefix sorts first.
+machine resolver_span_compare(a: &[u8], b: &[u8]) -> i64 {
+    transition {
+        _ -> scan(a, b, 0)
+    }
+    state scan(a: &[u8], b: &[u8], position: u64) -> i64 {
+        transition position < a.len && position < b.len {
+            true -> compare(a, b, position)
+            false -> length_order(a, b)
+        }
+    }
+    state compare(a: &[u8], b: &[u8], position: u64) -> i64
+        requires position < a.len && position < b.len
+    {
+        let a_byte: u64 = (a[position] as u64);
+        let b_byte: u64 = (b[position] as u64);
+        transition a_byte == b_byte {
+            true -> scan(a, b, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> byte_order(a_byte, b_byte)
+        }
+    }
+    state byte_order(a_byte: u64, b_byte: u64) -> i64 {
+        transition a_byte < b_byte {
+            true -> (-1)
+            false -> (1)
+        }
+    }
+    state length_order(a: &[u8], b: &[u8]) -> i64 {
+        transition a.len < b.len {
+            true -> (-1)
+            false -> longer_or_equal(a, b)
+        }
+    }
+    state longer_or_equal(a: &[u8], b: &[u8]) -> i64 {
+        transition a.len > b.len {
+            true -> (1)
+            false -> (0)
+        }
+    }
 }

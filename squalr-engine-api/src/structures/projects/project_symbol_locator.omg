@@ -114,3 +114,177 @@ machine copy_bounded_span(out: &mut [u8; 256], text: &[u8]) -> u64 {
         }
     }
 }
+
+// Upstream `to_locator_key` — "absolute:{:X}" / "module:{name}:{:X}".
+// Writes into `out` and reports the key width (upstream returned String).
+pub machine ProjectSymbolLocator::to_locator_key(&self, out: &mut [u8; 256]) -> u64 {
+    transition self {
+        ProjectSymbolLocator::AbsoluteAddress { address, module_name, module_name_len } -> write_absolute(out, address)
+        ProjectSymbolLocator::ModuleOffset { module_name, module_name_len, offset } -> write_module(out, &module_name[0..256], module_name_len, offset)
+    }
+    state write_absolute(&self, out: &mut [u8; 256], address: u64) -> u64 {
+        let prefix_len: u64 = locator_write_text(out, "absolute:", 0);
+        (write_locator_hex(out, prefix_len, address))
+    }
+    state write_module(&self, out: &mut [u8; 256], module_name: &[u8], module_name_len: u64, offset: u64) -> u64 {
+        let prefix_len: u64 = locator_write_text(out, "module:", 0);
+        transition { _ -> write_module_name(out, module_name, prefix_len, module_name_len, offset) }
+    }
+    state write_module_name(&self, out: &mut [u8; 256], module_name: &[u8], position: u64, module_name_len: u64, offset: u64) -> u64 {
+        let source: u64 = ((position as u64 in Wrapping) - (7 as u64 in Wrapping)) as u64;
+        transition position < 256 && position >= 7 && source < module_name_len && source < module_name.len {
+            true -> store_module_name(out, module_name, position, source, module_name_len, offset)
+            false -> seal_module_name(out, module_name, position, module_name_len, offset)
+        }
+    }
+    state store_module_name(&self, out: &mut [u8; 256], module_name: &[u8], position: u64, source: u64, module_name_len: u64, offset: u64) -> u64
+        requires position < 256 && source < module_name.len
+    {
+        out[position] = module_name[source];
+        transition {
+            _ -> write_module_name(out, module_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, module_name_len, offset)
+        }
+    }
+    state seal_module_name(&self, out: &mut [u8; 256], module_name: &[u8], position: u64, module_name_len: u64, offset: u64) -> u64 {
+        transition position < 256 {
+            true -> write_module_separator(out, position, offset)
+            false -> (position)
+        }
+    }
+    state write_module_separator(&self, out: &mut [u8; 256], position: u64, offset: u64) -> u64
+        requires position < 256
+    {
+        out[position] = 58;
+        (write_locator_hex(out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, offset))
+    }
+}
+
+// Upstream `rename_module` — the ModuleOffset arm swaps a matching
+// module_name for new_module_name (union fields rebuild whole).
+pub machine ProjectSymbolLocator::rename_module(&mut self, old_module_name: &[u8], new_module_name: &[u8]) {
+    transition self {
+        ProjectSymbolLocator::ModuleOffset { module_name, module_name_len, offset } -> match_old(&module_name[0..module_name_len], module_name_len, offset, old_module_name, new_module_name)
+        _ -> keep()
+    }
+    state match_old(&mut self, module_name: &[u8], module_name_len: u64, offset: u64, old_module_name: &[u8], new_module_name: &[u8]) {
+        let equal: bool = locator_span_equals(module_name, old_module_name);
+        transition equal {
+            true -> apply_rename(offset, new_module_name)
+            false -> keep()
+        }
+    }
+    state apply_rename(&mut self, offset: u64, new_module_name: &[u8]) {
+        let rebuilt: ProjectSymbolLocator = ProjectSymbolLocator::new_module_offset(new_module_name, offset);
+        self = rebuilt;
+    }
+    state keep(&mut self) {
+    }
+}
+
+machine locator_span_equals(a: &[u8], b: &[u8]) -> bool {
+    transition a.len == b.len {
+        true -> scan(a, b, 0)
+        false -> (false)
+    }
+    state scan(a: &[u8], b: &[u8], position: u64) -> bool {
+        transition position < a.len && position < b.len {
+            true -> compare(a, b, position)
+            false -> (true)
+        }
+    }
+    state compare(a: &[u8], b: &[u8], position: u64) -> bool
+        requires position < a.len && position < b.len
+    {
+        transition a[position] == b[position] {
+            true -> scan(a, b, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+        }
+    }
+}
+
+machine locator_write_text(out: &mut [u8; 256], text: &[u8], start: u64) -> u64 {
+    transition {
+        _ -> copy(out, text, start, 0)
+    }
+    state copy(out: &mut [u8; 256], text: &[u8], start: u64, position: u64) -> u64 {
+        transition position < text.len && (((start as u64 in Wrapping) + (position as u64 in Wrapping)) as u64) <= 256 {
+            true -> store(out, text, start, position)
+            false -> (((start as u64 in Wrapping) + (position as u64 in Wrapping)) as u64)
+        }
+    }
+    state store(out: &mut [u8; 256], text: &[u8], start: u64, position: u64) -> u64
+        requires position < text.len
+    {
+        let at: u64 = ((start as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition at < 256 {
+            true -> commit(out, text, start, position, at)
+            false -> (((start as u64 in Wrapping) + (position as u64 in Wrapping)) as u64)
+        }
+    }
+    state commit(out: &mut [u8; 256], text: &[u8], start: u64, position: u64, at: u64) -> u64
+        requires position < text.len && at < 256
+    {
+        out[at] = text[position];
+        transition {
+            _ -> copy(out, text, start, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Minimal-width uppercase hex digits into `out` — `{:X}` without a "0x" leader.
+machine write_locator_hex(out: &mut [u8; 256], start: u64, value: u64) -> u64 {
+    let width: u64 = locator_hex_width(value);
+    transition {
+        _ -> emit(out, start, value, width, 0)
+    }
+    state emit(out: &mut [u8; 256], start: u64, value: u64, width: u64, digit_index: u64) -> u64 {
+        transition digit_index < width && (((start as u64 in Wrapping) + (digit_index as u64 in Wrapping)) as u64) < 256 {
+            true -> store_digit(out, start, value, width, digit_index)
+            false -> (((start as u64 in Wrapping) + (digit_index as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_digit(out: &mut [u8; 256], start: u64, value: u64, width: u64, digit_index: u64) -> u64
+        requires digit_index < width
+    {
+        let remaining: u64 = ((((width as u64 in Wrapping) - (digit_index as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let shift_count: u64 = ((remaining as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64;
+        let nibble: u64 = (((((value as u64 in Wrapping) >> (shift_count as u64 in Wrapping)) as u64 in Wrapping) & (15 as u64 in Wrapping)) as u64 in Wrapping) as u64;
+        let byte: u64 = locator_hex_digit(nibble);
+        let at: u64 = ((start as u64 in Wrapping) + (digit_index as u64 in Wrapping)) as u64;
+        transition at < 256 {
+            true -> commit_digit(out, start, value, width, digit_index, at, byte)
+            false -> (at)
+        }
+    }
+    state commit_digit(out: &mut [u8; 256], start: u64, value: u64, width: u64, digit_index: u64, at: u64, byte: u64) -> u64
+        requires at < 256
+    {
+        out[at] = ((byte as u8 in Wrapping) as u8);
+        transition {
+            _ -> emit(out, start, value, width, ((digit_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine locator_hex_width(value: u64) -> u64 {
+    transition {
+        _ -> measure(value, 0)
+    }
+    state measure(remaining: u64, width: u64) -> u64 {
+        let next: u64 = ((remaining as u64 in Wrapping) / (16 as u64 in Wrapping)) as u64;
+        transition next > 0 {
+            true -> measure(next, ((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine locator_hex_digit(nibble: u64) -> u64 {
+    transition nibble < 10 {
+        true -> (((nibble as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64)
+        false -> alpha(nibble)
+    }
+    state alpha(nibble: u64) -> u64 {
+        (((((nibble as u64 in Wrapping) - (10 as u64 in Wrapping)) as u64 in Wrapping) + (65 as u64 in Wrapping)) as u64)
+    }
+}

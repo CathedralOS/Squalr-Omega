@@ -89,3 +89,679 @@ pub machine SymbolicResolverRelativeSymbolPathSegment::get_offset_in_bytes(&self
 pub machine SymbolicResolverRelativeSymbolPathSegment::set_offset_in_bytes(&mut self, offset_in_bytes: u64) {
     self.offset_in_bytes = offset_in_bytes;
 }
+
+use src::structures::memory::address_display;
+use src::structures::memory::symbolic_pointer_chain::PointerChainSymbol;
+use src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use src::structures::memory::symbolic_pointer_chain::SymbolicLinkBuild;
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::structures::structs::symbolic_resolver_evaluation_error::SymbolicResolverEvaluationError;
+
+// Upstream `is_empty`.
+pub machine SymbolicResolverRelativeSymbolPath::is_empty(&self) -> bool {
+    (self.pointer_chain.get_link_count() == 0)
+}
+
+// Upstream `from_links(links)` — an empty root module name and Pointer64.
+pub machine SymbolicResolverRelativeSymbolPath::from_links(
+    links: &[SymbolicPointerChainLink],
+    link_count: u64
+) -> SymbolicResolverRelativeSymbolPath {
+    let mut built: SymbolicResolverRelativeSymbolPath = SymbolicResolverRelativeSymbolPath::default();
+    built.pointer_chain.set_pointer_size(PointerScanPointerSize::Pointer64);
+    transition {
+        _ -> copy_links(&mut built, links, link_count, 0)
+    }
+    state copy_links(built: &mut SymbolicResolverRelativeSymbolPath, links: &[SymbolicPointerChainLink], link_count: u64, position: u64) -> SymbolicResolverRelativeSymbolPath {
+        transition position < link_count && position < links.len {
+            true -> add_one(built, links, link_count, position)
+            false -> finish(built)
+        }
+    }
+    state add_one(built: &mut SymbolicResolverRelativeSymbolPath, links: &[SymbolicPointerChainLink], link_count: u64, position: u64) -> SymbolicResolverRelativeSymbolPath {
+        let link: SymbolicPointerChainLink = links[position];
+        _ = built.pointer_chain.add_link(link);
+        transition {
+            _ -> copy_links(built, links, link_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(built: &mut SymbolicResolverRelativeSymbolPath) -> SymbolicResolverRelativeSymbolPath {
+        let done: SymbolicResolverRelativeSymbolPath = SymbolicResolverRelativeSymbolPath::new(&built.pointer_chain);
+        (done)
+    }
+}
+
+// Upstream `without_first_link` — links.iter().skip(1).
+pub machine SymbolicResolverRelativeSymbolPath::without_first_link(&self) -> SymbolicResolverRelativeSymbolPath {
+    let mut built: SymbolicResolverRelativeSymbolPath = SymbolicResolverRelativeSymbolPath::default();
+    built.pointer_chain.set_pointer_size(PointerScanPointerSize::Pointer64);
+    transition {
+        _ -> copy_tail(&mut built, 1)
+    }
+    state copy_tail(&self, built: &mut SymbolicResolverRelativeSymbolPath, position: u64) -> SymbolicResolverRelativeSymbolPath {
+        transition position < self.pointer_chain.link_count && position < 64 {
+            true -> append_tail(built, position)
+            false -> finish_tail(built)
+        }
+    }
+    state append_tail(&self, built: &mut SymbolicResolverRelativeSymbolPath, position: u64) -> SymbolicResolverRelativeSymbolPath {
+        let link: SymbolicPointerChainLink = self.pointer_chain.get_link(position);
+        _ = built.pointer_chain.add_link(link);
+        transition {
+            _ -> copy_tail(built, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish_tail(&self, built: &mut SymbolicResolverRelativeSymbolPath) -> SymbolicResolverRelativeSymbolPath {
+        let done: SymbolicResolverRelativeSymbolPath = SymbolicResolverRelativeSymbolPath::new(&built.pointer_chain);
+        (done)
+    }
+}
+
+// Per-segment step of upstream `new(segments)` + `segments_to_links` —
+// trims the segment, drops empties, parses `field+offset`, and appends a
+// Symbol link (+ optional Offset link when the parsed offset is nonzero);
+// a segment that fails parse lands as a raw Symbol link, matching
+// upstream's `let Ok(..) else return vec![Symbol(segment)]` fallback.
+// Returns false when the bounded link arena refuses (overflow).
+pub machine SymbolicResolverRelativeSymbolPath::add_segment(&mut self, segment: &[u8]) -> bool {
+    let start: u64 = trim_left(segment, 0, segment.len);
+    let end: u64 = trim_right(segment, start, segment.len);
+    transition start < end {
+        true -> parse_then_add(segment, start, end)
+        false -> (true)
+    }
+    state parse_then_add(&mut self, segment: &[u8], start: u64, end: u64) -> bool {
+        let parsed: SymbolicResolverSegmentParse = parse_segment(segment, start, end);
+        transition parsed {
+            SymbolicResolverSegmentParse::Parsed { segment } -> add_parsed(segment)
+            SymbolicResolverSegmentParse::Failed { error } -> add_raw(segment, start, end, error)
+            _ -> add_raw(segment, start, end, error_fallback())
+        }
+    }
+    // Upstream's parse-failure fallback: Symbol(raw trimmed segment).
+    state add_raw(&mut self, segment: &[u8], start: u64, end: u64, error: SymbolicResolverEvaluationError) -> bool {
+        let mut name: [u8; 256];
+        let name_len: u64 = copy_window(&mut name, segment, start, end);
+        transition name_len <= 256 {
+            true -> build_raw(name, name_len)
+            false -> (false)
+        }
+    }
+    state build_raw(&mut self, name: [u8; 256], name_len: u64) -> bool {
+        let build: SymbolicLinkBuild = SymbolicPointerChainLink::new_symbol(&name[0..name_len]);
+        transition build.found {
+            true -> store_raw(build)
+            false -> (false)
+        }
+    }
+    state store_raw(&mut self, build: SymbolicLinkBuild) -> bool {
+        (self.pointer_chain.add_link(build.link))
+    }
+    state add_parsed(&mut self, parsed_segment: SymbolicResolverRelativeSymbolPathSegment) -> bool {
+        let parsed_name: &[u8] = parsed_segment.get_field_name();
+        let build: SymbolicLinkBuild = SymbolicPointerChainLink::new_symbol(parsed_name);
+        transition build.found {
+            true -> store_symbol(build, parsed_segment)
+            false -> (false)
+        }
+    }
+    state store_symbol(&mut self, build: SymbolicLinkBuild, parsed_segment: SymbolicResolverRelativeSymbolPathSegment) -> bool {
+        let added: bool = self.pointer_chain.add_link(build.link);
+        transition added {
+            true -> maybe_add_offset(parsed_segment)
+            false -> (false)
+        }
+    }
+    state maybe_add_offset(&mut self, parsed_segment: SymbolicResolverRelativeSymbolPathSegment) -> bool {
+        // Upstream keeps the offset only when nonzero AND when
+        // i64::try_from succeeds — over-i64::MAX offsets drop silently.
+        let offset: u64 = parsed_segment.get_offset_in_bytes();
+        let fits_i64: bool = ((offset as i64 in Wrapping) as i64) >= 0;
+        transition offset != 0 && fits_i64 {
+            true -> store_offset(parsed_segment)
+            false -> (true)
+        }
+    }
+    state store_offset(&mut self, parsed_segment: SymbolicResolverRelativeSymbolPathSegment) -> bool {
+        let offset: u64 = parsed_segment.get_offset_in_bytes();
+        let signed: i64 = ((offset as i64 in Wrapping) as i64);
+        (self.pointer_chain.add_link(SymbolicPointerChainLink::new_offset(signed)))
+    }
+}
+
+// Upstream `parse_segment` — `field_name+offset` split on the last '+'.
+pub data SymbolicResolverSegmentParse {
+    case Parsed(segment: SymbolicResolverRelativeSymbolPathSegment);
+    case Failed(error: SymbolicResolverEvaluationError);
+}
+
+machine parse_segment(segment: &[u8], start: u64, end: u64) -> SymbolicResolverSegmentParse {
+    let trimmed_start: u64 = trim_left(segment, start, end);
+    let trimmed_end: u64 = trim_right(segment, trimmed_start, end);
+    transition trimmed_start >= trimmed_end {
+        true -> fail_empty_segment()
+        false -> find_plus(segment, trimmed_start, trimmed_end)
+    }
+    state fail_empty_segment() -> SymbolicResolverSegmentParse {
+        let mut message: [u8; 256];
+        let message_len: u64 = copy_literal(&mut message, "Empty symbol path segment", 0);
+        (SymbolicResolverSegmentParse::Failed {
+            error: (SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+                symbol_path: message,
+                symbol_path_len: message_len,
+            })
+        })
+    }
+    // Locate the LAST '+' inside the window (rsplit_once).
+    state find_plus(segment: &[u8], trimmed_start: u64, trimmed_end: u64) -> SymbolicResolverSegmentParse {
+        transition {
+            _ -> scan_back(segment, trimmed_start, trimmed_end, trimmed_end)
+        }
+    }
+    state scan_back(segment: &[u8], trimmed_start: u64, trimmed_end: u64, cursor: u64) -> SymbolicResolverSegmentParse {
+        transition cursor > trimmed_start {
+            true -> probe_back(segment, trimmed_start, trimmed_end, cursor)
+            false -> plain_symbol(segment, trimmed_start, trimmed_end)
+        }
+    }
+    state probe_back(segment: &[u8], trimmed_start: u64, trimmed_end: u64, cursor: u64) -> SymbolicResolverSegmentParse {
+        let look: u64 = ((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition look < segment.len {
+            true -> match_plus(segment, trimmed_start, trimmed_end, cursor, look)
+            false -> plain_symbol(segment, trimmed_start, trimmed_end)
+        }
+    }
+    state match_plus(segment: &[u8], trimmed_start: u64, trimmed_end: u64, cursor: u64, look: u64) -> SymbolicResolverSegmentParse {
+        transition segment[look] == 43 {
+            true -> split_at_plus(segment, trimmed_start, trimmed_end, look)
+            false -> scan_back(segment, trimmed_start, trimmed_end, look)
+        }
+    }
+    // No '+' — the whole trimmed window is a bare field symbol, offset 0.
+    state plain_symbol(segment: &[u8], trimmed_start: u64, trimmed_end: u64) -> SymbolicResolverSegmentParse {
+        let mut field_name: [u8; 256];
+        let field_name_len: u64 = copy_window(&mut field_name, segment, trimmed_start, trimmed_end);
+        (SymbolicResolverSegmentParse::Parsed {
+            segment: (SymbolicResolverRelativeSymbolPathSegment {
+                field_name: field_name,
+                field_name_len: field_name_len,
+                offset_in_bytes: 0,
+            })
+        })
+    }
+    state split_at_plus(segment: &[u8], trimmed_start: u64, trimmed_end: u64, plus_index: u64) -> SymbolicResolverSegmentParse {
+        let after_plus: u64 = ((plus_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let field_start: u64 = trim_left(segment, trimmed_start, plus_index);
+        let field_end: u64 = trim_right(segment, field_start, plus_index);
+        let offset_start: u64 = trim_left(segment, after_plus, trimmed_end);
+        let offset_end: u64 = trim_right(segment, offset_start, trimmed_end);
+        transition field_start >= field_end || offset_start >= offset_end {
+            true -> fail_invalid_segment(segment, trimmed_start, trimmed_end)
+            false -> parse_offset(segment, trimmed_start, trimmed_end, field_start, field_end, offset_start, offset_end)
+        }
+    }
+    state fail_invalid_segment(segment: &[u8], trimmed_start: u64, trimmed_end: u64) -> SymbolicResolverSegmentParse {
+        let mut message: [u8; 256];
+        let prefix_len: u64 = copy_literal(&mut message, "Invalid symbol path segment `", 0);
+        let with_segment: u64 = copy_window_at(&mut message, segment, trimmed_start, trimmed_end, prefix_len);
+        let total: u64 = write_byte_at(&mut message, 96, with_segment);
+        (SymbolicResolverSegmentParse::Failed {
+            error: (SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+                symbol_path: message,
+                symbol_path_len: total,
+            })
+        })
+    }
+    state parse_offset(segment: &[u8], trimmed_start: u64, trimmed_end: u64, field_start: u64, field_end: u64, offset_start: u64, offset_end: u64) -> SymbolicResolverSegmentParse {
+        let parsed_offset: U64Literal = parse_u64_literal(segment, offset_start, offset_end);
+        transition parsed_offset.found {
+            true -> build_parsed(segment, field_start, field_end, parsed_offset)
+            false -> fail_invalid_offset(segment, trimmed_start, trimmed_end)
+        }
+    }
+    state fail_invalid_offset(segment: &[u8], trimmed_start: u64, trimmed_end: u64) -> SymbolicResolverSegmentParse {
+        let mut message: [u8; 256];
+        let prefix_len: u64 = copy_literal(&mut message, "Invalid symbol path offset `", 0);
+        let with_segment: u64 = copy_window_at(&mut message, segment, trimmed_start, trimmed_end, prefix_len);
+        let total: u64 = write_byte_at(&mut message, 96, with_segment);
+        (SymbolicResolverSegmentParse::Failed {
+            error: (SymbolicResolverEvaluationError::UnknownRelativeSymbolPath {
+                symbol_path: message,
+                symbol_path_len: total,
+            })
+        })
+    }
+    state build_parsed(segment: &[u8], field_start: u64, field_end: u64, parsed_offset: U64Literal) -> SymbolicResolverSegmentParse {
+        let mut field_name: [u8; 256];
+        let field_name_len: u64 = copy_window(&mut field_name, segment, field_start, field_end);
+        (SymbolicResolverSegmentParse::Parsed {
+            segment: (SymbolicResolverRelativeSymbolPathSegment {
+                field_name: field_name,
+                field_name_len: field_name_len,
+                offset_in_bytes: parsed_offset.value,
+            })
+        })
+    }
+}
+
+// Carrier for upstream's `Option<u64>` literal parse.
+pub data U64Literal [copy] {
+    found: bool;
+    value: u64;
+}
+
+// Upstream `parse_u64_literal` — trim, drop '_', then 0x/0X hex or
+// decimal u64 (both routes accept a leading '+', neither accepts '-').
+pub machine parse_u64_literal(text: &[u8], start: u64, end: u64) -> U64Literal {
+    let content_start: u64 = trim_left(text, start, end);
+    let content_end: u64 = trim_right(text, content_start, end);
+    transition content_start >= content_end {
+        true -> (U64Literal { found: false, value: 0 })
+        false -> check_prefix(text, content_start, content_end)
+    }
+    state check_prefix(text: &[u8], start: u64, end: u64) -> U64Literal {
+        let second: u64 = ((start as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition second < end && second < text.len && start < text.len {
+            true -> match_prefix(text, start, end, second)
+            false -> decimal(text, start, end)
+        }
+    }
+    state match_prefix(text: &[u8], start: u64, end: u64, second: u64) -> U64Literal {
+        transition text[start] == 48 && (text[second] == 120 || text[second] == 88) {
+            true -> hexadecimal(text, ((start as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64, end)
+            false -> decimal(text, start, end)
+        }
+    }
+    // u64::from_str_radix(_, 16) — leading '+' allowed.
+    state hexadecimal(text: &[u8], start: u64, end: u64) -> U64Literal {
+        transition {
+            _ -> scan_hex(text, start, start, end, 0, 0)
+        }
+    }
+    // `first` marks the digit-window start ('+' is legal only there);
+    // `digits` counts real digits (from_str_radix rejects empty inputs).
+    state scan_hex(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64) -> U64Literal {
+        transition position < end && position < text.len {
+            true -> hex_digit(text, first, position, end, accumulated, digits)
+            false -> (U64Literal { found: digits > 0, value: accumulated })
+        }
+    }
+    state hex_digit(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64) -> U64Literal {
+        let digit: u64 = hex_value(text[position]);
+        transition digit < 16 || text[position] == 95 || (text[position] == 43 && position == first && digits == 0) {
+            true -> accumulate_hex(text, first, position, end, accumulated, digits, digit)
+            false -> (U64Literal { found: false, value: 0 })
+        }
+    }
+    state accumulate_hex(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64, digit: u64) -> U64Literal {
+        transition text[position] == 95 {
+            true -> scan_hex(text, first, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, accumulated, digits)
+            false -> shift_hex(text, first, position, end, accumulated, digits, digit)
+        }
+    }
+    state shift_hex(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64, digit: u64) -> U64Literal {
+        transition text[position] == 43 {
+            true -> scan_hex(text, first, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, accumulated, digits)
+            false -> mul_add_hex(text, first, position, end, accumulated, digits, digit)
+        }
+    }
+    state mul_add_hex(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64, digit: u64) -> U64Literal {
+        let shifted: u64 = ((accumulated as u64 in Wrapping) * (16 as u64 in Wrapping)) as u64;
+        let next: u64 = ((shifted as u64 in Wrapping) + (digit as u64 in Wrapping)) as u64;
+        let overflowed: bool = ((shifted as u64 in Wrapping) / (16 as u64 in Wrapping)) as u64 != accumulated || next < shifted;
+        transition overflowed {
+            true -> (U64Literal { found: false, value: 0 })
+            false -> scan_hex(text, first, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, next, ((digits as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // parse::<u64> — digits, '_', leading '+'.
+    state decimal(text: &[u8], start: u64, end: u64) -> U64Literal {
+        transition {
+            _ -> scan_dec(text, start, start, end, 0, 0)
+        }
+    }
+    state scan_dec(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64) -> U64Literal {
+        transition position < end && position < text.len {
+            true -> dec_digit(text, first, position, end, accumulated, digits)
+            false -> (U64Literal { found: digits > 0, value: accumulated })
+        }
+    }
+    state dec_digit(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64) -> U64Literal {
+        let byte: u64 = (text[position] as u64);
+        transition (byte >= 48 && byte <= 57) || byte == 95 || (byte == 43 && position == first && digits == 0) {
+            true -> accumulate_dec(text, first, position, end, accumulated, digits, byte)
+            false -> (U64Literal { found: false, value: 0 })
+        }
+    }
+    state accumulate_dec(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64, byte: u64) -> U64Literal {
+        transition byte == 95 || byte == 43 {
+            true -> scan_dec(text, first, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, accumulated, digits)
+            false -> mul_add_dec(text, first, position, end, accumulated, digits, byte)
+        }
+    }
+    state mul_add_dec(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64, byte: u64) -> U64Literal {
+        let digit: u64 = ((byte as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64;
+        let shifted: u64 = ((accumulated as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64;
+        let next: u64 = ((shifted as u64 in Wrapping) + (digit as u64 in Wrapping)) as u64;
+        let overflowed: bool = ((shifted as u64 in Wrapping) / (10 as u64 in Wrapping)) as u64 != accumulated || next < shifted;
+        transition overflowed {
+            true -> (U64Literal { found: false, value: 0 })
+            false -> scan_dec(text, first, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, next, ((digits as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine hex_value(byte: u8) -> u64 {
+    let wide: u64 = (byte as u64);
+    transition wide >= 48 && wide <= 57 {
+        true -> (((wide as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64)
+        false -> alpha(wide)
+    }
+    state alpha(wide: u64) -> u64 {
+        transition wide >= 65 && wide <= 70 {
+            true -> ((((wide as u64 in Wrapping) - (65 as u64 in Wrapping)) as u64 in Wrapping) + (10 as u64 in Wrapping)) as u64
+            false -> lower(wide)
+        }
+    }
+    state lower(wide: u64) -> u64 {
+        transition wide >= 97 && wide <= 102 {
+            true -> ((((wide as u64 in Wrapping) - (97 as u64 in Wrapping)) as u64 in Wrapping) + (10 as u64 in Wrapping)) as u64
+            false -> (16)
+        }
+    }
+}
+
+// Upstream `Display` — '.'-joined Symbol names; offsets append as
+// `+0x{:X}` / `-0x{:X}` (saturating magnitude) with no separator.
+pub machine SymbolicResolverRelativeSymbolPath::display_text(&self, out: &mut [u8; 256]) -> u64 {
+    transition {
+        _ -> write_links(out, 0, 0)
+    }
+    state write_links(&self, out: &mut [u8; 256], link_position: u64, written: u64) -> u64 {
+        transition link_position < self.pointer_chain.link_count && link_position < 64 && written < 256 {
+            true -> write_link(out, link_position, written)
+            false -> (written)
+        }
+    }
+    state write_link(&self, out: &mut [u8; 256], link_position: u64, written: u64) -> u64
+        requires link_position < self.pointer_chain.link_count && link_position < 64
+    {
+        let link: SymbolicPointerChainLink = self.pointer_chain.get_link(link_position);
+        transition link {
+            SymbolicPointerChainLink::Symbol { symbol } -> write_symbol(out, link_position, written, symbol)
+            SymbolicPointerChainLink::Offset { offset } -> write_offset(out, link_position, written, offset)
+        }
+    }
+    state write_symbol(&self, out: &mut [u8; 256], link_position: u64, written: u64, symbol: PointerChainSymbol) -> u64 {
+        // '.' separator only between symbols — matches upstream's
+        // is_empty gate on the accumulated text.
+        transition written > 0 {
+            true -> write_separator(out, link_position, written, symbol)
+            false -> write_symbol_bytes(out, link_position, written, symbol)
+        }
+    }
+    state write_separator(&self, out: &mut [u8; 256], link_position: u64, written: u64, symbol: PointerChainSymbol) -> u64 {
+        transition written < 256 {
+            true -> store_separator(out, link_position, written, symbol)
+            false -> (written)
+        }
+    }
+    state store_separator(&self, out: &mut [u8; 256], link_position: u64, written: u64, symbol: PointerChainSymbol) -> u64 {
+        out[written] = 46;
+        transition { _ -> write_symbol_bytes(out, link_position, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, symbol) }
+    }
+    state write_symbol_bytes(&self, out: &mut [u8; 256], link_position: u64, written: u64, symbol: PointerChainSymbol) -> u64 {
+        let name_len: u64 = symbol.symbol_name_len;
+        transition {
+            _ -> copy_symbol_bytes(out, link_position, written, symbol, 0)
+        }
+    }
+    state copy_symbol_bytes(&self, out: &mut [u8; 256], link_position: u64, written: u64, symbol: PointerChainSymbol, name_position: u64) -> u64 {
+        transition name_position < symbol.symbol_name_len && name_position < 256 && (((written as u64 in Wrapping) + (name_position as u64 in Wrapping)) as u64) < 256 {
+            true -> store_symbol_byte(out, link_position, written, symbol, name_position)
+            false -> write_links_next(out, link_position, ((written as u64 in Wrapping) + (name_position as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_symbol_byte(&self, out: &mut [u8; 256], link_position: u64, written: u64, symbol: PointerChainSymbol, name_position: u64) -> u64 {
+        let target: u64 = ((written as u64 in Wrapping) + (name_position as u64 in Wrapping)) as u64;
+        transition target < 256 && name_position < symbol.symbol_name.len {
+            true -> commit_symbol_byte(out, link_position, written, symbol, name_position, target)
+            false -> (written)
+        }
+    }
+    state commit_symbol_byte(&self, out: &mut [u8; 256], link_position: u64, written: u64, symbol: PointerChainSymbol, name_position: u64, target: u64) -> u64 {
+        out[target] = symbol.symbol_name[name_position];
+        transition { _ -> copy_symbol_bytes(out, link_position, written, symbol, ((name_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state write_links_next(&self, out: &mut [u8; 256], link_position: u64, written: u64) -> u64 {
+        transition { _ -> write_links(out, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, written) }
+    }
+    state write_offset(&self, out: &mut [u8; 256], link_position: u64, written: u64, offset: i64) -> u64 {
+        transition written < 256 {
+            true -> offset_sign(out, link_position, written, offset)
+            false -> (written)
+        }
+    }
+    state offset_sign(&self, out: &mut [u8; 256], link_position: u64, written: u64, offset: i64) -> u64 {
+        transition offset < 0 {
+            true -> offset_negative(out, link_position, written, offset)
+            false -> offset_positive(out, link_position, written, offset)
+        }
+    }
+    // `-0x{:X}` on the saturating magnitude.
+    state offset_negative(&self, out: &mut [u8; 256], link_position: u64, written: u64, offset: i64) -> u64 {
+        let magnitude: u64 = ((((0 as i64 in Wrapping) - (offset as i64 in Wrapping)) as i64) as u64 in Wrapping) as u64;
+        transition {
+            _ -> offset_emit(out, link_position, written, magnitude, true)
+        }
+    }
+    state offset_positive(&self, out: &mut [u8; 256], link_position: u64, written: u64, offset: i64) -> u64 {
+        let magnitude: u64 = ((offset as i64 in Wrapping) as u64 in Wrapping) as u64;
+        transition {
+            _ -> offset_emit(out, link_position, written, magnitude, false)
+        }
+    }
+    state offset_emit(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64, negative: bool) -> u64 {
+        transition written < 256 {
+            true -> offset_sign_byte(out, link_position, written, magnitude, negative)
+            false -> (written)
+        }
+    }
+    state offset_sign_byte(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64, negative: bool) -> u64 {
+        transition negative {
+            true -> emit_minus(out, link_position, written, magnitude)
+            false -> emit_plus(out, link_position, written, magnitude)
+        }
+    }
+    state emit_minus(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64) -> u64 {
+        out[written] = 45;
+        transition { _ -> emit_hex_prefix(out, link_position, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, magnitude) }
+    }
+    state emit_plus(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64) -> u64 {
+        out[written] = 43;
+        transition { _ -> emit_hex_prefix(out, link_position, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, magnitude) }
+    }
+    state emit_hex_prefix(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64) -> u64 {
+        transition written <= 254 {
+            true -> store_hex_prefix(out, link_position, written, magnitude)
+            false -> (written)
+        }
+    }
+    state store_hex_prefix(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64) -> u64 {
+        let after_zero: u64 = ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        out[written] = 48;
+        transition after_zero < 256 {
+            true -> store_hex_x(out, link_position, written, magnitude, after_zero)
+            false -> (written)
+        }
+    }
+    state store_hex_x(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64, after_zero: u64) -> u64 {
+        let digits_start: u64 = ((after_zero as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        out[after_zero] = 120;
+        transition { _ -> emit_hex_digits(out, link_position, digits_start, magnitude, 0) }
+    }
+    // Minimal-width uppercase hex ({:X}).
+    state emit_hex_digits(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64, digit_index: u64) -> u64 {
+        let width: u64 = hex_width(magnitude);
+        transition digit_index < width && (((written as u64 in Wrapping) + (digit_index as u64 in Wrapping)) as u64) < 256 {
+            true -> store_hex_digit(out, link_position, written, magnitude, digit_index, width)
+            false -> finish_offset(out, link_position, written, width)
+        }
+    }
+    state store_hex_digit(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64, digit_index: u64, width: u64) -> u64 {
+        let remaining: u64 = ((((width as u64 in Wrapping) - (digit_index as u64 in Wrapping)) as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let shift_count: u64 = ((remaining as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64;
+        let nibble: u64 = (((((magnitude as u64 in Wrapping) >> (shift_count as u64 in Wrapping)) as u64 in Wrapping) & (15 as u64 in Wrapping)) as u64 in Wrapping) as u64;
+        let digit_byte: u64 = hex_digit_byte(nibble);
+        let target: u64 = ((written as u64 in Wrapping) + (digit_index as u64 in Wrapping)) as u64;
+        transition target < 256 {
+            true -> commit_hex_digit(out, link_position, written, magnitude, digit_index, digit_byte, target)
+            false -> (written)
+        }
+    }
+    state commit_hex_digit(&self, out: &mut [u8; 256], link_position: u64, written: u64, magnitude: u64, digit_index: u64, digit_byte: u64, target: u64) -> u64 {
+        out[target] = ((digit_byte as u8 in Wrapping) as u8);
+        transition { _ -> emit_hex_digits(out, link_position, written, magnitude, ((digit_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state finish_offset(&self, out: &mut [u8; 256], link_position: u64, written: u64, width: u64) -> u64 {
+        transition { _ -> write_links(out, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((written as u64 in Wrapping) + (width as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine hex_digit_byte(nibble: u64) -> u64 {
+    transition nibble < 10 {
+        true -> (((nibble as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64)
+        false -> alpha(nibble)
+    }
+    state alpha(nibble: u64) -> u64 {
+        (((((nibble as u64 in Wrapping) - (10 as u64 in Wrapping)) as u64 in Wrapping) + (65 as u64 in Wrapping)) as u64)
+    }
+}
+
+machine hex_width(value: u64) -> u64 {
+    transition {
+        _ -> measure(value, 0)
+    }
+    state measure(remaining: u64, width: u64) -> u64 {
+        let next: u64 = ((remaining as u64 in Wrapping) / (16 as u64 in Wrapping)) as u64;
+        transition next > 0 {
+            true -> measure(next, ((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Shared ASCII-whitespace trim windows + bounded span copies (the
+// package's authored-text idiom).
+machine byte_is_space(byte: u8) -> bool {
+    (byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 || byte == 32)
+}
+
+machine trim_left(text: &[u8], cursor: u64, end: u64) -> u64 {
+    transition { _ -> probe(text, cursor, end) }
+    state probe(text: &[u8], cursor: u64, end: u64) -> u64 {
+        transition cursor < end && cursor < text.len {
+            true -> space(text, cursor, end)
+            false -> (cursor)
+        }
+    }
+    state space(text: &[u8], cursor: u64, end: u64) -> u64 {
+        transition byte_is_space(text[cursor]) {
+            true -> probe(text, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end)
+            false -> (cursor)
+        }
+    }
+}
+
+machine trim_right(text: &[u8], start: u64, end: u64) -> u64 {
+    transition { _ -> edge(text, start, end) }
+    state edge(text: &[u8], start: u64, end: u64) -> u64 {
+        transition end > start && end >= 1 {
+            true -> look(text, start, end, ((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64)
+            false -> (end)
+        }
+    }
+    state look(text: &[u8], start: u64, end: u64, last: u64) -> u64 {
+        transition last < text.len {
+            true -> peek(text, start, end, last, text[last])
+            false -> (end)
+        }
+    }
+    state peek(text: &[u8], start: u64, end: u64, last: u64, byte: u8) -> u64 {
+        transition byte_is_space(byte) {
+            true -> edge(text, start, last)
+            false -> (end)
+        }
+    }
+}
+
+machine copy_window(out: &mut [u8; 256], text: &[u8], start: u64, end: u64) -> u64 {
+    transition { _ -> copy_window_at(out, text, start, end, 0) }
+}
+
+// Copies text[start..end) into out at `at`; returns the next write
+// position (bounded by 256).
+machine copy_window_at(out: &mut [u8; 256], text: &[u8], start: u64, end: u64, at: u64) -> u64 {
+    transition {
+        _ -> copy(out, text, start, end, at, 0)
+    }
+    state copy(out: &mut [u8; 256], text: &[u8], start: u64, end: u64, at: u64, position: u64) -> u64 {
+        let read_at: u64 = ((start as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition read_at < end && read_at < text.len {
+            true -> write_byte(out, text, start, end, at, position, read_at)
+            false -> (at)
+        }
+    }
+    state write_byte(out: &mut [u8; 256], text: &[u8], start: u64, end: u64, at: u64, position: u64, read_at: u64) -> u64 {
+        let target: u64 = ((at as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition target < 256 {
+            true -> store_byte(out, text, start, end, at, position, read_at, target)
+            false -> (target)
+        }
+    }
+    state store_byte(out: &mut [u8; 256], text: &[u8], start: u64, end: u64, at: u64, position: u64, read_at: u64, target: u64) -> u64 {
+        out[target] = text[read_at];
+        transition { _ -> copy(out, text, start, end, at, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Bounded literal write into `out` at `at` — returns the next position.
+machine copy_literal(out: &mut [u8; 256], literal: &[u8], at: u64) -> u64 {
+    transition {
+        _ -> copy(out, literal, at, 0)
+    }
+    state copy(out: &mut [u8; 256], literal: &[u8], at: u64, position: u64) -> u64 {
+        transition position < literal.len {
+            true -> write_at(out, literal, at, position)
+            false -> (at)
+        }
+    }
+    state write_at(out: &mut [u8; 256], literal: &[u8], at: u64, position: u64) -> u64 {
+        let target: u64 = ((at as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition target < 256 {
+            true -> store(out, literal, at, position, target)
+            false -> (target)
+        }
+    }
+    state store(out: &mut [u8; 256], literal: &[u8], at: u64, position: u64, target: u64) -> u64 {
+        out[target] = literal[position];
+        transition { _ -> copy(out, literal, at, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine write_byte_at(out: &mut [u8; 256], byte: u8, at: u64) -> u64 {
+    transition at < 256 {
+        true -> store(out, byte, at)
+        false -> (at)
+    }
+    state store(out: &mut [u8; 256], byte: u8, at: u64) -> u64 {
+        out[at] = byte;
+        (((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+    }
+}
+
+// Unreachable `_` arm for the SegmentParse transition (the checker counts
+// only literal arms it can enumerate; the wildcard feeds it).
+machine error_fallback() -> SymbolicResolverEvaluationError {
+    (SymbolicResolverEvaluationError::ArithmeticOverflow)
+}

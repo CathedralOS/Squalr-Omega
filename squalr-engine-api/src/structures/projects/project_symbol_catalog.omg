@@ -4,6 +4,7 @@ use src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
 use src::registries::symbols::symbolic_resolver_descriptor::SymbolicResolverDescriptor;
 use src::structures::projects::project_symbol_claim::ProjectSymbolClaim;
 use src::structures::projects::project_symbol_module::ProjectSymbolModule;
+use src::structures::projects::project_symbol_module_field::ProjectSymbolModuleField;
 
 // Port of structures/projects/project_symbol_catalog.rs — the project's
 // symbol database: modules, layout descriptors, resolver descriptors and
@@ -182,6 +183,383 @@ machine bytes_equal(a: &[u8], b: &[u8]) -> bool {
         transition (a[position] == b[position]) {
             true -> (scan(a, b, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64))
             false -> (false)
+        }
+    }
+}
+
+// === Upstream catalog resolve machinery ===
+
+use src::structures::projects::project_symbol_locator::ProjectSymbolLocator;
+use src::structures::structs::symbolic_resolver_relative_symbol_path::U64Literal;
+
+// Carrier for upstream `Option<(&ProjectSymbolModule,
+// &ProjectSymbolModuleField)>` — the position-or-count respell hands
+// back both slot positions.
+pub data ProjectModuleFieldMatch [copy] {
+    found: bool;
+    module_position: u64;
+    field_position: u64;
+}
+
+// Carrier for upstream `Option<u64>` offset finds.
+pub data SymbolOffsetMatch [copy] {
+    found: bool;
+    offset: u64;
+}
+
+// Carrier for upstream `Option<ProjectSymbolClaim>` — the claim moves
+// whole into the carrier.
+pub data ProjectSymbolClaimMatch {
+    found: bool;
+    claim: ProjectSymbolClaim;
+}
+
+// Carrier for upstream `Option<ProjectSymbolLocator>`.
+pub data ProjectSymbolLocatorParse {
+    found: bool;
+    locator: ProjectSymbolLocator;
+}
+
+// Upstream `find_symbol_claim` — String compare against each claim's
+// `get_symbol_locator_key()` (faithful: a non-canonical key text misses
+// upstream too). Option<&claim> respelled position-or-count.
+pub machine ProjectSymbolCatalog::find_symbol_claim_position(&self, symbol_locator_key: &[u8]) -> u64 {
+    transition {
+        _ -> scan_claims(symbol_locator_key, 0)
+    }
+    state scan_claims(&self, symbol_locator_key: &[u8], position: u64) -> u64 {
+        transition position < self.symbol_claim_count && position < 128 {
+            true -> compare_claim_key(symbol_locator_key, position)
+            false -> (position)
+        }
+    }
+    state compare_claim_key(&self, symbol_locator_key: &[u8], position: u64) -> u64
+        requires position < self.symbol_claim_count && position < 128
+    {
+        let mut claim_key: [u8; 256];
+        let claim_key_len: u64 = self.symbol_claims[position].get_symbol_locator_key(&mut claim_key);
+        transition claim_key_len <= 256 {
+            true -> keys_equal(symbol_locator_key, claim_key, claim_key_len, position)
+            false -> scan_claims(symbol_locator_key, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state keys_equal(&self, symbol_locator_key: &[u8], claim_key: [u8; 256], claim_key_len: u64, position: u64) -> u64 {
+        transition claim_key_len <= 256 {
+            true -> match_or_next(symbol_locator_key, &claim_key[0..claim_key_len], position)
+            false -> scan_claims(symbol_locator_key, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state match_or_next(&self, symbol_locator_key: &[u8], claim_key: &[u8], position: u64) -> u64 {
+        let equal: bool = bytes_equal(claim_key, symbol_locator_key);
+        transition equal {
+            true -> (position)
+            false -> scan_claims(symbol_locator_key, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `find_symbol_claim` — clones the claim whole on a hit.
+pub machine ProjectSymbolCatalog::find_symbol_claim(&self, symbol_locator_key: &[u8]) -> ProjectSymbolClaimMatch {
+    let position: u64 = self.find_symbol_claim_position(symbol_locator_key);
+    transition position < self.symbol_claim_count && position < 128 {
+        true -> claim_at(position)
+        false -> (ProjectSymbolClaimMatch { found: false, claim: ProjectSymbolClaim::default() })
+    }
+    state claim_at(&self, position: u64) -> ProjectSymbolClaimMatch
+        requires position < self.symbol_claim_count && position < 128
+    {
+        let mut claim: ProjectSymbolClaim = ProjectSymbolClaim::default();
+        claim.clone_from(&self.symbol_claims[position]);
+        (ProjectSymbolClaimMatch { found: true, claim: claim })
+    }
+}
+
+// Upstream `find_module_field` — parse the locator key, then
+// find_symbol_module + find_field. Option<(&module,&field)> respelled
+// as positions.
+pub machine ProjectSymbolCatalog::find_module_field(&self, symbol_locator_key: &[u8]) -> ProjectModuleFieldMatch {
+    let parsed: ProjectSymbolLocatorParse = parse_symbol_locator_key(symbol_locator_key);
+    transition parsed.found && parsed.locator.is_module_offset() {
+        true -> module_of(parsed)
+        false -> (ProjectModuleFieldMatch { found: false, module_position: 0, field_position: 0 })
+    }
+    state module_of(&self, parsed: ProjectSymbolLocatorParse) -> ProjectModuleFieldMatch {
+        let module_name: &[u8] = parsed.locator.get_focus_module_name();
+        let module_position: u64 = self.find_symbol_module_position(module_name);
+        transition module_position < self.symbol_module_count && module_position < 64 {
+            true -> field_of(module_position, parsed.locator.get_focus_address())
+            false -> (ProjectModuleFieldMatch { found: false, module_position: 0, field_position: 0 })
+        }
+    }
+    state field_of(&self, module_position: u64, offset: u64) -> ProjectModuleFieldMatch
+        requires module_position < self.symbol_module_count && module_position < 64
+    {
+        let field_position: u64 = self.symbol_modules[module_position].find_field_position(offset);
+        transition field_position < self.symbol_modules[module_position].field_count && field_position < 64 {
+            true -> (ProjectModuleFieldMatch { found: true, module_position: module_position, field_position: field_position })
+            false -> (ProjectModuleFieldMatch { found: false, module_position: 0, field_position: 0 })
+        }
+    }
+}
+
+// Upstream `find_module_field_offset_by_display_name`.
+pub machine ProjectSymbolCatalog::find_module_field_offset_by_display_name(&self, module_name: &[u8], display_name: &[u8]) -> SymbolOffsetMatch {
+    let module_position: u64 = self.find_symbol_module_position(module_name);
+    transition module_position < self.symbol_module_count && module_position < 64 {
+        true -> scan_module_fields(module_position, display_name, 0)
+        false -> (SymbolOffsetMatch { found: false, offset: 0 })
+    }
+    state scan_module_fields(&self, module_position: u64, display_name: &[u8], field_position: u64) -> SymbolOffsetMatch {
+        transition module_position < self.symbol_module_count && module_position < 64 && field_position < self.symbol_modules[module_position].field_count && field_position < 64 {
+            true -> compare_field_name(module_position, display_name, field_position)
+            false -> (SymbolOffsetMatch { found: false, offset: 0 })
+        }
+    }
+    state compare_field_name(&self, module_position: u64, display_name: &[u8], field_position: u64) -> SymbolOffsetMatch
+        requires module_position < self.symbol_module_count && module_position < 64 && field_position < self.symbol_modules[module_position].field_count && field_position < 64
+    {
+        let module_field: &ProjectSymbolModuleField = self.symbol_modules[module_position].get_field(field_position);
+        let equal: bool = bytes_equal(module_field.get_display_name(), display_name);
+        transition equal {
+            true -> (SymbolOffsetMatch { found: true, offset: module_field.get_offset() })
+            false -> scan_module_fields(module_position, display_name, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `find_module_symbol_offset_by_display_name` — module fields
+// first, then claims whose ModuleOffset locator names the module.
+pub machine ProjectSymbolCatalog::find_module_symbol_offset_by_display_name(&self, module_name: &[u8], display_name: &[u8]) -> SymbolOffsetMatch {
+    let field_match: SymbolOffsetMatch = self.find_module_field_offset_by_display_name(module_name, display_name);
+    transition field_match.found {
+        true -> (field_match)
+        false -> scan_claim_names(module_name, display_name, 0)
+    }
+    state scan_claim_names(&self, module_name: &[u8], display_name: &[u8], position: u64) -> SymbolOffsetMatch {
+        transition position < self.symbol_claim_count && position < 128 {
+            true -> compare_claim_name(module_name, display_name, position)
+            false -> (SymbolOffsetMatch { found: false, offset: 0 })
+        }
+    }
+    state compare_claim_name(&self, module_name: &[u8], display_name: &[u8], position: u64) -> SymbolOffsetMatch
+        requires position < self.symbol_claim_count && position < 128
+    {
+        let name_equal: bool = bytes_equal(self.symbol_claims[position].get_display_name(), display_name);
+        transition name_equal {
+            true -> check_claim_module(module_name, display_name, position)
+            false -> scan_claim_names(module_name, display_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state check_claim_module(&self, module_name: &[u8], display_name: &[u8], position: u64) -> SymbolOffsetMatch
+        requires position < self.symbol_claim_count && position < 128
+    {
+        let is_module: bool = self.symbol_claims[position].get_locator().is_module_offset();
+        let module_equal: bool = bytes_equal(self.symbol_claims[position].get_locator().get_focus_module_name(), module_name);
+        transition is_module && module_equal {
+            true -> (SymbolOffsetMatch { found: true, offset: self.symbol_claims[position].get_locator().get_focus_address() })
+            false -> scan_claim_names(module_name, display_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `resolve_symbol_claim` — claim lookup, else module-field
+// fallback constructing a new ModuleOffset claim.
+pub machine ProjectSymbolCatalog::resolve_symbol_claim(&self, symbol_locator_key: &[u8]) -> ProjectSymbolClaimMatch {
+    let found: ProjectSymbolClaimMatch = self.find_symbol_claim(symbol_locator_key);
+    transition found.found {
+        true -> (found)
+        false -> claim_from_field(symbol_locator_key)
+    }
+    state claim_from_field(&self, symbol_locator_key: &[u8]) -> ProjectSymbolClaimMatch {
+        let matched: ProjectModuleFieldMatch = self.find_module_field(symbol_locator_key);
+        transition matched.found && matched.module_position < self.symbol_module_count && matched.module_position < 64 && matched.field_position < self.symbol_modules[matched.module_position].field_count && matched.field_position < 64 {
+            true -> build_claim(matched)
+            false -> (ProjectSymbolClaimMatch { found: false, claim: ProjectSymbolClaim::default() })
+        }
+    }
+    state build_claim(&self, matched: ProjectModuleFieldMatch) -> ProjectSymbolClaimMatch
+        requires matched.module_position < self.symbol_module_count && matched.module_position < 64 && matched.field_position < self.symbol_modules[matched.module_position].field_count && matched.field_position < 64
+    {
+        let module_field: &ProjectSymbolModuleField = self.symbol_modules[matched.module_position].get_field(matched.field_position);
+        let display_name: &[u8] = module_field.get_display_name();
+        let module_name: &[u8] = self.symbol_modules[matched.module_position].get_module_name();
+        let offset: u64 = module_field.get_offset();
+        let layout_id: &[u8] = module_field.get_struct_layout_id();
+        let claim: ProjectSymbolClaim = ProjectSymbolClaim::new_module_offset(display_name, module_name, offset, layout_id);
+        (ProjectSymbolClaimMatch { found: true, claim: claim })
+    }
+}
+
+// Upstream `parse_symbol_locator_key` — "absolute:{:X}" or
+// "module:{name}:{:X}" (module names may contain ':', split at the
+// LAST colon).
+pub machine parse_symbol_locator_key(symbol_locator_key: &[u8]) -> ProjectSymbolLocatorParse {
+    let absolute: bool = catalog_starts_with(symbol_locator_key, "absolute:");
+    transition absolute {
+        true -> parse_absolute(symbol_locator_key)
+        false -> parse_module(symbol_locator_key)
+    }
+    state parse_absolute(symbol_locator_key: &[u8]) -> ProjectSymbolLocatorParse {
+        let parsed: U64Literal = catalog_u64_hex(symbol_locator_key, 9, symbol_locator_key.len);
+        transition parsed.found {
+            true -> (ProjectSymbolLocatorParse { found: true, locator: ProjectSymbolLocator::new_absolute_address(parsed.value) })
+            false -> (ProjectSymbolLocatorParse { found: false, locator: ProjectSymbolLocator::default() })
+        }
+    }
+    state parse_module(symbol_locator_key: &[u8]) -> ProjectSymbolLocatorParse {
+        let module_prefix: bool = catalog_starts_with(symbol_locator_key, "module:");
+        transition module_prefix {
+            true -> find_last_colon(symbol_locator_key)
+            false -> (ProjectSymbolLocatorParse { found: false, locator: ProjectSymbolLocator::default() })
+        }
+    }
+    // rsplit_once(':') over the post-prefix window.
+    state find_last_colon(symbol_locator_key: &[u8]) -> ProjectSymbolLocatorParse {
+        let colon: u64 = catalog_rsplit_colon(symbol_locator_key, 7);
+        transition colon < symbol_locator_key.len {
+            true -> split_module(symbol_locator_key, colon)
+            false -> (ProjectSymbolLocatorParse { found: false, locator: ProjectSymbolLocator::default() })
+        }
+    }
+    state split_module(symbol_locator_key: &[u8], colon: u64) -> ProjectSymbolLocatorParse
+        requires colon < symbol_locator_key.len
+    {
+        let offset_start: u64 = ((colon as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let parsed: U64Literal = catalog_u64_hex(symbol_locator_key, offset_start, symbol_locator_key.len);
+        transition parsed.found {
+            true -> build_locator(symbol_locator_key, colon, parsed.value)
+            false -> (ProjectSymbolLocatorParse { found: false, locator: ProjectSymbolLocator::default() })
+        }
+    }
+    state build_locator(symbol_locator_key: &[u8], colon: u64, offset: u64) -> ProjectSymbolLocatorParse
+        requires colon < symbol_locator_key.len
+    {
+        transition colon >= 7 && colon <= 256 {
+            true -> name_window(symbol_locator_key, colon, offset)
+            false -> (ProjectSymbolLocatorParse { found: false, locator: ProjectSymbolLocator::default() })
+        }
+    }
+    state name_window(symbol_locator_key: &[u8], colon: u64, offset: u64) -> ProjectSymbolLocatorParse
+        requires colon >= 7 && colon <= 256 && colon < symbol_locator_key.len
+    {
+        transition symbol_locator_key.len >= colon {
+            true -> emit_locator(&symbol_locator_key[7..colon], offset)
+            false -> (ProjectSymbolLocatorParse { found: false, locator: ProjectSymbolLocator::default() })
+        }
+    }
+    state emit_locator(module_name: &[u8], offset: u64) -> ProjectSymbolLocatorParse {
+        (ProjectSymbolLocatorParse { found: true, locator: ProjectSymbolLocator::new_module_offset(module_name, offset) })
+    }
+}
+
+// First ':' at or after `from` when scanning backwards — returns
+// text.len when absent (the Option respell).
+machine catalog_rsplit_colon(text: &[u8], from: u64) -> u64 {
+    transition {
+        _ -> scan(text, from, text.len)
+    }
+    state scan(text: &[u8], from: u64, cursor: u64) -> u64 {
+        transition cursor > from && cursor <= text.len {
+            true -> probe(text, from, cursor)
+            false -> (text.len)
+        }
+    }
+    state probe(text: &[u8], from: u64, cursor: u64) -> u64
+        requires cursor > from && cursor <= text.len
+    {
+        let look: u64 = ((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition look < text.len {
+            true -> match_colon(text, cursor, look)
+            false -> (text.len)
+        }
+    }
+    state match_colon(text: &[u8], cursor: u64, look: u64) -> u64
+        requires look < text.len
+    {
+        transition text[look] == 58 {
+            true -> (look)
+            false -> (scan(text, 7, look))
+        }
+    }
+}
+
+machine catalog_starts_with(text: &[u8], prefix: &[u8]) -> bool {
+    transition text.len >= prefix.len {
+        true -> scan(text, prefix, 0)
+        false -> (false)
+    }
+    state scan(text: &[u8], prefix: &[u8], position: u64) -> bool {
+        transition position < prefix.len && position < text.len {
+            true -> compare(text, prefix, position)
+            false -> (position == prefix.len)
+        }
+    }
+    state compare(text: &[u8], prefix: &[u8], position: u64) -> bool
+        requires position < prefix.len && position < text.len
+    {
+        transition text[position] == prefix[position] {
+            true -> scan(text, prefix, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+        }
+    }
+}
+
+// u64::from_str_radix(_, 16) — optional leading '+', one or more hex
+// digits, overflow rejected. No '_' separators (unlike literal parsing).
+machine catalog_u64_hex(text: &[u8], start: u64, end: u64) -> U64Literal {
+    transition {
+        _ -> scan(text, start, start, end, 0, 0)
+    }
+    state scan(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64) -> U64Literal {
+        transition position < end && position < text.len {
+            true -> digit(text, first, position, end, accumulated, digits)
+            false -> (U64Literal { found: digits > 0, value: accumulated })
+        }
+    }
+    state digit(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64) -> U64Literal
+        requires position < text.len
+    {
+        let value: u64 = catalog_hex_value(text[position]);
+        transition value < 16 || (text[position] == 43 && position == first && digits == 0) {
+            true -> accumulate(text, first, position, end, accumulated, digits, value)
+            false -> (U64Literal { found: false, value: 0 })
+        }
+    }
+    state accumulate(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64, value: u64) -> U64Literal
+        requires position < text.len
+    {
+        transition text[position] == 43 {
+            true -> scan(text, first, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, accumulated, digits)
+            false -> shift_in(text, first, position, end, accumulated, digits, value)
+        }
+    }
+    state shift_in(text: &[u8], first: u64, position: u64, end: u64, accumulated: u64, digits: u64, value: u64) -> U64Literal {
+        let shifted: u64 = ((accumulated as u64 in Wrapping) * (16 as u64 in Wrapping)) as u64;
+        let next: u64 = ((shifted as u64 in Wrapping) + (value as u64 in Wrapping)) as u64;
+        let overflowed: bool = ((shifted as u64 in Wrapping) / (16 as u64 in Wrapping)) as u64 != accumulated || next < shifted;
+        transition overflowed {
+            true -> (U64Literal { found: false, value: 0 })
+            false -> scan(text, first, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, next, ((digits as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine catalog_hex_value(byte: u8) -> u64 {
+    let wide: u64 = (byte as u64);
+    transition wide >= 48 && wide <= 57 {
+        true -> (((wide as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64)
+        false -> upper(wide)
+    }
+    state upper(wide: u64) -> u64 {
+        transition wide >= 65 && wide <= 70 {
+            true -> ((((wide as u64 in Wrapping) - (65 as u64 in Wrapping)) as u64 in Wrapping) + (10 as u64 in Wrapping)) as u64
+            false -> lower(wide)
+        }
+    }
+    state lower(wide: u64) -> u64 {
+        transition wide >= 97 && wide <= 102 {
+            true -> ((((wide as u64 in Wrapping) - (97 as u64 in Wrapping)) as u64 in Wrapping) + (10 as u64 in Wrapping)) as u64
+            false -> (16)
         }
     }
 }
