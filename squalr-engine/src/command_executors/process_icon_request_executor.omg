@@ -1,0 +1,125 @@
+module src::command_executors::process_icon_request_executor;
+
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::process::icon::process_icon_request::ProcessIconRequest;
+use squalr_engine_api::src::commands::process::icon::process_icon_response::ProcessIconEntry;
+use squalr_engine_api::src::commands::process::icon::process_icon_response::ProcessIconResponse;
+use squalr_engine_api::src::structures::processes::process_info::ProcessInfo;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::engine_os_provider::EngineOsProviders;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryLimit;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryOptions;
+use squalr_engine_targets::src::process_query::process_query_options::RequiredProcessId;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessNameSearch;
+use squalr_engine_targets::src::target_providers::ProcessListOutcome;
+
+// Port of command_executors/process/icon/process_icon_request_executor.rs —
+// one provider sweep per unique pid with fetch_icons set, then an entry per
+// id. `process_icon` is always absent here: the port's ProcessInfo drops
+// upstream's icon field (GUI payload, unported — see
+// linux_process_query.omg), so fetch_icons is a documented no-op and every
+// entry lands has_process_icon = false. Upstream's HashSet dedup is a
+// linear scan over the entries already written (the request is 64-bounded).
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ProcessIconRequestExecutor {}
+
+pub linux_x86_64 machine ProcessIconRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    request: &ProcessIconRequest
+) -> ProcessIconResponse
+reaches FilesystemHost
+invokes FilesystemHost;
+crashes Trap
+{
+    let response: ProcessIconResponse = ProcessIconResponse::new();
+    transition { _ -> each(engine_privileged_state, request, response, 0) }
+
+    state each(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ProcessIconRequest,
+        mut response: ProcessIconResponse,
+        position: u64
+    ) -> ProcessIconResponse {
+        transition position < request.get_process_id_count() && position < 64 {
+            true -> seen(engine_privileged_state, request, response, position, 0)
+            false -> (response)
+            _ -> (response)
+        }
+    }
+
+    // Dedup scan: skip pids already covered by an earlier entry.
+    state seen(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ProcessIconRequest,
+        response: ProcessIconResponse,
+        position: u64,
+        earlier: u64
+    ) -> ProcessIconResponse
+        requires 0 <= position && position < 64
+    {
+        transition earlier < position {
+            true -> compare(engine_privileged_state, request, response, position, earlier)
+            false -> query(engine_privileged_state, request, response, position)
+            _ -> query(engine_privileged_state, request, response, position)
+        }
+    }
+
+    state compare(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ProcessIconRequest,
+        response: ProcessIconResponse,
+        position: u64,
+        earlier: u64
+    ) -> ProcessIconResponse
+        requires 0 <= position && position < 64 && earlier < position
+    {
+        transition request.get_process_id(earlier) == request.get_process_id(position) {
+            true -> next(engine_privileged_state, request, response, position)
+            false -> seen(engine_privileged_state, request, response, position, earlier + 1)
+            _ -> seen(engine_privileged_state, request, response, position, earlier + 1)
+        }
+    }
+
+    state query(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ProcessIconRequest,
+        mut response: ProcessIconResponse,
+        position: u64
+    ) -> ProcessIconResponse
+        requires 0 <= position && position < 64
+    {
+        let mut found: [ProcessInfo; 1];
+        let process_id: u32 = request.get_process_id(position);
+        let options: ProcessQueryOptions = ProcessQueryOptions {
+            required_process_id: RequiredProcessId::Required { process_id: process_id },
+            search_name: ProcessNameSearch::Any,
+            require_windowed: false,
+            match_case: false,
+            fetch_icons: true,
+            limit: ProcessQueryLimit::Limited { limit: 1 }
+        };
+        // The sweep only fetches the icon upstream stored on ProcessInfo —
+        // unported payload, so the outcome rides the discard and every id
+        // gets its entry with the icon leg absent (upstream still emits an
+        // entry per unique id, found or not).
+        let providers: &mut EngineOsProviders = engine_privileged_state.get_os_providers();
+        _ = providers.get_processes(options, &mut found);
+        let entry: ProcessIconEntry = ProcessIconEntry {
+            process_id: process_id,
+            has_process_icon: false
+        };
+        _ = response.add_process_icon_entry(entry);
+        transition { _ -> next(engine_privileged_state, request, response, position) }
+    }
+
+    state next(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ProcessIconRequest,
+        response: ProcessIconResponse,
+        position: u64
+    ) -> ProcessIconResponse
+        requires 0 <= position && position < 64
+    {
+        transition { _ -> each(engine_privileged_state, request, response, position + 1) }
+    }
+}

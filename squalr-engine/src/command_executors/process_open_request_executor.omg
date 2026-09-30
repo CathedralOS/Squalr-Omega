@@ -1,0 +1,143 @@
+module src::command_executors::process_open_request_executor;
+
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::process::open::process_open_request::ProcessOpenRequest;
+use squalr_engine_api::src::commands::process::open::process_open_response::ProcessOpenResponse;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_api::src::structures::processes::process_info::ProcessInfo;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::engine_os_provider::EngineOsProviders;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessNameSearch;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryLimit;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryOptions;
+use squalr_engine_targets::src::process_query::process_query_options::RequiredProcessId;
+use squalr_engine_targets::src::target_providers::OpenedProcessResult;
+use squalr_engine_targets::src::target_providers::ProcessListOutcome;
+
+// Port of command_executors/process/open/process_open_request_executor.rs —
+// the open resolves through the same provider sweep as the list (pid or
+// name filter, first match, limit one), opens the matched process and
+// stores it as the state's opened process. Both filters absent -> an empty
+// response, matching upstream's early return.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ProcessOpenRequestExecutor {}
+
+pub linux_x86_64 machine ProcessOpenRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    request: &ProcessOpenRequest
+) -> ProcessOpenResponse
+reaches FilesystemHost
+invokes FilesystemHost;
+crashes Trap
+{
+    let response: ProcessOpenResponse = ProcessOpenResponse::new();
+    transition request.has_process_id() || request.has_search_name() {
+        true -> query(engine_privileged_state, request, response)
+        false -> (response)
+        _ -> (response)
+    }
+
+    state query(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &ProcessOpenRequest,
+        response: ProcessOpenResponse
+    ) -> ProcessOpenResponse {
+        let name_view: &[u8] = request.get_search_name();
+        let mut name: [u8; 256];
+        let name_len: u64 = ProcessOpenRequestExecutor::copy_bounded_name(name_view, &mut name);
+        let mut found: [ProcessInfo; 1];
+        let options: ProcessQueryOptions = ProcessQueryOptions {
+            required_process_id: ProcessOpenRequestExecutor::required_process_id(request),
+            search_name: ProcessOpenRequestExecutor::search_name(request, name, name_len),
+            require_windowed: false,
+            match_case: request.get_match_case(),
+            fetch_icons: false,
+            limit: ProcessQueryLimit::Limited { limit: 1 }
+        };
+        let providers: &mut EngineOsProviders = engine_privileged_state.get_os_providers();
+        let outcome: ProcessListOutcome = providers.get_processes(options, &mut found);
+        transition outcome {
+            ProcessListOutcome::Listed { count, truncated } -> matched(engine_privileged_state, response, found, count)
+            ProcessListOutcome::Failed { error } -> (response)
+            _ -> (response)
+        }
+    }
+
+    state matched(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        response: ProcessOpenResponse,
+        found: [ProcessInfo; 1],
+        count: u64
+    ) -> ProcessOpenResponse {
+        transition count > 0 {
+            true -> open(engine_privileged_state, response, &found[0])
+            false -> (response)
+            _ -> (response)
+        }
+    }
+
+    state open(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: ProcessOpenResponse,
+        process_info: &ProcessInfo
+    ) -> ProcessOpenResponse {
+        let providers: &mut EngineOsProviders = engine_privileged_state.get_os_providers();
+        let result: OpenedProcessResult = providers.open_process(process_info);
+        transition result.succeeded() {
+            true -> opened(engine_privileged_state, response, result)
+            false -> (response)
+            _ -> (response)
+        }
+    }
+
+    state opened(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: ProcessOpenResponse,
+        result: OpenedProcessResult
+    ) -> ProcessOpenResponse {
+        engine_privileged_state.set_opened_process(result.info);
+        response.set_opened_process_info(result.info);
+        (response)
+    }
+}
+
+machine ProcessOpenRequestExecutor::required_process_id(
+    request: &ProcessOpenRequest
+) -> RequiredProcessId {
+    transition request.has_process_id() {
+        true -> (RequiredProcessId::Required { process_id: request.get_process_id() })
+        false -> (RequiredProcessId::Any)
+        _ -> (RequiredProcessId::Any)
+    }
+}
+
+machine ProcessOpenRequestExecutor::copy_bounded_name(name: &[u8], out: &mut [u8; 256]) -> u64 {
+    transition { _ -> copy(name, out, 0) }
+
+    state copy(name: &[u8], out: &mut [u8; 256], position: u64) -> u64 {
+        transition position < name.len && position < 256 {
+            true -> store(name, out, position)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+
+    state store(name: &[u8], out: &mut [u8; 256], position: u64) -> u64
+        requires 0 <= position && position < name.len && position < 256;
+    {
+        out[position] = name[position];
+        transition { _ -> copy(name, out, position + 1) }
+    }
+}
+
+machine ProcessOpenRequestExecutor::search_name(
+    request: &ProcessOpenRequest,
+    name: [u8; 256],
+    name_len: u64
+) -> ProcessNameSearch {
+    transition request.has_search_name() {
+        true -> (ProcessNameSearch::Named { name: name, name_len: name_len })
+        false -> (ProcessNameSearch::Any)
+        _ -> (ProcessNameSearch::Any)
+    }
+}

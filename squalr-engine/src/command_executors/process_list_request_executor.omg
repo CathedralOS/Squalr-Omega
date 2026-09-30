@@ -1,0 +1,98 @@
+module src::command_executors::process_list_request_executor;
+
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::process::list::process_list_request::ProcessListRequest;
+use squalr_engine_api::src::commands::process::list::process_list_response::ProcessListResponse;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::os::engine_os_provider::EngineOsProviders;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessNameSearch;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryLimit;
+use squalr_engine_targets::src::process_query::process_query_options::ProcessQueryOptions;
+use squalr_engine_targets::src::process_query::process_query_options::RequiredProcessId;
+use squalr_engine_targets::src::target_providers::ProcessListOutcome;
+use squalr_engine_targets::src::target_providers::ProcessQueryProvider;
+
+// Port of command_executors/process/list/process_list_request_executor.rs —
+// the request's filters become the provider query options, and the sweep's
+// listed rows move into the bounded response. Upstream returns the Vec the
+// provider filled; the port passes the response's own array as the out
+// buffer — the same zero-copy shape (the provider's count is the fill).
+// required_process_id stays Any: only the open request binds a pid.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data ProcessListRequestExecutor {}
+
+pub linux_x86_64 machine ProcessListRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    request: &ProcessListRequest
+) -> ProcessListResponse
+reaches FilesystemHost
+invokes FilesystemHost;
+crashes Trap
+{
+    let mut response: ProcessListResponse = ProcessListResponse::new();
+    let name_view: &[u8] = request.get_search_name();
+    let mut name: [u8; 256];
+    let name_len: u64 = ProcessListRequestExecutor::copy_bounded_name(name_view, &mut name);
+    let options: ProcessQueryOptions = ProcessQueryOptions {
+        required_process_id: RequiredProcessId::Any,
+        search_name: ProcessListRequestExecutor::search_name(request, name, name_len),
+        require_windowed: request.get_require_windowed(),
+        match_case: request.get_match_case(),
+        fetch_icons: request.get_fetch_icons(),
+        limit: ProcessListRequestExecutor::query_limit(request)
+    };
+    let providers: &mut EngineOsProviders = engine_privileged_state.get_os_providers();
+    let outcome: ProcessListOutcome = providers.get_processes(options, &mut response.processes);
+    transition outcome {
+        ProcessListOutcome::Listed { count, truncated } -> finish(response, count)
+        ProcessListOutcome::Failed { error } -> (response)
+        _ -> (response)
+    }
+
+    state finish(mut response: ProcessListResponse, count: u64) -> ProcessListResponse {
+        response.process_count = count;
+        (response)
+    }
+}
+
+// The request's Option<String> name as a fixed buffer — the same
+// bounded-name convention the request records itself uses. The byte count
+// is meaningful only when `has_search_name` holds.
+machine ProcessListRequestExecutor::copy_bounded_name(name: &[u8], out: &mut [u8; 256]) -> u64 {
+    transition { _ -> copy(name, out, 0) }
+
+    state copy(name: &[u8], out: &mut [u8; 256], position: u64) -> u64 {
+        transition position < name.len && position < 256 {
+            true -> store(name, out, position)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+
+    state store(name: &[u8], out: &mut [u8; 256], position: u64) -> u64
+        requires 0 <= position && position < name.len && position < 256;
+    {
+        out[position] = name[position];
+        transition { _ -> copy(name, out, position + 1) }
+    }
+}
+
+machine ProcessListRequestExecutor::search_name(
+    request: &ProcessListRequest,
+    name: [u8; 256],
+    name_len: u64
+) -> ProcessNameSearch {
+    transition request.has_search_name() {
+        true -> (ProcessNameSearch::Named { name: name, name_len: name_len })
+        false -> (ProcessNameSearch::Any)
+        _ -> (ProcessNameSearch::Any)
+    }
+}
+
+machine ProcessListRequestExecutor::query_limit(request: &ProcessListRequest) -> ProcessQueryLimit {
+    transition request.has_limit() {
+        true -> (ProcessQueryLimit::Limited { limit: request.get_limit() })
+        false -> (ProcessQueryLimit::Unlimited)
+        _ -> (ProcessQueryLimit::Unlimited)
+    }
+}
