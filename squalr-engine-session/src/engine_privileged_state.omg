@@ -11,6 +11,9 @@ use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
 use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
 use src::os::engine_os_provider::EngineOsProviders;
+use src::patches::patch_service::PatchService;
+use src::patches::patch_service::PatchServiceResult;
+use squalr_engine_api::src::structures::patches::patch_kind::PatchKind;
 use src::os::supplied_memory_source::SuppliedMemorySource;
 use src::os::supplied_memory_source::SuppliedRegion;
 use src::pending_engine_events::PendingEngineEvents;
@@ -80,6 +83,11 @@ pub data EnginePrivilegedState {
     // Upstream `symbol_registry_generation: AtomicU64` (starts at 1,
     // bumps on every accepted registry mutation).
     symbol_registry_generation: u64;
+    // Upstream `PatchService` (the `Mutex<PatchServiceState>` inside maps
+    // onto the field itself). `clear_if_process_changed` fires from
+    // upstream's ProcessChanged event hook; headless calls it inline at the
+    // open/close setters below — the patch table follows the opened process.
+    patch_service: PatchService;
 }
 
 // Entry-plan variant of `new`: only the non-zero-initialized scalar is
@@ -97,6 +105,11 @@ pub machine EnginePrivilegedState::init(&mut self) {
     // run to match `new` (upstream `SymbolRegistry::new` seeds them).
     self.symbol_registry = SymbolRegistry::new();
     self.symbol_registry_generation = 1;
+    // PatchService::new is plain record init whose non-zero field is the
+    // id counter — entry plan can write it directly.
+    self.patch_service.next_patch_number = 1;
+    self.patch_service.has_process_key = false;
+    self.patch_service.patch_count = 0;
 }
 
 pub machine EnginePrivilegedState::new() -> EnginePrivilegedState {
@@ -116,6 +129,7 @@ pub machine EnginePrivilegedState::new() -> EnginePrivilegedState {
         pending_engine_events: PendingEngineEvents::new(),
         symbol_registry: SymbolRegistry::new(),
         symbol_registry_generation: 1,
+        patch_service: PatchService::new(),
     }
 }
 
@@ -132,6 +146,11 @@ pub machine EnginePrivilegedState::get_opened_process(&self) -> OpenedProcessInf
 pub machine EnginePrivilegedState::set_opened_process(&mut self, opened_process: OpenedProcessInfo) {
     self.opened_process = opened_process;
     self.has_opened_process = true;
+    // Upstream's ProcessChanged event → PatchService::clear_if_process_changed.
+    self.patch_service.clear_if_process_changed(
+        true,
+        self.opened_process.get_process_id_raw() as u64,
+        self.opened_process.get_handle());
 }
 
 // Fixture form of `set_opened_process` for entry contexts that cannot move
@@ -143,6 +162,7 @@ pub machine EnginePrivilegedState::set_opened_process_fixture(&mut self, process
     self.opened_process.process_id = process_id;
     self.opened_process.handle = process_id as u64;
     self.has_opened_process = true;
+    self.patch_service.clear_if_process_changed(true, process_id as u64, process_id as u64);
 }
 
 // One zeroed supplied region — the fixture form of `supply_memory` for
@@ -158,6 +178,67 @@ pub machine EnginePrivilegedState::make_fixture_source(
 
 pub machine EnginePrivilegedState::clear_opened_process(&mut self) {
     self.has_opened_process = false;
+    self.patch_service.clear_if_process_changed(false, 0, 0);
+}
+
+// Upstream `get_patch_service()` / the patch-command wrappers — receiver
+// `self.patch_service` and arg `&mut self.os_providers` are disjoint field
+// borrows, so the borrow rule needs these wrappers (one expression cannot
+// take two borrows of `self`).
+pub machine EnginePrivilegedState::borrow_patch_service_mut(&mut self) -> &mut PatchService {
+    &mut self.patch_service
+}
+
+pub machine EnginePrivilegedState::apply_patch(
+    &mut self,
+    opened_process_info: &OpenedProcessInfo,
+    address: u64,
+    module_name: &[u8],
+    patched_bytes: &[u8],
+    kind: PatchKind,
+    has_label: bool,
+    label: &[u8]
+) -> PatchServiceResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.patch_service.apply_patch(opened_process_info, &mut self.os_providers, address, module_name, patched_bytes, kind, has_label, label)
+}
+
+pub machine EnginePrivilegedState::restore_patch(
+    &mut self,
+    opened_process_info: &OpenedProcessInfo,
+    patch_id: &[u8]
+) -> PatchServiceResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.patch_service.restore_patch(opened_process_info, &mut self.os_providers, patch_id)
+}
+
+pub machine EnginePrivilegedState::restore_patch_at_address(
+    &mut self,
+    opened_process_info: &OpenedProcessInfo,
+    address: u64,
+    module_name: &[u8],
+    has_expected_kind: bool,
+    expected_kind: PatchKind
+) -> PatchServiceResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.patch_service.restore_patch_at_address(opened_process_info, &mut self.os_providers, address, module_name, has_expected_kind, expected_kind)
+}
+
+pub machine EnginePrivilegedState::list_patches(&mut self, opened_process_info: &OpenedProcessInfo) {
+    self.patch_service.list_patches(opened_process_info);
+}
+
+// Upstream PluginsPluginRegistry::find_instruction_set — the headless port
+// has no plugin subsystem (upstream's own failure path runs when the set
+// is absent); returns false so callers take upstream's documented error.
+pub machine EnginePrivilegedState::find_instruction_set(&mut self, instruction_set_id: &[u8]) -> bool {
+    (false)
 }
 
 // Upstream `get_os_providers()` — the session's provider registry. The
