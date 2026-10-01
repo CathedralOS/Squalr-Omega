@@ -1,0 +1,167 @@
+module src::command_executors::plugin_set_order_request_executor;
+
+use squalr_engine_api::src::commands::plugins::set_order::plugin_set_order_request::PluginSetOrderRequest;
+use squalr_engine_api::src::commands::plugins::set_order::plugin_set_order_response::PluginSetOrderResponse;
+use squalr_engine_api::src::events::engine_event::EngineEvent;
+use squalr_engine_api::src::events::plugins::changed::plugins_changed_event::PluginsChangedEvent;
+use squalr_engine_api::src::plugins::plugin_id::PluginId;
+use squalr_engine_api::src::plugins::plugin_state::PluginState;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::plugins::plugin_registry::PluginRegistry;
+
+// Port of command_executors/plugins/set_order/
+// plugin_set_order_request_executor.rs — `set_plugin_order` then, only when
+// it updated: `invalidate_memory_view_runtime_state` +
+// `notify_registry_changed` + `PluginsChangedEvent` — all three
+// unconditionally inside the update arm, unlike set_enabled's
+// capability-keyed guards.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data PluginSetOrderRequestExecutor {}
+
+pub machine PluginSetOrderRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    plugin_set_order_request: &PluginSetOrderRequest
+) -> PluginSetOrderResponse {
+    transition { _ -> apply(engine_privileged_state, plugin_set_order_request) }
+
+    state apply(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        request: &PluginSetOrderRequest
+    ) -> PluginSetOrderResponse {
+        let registry: &mut PluginRegistry = engine_privileged_state.borrow_plugin_registry_mut();
+        let did_update: bool = registry.set_plugin_order(request);
+        transition did_update {
+            true -> invalidate(engine_privileged_state)
+            _ -> walk(engine_privileged_state, PluginSetOrderResponse::new(), did_update, 0)
+        }
+    }
+
+    state invalidate(
+        engine_privileged_state: &mut EnginePrivilegedState
+    ) -> PluginSetOrderResponse {
+        engine_privileged_state.invalidate_memory_view_runtime_state();
+        transition { _ -> notify(engine_privileged_state) }
+    }
+
+    state notify(
+        engine_privileged_state: &mut EnginePrivilegedState
+    ) -> PluginSetOrderResponse {
+        engine_privileged_state.notify_registry_changed();
+        transition { _ -> emit(engine_privileged_state) }
+    }
+
+    // `emit_event(PluginsChangedEvent {})`.
+    state emit(
+        engine_privileged_state: &mut EnginePrivilegedState
+    ) -> PluginSetOrderResponse {
+        let changed_event: PluginsChangedEvent = PluginsChangedEvent::new();
+        let engine_event: EngineEvent = changed_event.to_engine_event();
+        _ = engine_privileged_state.emit_event(&engine_event);
+        transition { _ -> walk(engine_privileged_state, PluginSetOrderResponse::new(), true, 0) }
+    }
+
+    state walk(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PluginSetOrderResponse,
+        did_update: bool,
+        ordinal: u64
+    ) -> PluginSetOrderResponse {
+        let registry: &PluginRegistry = engine_privileged_state.get_plugin_registry();
+        transition ordinal < registry.get_plugin_order_count() && ordinal < 8 {
+            true -> append(engine_privileged_state, response, did_update, ordinal)
+            _ -> set_process_info(engine_privileged_state, response, did_update)
+        }
+    }
+
+    state append(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PluginSetOrderResponse,
+        did_update: bool,
+        ordinal: u64
+    ) -> PluginSetOrderResponse
+        requires ordinal < 8
+    {
+        let registry: &PluginRegistry = engine_privileged_state.get_plugin_registry();
+        let position: u64 = registry.get_ordered_plugin_position(ordinal);
+        transition position < 8 {
+            true -> push(engine_privileged_state, response, did_update, ordinal, position)
+            _ -> walk(engine_privileged_state, response, did_update, ((ordinal as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state push(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PluginSetOrderResponse,
+        did_update: bool,
+        ordinal: u64,
+        position: u64
+    ) -> PluginSetOrderResponse
+        requires ordinal < 8 && position < 8
+    {
+        let registry: &PluginRegistry = engine_privileged_state.get_plugin_registry();
+        let plugin_state: PluginState = registry.get_plugin_state_at(position);
+        _ = response.add_plugin(&plugin_state);
+        transition {
+            _ -> walk(engine_privileged_state, response, did_update, ((ordinal as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state set_process_info(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PluginSetOrderResponse,
+        did_update: bool
+    ) -> PluginSetOrderResponse {
+        transition engine_privileged_state.has_opened_process() {
+            true -> set_present(engine_privileged_state, response, did_update)
+            _ -> fill_default_ids(engine_privileged_state, response, did_update, 0)
+        }
+    }
+
+    state set_present(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PluginSetOrderResponse,
+        did_update: bool
+    ) -> PluginSetOrderResponse {
+        let opened_process_info: OpenedProcessInfo = engine_privileged_state.get_opened_process();
+        response.set_opened_process_info(opened_process_info);
+        transition { _ -> fill_default_ids(engine_privileged_state, response, did_update, 0) }
+    }
+
+    state fill_default_ids(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PluginSetOrderResponse,
+        did_update: bool,
+        position: u64
+    ) -> PluginSetOrderResponse {
+        let registry: &PluginRegistry = engine_privileged_state.get_plugin_registry();
+        transition position < registry.get_plugin_count() && position < 8 {
+            true -> push_id(engine_privileged_state, response, did_update, position)
+            _ -> finish(response, did_update)
+        }
+    }
+
+    state push_id(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PluginSetOrderResponse,
+        did_update: bool,
+        position: u64
+    ) -> PluginSetOrderResponse
+        requires position < 8
+    {
+        let registry: &PluginRegistry = engine_privileged_state.get_plugin_registry();
+        let plugin_id: PluginId = registry.get_default_plugin_id_at(position);
+        _ = response.add_default_plugin_id(&plugin_id);
+        transition {
+            _ -> fill_default_ids(engine_privileged_state, response, did_update, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state finish(
+        mut response: PluginSetOrderResponse,
+        did_update: bool
+    ) -> PluginSetOrderResponse {
+        response.set_did_update(did_update);
+        transition { _ -> (response) }
+    }
+}
