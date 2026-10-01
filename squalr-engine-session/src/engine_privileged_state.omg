@@ -19,6 +19,12 @@ use src::tasks::trackable_task_manager::TrackableTaskManager;
 use squalr_engine_api::src::events::engine_event::EngineEvent;
 use squalr_engine_api::src::structures::snapshots::element_window::ElementWindow;
 use squalr_engine_api::src::registries::freeze_list::freeze_list_registry::FreezeListRegistry;
+use squalr_engine_api::src::registries::symbols::symbol_registry::SymbolRegistry;
+use squalr_engine_api::src::registries::symbols::privileged_registry_catalog::PrivilegedRegistryCatalog;
+use squalr_engine_api::src::registries::symbols::data_type_descriptor::DataTypeDescriptor;
+use squalr_engine_api::src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::events::registry::changed::registry_changed_event::RegistryChangedEvent;
 
 // Port of engine_privileged_state.rs for the headless command leg. Upstream
 // holds `Arc<RwLock<...>>` fields behind a singleton; the port keeps the same
@@ -64,6 +70,16 @@ pub data EnginePrivilegedState {
     // events queue here for consumers to drain (see
     // pending_engine_events.omg for the deviation rationale).
     pending_engine_events: PendingEngineEvents;
+    // Upstream keeps the symbol registry inside `Arc<Registries>`
+    // (`registries.get_symbol_registry()`); the port lifts the one
+    // registry the session owns onto the record directly. Upstream's
+    // `symbol_registry_mutation_guard: Mutex<()>` drops — a session-owned
+    // record is already single-writer (the mutation wrappers below carry
+    // upstream's change-then-notify contract).
+    symbol_registry: SymbolRegistry;
+    // Upstream `symbol_registry_generation: AtomicU64` (starts at 1,
+    // bumps on every accepted registry mutation).
+    symbol_registry_generation: u64;
 }
 
 // Entry-plan variant of `new`: only the non-zero-initialized scalar is
@@ -77,6 +93,10 @@ pub machine EnginePrivilegedState::init(&mut self) {
     self.memory_settings.memory_type_image = true;
     self.memory_settings.memory_type_mapped = true;
     self.memory_settings.end_address = 18446744073709551615;
+    // Zero-init leaves the registry tables empty — the builtin seed must
+    // run to match `new` (upstream `SymbolRegistry::new` seeds them).
+    self.symbol_registry = SymbolRegistry::new();
+    self.symbol_registry_generation = 1;
 }
 
 pub machine EnginePrivilegedState::new() -> EnginePrivilegedState {
@@ -94,6 +114,8 @@ pub machine EnginePrivilegedState::new() -> EnginePrivilegedState {
         next_pointer_scan_results_id: 0,
         supplied_module_count: 0,
         pending_engine_events: PendingEngineEvents::new(),
+        symbol_registry: SymbolRegistry::new(),
+        symbol_registry_generation: 1,
     }
 }
 
@@ -402,4 +424,94 @@ pub machine EnginePrivilegedState::push_supplied_module(
         self.supplied_module_count = self.supplied_module_count + 1;
         true
     }
+}
+
+// ── Symbol registry (upstream engine_privileged_state.rs registry surface) ──
+
+// Upstream `registries.get_symbol_registry()` — the session-owned symbol
+// + descriptor tables (see the field comment for the Arc<Registries>
+// deviation).
+pub machine EnginePrivilegedState::get_symbol_registry(&self) -> &SymbolRegistry {
+    (&self.symbol_registry)
+}
+
+pub machine EnginePrivilegedState::borrow_symbol_registry_mut(&mut self) -> &mut SymbolRegistry {
+    (&mut self.symbol_registry)
+}
+
+// Upstream `get_registry_generation` — the catalog's generation tag.
+pub machine EnginePrivilegedState::get_registry_generation(&self) -> u64 {
+    (self.symbol_registry_generation)
+}
+
+// Upstream `notify_registry_changed`: bump the generation and emit
+// `RegistryChangedEvent` (headless: pushed onto the pending queue —
+// upstream's subscriber dispatch is the bindings leg).
+pub machine EnginePrivilegedState::notify_registry_changed(&mut self) {
+    // Upstream `fetch_add(1, Relaxed)` wraps at the u64 boundary — the
+    // generation tag's overflow domain is therefore Wrapping, not exact.
+    let next_generation: u64 = ((self.symbol_registry_generation as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    self.symbol_registry_generation = next_generation;
+    let event: RegistryChangedEvent = RegistryChangedEvent::new(next_generation);
+    let engine_event: EngineEvent = event.to_engine_event();
+    _ = self.emit_event(&engine_event);
+}
+
+// Upstream `get_privileged_registry_catalog`: the registry's sorted
+// catalog stamped with the current generation. Upstream additionally
+// filters each descriptor through `plugin_registry.is_data_type_enabled`;
+// the port has no plugin registry, and upstream answers true for ids no
+// plugin owns — so the headless result matches the plugin-free case.
+// (Named residual: the plugin-enabled filter joins with the Plugins
+// domain.)
+pub machine EnginePrivilegedState::get_privileged_registry_catalog(&self) -> PrivilegedRegistryCatalog {
+    (self.symbol_registry.create_registry_catalog(self.symbol_registry_generation))
+}
+
+// The tail of upstream's `mutate_symbol_registry` — the guard's
+// change-then-notify contract (the Mutex itself drops, see the field
+// comment): emit only when the mutation landed.
+machine EnginePrivilegedState::finish_symbol_registry_mutation(&mut self, did_change: bool) -> bool {
+    transition did_change {
+        true -> notify()
+        _ -> (false)
+    }
+    state notify(&mut self) -> bool {
+        self.notify_registry_changed();
+        (true)
+    }
+}
+
+// Upstream `set_project_symbol_catalog` — install the project-authored
+// symbol catalog under the mutation contract.
+pub machine EnginePrivilegedState::set_project_symbol_catalog(&mut self, project_symbol_catalog: &ProjectSymbolCatalog) -> bool {
+    let did_change: bool = self.symbol_registry.set_project_symbol_catalog(project_symbol_catalog);
+    (self.finish_symbol_registry_mutation(did_change))
+}
+
+// Upstream `register_symbol_data_type_descriptor`.
+pub machine EnginePrivilegedState::register_symbol_data_type_descriptor(&mut self, data_type_descriptor: &DataTypeDescriptor) -> bool {
+    let did_change: bool = self.symbol_registry.register_data_type_descriptor(data_type_descriptor);
+    (self.finish_symbol_registry_mutation(did_change))
+}
+
+// Upstream `unregister_symbol_data_type_descriptor`.
+pub machine EnginePrivilegedState::unregister_symbol_data_type_descriptor(&mut self, data_type_id: &[u8]) -> bool {
+    let did_change: bool = self.symbol_registry.unregister_data_type_descriptor(data_type_id);
+    (self.finish_symbol_registry_mutation(did_change))
+}
+
+// Upstream `register_struct_layout_descriptor` — registers the
+// descriptor's definition under its layout id.
+pub machine EnginePrivilegedState::register_struct_layout_descriptor(&mut self, struct_layout_descriptor: &StructLayoutDescriptor) -> bool {
+    let did_change: bool = self.symbol_registry.register_symbolic_struct(
+        struct_layout_descriptor.get_struct_layout_id(),
+        struct_layout_descriptor.get_struct_layout_definition());
+    (self.finish_symbol_registry_mutation(did_change))
+}
+
+// Upstream `unregister_struct_layout_descriptor`.
+pub machine EnginePrivilegedState::unregister_struct_layout_descriptor(&mut self, symbolic_struct_id: &[u8]) -> bool {
+    let did_change: bool = self.symbol_registry.unregister_symbolic_struct(symbolic_struct_id);
+    (self.finish_symbol_registry_mutation(did_change))
 }
