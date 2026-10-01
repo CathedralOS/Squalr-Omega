@@ -1,0 +1,1152 @@
+module src::patches::patch_service;
+
+use squalr_engine_api::src::structures::memory::normalized_region::NormalizedRegion;
+use squalr_engine_api::src::structures::patches::patch_descriptor::PatchDescriptor;
+use squalr_engine_api::src::structures::patches::patch_kind::PatchKind;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_targets::src::target_providers::MemoryReadResult;
+use squalr_engine_targets::src::target_providers::MemoryWriteResult;
+use squalr_engine_targets_native::src::memory_queryer::normalized_module::ResolvedModuleAddress;
+use src::os::engine_os_provider::EngineOsProviders;
+
+// Port of squalr-engine-session/src/patches/patch_service.rs — the applied-
+// patch table behind the Patches command domain: {process scope key,
+// patch-N id allocator, patches_by_id}. Named deviations:
+//
+// - `patches_by_id: HashMap<String, PatchDescriptor>` becomes a bounded
+//   64-slot insertion-order table — the wire's `PatchListResponse` bound is
+//   [PatchDescriptor; 64], so the store and the list surface share one
+//   bound. A full table refuses the apply rather than evicting silently.
+// - The `Mutex<PatchServiceState>` guard maps onto the single-owner session
+//   field; `lock_state()`'s poison-error arm has no correspondent.
+// - `next_patch_id: AtomicU64` becomes a plain u64 bump in the `Wrapping`
+//   domain — the id is a tag; wrap is upstream's fetch_add semantics.
+// - `resolve_absolute_address` routes through the provider's
+//   `resolve_module_address` (identifier + offset); upstream's separate
+//   not-loaded vs overflow error arms collapse into the resolver's
+//   `Unresolvable` case.
+// - `clear_if_process_changed` fires from upstream's ProcessChanged event
+//   hook; headless calls it inline at the process open/close transition
+//   (the event bus is the bindings leg). Every public op still runs
+//   `ensure_process_scope` first, matching upstream's second check.
+// - `Option<PatchDescriptor>` returns flatten to `Found(patch)/Miss`;
+//   `Result<PatchDescriptor, String>` becomes `PatchServiceResult` with a
+//   bounded error-text carrier. Upstream's format! interpolation is kept —
+//   `put`/`put_hex16`/`put_decimal`/`put_kind` build the same messages.
+// - `write_code_bytes_checked` and public `find_active_overlap` belong to
+//   the debugger leg's breakpoint path; the overlap helpers they share are
+//   ported here already.
+// - `list_patches` sorts by (base_address, patch_id) like upstream's
+//   `sort_by`; insertion sort keeps the bounded table ordered in place.
+
+pub data PatchServiceError {
+    message: [u8; 256];
+    message_len: u64;
+}
+
+pub machine PatchServiceError::empty() -> PatchServiceError {
+    PatchServiceError { message_len: 0 }
+}
+
+// Bounded append — upstream's format! pieces. Overrun truncates at the
+// 256-byte carrier; status messages are diagnostic text, never patch data.
+pub machine PatchServiceError::put(&mut self, bytes: &[u8]) {
+    transition { _ -> copy(bytes, 0) }
+    state copy(&mut self, bytes: &[u8], position: u64) {
+        transition position < bytes.len && self.message_len < 256 {
+            true -> store(bytes, position)
+            _ -> done()
+        }
+    }
+    state store(&mut self, bytes: &[u8], position: u64)
+        requires position < bytes.len && self.message_len < 256
+    {
+        let target: u64 = self.message_len;
+        self.message[target] = bytes[position];
+        self.message_len = ((target as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy(bytes, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state done(&mut self) {}
+}
+
+// Upstream `{:X}` — minimal-width uppercase hex.
+pub machine PatchServiceError::put_hex16(&mut self, value: u64) {
+    transition value == 0 {
+        true -> emit_zero()
+        _ -> measure(value, 0)
+    }
+    state emit_zero(&mut self) {
+        self.put("0");
+        transition { _ -> done() }
+    }
+    // Count the significant nibbles so emission stays MSB-first.
+    state measure(&mut self, value: u64, width: u64)
+        requires width < 17
+    {
+        transition width < 16 {
+            true -> probe(value, width)
+            _ -> emit(value, width, 0)
+        }
+    }
+    state probe(&mut self, value: u64, width: u64)
+        requires width < 16
+    {
+        let shift: u64 = (((width as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64);
+        let shifted: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) != 0) as u64;
+        let next_width: u64 = ((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition shifted == 1 && next_width < 17 {
+            true -> measure(value, next_width)
+            _ -> emit(value, width, 0)
+        }
+    }
+    state emit(&mut self, value: u64, width: u64, position: u64)
+        requires width < 17
+    {
+        transition position < width && position < 16 && self.message_len < 256 {
+            true -> emit_digit(value, width, position)
+            _ -> done()
+        }
+    }
+    state emit_digit(&mut self, value: u64, width: u64, position: u64)
+        requires position < width && position < 16 && width < 17
+    {
+        // `width <= 16 && width > position` — subtraction stays in range.
+        let shift_base: u64 = ((width as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let shift: u64 = (((((shift_base as u64 in Wrapping) - (position as u64 in Wrapping)) as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64);
+        let digit: u64 = (((((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) % (16 as u64 in Wrapping))) as u64);
+        let target: u64 = self.message_len;
+        self.message[target] = hex_digit(digit);
+        self.message_len = ((target as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> emit(value, width, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state done(&mut self) {}
+}
+
+// Decimal append for the patch-id tail and interpolated counts — u64,
+// minimal width, divisor-forward so no index is ever computed.
+pub machine PatchServiceError::put_decimal(&mut self, value: u64) {
+    transition value == 0 {
+        true -> emit_zero()
+        _ -> measure(value, 1)
+    }
+    state emit_zero(&mut self) {
+        self.put("0");
+        transition { _ -> done() }
+    }
+    // `divisor` grows to the largest 10^k <= value (10^19 is the u64 cap).
+    state measure(&mut self, value: u64, divisor: u64) {
+        transition divisor <= value / 10 && divisor < 10000000000000000000 {
+            true -> measure(value, ((divisor as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64)
+            _ -> emit(value, divisor)
+        }
+    }
+    state emit(&mut self, value: u64, divisor: u64) {
+        transition divisor != 0 && self.message_len < 256 {
+            true -> digit(value, divisor)
+            _ -> done()
+        }
+    }
+    state digit(&mut self, value: u64, divisor: u64)
+        requires divisor != 0
+    {
+        let quotient: u64 = value / divisor;
+        let digit: u64 = quotient % 10;
+        transition digit < 10 && self.message_len < 256 {
+            true -> store(value, divisor, digit)
+            _ -> done()
+        }
+    }
+    state store(&mut self, value: u64, divisor: u64, digit: u64)
+        requires divisor != 0 && digit < 10 && self.message_len < 256
+    {
+        let target: u64 = self.message_len;
+        self.message[target] = ((((48 as u64 in Wrapping) + (digit as u64 in Wrapping)) as u64) as u8);
+        self.message_len = ((target as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let next_divisor: u64 = divisor / 10;
+        transition { _ -> emit(value, next_divisor) }
+    }
+    state done(&mut self) {}
+}
+
+machine hex_digit(digit: u64) -> u8 {
+    transition digit < 10 {
+        true -> ((((48 as u64 in Wrapping) + (digit as u64 in Wrapping)) as u64) as u8)
+        _ -> upper(digit)
+    }
+    // The `% 16` inputs keep digit in 0-15; `digit >= 16` is unreachable —
+    // the arm returns '?' rather than widen the contract to a masked char.
+    state upper(digit: u64) -> u8 {
+        transition digit < 16 {
+            true -> (hex_digit_upper(digit))
+            _ -> (63)
+        }
+    }
+}
+
+machine hex_digit_upper(digit: u64) -> u8
+    requires digit >= 10 && digit < 16
+{
+    ((((55 as u64 in Wrapping) + ((digit as u64 in Wrapping) - (10 as u64 in Wrapping))) as u64) as u8)
+}
+
+// Upstream `{:?}` on PatchKind — the Debug spelling is the variant name.
+pub machine PatchServiceError::put_kind(&mut self, kind: PatchKind) {
+    transition kind {
+        PatchKind::Code -> emit("Code")
+        PatchKind::NoOperation -> emit("NoOperation")
+        PatchKind::SoftwareBreakpoint -> emit("SoftwareBreakpoint")
+        PatchKind::Generic -> emit("Generic")
+    }
+    state emit(&mut self, name: &[u8]) {
+        self.put(name);
+        transition { _ -> done() }
+    }
+    state done(&mut self) {}
+}
+
+pub machine PatchServiceError::get_message(&self) -> &[u8] {
+    transition self.message_len <= 256 {
+        true -> (&self.message[0 .. self.message_len])
+        _ -> (&self.message)
+    }
+}
+
+// `Result<PatchDescriptor, String>` — upstream's Ok descriptor / Err text.
+pub data PatchServiceResult {
+    case Ok(patch: PatchDescriptor);
+    case Err(error: PatchServiceError);
+}
+
+// `Result<u64, String>` for the resolve stage.
+pub data PatchAddressResult {
+    case Resolved(address: u64);
+    case Err(error: PatchServiceError);
+}
+
+// `Result<Option<PatchDescriptor>, String>` — lock errors gone headless.
+pub data PatchOverlapOutcome {
+    case Found(patch: PatchDescriptor);
+    case Miss;
+}
+
+// The patch store. `process_key_*` pairs carry upstream's Option
+// PatchProcessKey { process_id: u32, process_handle: u64 }.
+pub data PatchService {
+    next_patch_number: u64;
+    has_process_key: bool;
+    process_key_id: u64;
+    process_key_handle: u64;
+    patches: [PatchDescriptor; 64];
+    patch_count: u64;
+}
+
+pub machine PatchService::new() -> PatchService {
+    PatchService {
+        next_patch_number: 1,
+        has_process_key: false,
+        process_key_id: 0,
+        process_key_handle: 0,
+        patch_count: 0,
+    }
+}
+
+pub machine PatchService::default() -> PatchService {
+    (PatchService::new())
+}
+
+pub machine PatchService::get_patch_count(&self) -> u64 {
+    self.patch_count
+}
+
+pub machine PatchService::get_patch_at(&self, position: u64) -> &PatchDescriptor
+    requires position < 64
+{
+    &self.patches[position]
+}
+
+// The list executor copies the sorted table out; the `&` returned by
+// get_patch_at loans through two `&mut` hops and cannot feed clone's
+// shared receiver, so the by-value variant lives beside it.
+pub machine PatchService::clone_patch_at(&self, position: u64) -> PatchDescriptor
+    requires position < 64
+{
+    self.patches[position].clone()
+}
+
+// Upstream `clear` — drops the scope key and the whole table.
+pub machine PatchService::clear(&mut self) {
+    self.has_process_key = false;
+    self.patch_count = 0;
+}
+
+// Upstream `clear_if_process_changed` — rekeys and empties the table when
+// the opened process (or its absence) no longer matches the stored key.
+pub machine PatchService::clear_if_process_changed(&mut self, has_opened: bool, process_id: u64, handle: u64) {
+    transition self.has_process_key != has_opened || self.process_key_id != process_id || self.process_key_handle != handle {
+        true -> rekey(has_opened, process_id, handle)
+        _ -> done()
+    }
+    state rekey(&mut self, has_opened: bool, process_id: u64, handle: u64) {
+        self.has_process_key = has_opened;
+        self.process_key_id = process_id;
+        self.process_key_handle = handle;
+        self.patch_count = 0;
+        transition { _ -> done() }
+    }
+    state done(&mut self) {}
+}
+
+// Upstream `ensure_process_scope` — same key test driven from the op's
+// opened process, matching upstream's in-lock call order.
+machine PatchService::ensure_process_scope(&mut self, opened_process_info: &OpenedProcessInfo) {
+    let process_id: u64 = opened_process_info.get_process_id_raw() as u64;
+    let handle: u64 = opened_process_info.get_handle();
+    self.clear_if_process_changed(true, process_id, handle);
+}
+
+machine is_whitespace_byte(byte: u8) -> bool {
+    (byte == 32 || byte == 9 || byte == 10 || byte == 13)
+}
+
+// Upstream `module_name.trim().is_empty()` — whitespace-only names still
+// mean an absolute address.
+machine is_span_blank(value: &[u8]) -> bool {
+    transition { _ -> scan(value, 0) }
+    state scan(value: &[u8], position: u64) -> bool {
+        transition position < value.len {
+            true -> check(value, position)
+            false -> (true)
+        }
+    }
+    state check(value: &[u8], position: u64) -> bool
+        requires position < value.len
+    {
+        transition is_whitespace_byte(value[position]) {
+            true -> scan(value, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// `HashMap::values().find(pred)` — returns the first matching slot
+// position, or `patch_count` as the none-found sentinel (upstream Option).
+machine PatchService::find_active_overlap_position(&self, region: &NormalizedRegion) -> u64 {
+    transition { _ -> scan(region, 0) }
+    state scan(&self, region: &NormalizedRegion, position: u64) -> u64 {
+        transition position < self.patch_count && position < 64 {
+            true -> probe(region, position)
+            _ -> (self.patch_count)
+        }
+    }
+    state probe(&self, region: &NormalizedRegion, position: u64) -> u64
+        requires position < self.patch_count && position < 64
+    {
+        transition self.patches[position].get_is_active() && regions_overlap(self.patches[position].get_region(), region) {
+            true -> (position)
+            _ -> scan(region, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine PatchService::find_active_overlap_with_kind_position(&self, region: &NormalizedRegion, kind: PatchKind) -> u64 {
+    transition { _ -> scan(region, kind, 0) }
+    state scan(&self, region: &NormalizedRegion, kind: PatchKind, position: u64) -> u64 {
+        transition position < self.patch_count && position < 64 {
+            true -> probe(region, kind, position)
+            _ -> (self.patch_count)
+        }
+    }
+    state probe(&self, region: &NormalizedRegion, kind: PatchKind, position: u64) -> u64
+        requires position < self.patch_count && position < 64
+    {
+        transition self.patches[position].get_is_active() && patch_kind_is(self.patches[position].get_kind(), kind) && regions_overlap(self.patches[position].get_region(), region) {
+            true -> (position)
+            _ -> scan(region, kind, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// `find(|d| d.get_patch_id() == patch_id)` — bounded id spans compare
+// byte-exact like upstream's String ==.
+machine PatchService::find_position_by_patch_id(&self, patch_id: &[u8]) -> u64 {
+    transition { _ -> scan(patch_id, 0) }
+    state scan(&self, patch_id: &[u8], position: u64) -> u64 {
+        transition position < self.patch_count && position < 64 {
+            true -> probe(patch_id, position)
+            _ -> (self.patch_count)
+        }
+    }
+    state probe(&self, patch_id: &[u8], position: u64) -> u64
+        requires position < self.patch_count && position < 64
+    {
+        transition spans_equal(self.patches[position].get_patch_id(), patch_id) {
+            true -> (position)
+            _ -> scan(patch_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// `find(|active && region contains address)` for restore-at-address.
+machine PatchService::find_active_containing_position(&self, address: u64) -> u64 {
+    transition { _ -> scan(address, 0) }
+    state scan(&self, address: u64, position: u64) -> u64 {
+        transition position < self.patch_count && position < 64 {
+            true -> probe(address, position)
+            _ -> (self.patch_count)
+        }
+    }
+    state probe(&self, address: u64, position: u64) -> u64
+        requires position < self.patch_count && position < 64
+    {
+        transition self.patches[position].get_is_active() && region_contains(self.patches[position].get_region(), address) {
+            true -> (position)
+            _ -> scan(address, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine regions_overlap(left: &NormalizedRegion, right: &NormalizedRegion) -> bool {
+    (left.get_base_address() < right.get_end_address() && right.get_base_address() < left.get_end_address())
+}
+
+machine region_contains(region: &NormalizedRegion, address: u64) -> bool {
+    (address >= region.get_base_address() && address < region.get_end_address())
+}
+
+machine patch_kind_is(left: PatchKind, right: PatchKind) -> bool {
+    transition left {
+        PatchKind::Code -> match_code(right)
+        PatchKind::NoOperation -> match_no_operation(right)
+        PatchKind::SoftwareBreakpoint -> match_software_breakpoint(right)
+        PatchKind::Generic -> match_generic(right)
+    }
+    state match_code(right: PatchKind) -> bool {
+        transition right {
+            PatchKind::Code -> (true)
+            _ -> (false)
+        }
+    }
+    state match_no_operation(right: PatchKind) -> bool {
+        transition right {
+            PatchKind::NoOperation -> (true)
+            _ -> (false)
+        }
+    }
+    state match_software_breakpoint(right: PatchKind) -> bool {
+        transition right {
+            PatchKind::SoftwareBreakpoint -> (true)
+            _ -> (false)
+        }
+    }
+    state match_generic(right: PatchKind) -> bool {
+        transition right {
+            PatchKind::Generic -> (true)
+            _ -> (false)
+        }
+    }
+}
+
+machine spans_equal(left: &[u8], right: &[u8]) -> bool {
+    transition left.len == right.len {
+        true -> compare(left, right, 0)
+        _ -> (false)
+    }
+    state compare(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> check(left, right, position)
+            false -> (true)
+        }
+    }
+    state check(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] == right[position] {
+            true -> compare(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// upstream `format!("patch-{}", n)` — writes "patch-N" into `out` and
+// returns the live length. Counter grows in Wrapping like fetch_add.
+machine write_patch_id(out: &mut [u8; 256], number: u64) -> u64 {
+    out[0] = 112;
+    out[1] = 97;
+    out[2] = 116;
+    out[3] = 99;
+    out[4] = 104;
+    out[5] = 45;
+    (((6 as u64 in Wrapping) + (write_decimal(out, 6, number) as u64 in Wrapping)) as u64)
+}
+
+// Minimal-width decimal into `out` starting at `position` — digits are
+// collected into a scratch then written forward so no index is computed.
+machine write_decimal(out: &mut [u8; 256], position: u64, value: u64) -> u64
+    requires position < 256
+{
+    transition value == 0 {
+        true -> write_zero(out, position)
+        _ -> measure(out, value, position, 1)
+    }
+    state write_zero(out: &mut [u8; 256], position: u64) -> u64
+        requires position < 256
+    {
+        out[position] = 48;
+        (1)
+    }
+    // `divisor` = largest 10^k <= value; 10^19 is the u64 ceiling.
+    state measure(out: &mut [u8; 256], value: u64, position: u64, divisor: u64) -> u64
+        requires position < 256
+    {
+        transition divisor <= value / 10 && divisor < 10000000000000000000 {
+            true -> grow(out, value, position, divisor)
+            _ -> emit(out, value, position, divisor, 0)
+        }
+    }
+    state grow(out: &mut [u8; 256], value: u64, position: u64, divisor: u64) -> u64
+        requires position < 256 && divisor < 10000000000000000000
+    {
+        transition {
+            _ -> measure(out, value, position, ((divisor as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64)
+        }
+    }
+    state emit(out: &mut [u8; 256], value: u64, write_at: u64, divisor: u64, written: u64) -> u64
+        requires write_at < 256
+    {
+        transition divisor != 0 && write_at < 256 {
+            true -> digit(out, value, write_at, divisor, written)
+            _ -> (written)
+        }
+    }
+    state digit(out: &mut [u8; 256], value: u64, write_at: u64, divisor: u64, written: u64) -> u64
+        requires write_at < 256 && divisor != 0
+    {
+        let quotient: u64 = value / divisor;
+        let digit: u64 = quotient % 10;
+        transition digit < 10 {
+            true -> store(out, value, write_at, divisor, digit, written)
+            _ -> (written)
+        }
+    }
+    state store(out: &mut [u8; 256], value: u64, write_at: u64, divisor: u64, digit: u64, written: u64) -> u64
+        requires write_at < 256 && divisor != 0 && digit < 10
+    {
+        out[write_at] = ((((48 as u64 in Wrapping) + (digit as u64 in Wrapping)) as u64) as u8);
+        let next_divisor: u64 = divisor / 10;
+        let next_at: u64 = ((write_at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_at < 256 {
+            true -> emit(out, value, next_at, next_divisor, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `resolve_absolute_address`: a blank module name means `address`
+// is already absolute; a named module resolves identifier+offset through
+// the provider. `Unresolvable` carries upstream's not-loaded arm (the
+// overflow arm shares it — the resolver's own arithmetic decides).
+machine PatchService::resolve_absolute_address(
+    &mut self,
+    opened_process_info: &OpenedProcessInfo,
+    providers: &mut EngineOsProviders,
+    address: u64,
+    module_name: &[u8]
+) -> PatchAddressResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition is_span_blank(module_name) {
+        true -> (PatchAddressResult::Resolved { address: address })
+        _ -> resolve_module(opened_process_info, providers, address, module_name)
+    }
+    state resolve_module(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, address: u64, module_name: &[u8]) -> PatchAddressResult {
+        let resolved: ResolvedModuleAddress = providers.resolve_module_address(opened_process_info, module_name, address);
+        transition resolved {
+            ResolvedModuleAddress::Resolved { address } -> (PatchAddressResult::Resolved { address: address })
+            _ -> not_loaded(module_name)
+        }
+    }
+    state not_loaded(&mut self, module_name: &[u8]) -> PatchAddressResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Module '");
+        error.put(module_name);
+        error.put("' is not loaded in the opened process.");
+        (PatchAddressResult::Err { error: error })
+    }
+}
+
+// Upstream `apply_patch` — empty-payload refuse, module/absolute resolve,
+// scope, active-overlap refuse, original-bytes read, patched write,
+// id allocation, insert, clone back as the Ok payload.
+pub machine PatchService::apply_patch(
+    &mut self,
+    opened_process_info: &OpenedProcessInfo,
+    providers: &mut EngineOsProviders,
+    address: u64,
+    module_name: &[u8],
+    patched_bytes: &[u8],
+    kind: PatchKind,
+    has_label: bool,
+    label: &[u8]
+) -> PatchServiceResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition patched_bytes.len == 0 {
+        true -> fail("Patch bytes cannot be empty.")
+        _ -> bounded(opened_process_info, providers, address, module_name, patched_bytes, kind, has_label, label)
+    }
+    state fail(&mut self, text: &[u8]) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put(text);
+        (PatchServiceResult::Err { error: error })
+    }
+    // The 256-byte descriptor carrier refuses an oversized payload —
+    // upstream's Vec is unbounded; truncating a patch stream is wrong data.
+    state bounded(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8]) -> PatchServiceResult {
+        transition patched_bytes.len < 257 {
+            true -> resolve(opened_process_info, providers, address, module_name, patched_bytes, kind, has_label, label)
+            _ -> fail("Patch bytes exceed the 256-byte carrier.")
+        }
+    }
+    state resolve(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8]) -> PatchServiceResult {
+        let resolved: PatchAddressResult = self.resolve_absolute_address(opened_process_info, providers, address, module_name);
+        transition resolved {
+            PatchAddressResult::Resolved { address } -> overlap(opened_process_info, providers, address, module_name, patched_bytes, kind, has_label, label)
+            PatchAddressResult::Err { error } -> (PatchServiceResult::Err { error: error })
+        }
+    }
+    state overlap(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, absolute_address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8]) -> PatchServiceResult
+    {
+        self.ensure_process_scope(opened_process_info);
+        let patch_region: NormalizedRegion = NormalizedRegion::new(absolute_address, patched_bytes.len);
+        let overlapping_position: u64 = self.find_active_overlap_position(&patch_region);
+        transition overlapping_position < self.patch_count && overlapping_position < 64 {
+            true -> fail_overlap(overlapping_position, &patch_region)
+            _ -> read_original(opened_process_info, providers, absolute_address, module_name, patched_bytes, kind, has_label, label)
+        }
+    }
+    state fail_overlap(&mut self, overlapping_position: u64, patch_region: &NormalizedRegion) -> PatchServiceResult
+        requires overlapping_position < self.patch_count && overlapping_position < 64
+    {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Patch range 0x");
+        error.put_hex16(patch_region.get_base_address());
+        error.put("-0x");
+        error.put_hex16(patch_region.get_end_address());
+        error.put(" overlaps active patch '");
+        error.put(self.patches[overlapping_position].get_patch_id());
+        error.put("'.");
+        (PatchServiceResult::Err { error: error })
+    }
+    state read_original(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, absolute_address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8]) -> PatchServiceResult {
+        let patched_len: u64 = patched_bytes.len;
+        transition patched_len < 257 {
+            true -> read_apply(opened_process_info, providers, absolute_address, module_name, patched_bytes, kind, has_label, label, patched_len)
+            _ -> fail("Patch bytes exceed the 256-byte carrier.")
+        }
+    }
+    state read_apply(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, absolute_address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8], patched_len: u64) -> PatchServiceResult
+        requires patched_len < 257
+    {
+        let mut original_buffer: [u8; 256] ;
+        let read_result: MemoryReadResult = providers.read_bytes(opened_process_info, absolute_address, &mut original_buffer[0 .. patched_len]);
+        transition read_result.is_complete() {
+            true -> write_patch(opened_process_info, providers, absolute_address, module_name, patched_bytes, kind, has_label, label, &original_buffer[0 .. patched_len])
+            _ -> fail_read_original(absolute_address)
+        }
+    }
+    state fail_read_original(&mut self, absolute_address: u64) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Failed to read original bytes at 0x");
+        error.put_hex16(absolute_address);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    state write_patch(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, absolute_address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8], original_bytes: &[u8]) -> PatchServiceResult
+    {
+        let write_result: MemoryWriteResult = providers.write_bytes(opened_process_info, absolute_address, patched_bytes);
+        transition write_result.is_complete() {
+            true -> insert(absolute_address, module_name, patched_bytes, kind, has_label, label, original_bytes)
+            _ -> fail_write_patch(absolute_address)
+        }
+    }
+    state fail_write_patch(&mut self, absolute_address: u64) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Failed to write patch bytes at 0x");
+        error.put_hex16(absolute_address);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    state insert(&mut self, absolute_address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8], original_bytes: &[u8]) -> PatchServiceResult
+    {
+        transition self.patch_count < 64 {
+            true -> allocate(absolute_address, module_name, patched_bytes, kind, has_label, label, original_bytes)
+            _ -> fail("Patch table is full (64 active entries).")
+        }
+    }
+    state allocate(&mut self, absolute_address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8], original_bytes: &[u8]) -> PatchServiceResult
+        requires self.patch_count < 64
+    {
+        let mut id_buffer: [u8; 256] ;
+        let id_length: u64 = write_patch_id(&mut id_buffer, self.next_patch_number);
+        self.next_patch_number = ((self.next_patch_number as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition id_length < 257 {
+            true -> fill(absolute_address, module_name, patched_bytes, kind, has_label, label, original_bytes, &id_buffer, id_length)
+            _ -> fail("Patch id overflowed the carrier.")
+        }
+    }
+    state fill(&mut self, absolute_address: u64, module_name: &[u8], patched_bytes: &[u8], kind: PatchKind, has_label: bool, label: &[u8], original_bytes: &[u8], id_buffer: &[u8; 256], id_length: u64) -> PatchServiceResult
+        requires self.patch_count < 64 && id_length < 257
+    {
+        let patch_region: NormalizedRegion = NormalizedRegion::new(absolute_address, patched_bytes.len);
+        let mut descriptor: PatchDescriptor = PatchDescriptor::new(&id_buffer[0 .. id_length], "", &patch_region, kind, true);
+        descriptor.set_module_name(module_name);
+        _ = descriptor.set_original_bytes(original_bytes);
+        _ = descriptor.set_patched_bytes(patched_bytes);
+        transition has_label {
+            true -> label_gate(descriptor, label)
+            _ -> commit_gate(descriptor)
+        }
+    }
+    // `self.patch_count` facts do not cross the state boundary — each
+    // guarded hop re-dominates the count bound for the callee's requires.
+    state label_gate(&mut self, descriptor: PatchDescriptor, label: &[u8]) -> PatchServiceResult {
+        transition self.patch_count < 64 {
+            true -> with_label(descriptor, label)
+            _ -> fail("Patch table is full (64 active entries).")
+        }
+    }
+    state commit_gate(&mut self, descriptor: PatchDescriptor) -> PatchServiceResult {
+        transition self.patch_count < 64 {
+            true -> commit(descriptor)
+            _ -> fail("Patch table is full (64 active entries).")
+        }
+    }
+    state with_label(&mut self, descriptor: PatchDescriptor, label: &[u8]) -> PatchServiceResult
+        requires self.patch_count < 64
+    {
+        let mut labelled: PatchDescriptor = descriptor;
+        labelled.set_label(label);
+        transition self.patch_count < 64 {
+            true -> commit(labelled)
+            _ -> fail("Patch table is full (64 active entries).")
+        }
+    }
+    state commit(&mut self, descriptor: PatchDescriptor) -> PatchServiceResult
+        requires self.patch_count < 64
+    {
+        let target: u64 = self.patch_count;
+        self.patches[target].clone_from(&descriptor);
+        self.patch_count = ((target as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (PatchServiceResult::Ok { patch: self.patches[target].clone() })
+    }
+}
+
+// Upstream `restore_patch` — scope, id lookup, active check, current-bytes
+// equality (skipped for NoOperation kind), original-bytes write, deactivate.
+pub machine PatchService::restore_patch(
+    &mut self,
+    opened_process_info: &OpenedProcessInfo,
+    providers: &mut EngineOsProviders,
+    patch_id: &[u8]
+) -> PatchServiceResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.ensure_process_scope(opened_process_info);
+    let position: u64 = self.find_position_by_patch_id(patch_id);
+    transition position < self.patch_count && position < 64 {
+        true -> found(opened_process_info, providers, position, patch_id)
+        _ -> fail_missing(patch_id)
+    }
+    state fail_missing(&mut self, patch_id: &[u8]) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Patch '");
+        error.put(patch_id);
+        error.put("' does not exist.");
+        (PatchServiceResult::Err { error: error })
+    }
+    state found(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_id: &[u8]) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        transition self.patches[position].get_is_active() {
+            true -> sized(opened_process_info, providers, position, patch_id)
+            _ -> fail_inactive(patch_id)
+        }
+    }
+    state fail_inactive(&mut self, patch_id: &[u8]) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Patch '");
+        error.put(patch_id);
+        error.put("' is already inactive.");
+        (PatchServiceResult::Err { error: error })
+    }
+    state sized(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_id: &[u8]) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        let patch_address: u64 = self.patches[position].get_region().get_base_address();
+        let patched_len: u64 = self.patches[position].get_patched_bytes().len;
+        transition patched_len < 257 {
+            true -> read_current(opened_process_info, providers, position, patch_id, patch_address, patched_len)
+            _ -> fail_carrier(patch_id)
+        }
+    }
+    state fail_carrier(&mut self, patch_id: &[u8]) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Patch '");
+        error.put(patch_id);
+        error.put("' payload exceeds the 256-byte carrier.");
+        (PatchServiceResult::Err { error: error })
+    }
+    // Upstream's read of `patched_bytes.len` live bytes at the patch base.
+    state read_current(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_id: &[u8], patch_address: u64, patched_len: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64 && patched_len < 257
+    {
+        let mut current_buffer: [u8; 256] ;
+        let read_result: MemoryReadResult = providers.read_bytes(opened_process_info, patch_address, &mut current_buffer[0 .. patched_len]);
+        transition read_result.is_complete() {
+            true -> compare_or_write(opened_process_info, providers, position, patch_id, patch_address, patched_len, &current_buffer[0 .. patched_len])
+            _ -> fail_read_patched(patch_address)
+        }
+    }
+    state fail_read_patched(&mut self, patch_address: u64) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Failed to read patched bytes at 0x");
+        error.put_hex16(patch_address);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    // Upstream skips current-vs-recorded equality for NoOperation patches.
+    state compare_or_write(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_id: &[u8], patch_address: u64, patched_len: u64, current_bytes: &[u8]) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        transition patch_kind_is(self.patches[position].get_kind(), PatchKind::NoOperation) {
+            true -> write_original(opened_process_info, providers, position, patch_id, patch_address)
+            _ -> compare(opened_process_info, providers, position, patch_id, patch_address, current_bytes)
+        }
+    }
+    state compare(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_id: &[u8], patch_address: u64, current_bytes: &[u8]) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        transition spans_equal(current_bytes, self.patches[position].get_patched_bytes()) {
+            true -> write_original(opened_process_info, providers, position, patch_id, patch_address)
+            _ -> fail_mismatch(patch_id)
+        }
+    }
+    state fail_mismatch(&mut self, patch_id: &[u8]) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Patch '");
+        error.put(patch_id);
+        error.put("' cannot be restored because target bytes no longer match the recorded patch bytes.");
+        (PatchServiceResult::Err { error: error })
+    }
+    state write_original(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_id: &[u8], patch_address: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        // Two receiver borrows: providers (&mut param) and the patch
+        // record's original_bytes (&self field) — disjoint places.
+        let original_bytes: &[u8] = self.patches[position].get_original_bytes();
+        let write_result: MemoryWriteResult = providers.write_bytes(opened_process_info, patch_address, original_bytes);
+        transition write_result.is_complete() {
+            true -> deactivate(position)
+            _ -> fail_restore_write(patch_address)
+        }
+    }
+    state fail_restore_write(&mut self, patch_address: u64) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Failed to restore original bytes at 0x");
+        error.put_hex16(patch_address);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    state deactivate(&mut self, position: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        self.patches[position].set_is_active(false);
+        (PatchServiceResult::Ok { patch: self.patches[position].clone() })
+    }
+}
+
+// Upstream `restore_patch_at_address` — resolve, find the active patch
+// containing the address, expected-kind check when supplied, restore.
+pub machine PatchService::restore_patch_at_address(
+    &mut self,
+    opened_process_info: &OpenedProcessInfo,
+    providers: &mut EngineOsProviders,
+    address: u64,
+    module_name: &[u8],
+    has_expected_kind: bool,
+    expected_kind: PatchKind
+) -> PatchServiceResult
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let resolved: PatchAddressResult = self.resolve_absolute_address(opened_process_info, providers, address, module_name);
+    transition resolved {
+        PatchAddressResult::Resolved { address } -> scoped(opened_process_info, providers, address, has_expected_kind, expected_kind)
+        PatchAddressResult::Err { error } -> (PatchServiceResult::Err { error: error })
+    }
+    state scoped(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, absolute_address: u64, has_expected_kind: bool, expected_kind: PatchKind) -> PatchServiceResult {
+        self.ensure_process_scope(opened_process_info);
+        let position: u64 = self.find_active_containing_position(absolute_address);
+        transition position < self.patch_count && position < 64 {
+            true -> kind_check(opened_process_info, providers, position, absolute_address, has_expected_kind, expected_kind)
+            _ -> fail_no_containing(absolute_address)
+        }
+    }
+    state fail_no_containing(&mut self, absolute_address: u64) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("No active patch contains address 0x");
+        error.put_hex16(absolute_address);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    state kind_check(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, absolute_address: u64, has_expected_kind: bool, expected_kind: PatchKind) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        transition has_expected_kind {
+            true -> check(opened_process_info, providers, position, absolute_address, expected_kind)
+            _ -> delegate(opened_process_info, providers, position)
+        }
+    }
+    state check(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, absolute_address: u64, expected_kind: PatchKind) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        transition patch_kind_is(self.patches[position].get_kind(), expected_kind) {
+            true -> delegate(opened_process_info, providers, position)
+            _ -> fail_kind(position, absolute_address, expected_kind)
+        }
+    }
+    state fail_kind(&mut self, position: u64, absolute_address: u64, expected_kind: PatchKind) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Active patch '");
+        error.put(self.patches[position].get_patch_id());
+        error.put("' at 0x");
+        error.put_hex16(absolute_address);
+        error.put(" has kind ");
+        error.put_kind(self.patches[position].get_kind());
+        error.put(", not ");
+        error.put_kind(expected_kind);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    state delegate(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        // Inline `restore_patch` on the found position — the id lookup
+        // already ran; go straight at the active-check stage.
+        transition self.patches[position].get_is_active() {
+            true -> sized(opened_process_info, providers, position)
+            _ -> fail("Patch table changed mid-operation.")
+        }
+    }
+    state fail(&mut self, text: &[u8]) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put(text);
+        (PatchServiceResult::Err { error: error })
+    }
+    state sized(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        let patch_address: u64 = self.patches[position].get_region().get_base_address();
+        let patched_len: u64 = self.patches[position].get_patched_bytes().len;
+        transition patched_len < 257 {
+            true -> read_current(opened_process_info, providers, position, patch_address, patched_len)
+            _ -> fail("Recorded patch payload exceeds the 256-byte carrier.")
+        }
+    }
+    state read_current(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_address: u64, patched_len: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64 && patched_len < 257
+    {
+        let mut current_buffer: [u8; 256] ;
+        let read_result: MemoryReadResult = providers.read_bytes(opened_process_info, patch_address, &mut current_buffer[0 .. patched_len]);
+        transition read_result.is_complete() {
+            true -> compare_or_write(opened_process_info, providers, position, patch_address, &current_buffer[0 .. patched_len])
+            _ -> fail_read(patch_address)
+        }
+    }
+    state fail_read(&mut self, patch_address: u64) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Failed to read patched bytes at 0x");
+        error.put_hex16(patch_address);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    state compare_or_write(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_address: u64, current_bytes: &[u8]) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        transition patch_kind_is(self.patches[position].get_kind(), PatchKind::NoOperation) {
+            true -> write_original(opened_process_info, providers, position, patch_address)
+            _ -> compare(opened_process_info, providers, position, patch_address, current_bytes)
+        }
+    }
+    state compare(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_address: u64, current_bytes: &[u8]) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        transition spans_equal(current_bytes, self.patches[position].get_patched_bytes()) {
+            true -> write_original(opened_process_info, providers, position, patch_address)
+            _ -> fail_mismatch(position)
+        }
+    }
+    state fail_mismatch(&mut self, position: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Patch '");
+        error.put(self.patches[position].get_patch_id());
+        error.put("' cannot be restored because target bytes no longer match the recorded patch bytes.");
+        (PatchServiceResult::Err { error: error })
+    }
+    state write_original(&mut self, opened_process_info: &OpenedProcessInfo, providers: &mut EngineOsProviders, position: u64, patch_address: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        let original_bytes: &[u8] = self.patches[position].get_original_bytes();
+        let write_result: MemoryWriteResult = providers.write_bytes(opened_process_info, patch_address, original_bytes);
+        transition write_result.is_complete() {
+            true -> deactivate(position)
+            _ -> fail_write(patch_address)
+        }
+    }
+    state fail_write(&mut self, patch_address: u64) -> PatchServiceResult {
+        let mut error: PatchServiceError = PatchServiceError::empty();
+        error.put("Failed to restore original bytes at 0x");
+        error.put_hex16(patch_address);
+        error.put(".");
+        (PatchServiceResult::Err { error: error })
+    }
+    state deactivate(&mut self, position: u64) -> PatchServiceResult
+        requires position < self.patch_count && position < 64
+    {
+        self.patches[position].set_is_active(false);
+        (PatchServiceResult::Ok { patch: self.patches[position].clone() })
+    }
+}
+
+// Upstream `list_patches` — scope check then sort by
+// (base_address, patch_id); the executor reads the ordered table via
+// get_patch_count/get_patch_at (upstream collects a cloned Vec).
+pub machine PatchService::list_patches(&mut self, opened_process_info: &OpenedProcessInfo) {
+    self.ensure_process_scope(opened_process_info);
+    self.sort_patches();
+}
+
+// `sort_by(|a,b| base then patch_id)` — insertion sort over the bounded
+// table; lexicographic id order matches upstream's String::cmp. Element
+// exchange clones through temporaries (same shape as the catalog sorter).
+machine PatchService::sort_patches(&mut self) {
+    transition {
+        _ -> outer(1)
+    }
+    state outer(&mut self, position: u64) {
+        transition position < self.patch_count && position < 64 {
+            true -> walk(position, position)
+            false -> done()
+        }
+    }
+    state walk(&mut self, position: u64, cursor: u64)
+        requires position < 64 && cursor < 64
+    {
+        transition cursor > 0 {
+            true -> probe(position, cursor)
+            false -> outer(position + 1)
+        }
+    }
+    state probe(&mut self, position: u64, cursor: u64)
+        requires position < 64 && 0 < cursor && cursor < 64
+    {
+        transition {
+            _ -> compare(position, cursor, cursor - 1)
+        }
+    }
+    state compare(&mut self, position: u64, cursor: u64, prior: u64)
+        requires position < 64 && cursor < 64 && prior < 64
+    {
+        transition cursor < self.patch_count && prior < self.patch_count {
+            true -> decide(position, cursor, prior)
+            false -> outer(position + 1)
+        }
+    }
+    state decide(&mut self, position: u64, cursor: u64, prior: u64)
+        requires position < 64 && cursor < 64 && prior < 64
+    {
+        transition self.patch_before(cursor, prior) {
+            true -> swap_patches(position, cursor, prior)
+            false -> outer(position + 1)
+            _ -> outer(position + 1)
+        }
+    }
+    state swap_patches(&mut self, position: u64, cursor: u64, prior: u64)
+        requires position < 64 && cursor < 64 && prior < 64
+    {
+        let prior_copy: PatchDescriptor = self.patches[prior].clone();
+        let cursor_copy: PatchDescriptor = self.patches[cursor].clone();
+        self.patches[cursor].clone_from(&prior_copy);
+        self.patches[prior].clone_from(&cursor_copy);
+        transition {
+            _ -> walk(position, prior)
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+// `a.base < b.base || (equal && a.patch_id < b.patch_id)` — the insertion
+// sort's strict ordering at adjacent positions.
+machine PatchService::patch_before(&self, left: u64, right: u64) -> bool
+    requires left < 64 && right < 64
+{
+    transition self.patches[left].get_region().get_base_address() < self.patches[right].get_region().get_base_address() {
+        true -> (true)
+        _ -> compare_base_equal(left, right)
+    }
+    state compare_base_equal(&self, left: u64, right: u64) -> bool
+        requires left < 64 && right < 64
+    {
+        transition self.patches[left].get_region().get_base_address() == self.patches[right].get_region().get_base_address() {
+            true -> compare_ids(left, right)
+            _ -> (false)
+        }
+    }
+    state compare_ids(&self, left: u64, right: u64) -> bool
+        requires left < 64 && right < 64
+    {
+        (span_lex_less(self.patches[left].get_patch_id(), self.patches[right].get_patch_id()))
+    }
+}
+
+// `String::cmp` — lexicographic byte order, shorter wins on prefix-equal.
+machine span_lex_less(left: &[u8], right: &[u8]) -> bool {
+    transition {
+        _ -> scan(left, right, 0)
+    }
+    state scan(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> check(left, right, position)
+            _ -> finish(left, right, position)
+        }
+    }
+    state check(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] == right[position] {
+            true -> scan(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> decide(left[position], right[position])
+        }
+    }
+    state decide(left_byte: u8, right_byte: u8) -> bool {
+        (left_byte < right_byte)
+    }
+    state finish(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len {
+            true -> (false)
+            _ -> (position < right.len)
+        }
+    }
+}
