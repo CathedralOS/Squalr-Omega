@@ -1,0 +1,74 @@
+module src::command_executors::patch_list_request_executor;
+
+use squalr_engine_api::src::commands::patches::list::patch_list_request::PatchListRequest;
+use squalr_engine_api::src::commands::patches::list::patch_list_response::PatchListResponse;
+use squalr_engine_api::src::structures::patches::patch_command_status::PatchCommandStatus;
+use squalr_engine_api::src::structures::patches::patch_descriptor::PatchDescriptor;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::patches::patch_service::PatchService;
+
+// Port of command_executors/patches/list/patch_list_request_executor.rs —
+// upstream returns the patch service's sorted `Vec<PatchDescriptor>`. The
+// port's bounded table sorts in place (`list_patches` returns unit), so
+// the executor copies the sorted entries into the response's 64-entry
+// page — identical observable contents, bounded carrier.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data PatchListRequestExecutor {}
+
+pub machine PatchListRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    patch_list_request: &PatchListRequest
+) -> PatchListResponse {
+    transition engine_privileged_state.has_opened_process() {
+        true -> prepare(engine_privileged_state)
+        _ -> absent()
+    }
+
+    state absent() -> PatchListResponse {
+        (PatchListResponse::new(PatchCommandStatus::failure("No opened process to patch.")))
+    }
+
+    state prepare(engine_privileged_state: &mut EnginePrivilegedState) -> PatchListResponse {
+        let opened_process_info: OpenedProcessInfo = engine_privileged_state.get_opened_process();
+        engine_privileged_state.list_patches(&opened_process_info);
+        let patch_count: u64 = engine_privileged_state.borrow_patch_service_mut().get_patch_count();
+        transition {
+            _ -> walk(
+                engine_privileged_state,
+                PatchListResponse::new(PatchCommandStatus::success()),
+                patch_count, 0)
+        }
+    }
+
+    state walk(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PatchListResponse,
+        patch_count: u64,
+        position: u64
+    ) -> PatchListResponse {
+        transition position < patch_count && position < 64 {
+            true -> append(engine_privileged_state, response, patch_count, position)
+            false -> (response)
+            _ -> (response)
+        }
+    }
+
+    state append(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        mut response: PatchListResponse,
+        patch_count: u64,
+        position: u64
+    ) -> PatchListResponse
+        requires position < 64
+    {
+        let service: &mut PatchService = engine_privileged_state.borrow_patch_service_mut();
+        let patch: PatchDescriptor = service.clone_patch_at(position);
+        let added: bool = response.add_patch(&patch);
+        transition {
+            _ -> walk(
+                engine_privileged_state, response, patch_count,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
