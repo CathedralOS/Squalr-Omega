@@ -82,3 +82,182 @@ pub machine PrivilegedRegistryCatalog::add_struct_layout_descriptor(&mut self, d
         (true)
     }
 }
+
+// Upstream `create_registry_catalog` sorts each collected Vec by id before
+// constructing the catalog; the port adds in collection order then orders
+// the bounded tables in place — the emitted catalog is identically sorted.
+// Insertion sort over byte-wise id order (Rust `str::cmp` for these ids is
+// the same byte order).
+// `clone_from` for callers holding a `&mut` to a catalog they must hand
+// back by value (upstream's `#[derive(Clone)]`-style copy).
+pub machine PrivilegedRegistryCatalog::clone_from(&mut self, source: &PrivilegedRegistryCatalog) {
+    self.generation = source.generation;
+    self.data_type_descriptor_count = source.data_type_descriptor_count;
+    self.struct_layout_descriptor_count = source.struct_layout_descriptor_count;
+    transition {
+        _ -> types(source, 0)
+    }
+    state types(&mut self, source: &PrivilegedRegistryCatalog, position: u64) {
+        transition position < source.data_type_descriptor_count && position < 128 {
+            true -> copy_type(source, position)
+            false -> structs(source, 0)
+        }
+    }
+    state copy_type(&mut self, source: &PrivilegedRegistryCatalog, position: u64)
+        requires position < 128
+    {
+        self.data_type_descriptors[position].clone_from(&source.data_type_descriptors[position]);
+        transition {
+            _ -> types(source, position + 1)
+        }
+    }
+    state structs(&mut self, source: &PrivilegedRegistryCatalog, position: u64) {
+        transition position < source.struct_layout_descriptor_count && position < 128 {
+            true -> copy_struct(source, position)
+            false -> done()
+        }
+    }
+    state copy_struct(&mut self, source: &PrivilegedRegistryCatalog, position: u64)
+        requires position < 128
+    {
+        self.struct_layout_descriptors[position].clone_from(&source.struct_layout_descriptors[position]);
+        transition {
+            _ -> structs(source, position + 1)
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+pub machine PrivilegedRegistryCatalog::sort_data_type_descriptors(&mut self) {
+    transition {
+        _ -> outer(1)
+    }
+    state outer(&mut self, position: u64) {
+        transition position < self.data_type_descriptor_count && position < 128 {
+            true -> walk(position, position)
+            false -> done()
+        }
+    }
+    state walk(&mut self, position: u64, cursor: u64)
+        requires position < 128 && cursor < 128
+    {
+        transition cursor > 0 {
+            true -> probe(position, cursor)
+            false -> outer(position + 1)
+        }
+    }
+    state probe(&mut self, position: u64, cursor: u64)
+        requires position < 128 && 0 < cursor && cursor < 128
+    {
+        transition {
+            _ -> compare(position, cursor, cursor - 1)
+        }
+    }
+    state compare(&mut self, position: u64, cursor: u64, prior: u64)
+        requires position < 128 && cursor < 128 && prior < 128
+    {
+        transition descriptor_id_less(self.data_type_descriptors[cursor].get_data_type_id(), self.data_type_descriptors[prior].get_data_type_id()) {
+            true -> swap_descriptors(position, cursor, prior)
+            false -> outer(position + 1)
+            _ -> outer(position + 1)
+        }
+    }
+    state swap_descriptors(&mut self, position: u64, cursor: u64, prior: u64)
+        requires position < 128 && cursor < 128 && prior < 128
+    {
+        let mut prior_copy: DataTypeDescriptor = DataTypeDescriptor::default();
+        prior_copy.clone_from(&self.data_type_descriptors[prior]);
+        let mut cursor_copy: DataTypeDescriptor = DataTypeDescriptor::default();
+        cursor_copy.clone_from(&self.data_type_descriptors[cursor]);
+        self.data_type_descriptors[cursor].clone_from(&prior_copy);
+        self.data_type_descriptors[prior].clone_from(&cursor_copy);
+        transition {
+            _ -> walk(position, prior)
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+pub machine PrivilegedRegistryCatalog::sort_struct_layout_descriptors(&mut self) {
+    transition {
+        _ -> outer(1)
+    }
+    state outer(&mut self, position: u64) {
+        transition position < self.struct_layout_descriptor_count && position < 128 {
+            true -> walk(position, position)
+            false -> done()
+        }
+    }
+    state walk(&mut self, position: u64, cursor: u64)
+        requires position < 128 && cursor < 128
+    {
+        transition cursor > 0 {
+            true -> probe(position, cursor)
+            false -> outer(position + 1)
+        }
+    }
+    state probe(&mut self, position: u64, cursor: u64)
+        requires position < 128 && 0 < cursor && cursor < 128
+    {
+        transition {
+            _ -> compare(position, cursor, cursor - 1)
+        }
+    }
+    state compare(&mut self, position: u64, cursor: u64, prior: u64)
+        requires position < 128 && cursor < 128 && prior < 128
+    {
+        transition descriptor_id_less(self.struct_layout_descriptors[cursor].get_struct_layout_id(), self.struct_layout_descriptors[prior].get_struct_layout_id()) {
+            true -> swap_descriptors(position, cursor, prior)
+            false -> outer(position + 1)
+            _ -> outer(position + 1)
+        }
+    }
+    state swap_descriptors(&mut self, position: u64, cursor: u64, prior: u64)
+        requires position < 128 && cursor < 128 && prior < 128
+    {
+        let mut prior_copy: StructLayoutDescriptor = StructLayoutDescriptor::default();
+        prior_copy.clone_from(&self.struct_layout_descriptors[prior]);
+        let mut cursor_copy: StructLayoutDescriptor = StructLayoutDescriptor::default();
+        cursor_copy.clone_from(&self.struct_layout_descriptors[cursor]);
+        self.struct_layout_descriptors[cursor].clone_from(&prior_copy);
+        self.struct_layout_descriptors[prior].clone_from(&cursor_copy);
+        transition {
+            _ -> walk(position, prior)
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Byte-order less-than over id windows — `str::cmp` on ASCII ids is the
+// same order.
+machine descriptor_id_less(left: &[u8], right: &[u8]) -> bool {
+    transition {
+        _ -> scan(left, right, 0)
+    }
+    state scan(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> probe(left, right, position)
+            false -> (left.len < right.len)
+        }
+    }
+    state probe(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] < right[position] {
+            true -> (true)
+            false -> check_equal(left, right, position)
+            _ -> check_equal(left, right, position)
+        }
+    }
+    state check_equal(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] == right[position] {
+            true -> scan(left, right, position + 1)
+            _ -> (false)
+        }
+    }
+}
