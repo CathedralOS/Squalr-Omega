@@ -1,0 +1,1175 @@
+module src::registries::symbols::symbol_registry;
+
+use src::registries::symbols::data_type_descriptor::DataTypeDescriptor;
+use src::registries::symbols::privileged_registry_catalog::PrivilegedRegistryCatalog;
+use src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::container_type::ContainerType;
+use src::structures::memory::endian::Endian;
+use src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+
+// Port of registries/symbols/symbol_registry.rs — the engine's symbolic
+// struct and data-type descriptor tables behind `EnginePrivilegedState`.
+// Named deviations, recorded once:
+// - Upstream's three `HashMap<String, Arc<...>>` maps become bounded
+//   insertion-ordered tables of 128 slots each (`[T; 128]` + count, the
+//   freeze-list registry convention; 128 matches the wire catalog bound so
+//   `apply_registry_catalog` stays infallible like upstream). Id-keyed
+//   lookup is a linear scan; where upstream's map insert could not fail,
+//   a full table here answers false.
+// - Upstream's `data_type_registry: HashMap<String, Arc<dyn DataType>>`
+//   carries dyn data types registered by plugins; dyn has no Omega
+//   equivalent, so the table is dropped. Its observable surface on this
+//   file is key membership — `is_registered_data_type` answers over the
+//   fixed builtin id set, since builtins are the only types that can
+//   register headless. Plugin-registered ids rejoin the check when the
+//   Plugins domain lands (named residual).
+// - Upstream guards each map with `RwLock` (and the session wraps
+//   mutators in `symbol_registry_mutation_guard: Mutex<()>`); a
+//   session-owned record needs neither. The lock-error arms are
+//   unreachable by construction and are not ported.
+// - `new` seeds the 21 upstream builtin data types — a descriptor plus
+//   the anonymous single-field symbolic struct each — matching
+//   `create_built_in_registries` field for field (icon id = data type id,
+//   unit sizes, endianness, float/signed flags, supported anonymous
+//   string formats).
+// - Upstream trims the probe side of each lookup (`key.trim()`); the
+//   port measures the probe's whitespace-trimmed window against stored
+//   raw ids (`ids_equal`). Stored ids are never trimmed — upstream map
+//   keys aren't either. Map-key equality (the merged view's shadow rule)
+//   uses exact `bytes_equal`, since `HashMap::extend` compares keys
+//   exactly.
+// - Deferred upstream surface: `register_data_type`/`unregister_data_type`/
+//   `get_data_type`/`get_data_type_registry`/`get_registered_data_type_refs`
+//   (dyn-typed, plugin-fed), `get_data_type_descriptor`'s base-id dyn
+//   fallback, the dyn-delegate ops (`is_valid`, `validate_value_string`,
+//   `validate_scan_constraint`, `deanonymize_value_string`, `get_icon_id`,
+//   `get_unit_size_in_bytes`), and `get`'s inline `from_str` struct
+//   definition fallback.
+pub data SymbolRegistry {
+    // Upstream `symbolic_struct_registry` (the privileged/base map).
+    symbolic_structs: [StructLayoutDescriptor; 128];
+    symbolic_struct_count: u64;
+    // Upstream `project_symbolic_struct_registry`.
+    project_symbolic_structs: [StructLayoutDescriptor; 128];
+    project_symbolic_struct_count: u64;
+    // Upstream `data_type_descriptor_registry` (builtins seeded at `new`).
+    data_type_descriptors: [DataTypeDescriptor; 128];
+    data_type_descriptor_count: u64;
+}
+
+pub machine SymbolRegistry::new() -> SymbolRegistry {
+    let mut registry: SymbolRegistry = SymbolRegistry {
+        symbolic_struct_count: 0,
+        project_symbolic_struct_count: 0,
+        data_type_descriptor_count: 0,
+    };
+    registry.seed_builtins();
+    (registry)
+}
+
+pub machine SymbolRegistry::default() -> SymbolRegistry {
+    (SymbolRegistry::new())
+}
+
+// Upstream `create_built_in_registries`: the 21 builtin data types, each
+// seeding a descriptor and an anonymous symbolic struct under its id.
+// `built_in_data_type_ids` is their key set — see `is_builtin_data_type_id`.
+machine SymbolRegistry::seed_builtins(&mut self) {
+    transition {
+        _ -> seed_bool8()
+    }
+    state seed_bool8(&mut self) {
+        self.seed_bool("bool8", 1);
+        transition { _ -> seed_bool32() }
+    }
+    state seed_bool32(&mut self) {
+        self.seed_bool("bool32", 4);
+        transition { _ -> seed_i8() }
+    }
+    state seed_i8(&mut self) {
+        self.seed_numeric("i8", 1, Endian::Little, true);
+        transition { _ -> seed_i16() }
+    }
+    state seed_i16(&mut self) {
+        self.seed_numeric("i16", 2, Endian::Little, true);
+        transition { _ -> seed_i16be() }
+    }
+    state seed_i16be(&mut self) {
+        self.seed_numeric("i16be", 2, Endian::Big, true);
+        transition { _ -> seed_i32() }
+    }
+    state seed_i32(&mut self) {
+        self.seed_numeric("i32", 4, Endian::Little, true);
+        transition { _ -> seed_i32be() }
+    }
+    state seed_i32be(&mut self) {
+        self.seed_numeric("i32be", 4, Endian::Big, true);
+        transition { _ -> seed_i64() }
+    }
+    state seed_i64(&mut self) {
+        self.seed_numeric("i64", 8, Endian::Little, true);
+        transition { _ -> seed_i64be() }
+    }
+    state seed_i64be(&mut self) {
+        self.seed_numeric("i64be", 8, Endian::Big, true);
+        transition { _ -> seed_u8() }
+    }
+    state seed_u8(&mut self) {
+        self.seed_numeric("u8", 1, Endian::Little, false);
+        transition { _ -> seed_u16() }
+    }
+    state seed_u16(&mut self) {
+        self.seed_numeric("u16", 2, Endian::Little, false);
+        transition { _ -> seed_u16be() }
+    }
+    state seed_u16be(&mut self) {
+        self.seed_numeric("u16be", 2, Endian::Big, false);
+        transition { _ -> seed_u32() }
+    }
+    state seed_u32(&mut self) {
+        self.seed_numeric("u32", 4, Endian::Little, false);
+        transition { _ -> seed_u32be() }
+    }
+    state seed_u32be(&mut self) {
+        self.seed_numeric("u32be", 4, Endian::Big, false);
+        transition { _ -> seed_u64() }
+    }
+    state seed_u64(&mut self) {
+        self.seed_numeric("u64", 8, Endian::Little, false);
+        transition { _ -> seed_u64be() }
+    }
+    state seed_u64be(&mut self) {
+        self.seed_numeric("u64be", 8, Endian::Big, false);
+        transition { _ -> seed_f32() }
+    }
+    state seed_f32(&mut self) {
+        self.seed_float("f32", 4, Endian::Little);
+        transition { _ -> seed_f32be() }
+    }
+    state seed_f32be(&mut self) {
+        self.seed_float("f32be", 4, Endian::Big);
+        transition { _ -> seed_f64() }
+    }
+    state seed_f64(&mut self) {
+        self.seed_float("f64", 8, Endian::Little);
+        transition { _ -> seed_f64be() }
+    }
+    state seed_f64be(&mut self) {
+        self.seed_float("f64be", 8, Endian::Big);
+        transition { _ -> seed_string_utf8() }
+    }
+    state seed_string_utf8(&mut self) {
+        self.seed_string("string_utf8", 1);
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
+    }
+}
+
+// `PrimitiveDataTypeBool::get_supported_anonymous_value_string_formats_bool`
+// is [Bool, Binary, Decimal, Hexadecimal]; numerics drop the Bool head;
+// strings carry String alone.
+machine SymbolRegistry::seed_bool(&mut self, data_type_id: &[u8], unit_size_in_bytes: u64) {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::new(
+        data_type_id, data_type_id, unit_size_in_bytes,
+        AnonymousValueStringFormat::Bool, Endian::Little, false, false);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Bool);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Binary);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Decimal);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Hexadecimal);
+    self.store_builtin_type(&descriptor);
+}
+
+machine SymbolRegistry::seed_numeric(&mut self, data_type_id: &[u8], unit_size_in_bytes: u64, endian: Endian, is_signed: bool) {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::new(
+        data_type_id, data_type_id, unit_size_in_bytes,
+        AnonymousValueStringFormat::Decimal, endian, false, is_signed);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Binary);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Decimal);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Hexadecimal);
+    self.store_builtin_type(&descriptor);
+}
+
+machine SymbolRegistry::seed_float(&mut self, data_type_id: &[u8], unit_size_in_bytes: u64, endian: Endian) {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::new(
+        data_type_id, data_type_id, unit_size_in_bytes,
+        AnonymousValueStringFormat::Decimal, endian, true, true);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Binary);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Decimal);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::Hexadecimal);
+    self.store_builtin_type(&descriptor);
+}
+
+machine SymbolRegistry::seed_string(&mut self, data_type_id: &[u8], unit_size_in_bytes: u64) {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::new(
+        data_type_id, data_type_id, unit_size_in_bytes,
+        AnonymousValueStringFormat::String, Endian::Little, false, false);
+    _ = descriptor.add_supported_format(AnonymousValueStringFormat::String);
+    self.store_builtin_type(&descriptor);
+}
+
+// The shared tail of every seed: descriptor into the descriptor table,
+// then the anonymous single-field struct under the same id. Seeds cannot
+// collide or overflow (21 < 128), so the bound arms are unreachable.
+machine SymbolRegistry::store_builtin_type(&mut self, descriptor: &DataTypeDescriptor) {
+    transition self.data_type_descriptor_count < 128 {
+        true -> descriptor_slot(descriptor, self.data_type_descriptor_count)
+        false -> done()
+    }
+    state descriptor_slot(&mut self, descriptor: &DataTypeDescriptor, position: u64)
+        requires position < 128
+    {
+        self.data_type_descriptors[position].clone_from(descriptor);
+        self.data_type_descriptor_count = position + 1;
+        let data_type_id: &[u8] = descriptor.get_data_type_id();
+        transition {
+            _ -> struct_seed(data_type_id)
+        }
+    }
+    state struct_seed(&mut self, data_type_id: &[u8]) {
+        _ = self.insert_anonymous_data_type_struct(data_type_id);
+        transition {
+            _ -> done()
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `create_anonymous_data_type_symbolic_struct`: an anonymous
+// (empty-namespace) struct of one field — `SymbolicFieldDefinition::new(
+// DataTypeRef::new(data_type_id), ContainerType::None)`.
+machine SymbolRegistry::insert_anonymous_data_type_struct(&mut self, data_type_id: &[u8]) -> bool {
+    let mut definition: SymbolicStructDefinition = SymbolicStructDefinition {
+        symbol_namespace_len: 0,
+        layout_kind: SymbolicLayoutKind::Struct,
+        has_declared_size: false,
+        declared_size_in_bytes: 0,
+        field_count: 0,
+    };
+    let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
+    let field: SymbolicFieldDefinition = SymbolicFieldDefinition::new_defined(
+        "", &data_type_ref, ContainerType::None);
+    _ = definition.add_field(&field);
+    (self.insert_base_struct(data_type_id, &definition))
+}
+
+// Upstream `HashMap::insert` replaces on exact key equality (the raw key,
+// no trim); the bounded table refreshes the matching slot or appends,
+// refusing only at the bound.
+machine SymbolRegistry::insert_base_struct(&mut self, struct_id: &[u8], definition: &SymbolicStructDefinition) -> bool {
+    let existing: u64 = self.find_base_struct_position_exact(struct_id);
+    transition existing == 18446744073709551615 {
+        true -> append(struct_id, definition)
+        false -> replace(existing, struct_id, definition)
+    }
+    state append(&mut self, struct_id: &[u8], definition: &SymbolicStructDefinition) -> bool {
+        transition self.symbolic_struct_count < 128 {
+            true -> slot(struct_id, definition, self.symbolic_struct_count)
+            false -> (false)
+        }
+    }
+    state slot(&mut self, struct_id: &[u8], definition: &SymbolicStructDefinition, position: u64) -> bool
+        requires position < 128
+    {
+        self.symbolic_structs[position] = StructLayoutDescriptor::new(struct_id, definition);
+        self.symbolic_struct_count = position + 1;
+        (true)
+    }
+    state replace(&mut self, position: u64, struct_id: &[u8], definition: &SymbolicStructDefinition) -> bool {
+        transition position < 128 && position < self.symbolic_struct_count {
+            true -> write(position, struct_id, definition)
+            _ -> (false)
+        }
+    }
+    state write(&mut self, position: u64, struct_id: &[u8], definition: &SymbolicStructDefinition) -> bool
+        requires position < 128 && position < self.symbolic_struct_count
+    {
+        self.symbolic_structs[position] = StructLayoutDescriptor::new(struct_id, definition);
+        (true)
+    }
+}
+
+machine SymbolRegistry::find_base_struct_position(&self, struct_id: &[u8]) -> u64 {
+    transition {
+        _ -> scan(struct_id, 0)
+    }
+    state scan(&self, struct_id: &[u8], position: u64) -> u64 {
+        transition position < self.symbolic_struct_count && position < 128 {
+            true -> probe(struct_id, position)
+            false -> (18446744073709551615)
+        }
+    }
+    state probe(&self, struct_id: &[u8], position: u64) -> u64
+        requires position < self.symbolic_struct_count && position < 128
+    {
+        transition ids_equal(self.symbolic_structs[position].get_struct_layout_id(), struct_id) {
+            true -> (position)
+            false -> scan(struct_id, position + 1)
+            _ -> scan(struct_id, position + 1)
+        }
+    }
+}
+
+// Exact-key variant of the base find — the probe is the raw insert key,
+// matching `HashMap::insert`'s replacement rule (no trim).
+machine SymbolRegistry::find_base_struct_position_exact(&self, struct_id: &[u8]) -> u64 {
+    transition {
+        _ -> scan(struct_id, 0)
+    }
+    state scan(&self, struct_id: &[u8], position: u64) -> u64 {
+        transition position < self.symbolic_struct_count && position < 128 {
+            true -> probe(struct_id, position)
+            false -> (18446744073709551615)
+        }
+    }
+    state probe(&self, struct_id: &[u8], position: u64) -> u64
+        requires position < self.symbolic_struct_count && position < 128
+    {
+        transition bytes_equal(self.symbolic_structs[position].get_struct_layout_id(), struct_id) {
+            true -> (position)
+            false -> scan(struct_id, position + 1)
+            _ -> scan(struct_id, position + 1)
+        }
+    }
+}
+
+machine SymbolRegistry::find_project_struct_position(&self, struct_id: &[u8]) -> u64 {
+    transition {
+        _ -> scan(struct_id, 0)
+    }
+    state scan(&self, struct_id: &[u8], position: u64) -> u64 {
+        transition position < self.project_symbolic_struct_count && position < 128 {
+            true -> probe(struct_id, position)
+            false -> (18446744073709551615)
+        }
+    }
+    state probe(&self, struct_id: &[u8], position: u64) -> u64
+        requires position < self.project_symbolic_struct_count && position < 128
+    {
+        transition ids_equal(self.project_symbolic_structs[position].get_struct_layout_id(), struct_id) {
+            true -> (position)
+            false -> scan(struct_id, position + 1)
+            _ -> scan(struct_id, position + 1)
+        }
+    }
+}
+
+machine SymbolRegistry::find_data_type_descriptor_position(&self, data_type_id: &[u8]) -> u64 {
+    transition {
+        _ -> scan(data_type_id, 0)
+    }
+    state scan(&self, data_type_id: &[u8], position: u64) -> u64 {
+        transition position < self.data_type_descriptor_count && position < 128 {
+            true -> probe(data_type_id, position)
+            false -> (18446744073709551615)
+        }
+    }
+    state probe(&self, data_type_id: &[u8], position: u64) -> u64
+        requires position < self.data_type_descriptor_count && position < 128
+    {
+        transition ids_equal(self.data_type_descriptors[position].get_data_type_id(), data_type_id) {
+            true -> (position)
+            false -> scan(data_type_id, position + 1)
+            _ -> scan(data_type_id, position + 1)
+        }
+    }
+}
+
+// The membership surface of upstream's dropped `data_type_registry`: the
+// builtin ids are the only registered data types a headless session can
+// hold. Plugin-registered ids rejoin when the Plugins domain lands.
+pub machine SymbolRegistry::is_registered_data_type(&self, data_type_id: &[u8]) -> bool {
+    (self.is_builtin_data_type_id(data_type_id))
+}
+
+// Upstream `built_in_data_type_ids` — the fixed key set seeded by
+// `create_built_in_registries` (the dyn values it pairs with are the
+// deferred residual documented on the record).
+pub machine SymbolRegistry::is_builtin_data_type_id(&self, data_type_id: &[u8]) -> bool {
+    transition ids_equal("bool8", data_type_id) {
+        true -> (true)
+        _ -> check_bool32(data_type_id)
+    }
+    state check_bool32(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("bool32", data_type_id) {
+            true -> (true)
+            _ -> check_i8(data_type_id)
+        }
+    }
+    state check_i8(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("i8", data_type_id) {
+            true -> (true)
+            _ -> check_i16(data_type_id)
+        }
+    }
+    state check_i16(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("i16", data_type_id) {
+            true -> (true)
+            _ -> check_i16be(data_type_id)
+        }
+    }
+    state check_i16be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("i16be", data_type_id) {
+            true -> (true)
+            _ -> check_i32(data_type_id)
+        }
+    }
+    state check_i32(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("i32", data_type_id) {
+            true -> (true)
+            _ -> check_i32be(data_type_id)
+        }
+    }
+    state check_i32be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("i32be", data_type_id) {
+            true -> (true)
+            _ -> check_i64(data_type_id)
+        }
+    }
+    state check_i64(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("i64", data_type_id) {
+            true -> (true)
+            _ -> check_i64be(data_type_id)
+        }
+    }
+    state check_i64be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("i64be", data_type_id) {
+            true -> (true)
+            _ -> check_u8(data_type_id)
+        }
+    }
+    state check_u8(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("u8", data_type_id) {
+            true -> (true)
+            _ -> check_u16(data_type_id)
+        }
+    }
+    state check_u16(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("u16", data_type_id) {
+            true -> (true)
+            _ -> check_u16be(data_type_id)
+        }
+    }
+    state check_u16be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("u16be", data_type_id) {
+            true -> (true)
+            _ -> check_u32(data_type_id)
+        }
+    }
+    state check_u32(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("u32", data_type_id) {
+            true -> (true)
+            _ -> check_u32be(data_type_id)
+        }
+    }
+    state check_u32be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("u32be", data_type_id) {
+            true -> (true)
+            _ -> check_u64(data_type_id)
+        }
+    }
+    state check_u64(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("u64", data_type_id) {
+            true -> (true)
+            _ -> check_u64be(data_type_id)
+        }
+    }
+    state check_u64be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("u64be", data_type_id) {
+            true -> (true)
+            _ -> check_f32(data_type_id)
+        }
+    }
+    state check_f32(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("f32", data_type_id) {
+            true -> (true)
+            _ -> check_f32be(data_type_id)
+        }
+    }
+    state check_f32be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("f32be", data_type_id) {
+            true -> (true)
+            _ -> check_f64(data_type_id)
+        }
+    }
+    state check_f64(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("f64", data_type_id) {
+            true -> (true)
+            _ -> check_f64be(data_type_id)
+        }
+    }
+    state check_f64be(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("f64be", data_type_id) {
+            true -> (true)
+            _ -> check_string_utf8(data_type_id)
+        }
+    }
+    state check_string_utf8(&self, data_type_id: &[u8]) -> bool {
+        transition ids_equal("string_utf8", data_type_id) {
+            true -> (true)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `register_symbolic_struct`: refuse when the (trimmed) id names
+// a registered data type, else insert/replace into the base map.
+pub machine SymbolRegistry::register_symbolic_struct(&mut self, symbolic_struct_id: &[u8], symbolic_struct_definition: &SymbolicStructDefinition) -> bool {
+    transition self.is_registered_data_type(symbolic_struct_id) {
+        true -> (false)
+        _ -> insert(symbolic_struct_id, symbolic_struct_definition)
+    }
+    state insert(&mut self, symbolic_struct_id: &[u8], symbolic_struct_definition: &SymbolicStructDefinition) -> bool {
+        (self.insert_base_struct(symbolic_struct_id, symbolic_struct_definition))
+    }
+}
+
+// Upstream `unregister_symbolic_struct`: same data-type guard, then
+// `map.remove(trimmed).is_some()`. The table's swap-remove has no order —
+// neither does the upstream map.
+pub machine SymbolRegistry::unregister_symbolic_struct(&mut self, symbolic_struct_id: &[u8]) -> bool {
+    transition self.is_registered_data_type(symbolic_struct_id) {
+        true -> (false)
+        _ -> lookup(symbolic_struct_id)
+    }
+    state lookup(&mut self, symbolic_struct_id: &[u8]) -> bool {
+        let position: u64 = self.find_base_struct_position(symbolic_struct_id);
+        transition position == 18446744073709551615 {
+            true -> (false)
+            _ -> remove(position)
+        }
+    }
+    state remove(&mut self, position: u64) -> bool {
+        transition position < self.symbolic_struct_count && position < 128 {
+            true -> swap(position)
+            _ -> (false)
+        }
+    }
+    state swap(&mut self, position: u64) -> bool
+        requires position < self.symbolic_struct_count && position < 128
+    {
+        transition 0 < self.symbolic_struct_count {
+            true -> choose(position)
+            _ -> (false)
+        }
+    }
+    state choose(&mut self, position: u64) -> bool
+        requires position < self.symbolic_struct_count && position < 128 && 0 < self.symbolic_struct_count
+    {
+        transition position + 1 < self.symbolic_struct_count {
+            true -> move_last(position)
+            false -> shorten()
+        }
+    }
+    // Swap-remove: the last live slot's content moves into `position`,
+    // then the count drops — content-equivalent to upstream's map remove.
+    state move_last(&mut self, position: u64) -> bool
+        requires position < self.symbolic_struct_count && position < 128 && 0 < self.symbolic_struct_count
+    {
+        let last: u64 = self.symbolic_struct_count - 1;
+        transition last < 128 {
+            true -> apply(position, last)
+            _ -> (false)
+        }
+    }
+    state apply(&mut self, position: u64, last: u64) -> bool
+        requires position < 128 && last < 128
+    {
+        let mut held: StructLayoutDescriptor = StructLayoutDescriptor::default();
+        held.clone_from(&self.symbolic_structs[last]);
+        self.symbolic_structs[position].clone_from(&held);
+        self.symbolic_struct_count = last;
+        (true)
+    }
+    state shorten(&mut self) -> bool {
+        transition 0 < self.symbolic_struct_count {
+            true -> apply_shorten()
+            _ -> (true)
+        }
+    }
+    state apply_shorten(&mut self) -> bool
+        requires 0 < self.symbolic_struct_count
+    {
+        self.symbolic_struct_count = self.symbolic_struct_count - 1;
+        (true)
+    }
+}
+
+// Upstream `register_data_type_descriptor`: refuse when the (trimmed) id
+// names a registered data type, else insert the descriptor plus an
+// anonymous struct under the same id.
+pub machine SymbolRegistry::register_data_type_descriptor(&mut self, data_type_descriptor: &DataTypeDescriptor) -> bool {
+    transition self.is_registered_data_type(data_type_descriptor.get_data_type_id()) {
+        true -> (false)
+        _ -> lookup(data_type_descriptor)
+    }
+    state lookup(&mut self, data_type_descriptor: &DataTypeDescriptor) -> bool {
+        transition self.data_type_descriptor_count < 128 {
+            true -> store(data_type_descriptor, self.data_type_descriptor_count)
+            false -> (false)
+        }
+    }
+    state store(&mut self, data_type_descriptor: &DataTypeDescriptor, position: u64) -> bool
+        requires position < 128
+    {
+        self.data_type_descriptors[position].clone_from(data_type_descriptor);
+        self.data_type_descriptor_count = position + 1;
+        (self.insert_anonymous_data_type_struct(data_type_descriptor.get_data_type_id()))
+    }
+}
+
+// Upstream `unregister_data_type_descriptor`: refuse when the (trimmed)
+// id names a registered data type, else remove the descriptor and the
+// anonymous struct it rode in on. Upstream's swap semantics: the map has
+// no order; the table's swap-remove is the same content.
+pub machine SymbolRegistry::unregister_data_type_descriptor(&mut self, data_type_id: &[u8]) -> bool {
+    transition self.is_registered_data_type(data_type_id) {
+        true -> (false)
+        _ -> lookup(data_type_id)
+    }
+    state lookup(&mut self, data_type_id: &[u8]) -> bool {
+        let position: u64 = self.find_data_type_descriptor_position(data_type_id);
+        transition position == 18446744073709551615 {
+            true -> (false)
+            _ -> remove(position, data_type_id)
+        }
+    }
+    state remove(&mut self, position: u64, data_type_id: &[u8]) -> bool {
+        transition position < self.data_type_descriptor_count && position < 128 {
+            true -> swap(position, data_type_id)
+            _ -> (false)
+        }
+    }
+    state swap(&mut self, position: u64, data_type_id: &[u8]) -> bool
+        requires position < self.data_type_descriptor_count && position < 128
+    {
+        transition 0 < self.data_type_descriptor_count {
+            true -> choose(position, data_type_id)
+            _ -> (false)
+        }
+    }
+    state choose(&mut self, position: u64, data_type_id: &[u8]) -> bool
+        requires position < self.data_type_descriptor_count && position < 128 && 0 < self.data_type_descriptor_count
+    {
+        transition position + 1 < self.data_type_descriptor_count {
+            true -> move_last(position, data_type_id)
+            false -> shorten(data_type_id)
+        }
+    }
+    state move_last(&mut self, position: u64, data_type_id: &[u8]) -> bool
+        requires position < self.data_type_descriptor_count && position < 128 && 0 < self.data_type_descriptor_count
+    {
+        let last: u64 = self.data_type_descriptor_count - 1;
+        transition last < 128 {
+            true -> apply(position, last, data_type_id)
+            _ -> (false)
+        }
+    }
+    state apply(&mut self, position: u64, last: u64, data_type_id: &[u8]) -> bool
+        requires position < 128 && last < 128
+    {
+        let mut held: DataTypeDescriptor = DataTypeDescriptor::default();
+        held.clone_from(&self.data_type_descriptors[last]);
+        self.data_type_descriptors[position].clone_from(&held);
+        self.data_type_descriptor_count = last;
+        (self.unregister_symbolic_struct(data_type_id))
+    }
+    state shorten(&mut self, data_type_id: &[u8]) -> bool {
+        transition 0 < self.data_type_descriptor_count {
+            true -> apply_shorten(data_type_id)
+            _ -> (self.unregister_symbolic_struct(data_type_id))
+        }
+    }
+    state apply_shorten(&mut self, data_type_id: &[u8]) -> bool
+        requires 0 < self.data_type_descriptor_count
+    {
+        self.data_type_descriptor_count = self.data_type_descriptor_count - 1;
+        (self.unregister_symbolic_struct(data_type_id))
+    }
+}
+
+// Upstream `get` — base map first, then project (the lookup side keeps
+// upstream's read order; only the merged enumeration is project-wins).
+// The `parse_inline_symbolic_struct_definition` fallback is a named
+// residual (it needs the definition's `from_str`).
+pub machine SymbolRegistry::get_symbolic_struct_definition(&self, symbolic_struct_id: &[u8], out: &mut SymbolicStructDefinition) -> bool {
+    let base_position: u64 = self.find_base_struct_position(symbolic_struct_id);
+    transition base_position == 18446744073709551615 {
+        true -> project(symbolic_struct_id, out)
+        false -> base(base_position, out)
+    }
+    state base(&self, position: u64, out: &mut SymbolicStructDefinition) -> bool {
+        transition position < 128 && position < self.symbolic_struct_count {
+            true -> read_base(position, out)
+            _ -> (false)
+        }
+    }
+    state read_base(&self, position: u64, out: &mut SymbolicStructDefinition) -> bool
+        requires position < 128 && position < self.symbolic_struct_count
+    {
+        out.clone_from(self.symbolic_structs[position].get_struct_layout_definition());
+        (true)
+    }
+    state project(&self, symbolic_struct_id: &[u8], out: &mut SymbolicStructDefinition) -> bool {
+        let project_position: u64 = self.find_project_struct_position(symbolic_struct_id);
+        transition project_position == 18446744073709551615 {
+            true -> (false)
+            _ -> found(project_position, out)
+        }
+    }
+    state found(&self, position: u64, out: &mut SymbolicStructDefinition) -> bool {
+        transition position < 128 && position < self.project_symbolic_struct_count {
+            true -> read_project(position, out)
+            _ -> (false)
+        }
+    }
+    state read_project(&self, position: u64, out: &mut SymbolicStructDefinition) -> bool
+        requires position < 128 && position < self.project_symbolic_struct_count
+    {
+        out.clone_from(self.project_symbolic_structs[position].get_struct_layout_definition());
+        (true)
+    }
+}
+
+// Upstream `set_project_symbol_catalog`: build the next project map from
+// the catalog's struct-layout descriptors, skipping empty ids and ids
+// colliding with the data-type registry or a base symbolic struct, then
+// replace wholesale. The port counts the accepted descriptors first so a
+// bound overflow refuses without mutating (upstream's unbounded map
+// cannot refuse — the only false arm upstream is the lock failure).
+// Accepted ids store trimmed, matching upstream's `trim().to_string()`
+// map keys.
+pub machine SymbolRegistry::set_project_symbol_catalog(&mut self, project_symbol_catalog: &ProjectSymbolCatalog) -> bool {
+    let accepted: u64 = self.count_accepted_project_descriptors(project_symbol_catalog);
+    transition accepted <= 128 {
+        true -> replace(project_symbol_catalog)
+        false -> (false)
+    }
+    state replace(&mut self, project_symbol_catalog: &ProjectSymbolCatalog) -> bool {
+        self.project_symbolic_struct_count = 0;
+        transition {
+            _ -> each(project_symbol_catalog, 0)
+        }
+    }
+    state each(&mut self, project_symbol_catalog: &ProjectSymbolCatalog, position: u64) -> bool {
+        transition position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 {
+            true -> consider(project_symbol_catalog, position)
+            false -> (true)
+        }
+    }
+    state consider(&mut self, project_symbol_catalog: &ProjectSymbolCatalog, position: u64) -> bool
+        requires position < 128 && position < project_symbol_catalog.struct_layout_descriptor_count
+    {
+        let descriptor: &StructLayoutDescriptor = project_symbol_catalog.get_struct_layout_descriptor(position);
+        transition self.accepts_project_descriptor(descriptor.get_struct_layout_id()) {
+            true -> store(project_symbol_catalog, position)
+            false -> each(project_symbol_catalog, position + 1)
+            _ -> each(project_symbol_catalog, position + 1)
+        }
+    }
+    state store(&mut self, project_symbol_catalog: &ProjectSymbolCatalog, position: u64) -> bool
+        requires position < 128 && position < project_symbol_catalog.struct_layout_descriptor_count
+    {
+        let descriptor: &StructLayoutDescriptor = project_symbol_catalog.get_struct_layout_descriptor(position);
+        transition self.project_symbolic_struct_count < 128 {
+            true -> slot(descriptor, self.project_symbolic_struct_count, position, project_symbol_catalog)
+            false -> (false)
+        }
+    }
+    state slot(&mut self, descriptor: &StructLayoutDescriptor, target: u64, position: u64, project_symbol_catalog: &ProjectSymbolCatalog) -> bool
+        requires target < 128 && position < 128
+    {
+        // Upstream keys the project map on the trimmed id — the stored
+        // descriptor carries that trimmed window so later lookups/catalog
+        // emission see the same id.
+        let raw_id: &[u8] = descriptor.get_struct_layout_id();
+        let id_start: u64 = count_leading_whitespace(raw_id);
+        let id_end: u64 = find_trim_end(raw_id, id_start);
+        transition id_start <= id_end && id_end <= raw_id.len {
+            true -> apply_trim(descriptor, target, raw_id, id_start, id_end, project_symbol_catalog, position)
+            _ -> each(project_symbol_catalog, position + 1)
+        }
+    }
+    state apply_trim(&mut self, descriptor: &StructLayoutDescriptor, target: u64, raw_id: &[u8], id_start: u64, id_end: u64, project_symbol_catalog: &ProjectSymbolCatalog, position: u64) -> bool
+        requires target < 128 && position < 128 && id_start <= id_end && id_end <= raw_id.len
+    {
+        self.project_symbolic_structs[target].clone_from(descriptor);
+        self.project_symbolic_structs[target].set_struct_layout_id(&raw_id[id_start..id_end]);
+        self.project_symbolic_struct_count = target + 1;
+        transition {
+            _ -> each(project_symbol_catalog, position + 1)
+        }
+    }
+}
+
+machine SymbolRegistry::count_accepted_project_descriptors(&self, project_symbol_catalog: &ProjectSymbolCatalog) -> u64 {
+    transition {
+        _ -> each(project_symbol_catalog, 0, 0)
+    }
+    state each(&self, project_symbol_catalog: &ProjectSymbolCatalog, position: u64, accepted: u64) -> u64
+        requires accepted <= position
+    {
+        transition position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 {
+            true -> consider(project_symbol_catalog, position, accepted)
+            false -> (accepted)
+        }
+    }
+    state consider(&self, project_symbol_catalog: &ProjectSymbolCatalog, position: u64, accepted: u64) -> u64
+        requires position < 128 && position < project_symbol_catalog.struct_layout_descriptor_count && accepted <= position
+    {
+        let descriptor: &StructLayoutDescriptor = project_symbol_catalog.get_struct_layout_descriptor(position);
+        transition self.accepts_project_descriptor(descriptor.get_struct_layout_id()) {
+            true -> each(project_symbol_catalog, position + 1, accepted + 1)
+            false -> each(project_symbol_catalog, position + 1, accepted)
+            _ -> each(project_symbol_catalog, position + 1, accepted)
+        }
+    }
+}
+
+// The `set_project_symbol_catalog` filter, upstream order: drop ids empty
+// after trim, then ids colliding with the data-type registry, then ids
+// colliding with a base symbolic struct.
+machine SymbolRegistry::accepts_project_descriptor(&self, struct_id: &[u8]) -> bool {
+    transition is_empty_after_trim(struct_id) {
+        true -> (false)
+        _ -> check_data_type(struct_id)
+    }
+    state check_data_type(&self, struct_id: &[u8]) -> bool {
+        transition self.is_registered_data_type(struct_id) {
+            true -> (false)
+            _ -> check_base(struct_id)
+        }
+    }
+    state check_base(&self, struct_id: &[u8]) -> bool {
+        transition self.find_base_struct_position(struct_id) == 18446744073709551615 {
+            true -> (true)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `create_registry_catalog(generation)`: collect the descriptor
+// table and the merged symbolic-struct view, each sorted by id. The
+// merged view is upstream `get_registry` — base map extended by the
+// project map, so project entries shadow base entries on exact key
+// collision; the base pass here skips ids the project table shadows.
+pub machine SymbolRegistry::create_registry_catalog(&self, generation: u64) -> PrivilegedRegistryCatalog {
+    let mut catalog: PrivilegedRegistryCatalog = PrivilegedRegistryCatalog::new(generation);
+    transition {
+        _ -> data_types(&mut catalog, 0)
+    }
+    state data_types(&self, catalog: &mut PrivilegedRegistryCatalog, position: u64) -> PrivilegedRegistryCatalog {
+        transition position < self.data_type_descriptor_count && position < 128 {
+            true -> add_type(catalog, position)
+            false -> structs(catalog, 0)
+        }
+    }
+    state add_type(&self, catalog: &mut PrivilegedRegistryCatalog, position: u64) -> PrivilegedRegistryCatalog
+        requires position < 128 && position < self.data_type_descriptor_count
+    {
+        _ = catalog.add_data_type_descriptor(&self.data_type_descriptors[position]);
+        transition {
+            _ -> data_types(catalog, position + 1)
+        }
+    }
+    state structs(&self, catalog: &mut PrivilegedRegistryCatalog, position: u64) -> PrivilegedRegistryCatalog {
+        transition position < self.symbolic_struct_count && position < 128 {
+            true -> maybe_add_base(catalog, position)
+            false -> projects(catalog, 0)
+        }
+    }
+    state maybe_add_base(&self, catalog: &mut PrivilegedRegistryCatalog, position: u64) -> PrivilegedRegistryCatalog
+        requires position < 128 && position < self.symbolic_struct_count
+    {
+        transition self.is_shadowed_by_project(self.symbolic_structs[position].get_struct_layout_id()) {
+            true -> structs(catalog, position + 1)
+            false -> add_base(catalog, position)
+            _ -> structs(catalog, position + 1)
+        }
+    }
+    state add_base(&self, catalog: &mut PrivilegedRegistryCatalog, position: u64) -> PrivilegedRegistryCatalog
+        requires position < 128 && position < self.symbolic_struct_count
+    {
+        _ = catalog.add_struct_layout_descriptor(&self.symbolic_structs[position]);
+        transition {
+            _ -> structs(catalog, position + 1)
+        }
+    }
+    state projects(&self, catalog: &mut PrivilegedRegistryCatalog, position: u64) -> PrivilegedRegistryCatalog {
+        transition position < self.project_symbolic_struct_count && position < 128 {
+            true -> add_project(catalog, position)
+            false -> finish(catalog)
+        }
+    }
+    state add_project(&self, catalog: &mut PrivilegedRegistryCatalog, position: u64) -> PrivilegedRegistryCatalog
+        requires position < 128 && position < self.project_symbolic_struct_count
+    {
+        _ = catalog.add_struct_layout_descriptor(&self.project_symbolic_structs[position]);
+        transition {
+            _ -> projects(catalog, position + 1)
+        }
+    }
+    state finish(&self, catalog: &mut PrivilegedRegistryCatalog) -> PrivilegedRegistryCatalog {
+        catalog.sort_data_type_descriptors();
+        catalog.sort_struct_layout_descriptors();
+        let mut sorted: PrivilegedRegistryCatalog = PrivilegedRegistryCatalog::default();
+        sorted.clone_from(catalog);
+        transition {
+            _ -> (sorted)
+        }
+    }
+}
+
+// Exact-key shadow check for the merged view (`HashMap::extend` compares
+// keys exactly — no trim).
+machine SymbolRegistry::is_shadowed_by_project(&self, struct_id: &[u8]) -> bool {
+    transition {
+        _ -> scan(struct_id, 0)
+    }
+    state scan(&self, struct_id: &[u8], position: u64) -> bool {
+        transition position < self.project_symbolic_struct_count && position < 128 {
+            true -> probe(struct_id, position)
+            false -> (false)
+        }
+    }
+    state probe(&self, struct_id: &[u8], position: u64) -> bool
+        requires position < 128 && position < self.project_symbolic_struct_count
+    {
+        transition bytes_equal(self.project_symbolic_structs[position].get_struct_layout_id(), struct_id) {
+            true -> (true)
+            false -> scan(struct_id, position + 1)
+            _ -> scan(struct_id, position + 1)
+        }
+    }
+}
+
+// Upstream `apply_registry_catalog`: replace the project map with the
+// catalog's struct-layout descriptors that do not collide with base ids,
+// and replace the descriptor table with the catalog's. Both writes are
+// wholesale; the 128-slot tables match the catalog's bounds, so the
+// upstream infallibility holds.
+pub machine SymbolRegistry::apply_registry_catalog(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog) {
+    let accepted: u64 = self.count_catalog_accepted_structs(privileged_registry_catalog);
+    transition {
+        _ -> replace_projects(privileged_registry_catalog, 0)
+    }
+    state replace_projects(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64) {
+        transition position < privileged_registry_catalog.struct_layout_descriptor_count && position < 128 {
+            true -> consider(privileged_registry_catalog, position)
+            false -> descriptors(privileged_registry_catalog)
+        }
+    }
+    state consider(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64)
+        requires position < 128 && position < privileged_registry_catalog.struct_layout_descriptor_count
+    {
+        let descriptor: &StructLayoutDescriptor = privileged_registry_catalog.get_struct_layout_descriptor(position);
+        transition self.find_base_struct_position(descriptor.get_struct_layout_id()) == 18446744073709551615 {
+            true -> store(privileged_registry_catalog, position)
+            _ -> replace_projects(privileged_registry_catalog, position + 1)
+        }
+    }
+    state store(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64)
+        requires position < 128 && position < privileged_registry_catalog.struct_layout_descriptor_count
+    {
+        transition self.project_symbolic_struct_count < 128 {
+            true -> slot(privileged_registry_catalog, position, self.project_symbolic_struct_count)
+            false -> replace_projects(privileged_registry_catalog, position + 1)
+        }
+    }
+    state slot(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64, target: u64)
+        requires target < 128 && position < 128 && position < privileged_registry_catalog.struct_layout_descriptor_count
+    {
+        self.project_symbolic_structs[target].clone_from(privileged_registry_catalog.get_struct_layout_descriptor(position));
+        self.project_symbolic_struct_count = target + 1;
+        transition {
+            _ -> replace_projects(privileged_registry_catalog, position + 1)
+        }
+    }
+    state descriptors(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog) {
+        self.data_type_descriptor_count = 0;
+        transition {
+            _ -> each_descriptor(privileged_registry_catalog, 0)
+        }
+    }
+    state each_descriptor(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64) {
+        transition position < privileged_registry_catalog.data_type_descriptor_count && position < 128 {
+            true -> store_descriptor(privileged_registry_catalog, position)
+            false -> done()
+        }
+    }
+    state store_descriptor(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64)
+        requires position < 128 && position < privileged_registry_catalog.data_type_descriptor_count
+    {
+        transition self.data_type_descriptor_count < 128 {
+            true -> apply(privileged_registry_catalog, position, self.data_type_descriptor_count)
+            false -> each_descriptor(privileged_registry_catalog, position + 1)
+        }
+    }
+    state apply(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64, target: u64)
+        requires target < 128 && position < 128 && position < privileged_registry_catalog.data_type_descriptor_count
+    {
+        // Direct field read — `get_data_type_descriptor`'s requires
+        // instantiates as `self.data_type_descriptor_count`, which collides
+        // with this registry's own field and can't be proved; the enclosing
+        // transition already bounds `position` by the same count.
+        self.data_type_descriptors[target].clone_from(&privileged_registry_catalog.data_type_descriptors[position]);
+        self.data_type_descriptor_count = target + 1;
+        transition {
+            _ -> each_descriptor(privileged_registry_catalog, position + 1)
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Counts the catalog struct descriptors that survive the base-id filter —
+// the pre-pass that keeps `apply_registry_catalog`'s project replace
+// atomic over the bounded table.
+machine SymbolRegistry::count_catalog_accepted_structs(&self, privileged_registry_catalog: &PrivilegedRegistryCatalog) -> u64 {
+    transition {
+        _ -> each(privileged_registry_catalog, 0, 0)
+    }
+    state each(&self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64, accepted: u64) -> u64
+        requires accepted <= position
+    {
+        transition position < privileged_registry_catalog.struct_layout_descriptor_count && position < 128 {
+            true -> consider(privileged_registry_catalog, position, accepted)
+            false -> (accepted)
+        }
+    }
+    state consider(&self, privileged_registry_catalog: &PrivilegedRegistryCatalog, position: u64, accepted: u64) -> u64
+        requires position < 128 && position < privileged_registry_catalog.struct_layout_descriptor_count && accepted <= position
+    {
+        let descriptor: &StructLayoutDescriptor = privileged_registry_catalog.get_struct_layout_descriptor(position);
+        transition self.find_base_struct_position(descriptor.get_struct_layout_id()) == 18446744073709551615 {
+            true -> each(privileged_registry_catalog, position + 1, accepted + 1)
+            _ -> each(privileged_registry_catalog, position + 1, accepted)
+        }
+    }
+}
+
+// Table sizes for the session-facing surface.
+pub machine SymbolRegistry::get_symbolic_struct_count(&self) -> u64 {
+    (self.symbolic_struct_count)
+}
+
+pub machine SymbolRegistry::get_project_symbolic_struct_count(&self) -> u64 {
+    (self.project_symbolic_struct_count)
+}
+
+pub machine SymbolRegistry::get_data_type_descriptor_count(&self) -> u64 {
+    (self.data_type_descriptor_count)
+}
+
+// Upstream `.trim()` semantics on the probe side of a lookup: whitespace
+// is the byte-domain subset of char::is_whitespace (9/10/11/12/13/32),
+// same as the numeric parser's split predicate.
+machine is_whitespace_byte(byte: u8) -> bool {
+    (byte == 32 || byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13)
+}
+
+machine count_leading_whitespace(value: &[u8]) -> u64 {
+    transition {
+        _ -> scan(value, 0)
+    }
+    state scan(value: &[u8], position: u64) -> u64 {
+        transition position < value.len {
+            true -> probe(value, position)
+            false -> (value.len)
+        }
+    }
+    state probe(value: &[u8], position: u64) -> u64
+        requires position < value.len
+    {
+        transition is_whitespace_byte(value[position]) {
+            true -> scan(value, position + 1)
+            _ -> (position)
+        }
+    }
+}
+
+// Forward-walker shape of upstream `end -= 1 while whitespace`: keeps the
+// boundary one past the last non-whitespace byte in [start, len) — the
+// result is identical and the slice probe stays on param indices.
+machine find_trim_end(value: &[u8], start: u64) -> u64 {
+    transition {
+        _ -> scan(value, start, start)
+    }
+    state scan(value: &[u8], position: u64, last_end: u64) -> u64 {
+        transition position < value.len {
+            true -> probe(value, position, last_end)
+            false -> (last_end)
+        }
+    }
+    state probe(value: &[u8], position: u64, last_end: u64) -> u64
+        requires position < value.len
+    {
+        transition is_whitespace_byte(value[position]) {
+            true -> scan(value, position + 1, last_end)
+            _ -> scan(value, position + 1, position + 1)
+        }
+    }
+}
+
+machine is_empty_after_trim(value: &[u8]) -> bool {
+    let start: u64 = count_leading_whitespace(value);
+    let end: u64 = find_trim_end(value, start);
+    (end == start)
+}
+
+// The lookup equality used everywhere upstream writes `map.get(key.trim())`:
+// stored ids compare raw; the probe compares its trimmed window.
+machine ids_equal(stored: &[u8], key: &[u8]) -> bool {
+    let key_start: u64 = count_leading_whitespace(key);
+    let key_end: u64 = find_trim_end(key, key_start);
+    transition {
+        _ -> compare(stored, key, key_end, 0, key_start)
+    }
+    state compare(stored: &[u8], key: &[u8], key_end: u64, offset: u64, key_position: u64) -> bool {
+        transition offset < stored.len && key_position < key_end && key_position < key.len {
+            true -> step(stored, key, key_end, offset, key_position)
+            false -> finish(stored, key_end, offset, key_position)
+        }
+    }
+    state step(stored: &[u8], key: &[u8], key_end: u64, offset: u64, key_position: u64) -> bool
+        requires offset < stored.len && key_position < key.len
+    {
+        transition stored[offset] == key[key_position] {
+            true -> compare(stored, key, key_end, offset + 1, key_position + 1)
+            _ -> (false)
+        }
+    }
+    state finish(stored: &[u8], key_end: u64, offset: u64, key_position: u64) -> bool {
+        (offset == stored.len && key_position == key_end)
+    }
+}
+
+// Exact byte equality for the merged view's shadow rule — upstream map
+// key equality trims nothing.
+machine bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    transition (left.len == right.len) {
+        true -> scan(left, right, 0)
+        false -> (false)
+    }
+    state scan(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition (position < left.len && position < right.len) {
+            true -> compare(left, right, position)
+            false -> (true)
+        }
+    }
+    state compare(left: &[u8], right: &[u8], position: u64) -> bool
+        requires 0 <= position && position < left.len && position < right.len
+    {
+        transition (left[position] == right[position]) {
+            true -> (scan(left, right, position + 1))
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
