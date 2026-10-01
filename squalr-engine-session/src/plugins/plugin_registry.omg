@@ -1,0 +1,960 @@
+module src::plugins::plugin_registry;
+
+use squalr_engine_api::src::commands::plugins::set_order::plugin_set_order_request::PluginSetOrderRequest;
+use squalr_engine_api::src::plugins::plugin_activation_state::PluginActivationState;
+use squalr_engine_api::src::plugins::plugin_capability::PluginCapability;
+use squalr_engine_api::src::plugins::plugin_id::PluginId;
+use squalr_engine_api::src::plugins::plugin_metadata::PluginMetadata;
+use squalr_engine_api::src::plugins::plugin_permission::PluginPermission;
+use squalr_engine_api::src::plugins::plugin_state::PluginState;
+
+// Port of plugins/plugin_registry.rs. The bounded-metadata port:
+// - `plugin_packages: Vec<Arc<dyn PluginPackage>>` maps to a 8-slot seed
+//   table of `PluginMetadata` — the command surface only ever reads
+//   metadata (list/set_enabled/set_order), so the record carries the
+//   same 7 builtin packages `get_builtin_plugin_packages()` returns.
+// - `enabled_plugin_ids: RwLock<HashSet<String>>` maps to a parallel
+//   `is_enabled` flag per seed entry.
+// - `plugin_order: RwLock<Vec<String>>` maps to a position permutation —
+//   the port orders positions, not ids, since the seed table is closed.
+// - `data_type_plugin_ids_by_data_type_id` maps to a bounded pair table
+//   rebuilt the same way (ordered packages, first-wins).
+//
+// Documented deviations (dyn plugin surfaces are absent headless):
+// - `as_*_plugin`/`can_attach`/`symbol_tree_actions`/`contributed_*` dyn
+//   calls have no plugin-host correspondent: `get_plugin_states` reports
+//   `PluginActivationState::Idle` for every entry (upstream's activation
+//   path requires a live memory-view/debugger plugin instance).
+// - `register_plugin_data_types` (the contribution of u24/i_* descriptors
+//   into the SymbolRegistry) is deferred to the plugin-host leg — the
+//   descriptor impls do not exist. The ownership TABLE is carried so
+//   `is_data_type_enabled` keeps upstream's real enablement semantics.
+// - `find_instruction_set`/`find_memory_view_plugin_package`/
+//   `find_debugger_plugin_package`/`get_enabled_symbol_tree_actions`/
+//   `plugin_action_has_required_permissions` arrive with the plugin-host
+//   leg (selection needs the plugin impls, not just metadata).
+
+// The 7 upstream builtin package entries in `get_builtin_plugin_packages`
+// order. Table is 8 slots so registration-order append keeps a spare.
+pub data PluginRegistry {
+    plugins: [PluginMetadata; 8];
+    plugin_count: u64;
+    is_enabled: [bool; 8];
+    plugin_order: [u64; 8];
+    plugin_order_count: u64;
+    data_type_ids: [[u8; 64]; 16];
+    data_type_id_lens: [u64; 16];
+    data_type_plugin_positions: [u64; 16];
+    data_type_count: u64;
+}
+
+pub machine PluginRegistry::new() -> PluginRegistry {
+    let mut registry: PluginRegistry = PluginRegistry {
+        plugin_count: 0,
+        plugin_order_count: 0,
+        data_type_count: 0,
+    };
+    registry.seed_builtins();
+    (registry)
+}
+
+pub machine PluginRegistry::default() -> PluginRegistry {
+    (PluginRegistry::new())
+}
+
+// `get_builtin_plugin_packages()` — one seed state per package, upstream
+// registration order. Each seed fills the metadata carrier and the
+// enabled flag (`is_enabled_by_default`) plus its order position and
+// contributed data-type pairs.
+machine PluginRegistry::seed_builtins(&mut self) {
+    transition { _ -> seed_dolphin() }
+
+    state seed_dolphin(&mut self) {
+        let mut metadata: PluginMetadata = PluginMetadata::new("builtin.memory-view.dolphin", "Dolphin Memory View", "Exposes Dolphin emulator memory as a canonical virtual address space.", true, true);
+        _ = metadata.add_plugin_capability(PluginCapability::MemoryView);
+        _ = metadata.add_plugin_permission(PluginPermission::ReadProcessMemory);
+        _ = metadata.add_plugin_permission(PluginPermission::WriteProcessMemory);
+        self.plugins[0].clone_from(&metadata);
+        self.is_enabled[0] = true;
+        self.plugin_order[0] = 0;
+        transition { _ -> seed_24bit() }
+    }
+
+    state seed_24bit(&mut self) {
+        let mut metadata: PluginMetadata = PluginMetadata::new("builtin.data-type.24bit-integers", "24-bit Integers", "Adds u24, u24be, i24, and i24be scan and formatting support.", true, false);
+        _ = metadata.add_plugin_capability(PluginCapability::DataType);
+        self.plugins[1].clone_from(&metadata);
+        self.is_enabled[1] = false;
+        self.plugin_order[1] = 1;
+        transition { _ -> seed_arm() }
+    }
+
+    state seed_arm(&mut self) {
+        let mut metadata: PluginMetadata = PluginMetadata::new("builtin.instruction-set.arm-family", "ARM Instructions", "Adds ARM32, Thumb, and ARM64 instruction data types with built-in assembly/disassembly support for common control-flow and load/store forms.", true, true);
+        _ = metadata.add_plugin_capability(PluginCapability::DataType);
+        _ = metadata.add_plugin_capability(PluginCapability::InstructionSet);
+        self.plugins[2].clone_from(&metadata);
+        self.is_enabled[2] = true;
+        self.plugin_order[2] = 2;
+        transition { _ -> seed_powerpc() }
+    }
+
+    state seed_powerpc(&mut self) {
+        let mut metadata: PluginMetadata = PluginMetadata::new("builtin.instruction-set.powerpc-family", "PowerPC Instructions", "Adds PowerPC instruction data types with built-in assembly/disassembly support for common branch, arithmetic, and load/store forms.", true, true);
+        _ = metadata.add_plugin_capability(PluginCapability::DataType);
+        _ = metadata.add_plugin_capability(PluginCapability::InstructionSet);
+        self.plugins[3].clone_from(&metadata);
+        self.is_enabled[3] = true;
+        self.plugin_order[3] = 3;
+        transition { _ -> seed_x86() }
+    }
+
+    state seed_x86(&mut self) {
+        let mut metadata: PluginMetadata = PluginMetadata::new("builtin.instruction-set.x86-family", "x86/x64 Instructions", "Adds x86 and x64 instruction data types with built-in assembly/disassembly support for common immediate/register forms.", true, true);
+        _ = metadata.add_plugin_capability(PluginCapability::DataType);
+        _ = metadata.add_plugin_capability(PluginCapability::InstructionSet);
+        self.plugins[4].clone_from(&metadata);
+        self.is_enabled[4] = true;
+        self.plugin_order[4] = 4;
+        transition { _ -> seed_binary_symbols() }
+    }
+
+    state seed_binary_symbols(&mut self) {
+        let mut metadata: PluginMetadata = PluginMetadata::new("builtin.symbols.binary", "Binary Symbols", "Populates common binary image structures into module symbol trees.", true, true);
+        _ = metadata.add_plugin_capability(PluginCapability::SymbolTree);
+        _ = metadata.add_plugin_permission(PluginPermission::ReadSymbolStore);
+        _ = metadata.add_plugin_permission(PluginPermission::WriteSymbolStore);
+        _ = metadata.add_plugin_permission(PluginPermission::ReadSymbolTreeWindow);
+        _ = metadata.add_plugin_permission(PluginPermission::WriteSymbolTreeWindow);
+        _ = metadata.add_plugin_permission(PluginPermission::ReadProcessMemory);
+        self.plugins[5].clone_from(&metadata);
+        self.is_enabled[5] = true;
+        self.plugin_order[5] = 5;
+        transition { _ -> seed_debuggers() }
+    }
+
+    state seed_debuggers(&mut self) {
+        let mut metadata: PluginMetadata = PluginMetadata::new("builtin.debuggers.native", "Native Debuggers", "Built-in native debugger backends for supported platforms.", true, true);
+        _ = metadata.add_plugin_capability(PluginCapability::Debugger);
+        _ = metadata.add_plugin_permission(PluginPermission::AttachDebugger);
+        _ = metadata.add_plugin_permission(PluginPermission::ControlDebuggerExecution);
+        _ = metadata.add_plugin_permission(PluginPermission::ManageDebuggerBreakpoints);
+        _ = metadata.add_plugin_permission(PluginPermission::ReadRegisters);
+        _ = metadata.add_plugin_permission(PluginPermission::WriteRegisters);
+        self.plugins[6].clone_from(&metadata);
+        self.is_enabled[6] = true;
+        self.plugin_order[6] = 6;
+        self.plugin_count = 7;
+        self.plugin_order_count = 7;
+        transition { _ -> seed_data_types(0, 0) }
+    }
+
+    // `build_data_type_plugin_ids_by_data_type_id` — walks the seeded
+    // package order (positions 0..count) and first-wins each package's
+    // contributed data-type ids. The contribution lists are the constant
+    // `*_DATA_TYPE_IDS` tables in each builtin's constants.rs.
+    state seed_data_types(&mut self, position: u64, index: u64) {
+        transition position < self.plugin_count && position < 8 && index < 16 {
+            true -> seed_data_type_pair(position, index)
+            _ -> done()
+        }
+    }
+
+    state seed_data_type_pair(&mut self, position: u64, index: u64)
+        requires position < 8 && index < 16
+    {
+        transition index < self.contributed_data_type_count(position) && self.data_type_count < 16 {
+            true -> insert_pair(position, index)
+            _ -> advance(position)
+        }
+    }
+
+    state insert_pair(&mut self, position: u64, index: u64)
+        requires position < 8 && index < 16
+    {
+        transition self.data_type_count < 16 {
+            true -> store_pair(position, index)
+            _ -> next_index(position, index)
+        }
+    }
+
+    state store_pair(&mut self, position: u64, index: u64)
+        requires position < 8 && index < 16 && self.data_type_count < 16
+    {
+        self.store_contributed_id(position, index);
+        transition { _ -> next_index(position, index) }
+    }
+
+    state next_index(&mut self, position: u64, index: u64)
+        requires position < 8 && index < 16
+    {
+        let next_index: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_index < 16 {
+            true -> seed_data_type_pair(position, next_index)
+            _ -> advance(position)
+        }
+    }
+
+    state advance(&mut self, position: u64)
+        requires position < 8
+    {
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_position < 16 {
+            true -> seed_data_types(next_position, 0)
+            _ -> done()
+        }
+    }
+
+    state done(&mut self) {}
+}
+
+// The contributed data-type id list per seed position — the constant
+// `*_DATA_TYPE_IDS` tables (24bit: u24/u24be/i24/i24be; arm: i_arm/i_thumb/
+// i_arm64; powerpc: i_ppc32be; x86: i_x86/i_x64; others: none).
+machine PluginRegistry::contributed_data_type_count(&self, position: u64) -> u64 {
+    transition position {
+        1 -> (4)
+        2 -> (3)
+        3 -> (1)
+        4 -> (2)
+        _ -> (0)
+    }
+}
+
+// Byte/len view of each contributed id — value-returning accessors so
+// callers never hold a `&[u8]` loan across a mutation of the pair table
+// (the checked borrow rule rejects write-while-borrowed shapes).
+machine PluginRegistry::contributed_data_type_len(&self, position: u64, index: u64) -> u64 {
+    transition position {
+        1 -> len_24bit(index)
+        2 -> len_arm(index)
+        3 -> len_powerpc(index)
+        4 -> len_x86(index)
+        _ -> (0)
+    }
+    state len_24bit(&self, index: u64) -> u64 {
+        transition index {
+            0 -> (3)
+            1 -> (5)
+            2 -> (3)
+            3 -> (5)
+            _ -> (0)
+        }
+    }
+    state len_arm(&self, index: u64) -> u64 {
+        transition index {
+            0 -> (5)
+            1 -> (7)
+            2 -> (7)
+            _ -> (0)
+        }
+    }
+    state len_powerpc(&self, index: u64) -> u64 {
+        transition index {
+            0 -> (9)
+            _ -> (0)
+        }
+    }
+    state len_x86(&self, index: u64) -> u64 {
+        transition index {
+            0 -> (5)
+            1 -> (4)
+            _ -> (0)
+        }
+    }
+}
+
+// "u24" "u24be" "i24" "i24be" / "i_arm" "i_thumb" "i_arm64" / "i_ppc32be"
+// / "i_x86" "i_x64" — each id's ASCII bytes by (position, index, char_pos).
+machine PluginRegistry::contributed_data_type_byte(&self, position: u64, index: u64, char_pos: u64) -> u8 {
+    transition position {
+        1 -> byte_24bit(index, char_pos)
+        2 -> byte_arm(index, char_pos)
+        3 -> byte_powerpc(index, char_pos)
+        4 -> byte_x86(index, char_pos)
+        _ -> (0)
+    }
+    state byte_24bit(&self, index: u64, char_pos: u64) -> u8 {
+        transition index {
+            0 -> u24(char_pos)
+            1 -> u24be(char_pos)
+            2 -> i24(char_pos)
+            3 -> i24be(char_pos)
+            _ -> (0)
+        }
+    }
+    state u24(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (117)
+            1 -> (50)
+            2 -> (52)
+            _ -> (0)
+        }
+    }
+    state u24be(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (117)
+            1 -> (50)
+            2 -> (52)
+            3 -> (98)
+            4 -> (101)
+            _ -> (0)
+        }
+    }
+    state i24(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (50)
+            2 -> (52)
+            _ -> (0)
+        }
+    }
+    state i24be(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (50)
+            2 -> (52)
+            3 -> (98)
+            4 -> (101)
+            _ -> (0)
+        }
+    }
+    state byte_arm(&self, index: u64, char_pos: u64) -> u8 {
+        transition index {
+            0 -> i_arm(char_pos)
+            1 -> i_thumb(char_pos)
+            2 -> i_arm64(char_pos)
+            _ -> (0)
+        }
+    }
+    state i_arm(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (95)
+            2 -> (97)
+            3 -> (114)
+            4 -> (109)
+            _ -> (0)
+        }
+    }
+    state i_thumb(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (95)
+            2 -> (116)
+            3 -> (104)
+            4 -> (117)
+            5 -> (109)
+            6 -> (98)
+            _ -> (0)
+        }
+    }
+    state i_arm64(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (95)
+            2 -> (97)
+            3 -> (114)
+            4 -> (109)
+            5 -> (54)
+            6 -> (52)
+            _ -> (0)
+        }
+    }
+    state byte_powerpc(&self, index: u64, char_pos: u64) -> u8 {
+        transition index {
+            0 -> i_ppc32be(char_pos)
+            _ -> (0)
+        }
+    }
+    state i_ppc32be(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (95)
+            2 -> (112)
+            3 -> (112)
+            4 -> (99)
+            5 -> (51)
+            6 -> (50)
+            7 -> (98)
+            8 -> (101)
+            _ -> (0)
+        }
+    }
+    state byte_x86(&self, index: u64, char_pos: u64) -> u8 {
+        transition index {
+            0 -> i_x86(char_pos)
+            1 -> i_x64(char_pos)
+            _ -> (0)
+        }
+    }
+    state i_x86(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (95)
+            2 -> (120)
+            3 -> (56)
+            4 -> (54)
+            _ -> (0)
+        }
+    }
+    state i_x64(&self, char_pos: u64) -> u8 {
+        transition char_pos {
+            0 -> (105)
+            1 -> (95)
+            2 -> (120)
+            3 -> (54)
+            4 -> (52)
+            _ -> (0)
+        }
+    }
+}
+
+// Writes the contributed id at `data_type_count` — the shared insert for
+// the seed walk and `set_plugin_order`'s ownership rebuild.
+machine PluginRegistry::store_contributed_id(&mut self, position: u64, index: u64)
+    requires position < 8 && index < 16 && self.data_type_count < 16
+{
+    let id_len: u64 = self.contributed_data_type_len(position, index);
+    self.data_type_id_lens[self.data_type_count] = id_len;
+    self.data_type_plugin_positions[self.data_type_count] = position;
+    transition { _ -> copy_bytes(position, index, self.data_type_count, id_len, 0) }
+    state copy_bytes(&mut self, position: u64, index: u64, slot: u64, id_len: u64, char_pos: u64)
+        requires position < 8 && index < 16 && slot < 16
+    {
+        transition char_pos < id_len && char_pos < 64 {
+            true -> write_byte(position, index, slot, id_len, char_pos)
+            _ -> bump()
+        }
+    }
+    state write_byte(&mut self, position: u64, index: u64, slot: u64, id_len: u64, char_pos: u64)
+        requires position < 8 && index < 16 && slot < 16 && char_pos < 64 && char_pos < id_len
+    {
+        let byte: u8 = self.contributed_data_type_byte(position, index, char_pos);
+        self.data_type_ids[slot][char_pos] = byte;
+        transition {
+            _ -> copy_bytes(position, index, slot, id_len, ((char_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state bump(&mut self) {
+        self.data_type_count = ((self.data_type_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    }
+}
+
+// `entry(id).or_insert(owner)` — the dedup probe for a contributed id:
+// walks the pair table comparing len + bytes via the value accessors.
+machine PluginRegistry::contributed_id_matches_slot(&self, position: u64, index: u64, pair: u64) -> bool
+    requires position < 8 && index < 16 && pair < 16
+{
+    let id_len: u64 = self.contributed_data_type_len(position, index);
+    transition id_len == self.data_type_id_lens[pair] {
+        true -> scan(position, index, pair, 0)
+        _ -> (false)
+    }
+    state scan(&self, position: u64, index: u64, pair: u64, char_pos: u64) -> bool
+        requires position < 8 && index < 16 && pair < 16
+    {
+        transition char_pos < self.data_type_id_lens[pair] && char_pos < 64 && position < 8 && index < 16 && pair < 16 {
+            true -> compare(position, index, pair, char_pos)
+            _ -> (true)
+        }
+    }
+    state compare(&self, position: u64, index: u64, pair: u64, char_pos: u64) -> bool
+        requires position < 8 && index < 16 && pair < 16 && char_pos < 64
+    {
+        let byte: u8 = self.contributed_data_type_byte(position, index, char_pos);
+        transition byte == self.data_type_ids[pair][char_pos] {
+            true -> scan(position, index, pair, ((char_pos as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+machine PluginRegistry::find_contributed_position(&self, position: u64, index: u64) -> u64 {
+    transition { _ -> scan(position, index, 0) }
+    state scan(&self, position: u64, index: u64, pair: u64) -> u64 {
+        transition pair < self.data_type_count && pair < 16 && position < 8 && index < 16 {
+            true -> probe(position, index, pair)
+            _ -> (self.data_type_count)
+        }
+    }
+    state probe(&self, position: u64, index: u64, pair: u64) -> u64
+        requires position < 8 && index < 16 && pair < 16
+    {
+        transition self.contributed_id_matches_slot(position, index, pair) {
+            true -> (pair)
+            _ -> scan(position, index, ((pair as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// `plugin_packages.iter().find(|p| p.metadata().get_plugin_id() == id)` —
+// returns the seed position or `plugin_count` as the none-found sentinel.
+machine PluginRegistry::find_plugin_position(&self, plugin_id: &[u8]) -> u64 {
+    transition { _ -> scan(plugin_id, 0) }
+    state scan(&self, plugin_id: &[u8], position: u64) -> u64 {
+        transition position < self.plugin_count && position < 8 {
+            true -> probe(plugin_id, position)
+            _ -> (self.plugin_count)
+        }
+    }
+    state probe(&self, plugin_id: &[u8], position: u64) -> u64
+        requires position < 8
+    {
+        transition spans_equal(self.plugins[position].get_plugin_id(), plugin_id) {
+            true -> (position)
+            _ -> scan(plugin_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine spans_equal(left: &[u8], right: &[u8]) -> bool {
+    transition left.len == right.len {
+        true -> scan(left, right, 0)
+        _ -> (false)
+    }
+    state scan(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> compare(left, right, position)
+            _ -> (true)
+        }
+    }
+    state compare(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] == right[position] {
+            true -> scan(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+machine data_type_span_equal(left: &[u8; 64], left_len: u64, right: &[u8]) -> bool {
+    transition left_len == right.len && left_len < 65 {
+        true -> scan(left, right, 0)
+        _ -> (false)
+    }
+    state scan(left: &[u8; 64], right: &[u8], position: u64) -> bool {
+        transition position < right.len && position < 64 {
+            true -> compare(left, right, position)
+            _ -> (true)
+        }
+    }
+    state compare(left: &[u8; 64], right: &[u8], position: u64) -> bool
+        requires position < 64
+    {
+        transition left[position] == right[position] {
+            true -> scan(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// `enabled_plugin_ids.contains` — false on an unknown id.
+pub machine PluginRegistry::is_plugin_enabled(&self, plugin_id: &[u8]) -> bool {
+    let position: u64 = self.find_plugin_position(plugin_id);
+    transition position < self.plugin_count && position < 8 {
+        true -> read(position)
+        _ -> (false)
+    }
+    state read(&self, position: u64) -> bool
+        requires position < 8
+    {
+        (self.is_enabled[position])
+    }
+}
+
+// `set_plugin_enabled` — false when the id names no seed package.
+pub machine PluginRegistry::set_plugin_enabled(&mut self, plugin_id: &[u8], is_enabled: bool) -> bool {
+    let position: u64 = self.find_plugin_position(plugin_id);
+    transition position < self.plugin_count && position < 8 {
+        true -> store(position, is_enabled)
+        _ -> (false)
+    }
+    state store(&mut self, position: u64, is_enabled: bool) -> bool
+        requires position < 8
+    {
+        self.is_enabled[position] = is_enabled;
+        (true)
+    }
+}
+
+// `get_plugin_order()` slot — the position occupying `ordinal`.
+pub machine PluginRegistry::get_ordered_plugin_position(&self, ordinal: u64) -> u64
+    requires ordinal < 8
+{
+    self.plugin_order[ordinal]
+}
+
+pub machine PluginRegistry::get_plugin_count(&self) -> u64 {
+    self.plugin_count
+}
+
+pub machine PluginRegistry::get_plugin_order_count(&self) -> u64 {
+    self.plugin_order_count
+}
+
+// `build_plugin_state` — metadata + enabled flag; activation is `Idle`
+// headless (see the file header — upstream resolves it through live
+// plugin instances that do not exist here).
+pub machine PluginRegistry::get_plugin_state_at(&self, position: u64) -> PluginState
+    requires position < 8
+{
+    (PluginState::new(self.plugins[position].clone(), self.is_enabled[position], PluginActivationState::Idle))
+}
+
+// `get_default_plugin_ids` — every seeded package id in registration
+// order (upstream returns plugin_packages order).
+pub machine PluginRegistry::get_default_plugin_id_at(&self, position: u64) -> PluginId
+    requires position < 8
+{
+    (PluginId::new(self.plugins[position].get_plugin_id()))
+}
+
+// `has_plugin_capability` — the package's capability set contains().
+pub machine PluginRegistry::has_plugin_capability(&self, plugin_id: &[u8], capability: PluginCapability) -> bool {
+    let position: u64 = self.find_plugin_position(plugin_id);
+    transition position < self.plugin_count && position < 8 {
+        true -> read(position, capability)
+        _ -> (false)
+    }
+    state read(&self, position: u64, capability: PluginCapability) -> bool
+        requires position < 8
+    {
+        (self.plugins[position].has_plugin_capability(capability))
+    }
+}
+
+// `has_plugin_permission` — same lookup on the permission set.
+pub machine PluginRegistry::has_plugin_permission(&self, plugin_id: &[u8], permission: PluginPermission) -> bool {
+    let position: u64 = self.find_plugin_position(plugin_id);
+    transition position < self.plugin_count && position < 8 {
+        true -> read(position, permission)
+        _ -> (false)
+    }
+    state read(&self, position: u64, permission: PluginPermission) -> bool
+        requires position < 8
+    {
+        (self.plugins[position].has_plugin_permission(permission))
+    }
+}
+
+// `is_data_type_enabled` — unowned data type ids report enabled
+// (upstream returns true on the None arm); owned ids defer to the owner
+// plugin's enabled flag.
+pub machine PluginRegistry::is_data_type_enabled(&self, data_type_id: &[u8]) -> bool {
+    let pair_position: u64 = self.find_data_type_position(data_type_id);
+    transition pair_position < self.data_type_count && pair_position < 16 {
+        true -> owner(pair_position)
+        _ -> (true)
+    }
+    state owner(&self, pair_position: u64) -> bool
+        requires pair_position < 16
+    {
+        let plugin_position: u64 = self.data_type_plugin_positions[pair_position];
+        transition plugin_position < 8 {
+            true -> read_flag(plugin_position)
+            _ -> (true)
+        }
+    }
+    state read_flag(&self, plugin_position: u64) -> bool
+        requires plugin_position < 8
+    {
+        (self.is_enabled[plugin_position])
+    }
+}
+
+// Map slot for a contributed data type id, `data_type_count` sentinel.
+machine PluginRegistry::find_data_type_position(&self, data_type_id: &[u8]) -> u64 {
+    transition { _ -> scan(data_type_id, 0) }
+    state scan(&self, data_type_id: &[u8], pair_position: u64) -> u64 {
+        transition pair_position < self.data_type_count && pair_position < 16 {
+            true -> probe(data_type_id, pair_position)
+            _ -> (self.data_type_count)
+        }
+    }
+    state probe(&self, data_type_id: &[u8], pair_position: u64) -> u64
+        requires pair_position < 16
+    {
+        transition data_type_span_equal(&self.data_type_ids[pair_position], self.data_type_id_lens[pair_position], data_type_id) {
+            true -> (pair_position)
+            _ -> scan(data_type_id, ((pair_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Scratch for `normalize_plugin_order` — the new order builds here before
+// the no-change comparison; a record (not a bare local) so the `&mut`
+// param shape matches the collection-walk precedent.
+data PluginOrderScratch {
+    order: [u64; 8];
+    count: u64;
+}
+
+// `set_plugin_order` — `normalize_plugin_order` (known unduplicated ids
+// first, missing ids appended in registration order), a no-change early
+// return, then the order store + ownership rebuild. Returns `did_update`.
+// Takes the request record so `get_plugin_id` carries the id bound.
+pub machine PluginRegistry::set_plugin_order(&mut self, request: &PluginSetOrderRequest) -> bool {
+    let mut scratch: PluginOrderScratch = PluginOrderScratch {
+        count: 0,
+    };
+    transition { _ -> normalize(request, &mut scratch, 0) }
+
+    state normalize(&mut self, request: &PluginSetOrderRequest, scratch: &mut PluginOrderScratch, index: u64) -> bool {
+        transition index < request.get_plugin_id_count() && index < 64 && scratch.count < 8 {
+            true -> accept(request, scratch, index)
+            _ -> fill_missing(scratch, 0)
+        }
+    }
+
+    state accept(&mut self, request: &PluginSetOrderRequest, scratch: &mut PluginOrderScratch, index: u64) -> bool
+        requires index < 64
+    {
+        let plugin_id: &PluginId = request.get_plugin_id(index);
+        let id_bytes: &[u8] = plugin_id.get_plugin_id();
+        let position: u64 = self.find_plugin_position(id_bytes);
+        transition position < self.plugin_count && position < 8 {
+            true -> maybe_push(request, scratch, index, position)
+            _ -> skip(request, scratch, index)
+        }
+    }
+
+    state maybe_push(&mut self, request: &PluginSetOrderRequest, scratch: &mut PluginOrderScratch, index: u64, position: u64) -> bool
+        requires index < 64 && position < 8
+    {
+        transition self.order_contains(scratch, position) {
+            true -> skip(request, scratch, index)
+            _ -> push(request, scratch, index, position)
+        }
+    }
+
+    state push(&mut self, request: &PluginSetOrderRequest, scratch: &mut PluginOrderScratch, index: u64, position: u64) -> bool
+        requires index < 64 && position < 8
+    {
+        let count: u64 = scratch.count;
+        transition count < 8 {
+            true -> store_at(request, scratch, index, position, count)
+            _ -> skip(request, scratch, index)
+        }
+    }
+
+    state store_at(&mut self, request: &PluginSetOrderRequest, scratch: &mut PluginOrderScratch, index: u64, position: u64, count: u64) -> bool
+        requires index < 64 && position < 8 && count < 8
+    {
+        scratch.order[count] = position;
+        scratch.count = ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> skip(request, scratch, index) }
+    }
+
+    state skip(&mut self, request: &PluginSetOrderRequest, scratch: &mut PluginOrderScratch, index: u64) -> bool
+        requires index < 64
+    {
+        let next_index: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_index < 64 {
+            true -> normalize(request, scratch, next_index)
+            _ -> fill_missing(scratch, 0)
+        }
+    }
+
+    state fill_missing(&mut self, scratch: &mut PluginOrderScratch, position: u64) -> bool {
+        transition position < self.plugin_count && position < 8 {
+            true -> maybe_push_missing(scratch, position)
+            _ -> changed(scratch)
+        }
+    }
+
+    state maybe_push_missing(&mut self, scratch: &mut PluginOrderScratch, position: u64) -> bool
+        requires position < 8
+    {
+        transition self.order_contains(scratch, position) {
+            true -> advance_missing(scratch, position)
+            _ -> push_missing(scratch, position)
+        }
+    }
+
+    state push_missing(&mut self, scratch: &mut PluginOrderScratch, position: u64) -> bool
+        requires position < 8
+    {
+        let count: u64 = scratch.count;
+        transition count < 8 {
+            true -> store_missing(scratch, position, count)
+            _ -> advance_missing(scratch, position)
+        }
+    }
+
+    state store_missing(&mut self, scratch: &mut PluginOrderScratch, position: u64, count: u64) -> bool
+        requires position < 8 && count < 8
+    {
+        scratch.order[count] = position;
+        scratch.count = ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> advance_missing(scratch, position) }
+    }
+
+    state advance_missing(&mut self, scratch: &mut PluginOrderScratch, position: u64) -> bool
+        requires position < 8
+    {
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_position < 16 {
+            true -> fill_missing(scratch, next_position)
+            _ -> changed(scratch)
+        }
+    }
+
+    // `*plugin_order == normalized` -> false (upstream's no-op early return).
+    state changed(&mut self, scratch: &mut PluginOrderScratch) -> bool {
+        transition scratch.count == self.plugin_order_count && self.orders_equal(scratch) {
+            true -> (false)
+            _ -> commit(scratch)
+        }
+    }
+
+    state commit(&mut self, scratch: &mut PluginOrderScratch) -> bool {
+        transition { _ -> copy_order(scratch, 0) }
+    }
+
+    state copy_order(&mut self, scratch: &mut PluginOrderScratch, index: u64) -> bool {
+        transition index < scratch.count && index < 8 {
+            true -> store_order(scratch, index)
+            _ -> finish_order(scratch)
+        }
+    }
+
+    state store_order(&mut self, scratch: &mut PluginOrderScratch, index: u64) -> bool
+        requires index < 8
+    {
+        self.plugin_order[index] = scratch.order[index];
+        transition {
+            _ -> copy_order(scratch, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state finish_order(&mut self, scratch: &mut PluginOrderScratch) -> bool {
+        self.plugin_order_count = scratch.count;
+        transition { _ -> rebuild() }
+    }
+
+    // `*data_type_plugin_ids_by_data_type_id = build(ordered_packages)` —
+    // ordered positions first, first-wins per id.
+    state rebuild(&mut self) -> bool {
+        self.data_type_count = 0;
+        transition { _ -> rebuild_order(0, 0) }
+    }
+
+    state rebuild_order(&mut self, ordinal: u64, index: u64) -> bool {
+        transition ordinal < self.plugin_order_count && ordinal < 8 {
+            true -> rebuild_entry(ordinal, index)
+            _ -> (true)
+        }
+    }
+
+    state rebuild_entry(&mut self, ordinal: u64, index: u64) -> bool
+        requires ordinal < 8 && index < 16
+    {
+        let position: u64 = self.plugin_order[ordinal];
+        transition position < 8 {
+            true -> rebuild_check(ordinal, position, index)
+            _ -> rebuild_advance(ordinal)
+        }
+    }
+
+    state rebuild_check(&mut self, ordinal: u64, position: u64, index: u64) -> bool
+        requires ordinal < 8 && position < 8 && index < 16
+    {
+        transition index < self.contributed_data_type_count(position) {
+            true -> rebuild_insert(ordinal, position, index)
+            _ -> rebuild_advance(ordinal)
+        }
+    }
+
+    state rebuild_insert(&mut self, ordinal: u64, position: u64, index: u64) -> bool
+        requires ordinal < 8 && position < 8 && index < 16
+    {
+        let existing: u64 = self.find_contributed_position(position, index);
+        transition existing < self.data_type_count && existing < 16 {
+            true -> rebuild_next_index(ordinal, position, index)
+            _ -> rebuild_slot(ordinal, position, index)
+        }
+    }
+
+    state rebuild_slot(&mut self, ordinal: u64, position: u64, index: u64) -> bool
+        requires ordinal < 8 && position < 8 && index < 16
+    {
+        transition self.data_type_count < 16 {
+            true -> rebuild_store(ordinal, position, index)
+            _ -> (true)
+        }
+    }
+
+    state rebuild_store(&mut self, ordinal: u64, position: u64, index: u64) -> bool
+        requires ordinal < 8 && position < 8 && index < 16
+    {
+        transition self.data_type_count < 16 {
+            true -> rebuild_commit(ordinal, position, index)
+            _ -> rebuild_next_index(ordinal, position, index)
+        }
+    }
+
+    state rebuild_commit(&mut self, ordinal: u64, position: u64, index: u64) -> bool
+        requires ordinal < 8 && position < 8 && index < 16 && self.data_type_count < 16
+    {
+        self.store_contributed_id(position, index);
+        transition { _ -> rebuild_next_index(ordinal, position, index) }
+    }
+
+    state rebuild_next_index(&mut self, ordinal: u64, position: u64, index: u64) -> bool
+        requires ordinal < 8 && position < 8 && index < 16
+    {
+        let next_index: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_index < 16 {
+            true -> rebuild_entry(ordinal, next_index)
+            _ -> rebuild_advance(ordinal)
+        }
+    }
+
+    state rebuild_advance(&mut self, ordinal: u64) -> bool
+        requires ordinal < 8
+    {
+        let next_ordinal: u64 = ((ordinal as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_ordinal < 16 {
+            true -> rebuild_order(next_ordinal, 0)
+            _ -> (true)
+        }
+    }
+}
+
+machine PluginRegistry::order_contains(&self, scratch: &PluginOrderScratch, position: u64) -> bool {
+    transition { _ -> scan(scratch, position, 0) }
+    state scan(&self, scratch: &PluginOrderScratch, position: u64, index: u64) -> bool {
+        transition index < scratch.count && index < 8 {
+            true -> compare(scratch, position, index)
+            _ -> (false)
+        }
+    }
+    state compare(&self, scratch: &PluginOrderScratch, position: u64, index: u64) -> bool
+        requires index < 8
+    {
+        transition scratch.order[index] == position {
+            true -> (true)
+            _ -> scan(scratch, position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine PluginRegistry::orders_equal(&self, scratch: &PluginOrderScratch) -> bool {
+    transition { _ -> scan(scratch, 0) }
+    state scan(&self, scratch: &PluginOrderScratch, index: u64) -> bool {
+        transition index < scratch.count && index < 8 {
+            true -> compare(scratch, index)
+            _ -> (true)
+        }
+    }
+    state compare(&self, scratch: &PluginOrderScratch, index: u64) -> bool
+        requires index < 8
+    {
+        transition self.plugin_order[index] == scratch.order[index] {
+            true -> scan(scratch, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
