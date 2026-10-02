@@ -1,0 +1,1876 @@
+module src::engine_unprivileged_state;
+
+use squalr_engine_api::src::commands::command_invocation::CommandInvocation;
+use squalr_engine_api::src::commands::command_invocation::CommandInvocationOutcome;
+use squalr_engine_api::src::commands::command_invocation::CommandInvocationDecision;
+use squalr_engine_api::src::commands::command_invocation::CommandInvocationSource;
+use squalr_engine_api::src::commands::command_invocation::CommandResponseDecision;
+use squalr_engine_api::src::commands::command_invocation::EngineCommand;
+use squalr_engine_api::src::commands::command_invocation::EngineCommandResponse;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::engine::engine_event_envelope::EngineEventEnvelope;
+use squalr_engine_api::src::events::engine_event::EngineEvent;
+use squalr_engine_api::src::events::logging::logging_event::LoggingEvent;
+use squalr_engine_api::src::registries::symbols::data_type_descriptor::DataTypeDescriptor;
+use squalr_engine_api::src::registries::symbols::privileged_registry_catalog::PrivilegedRegistryCatalog;
+use squalr_engine_api::src::structures::data_types::built_in_types::primitive_data_type_numeric::AnonymizeResult;
+use squalr_engine_api::src::structures::data_types::built_in_types::primitive_data_type_numeric::DeanonymizeResult;
+use squalr_engine_api::src::structures::data_types::built_in_types::primitive_data_type_numeric::PrimitiveDataTypeNumeric;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_types::floating_point_tolerance::FloatingPointTolerance;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::scanning::comparisons::scan_compare_type::ScanCompareType;
+use squalr_engine_api::src::structures::scanning::constraints::anonymous_scan_constraint::AnonymousScanConstraint;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_builder::ScanConstraintBuild;
+use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_builder::ScanConstraintBuilder;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use src::event_subscribers::event_subscriber_table::EventSubscriberTable;
+use src::logging::log_dispatcher::LogDispatcher;
+use squalr_engine_api::src::events::logging::log_level::LogLevel;
+use squalr_engine_api::src::events::logging::log_recorded_event::LogRecordedEvent;
+use squalr_engine_api::src::events::logging::logging_event::LoggingEvent;
+use src::pending_engine_events::PendingEngineEvents;
+use src::plugins::plugin_registry::PluginRegistry;
+use src::projects::project_manager::ProjectManager;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use src::registries::privileged_registry_cache::PrivilegedRegistryCache;
+use src::virtual_snapshots::virtual_snapshot::VirtualSnapshot;
+use src::virtual_snapshots::virtual_snapshot_materializer::VirtualSnapshotMaterializer;
+use src::virtual_snapshots::virtual_snapshot_query::VirtualSnapshotQuery;
+use src::virtual_snapshots::virtual_snapshot_query_result::VirtualSnapshotQueryResult;
+
+// Port of engine_unprivileged_state.rs — the session-side engine surface:
+// project manager, plugin registry, privileged-registry cache, virtual
+// snapshots, command-invocation middleware, response publication, and
+// engine-event routing.
+//
+// Upstream collaborators that have no Omega counterpart are folded per the
+// epic's documented substitutions:
+//  - `Arc<RwLock<dyn EngineApiUnprivilegedBindings>>` — bindings cannot be
+//    stored (no user dyn traits). The dispatch hop lives at the composition
+//    root: `prepare_*_dispatch` yields a `CommandDispatchPlan` the caller
+//    executes through `EngineApiUnprivilegedBindings` (the standalone
+//    bindings record satisfies the boundary trait in squalr-engine).
+//  - `Box<dyn Fn>` middleware / listener tables — bounded kind-tag tables;
+//    `run_invocation_middleware`/`run_response_middleware`/`run_response_
+//    listener` dispatch on the kind. Kind 0 is the absent-slot sentinel
+//    (Continue/observe-nothing); real kinds land with their consumers.
+//  - `HashMap<TypeId, Vec<Box<dyn Fn(&dyn Any)>>>` event listeners —
+//    `EventSubscriberTable` (interest-bit masks + per-subscriber queues).
+//  - `HashMap<String, VirtualSnapshot>` — bounded 8-slot key/value tables.
+//  - spawned threads (event dispatcher, snapshot materialization,
+//    catalog refresh) — synchronous caller-pumped seams:
+//    `route_engine_event`, `prepare_virtual_snapshot_refresh` +
+//    `finish_virtual_snapshot_refresh`, `needs_privileged_registry_refresh`
+//    + `apply_privileged_registry_catalog`. `Instant`/`Duration` arrive as
+//    `now_millis`/`refresh_interval_millis` u64 parameters.
+//  - `i128` scalar reads — `read_scalar_integer_value` widens to u64+sign.
+//  - `log::error!`/`log::warn!` — routed into `log_dispatcher` history.
+
+// Upstream's local `CommandDispatchPlan` enum — middleware may answer or
+// refuse an invocation before it reaches the bindings. Union payloads are
+// consumed by value at the scrutinee (invocation ownership transfers).
+pub data CommandDispatchPlan {
+    case Dispatch(invocation: CommandInvocation);
+    case Respond(invocation: CommandInvocation, response: EngineCommandResponse);
+    case Reject(invocation: CommandInvocation, reason: [u8; 256], reason_len: u64);
+}
+
+// Upstream `Option<EngineCommandResponse>` from publish — `None` means a
+// middleware suppressed the response.
+pub data CommandPublicationResult {
+    case Delivered(response: EngineCommandResponse);
+    case Suppressed(reason: [u8; 256], reason_len: u64);
+}
+
+// Deanonymize carrier — upstream `Result<DataValue, SymbolRegistryError>`.
+// `SymbolRegistryError` is unported; the failure arm carries the operation
+// and data type id, matching upstream's `data_type_not_registered` payload.
+pub data DeanonymizeValueOutcome {
+    case Value(data_value: DataValue);
+    case NotRegistered(operation: [u8; 64], operation_len: u64, data_type_id: [u8; 128], data_type_id_len: u64);
+}
+
+// Anonymize carrier — upstream `Result<AnonymousValueString,
+// SymbolRegistryError>`, same flattening.
+pub data AnonymizeValueOutcome {
+    case Value(anonymous_value_string: AnonymousValueString);
+    case NotRegistered(operation: [u8; 64], operation_len: u64, data_type_id: [u8; 128], data_type_id_len: u64);
+}
+
+// Scalar-integer read carrier — upstream `Result<Option<i128>,
+// SymbolRegistryError>`: three-valued (error / absent / value). The value
+// widens to u64 magnitude + sign flag (i128 absent).
+pub data ScalarIntegerReadOutcome {
+    case Absent;
+    case Value(magnitude: u64, negative: bool);
+    case NotRegistered(operation: [u8; 64], operation_len: u64, data_type_id: [u8; 128], data_type_id_len: u64);
+}
+
+// Upstream `EngineUnprivilegedStateOptions` — flattened to fields.
+pub data EngineUnprivilegedStateOptions {
+    enable_console_logging: bool;
+}
+
+pub machine EngineUnprivilegedStateOptions::default() -> EngineUnprivilegedStateOptions {
+    EngineUnprivilegedStateOptions { enable_console_logging: true }
+}
+
+pub data EngineUnprivilegedState {
+    // `AtomicU64` — the session is single-owner, plain u64.
+    next_command_invocation_id: u64;
+    // Kind-tag middleware tables (upstream `Vec<Box<dyn Fn>>`).
+    invocation_middleware_kinds: [u64; 16];
+    invocation_middleware_count: u64;
+    response_middleware_kinds: [u64; 16];
+    response_middleware_count: u64;
+    response_listener_kinds: [u64; 16];
+    response_listener_count: u64;
+    // Upstream `event_listeners` TypeId map.
+    event_subscribers: EventSubscriberTable;
+    // Upstream `file_system_logger`.
+    log_dispatcher: LogDispatcher;
+    project_manager: ProjectManager;
+    plugin_registry: PluginRegistry;
+    privileged_registry_cache: PrivilegedRegistryCache;
+    // Upstream `HashMap<String, VirtualSnapshot>` — bounded 8-slot tables.
+    virtual_snapshot_keys: [[u8; 64]; 8];
+    virtual_snapshot_key_lens: [u64; 8];
+    virtual_snapshot_values: [VirtualSnapshot; 8];
+    virtual_snapshot_count: u64;
+}
+
+pub machine EngineUnprivilegedState::new() -> EngineUnprivilegedState {
+    let mut state: EngineUnprivilegedState = EngineUnprivilegedState::new_with_options(
+        EngineUnprivilegedStateOptions::default());
+    state
+}
+
+pub machine EngineUnprivilegedState::new_with_options(
+    options: EngineUnprivilegedStateOptions
+) -> EngineUnprivilegedState {
+    let mut state: EngineUnprivilegedState = EngineUnprivilegedState {
+        next_command_invocation_id: 0,
+        invocation_middleware_count: 0,
+        response_middleware_count: 0,
+        response_listener_count: 0,
+        event_subscribers: EventSubscriberTable::new(),
+        log_dispatcher: LogDispatcher::new_with_options(options.enable_console_logging),
+        project_manager: ProjectManager::new(),
+        plugin_registry: PluginRegistry::new(),
+        privileged_registry_cache: PrivilegedRegistryCache::new(),
+        virtual_snapshot_count: 0,
+    };
+    state.seed_virtual_snapshot_keys();
+    state
+}
+
+// Entry-context initializer — `SqualrEngine` construction happens inside
+// the host entry plan where a structural local or call-source assignment
+// cannot bind, so the same default shape `new_with_options` produces is
+// written field-wise here (mirroring `EnginePrivilegedState::init`).
+pub machine EngineUnprivilegedState::init(&mut self) {
+    self.next_command_invocation_id = 0;
+    self.invocation_middleware_count = 0;
+    self.response_middleware_count = 0;
+    self.response_listener_count = 0;
+    self.event_subscribers = EventSubscriberTable::new();
+    self.log_dispatcher = LogDispatcher::new_with_options(true);
+    self.project_manager = ProjectManager::new();
+    self.plugin_registry = PluginRegistry::new();
+    self.privileged_registry_cache = PrivilegedRegistryCache::new();
+    self.virtual_snapshot_count = 0;
+    self.seed_virtual_snapshot_keys();
+}
+
+machine EngineUnprivilegedState::seed_virtual_snapshot_keys(&mut self) {
+    transition { _ -> walk(0) }
+    state walk(&mut self, position: u64)
+
+    {
+        transition position < 8 {
+            true -> clear(position)
+            false -> done()
+        }
+    }
+    state clear(&mut self, position: u64)
+        requires position < 8;
+    {
+        self.virtual_snapshot_key_lens[position] = 0;
+        transition { _ -> walk(position + 1) }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `initialize` — starts the event dispatcher and refreshes the
+// privileged registry catalog. Both are caller-pumped hops in the port:
+// `route_engine_event` is the dispatcher body, and the catalog refresh is
+// `needs_privileged_registry_refresh` + `apply_privileged_registry_catalog`
+// driven by the composition root. This machine is the upstream lifecycle
+// hook's honest remainder: mark the cache stale so the first
+// `needs_privileged_registry_refresh(expected > 0)` holds, which it already
+// does on a fresh cache (generation 0). Kept as a no-op body is a
+// placeholder — instead it returns whether a catalog sync is owed.
+pub machine EngineUnprivilegedState::initialize(&mut self) -> bool {
+    (self.get_needs_privileged_registry_refresh(1))
+}
+
+pub machine EngineUnprivilegedState::get_logger(&self) -> &LogDispatcher {
+    &self.log_dispatcher
+}
+
+pub machine EngineUnprivilegedState::borrow_log_dispatcher_mut(&mut self) -> &mut LogDispatcher {
+    &mut self.log_dispatcher
+}
+
+pub machine EngineUnprivilegedState::get_project_manager(&self) -> &ProjectManager {
+    &self.project_manager
+}
+
+pub machine EngineUnprivilegedState::borrow_project_manager_mut(&mut self) -> &mut ProjectManager {
+    &mut self.project_manager
+}
+
+pub machine EngineUnprivilegedState::get_plugin_registry(&self) -> &PluginRegistry {
+    &self.plugin_registry
+}
+
+pub machine EngineUnprivilegedState::borrow_plugin_registry_mut(&mut self) -> &mut PluginRegistry {
+    &mut self.plugin_registry
+}
+
+pub machine EngineUnprivilegedState::get_privileged_registry_cache(&self) -> &PrivilegedRegistryCache {
+    &self.privileged_registry_cache
+}
+
+pub machine EngineUnprivilegedState::borrow_privileged_registry_cache_mut(&mut self) -> &mut PrivilegedRegistryCache {
+    &mut self.privileged_registry_cache
+}
+
+pub machine EngineUnprivilegedState::get_event_subscribers(&self) -> &EventSubscriberTable {
+    &self.event_subscribers
+}
+
+pub machine EngineUnprivilegedState::borrow_event_subscribers_mut(&mut self) -> &mut EventSubscriberTable {
+    &mut self.event_subscribers
+}
+
+// ==== Privileged registry cache delegates ====
+
+pub machine EngineUnprivilegedState::get_privileged_registry_generation(&self) -> u64 {
+    self.privileged_registry_cache.get_generation()
+}
+
+pub machine EngineUnprivilegedState::get_has_privileged_registry_catalog(&self) -> bool {
+    self.privileged_registry_cache.get_has_registry_catalog()
+}
+
+pub machine EngineUnprivilegedState::get_privileged_registry_catalog(
+    &self,
+    out_catalog: &mut PrivilegedRegistryCatalog
+) -> bool {
+    transition self.privileged_registry_cache.get_has_registry_catalog() {
+        true -> copy(out_catalog)
+        false -> (false)
+        _ -> (false)
+    }
+    state copy(&self, out_catalog: &mut PrivilegedRegistryCatalog) -> bool {
+        out_catalog.clone_from(self.privileged_registry_cache.get_registry_catalog());
+        (true)
+    }
+}
+
+// Upstream `get_registered_data_type_refs` — count + indexed accessor pairs
+// (bounded, no Vec). Position indexes the merged catalog-first view.
+pub machine EngineUnprivilegedState::get_registered_data_type_ref_count(&self) -> u64 {
+    self.privileged_registry_cache.get_registered_data_type_descriptor_count()
+}
+
+pub machine EngineUnprivilegedState::get_registered_data_type_ref_at(
+    &self,
+    position: u64,
+    out_data_type_ref: &mut DataTypeRef
+) -> bool {
+    transition position < 128 {
+        true -> probe(position, out_data_type_ref)
+        false -> (false)
+        _ -> (false)
+    }
+    state probe(&self, position: u64, out_data_type_ref: &mut DataTypeRef) -> bool
+        requires position < 128;
+    {
+        let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+        transition self.privileged_registry_cache.get_registered_data_type_descriptor_at(position, &mut descriptor) {
+            true -> fill(position, &descriptor, out_data_type_ref)
+            false -> (false)
+        }
+    }
+    state fill(&self, position: u64, descriptor: &DataTypeDescriptor, out_data_type_ref: &mut DataTypeRef) -> bool {
+        out_data_type_ref.set_data_type_id(descriptor.get_data_type_id());
+        (true)
+    }
+}
+
+pub machine EngineUnprivilegedState::is_registered_data_type_ref(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> bool {
+    self.privileged_registry_cache.is_registered_data_type_ref(data_type_ref)
+}
+
+pub machine EngineUnprivilegedState::get_default_anonymous_value_string_format(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> AnonymousValueStringFormat {
+    self.privileged_registry_cache.get_default_anonymous_value_string_format(data_type_ref.get_data_type_id())
+}
+
+pub machine EngineUnprivilegedState::get_supported_anonymous_value_string_format_count(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> u64 {
+    self.privileged_registry_cache.get_supported_anonymous_value_string_format_count(data_type_ref.get_data_type_id())
+}
+
+pub machine EngineUnprivilegedState::get_supported_anonymous_value_string_format_at(
+    &self,
+    data_type_ref: &DataTypeRef,
+    position: u64
+) -> AnonymousValueStringFormat {
+    self.privileged_registry_cache.get_supported_anonymous_value_string_format(data_type_ref.get_data_type_id(), position)
+}
+
+// Upstream `resolve_supported_anonymous_value_string_format`: preferred when
+// empty-or-supported, else the default when supported, else the first
+// supported, else preferred.
+pub machine EngineUnprivilegedState::resolve_supported_anonymous_value_string_format(
+    &self,
+    data_type_ref: &DataTypeRef,
+    preferred_format: AnonymousValueStringFormat
+) -> AnonymousValueStringFormat {
+    let count: u64 = self.get_supported_anonymous_value_string_format_count(data_type_ref);
+    transition count == 0 {
+        true -> (preferred_format)
+        false -> contains_preferred(data_type_ref, preferred_format, count, 0)
+        _ -> (preferred_format)
+    }
+    state contains_preferred(&self,
+        data_type_ref: &DataTypeRef,
+        preferred_format: AnonymousValueStringFormat,
+        count: u64,
+        position: u64
+    ) -> AnonymousValueStringFormat
+
+    {
+        transition position < count && position < 8 {
+            true -> compare_at(data_type_ref, preferred_format, count, position)
+            false -> fallback(data_type_ref, preferred_format, count)
+        }
+    }
+    state compare_at(&self,
+        data_type_ref: &DataTypeRef,
+        preferred_format: AnonymousValueStringFormat,
+        count: u64,
+        position: u64
+    ) -> AnonymousValueStringFormat
+        requires position < count && position < 8;
+    {
+        let format: AnonymousValueStringFormat = self.get_supported_anonymous_value_string_format_at(data_type_ref, position);
+        transition format.get_tag() == preferred_format.get_tag() {
+            true -> (preferred_format)
+            false -> contains_preferred(data_type_ref, preferred_format, count, position + 1)
+        }
+    }
+    state fallback(&self,
+        data_type_ref: &DataTypeRef,
+        preferred_format: AnonymousValueStringFormat,
+        count: u64
+    ) -> AnonymousValueStringFormat {
+        let default_format: AnonymousValueStringFormat = self.get_default_anonymous_value_string_format(data_type_ref);
+        transition { _ -> contains_default(data_type_ref, preferred_format, default_format, count, 0) }
+    }
+    state contains_default(&self,
+        data_type_ref: &DataTypeRef,
+        preferred_format: AnonymousValueStringFormat,
+        default_format: AnonymousValueStringFormat,
+        count: u64,
+        position: u64
+    ) -> AnonymousValueStringFormat
+
+    {
+        transition position < count && position < 8 {
+            true -> compare_default_at(data_type_ref, preferred_format, default_format, count, position)
+            false -> first_or_preferred(data_type_ref, preferred_format, count)
+        }
+    }
+    state compare_default_at(&self,
+        data_type_ref: &DataTypeRef,
+        preferred_format: AnonymousValueStringFormat,
+        default_format: AnonymousValueStringFormat,
+        count: u64,
+        position: u64
+    ) -> AnonymousValueStringFormat
+        requires position < count && position < 8;
+    {
+        let format: AnonymousValueStringFormat = self.get_supported_anonymous_value_string_format_at(data_type_ref, position);
+        transition format.get_tag() == default_format.get_tag() {
+            true -> (default_format)
+            false -> contains_default(data_type_ref, preferred_format, default_format, count, position + 1)
+        }
+    }
+    state first_or_preferred(&self,
+        data_type_ref: &DataTypeRef,
+        preferred_format: AnonymousValueStringFormat,
+        count: u64
+    ) -> AnonymousValueStringFormat {
+        transition count > 0 {
+            true -> (self.get_supported_anonymous_value_string_format_at(data_type_ref, 0))
+            false -> (preferred_format)
+        }
+    }
+}
+
+// Upstream `normalize_anonymous_value_string_format` — rewrites the
+// string's format to the resolved supported one; false when already right.
+pub machine EngineUnprivilegedState::normalize_anonymous_value_string_format(
+    &self,
+    data_type_ref: &DataTypeRef,
+    anonymous_value_string: &mut AnonymousValueString
+) -> bool {
+    let current_format: AnonymousValueStringFormat = anonymous_value_string.get_anonymous_value_string_format();
+    let resolved_format: AnonymousValueStringFormat = self.resolve_supported_anonymous_value_string_format(
+        data_type_ref,
+        current_format);
+    transition resolved_format.get_tag() == current_format.get_tag() {
+        true -> (false)
+        false -> apply(anonymous_value_string, resolved_format)
+        _ -> (false)
+    }
+    state apply(&self, anonymous_value_string: &mut AnonymousValueString, resolved_format: AnonymousValueStringFormat) -> bool {
+        anonymous_value_string.set_anonymous_value_string_format(resolved_format);
+        (true)
+    }
+}
+
+// Upstream `validate_value_string` — the dyn data-type impl validates the
+// text. The port routes through the numeric deanonymizer (the constraint
+// builder's documented convention for the absent per-type impls): a string
+// that deanonymizes for this type validates.
+pub machine EngineUnprivilegedState::validate_value_string(
+    &self,
+    data_type_ref: &DataTypeRef,
+    anonymous_value_string: &AnonymousValueString
+) -> bool {
+    transition self.privileged_registry_cache.is_registered_data_type_ref(data_type_ref) {
+        true -> probe(data_type_ref, anonymous_value_string)
+        false -> (false)
+        _ -> (false)
+    }
+    state probe(&self, data_type_ref: &DataTypeRef, anonymous_value_string: &AnonymousValueString) -> bool {
+        let mut out_bytes: [u8; 4096];
+        let parser: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let unit_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let signed: bool = data_type_ref.is_signed();
+        let result: DeanonymizeResult = parser.deanonymize(
+            anonymous_value_string,
+            big_endian,
+            unit_size,
+            signed,
+            &mut out_bytes);
+        transition result {
+            DeanonymizeResult::Bytes { count } -> (count > 0)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `validate_scan_constraint` — builds a constraint; success means
+// the build yields a constraint.
+pub machine EngineUnprivilegedState::validate_scan_constraint(
+    &self,
+    data_type_ref: &DataTypeRef,
+    scan_compare_type: ScanCompareType,
+    anonymous_value_string: &AnonymousValueString
+) -> bool {
+    let builder: ScanConstraintBuilder = ScanConstraintBuilder::new(FloatingPointTolerance::default());
+    let anonymous_scan_constraint: AnonymousScanConstraint = AnonymousScanConstraint::new(
+        scan_compare_type,
+        AnonymousValueString::clone(anonymous_value_string));
+    let build: ScanConstraintBuild = builder.build(&anonymous_scan_constraint, data_type_ref);
+    transition build {
+        ScanConstraintBuild::Built { value } -> (true)
+        ScanConstraintBuild::BuiltPattern { value } -> (true)
+        _ -> (false)
+    }
+}
+
+pub machine EngineUnprivilegedState::validate_scan_constraint_with_hex_pattern_matching(
+    &self,
+    data_type_ref: &DataTypeRef,
+    scan_compare_type: ScanCompareType,
+    anonymous_value_string: &AnonymousValueString,
+    use_hex_pattern_matching: bool
+) -> bool {
+    let builder: ScanConstraintBuilder = ScanConstraintBuilder::new(FloatingPointTolerance::default());
+    let anonymous_scan_constraint: AnonymousScanConstraint = AnonymousScanConstraint::new(
+        scan_compare_type,
+        AnonymousValueString::clone(anonymous_value_string));
+    let matched_constraint: AnonymousScanConstraint = AnonymousScanConstraint::with_hex_pattern_matching(
+        &anonymous_scan_constraint,
+        use_hex_pattern_matching);
+    let build: ScanConstraintBuild = builder.build(&matched_constraint, data_type_ref);
+    transition build {
+        ScanConstraintBuild::Built { value } -> (true)
+        ScanConstraintBuild::BuiltPattern { value } -> (true)
+        _ -> (false)
+    }
+}
+
+// Upstream `deanonymize_value_string` — numeric-route port (see
+// `validate_value_string` for the convention); non-deanonymizing inputs and
+// unregistered types land on `NotRegistered`.
+pub machine EngineUnprivilegedState::deanonymize_value_string(
+    &self,
+    data_type_ref: &DataTypeRef,
+    anonymous_value_string: &AnonymousValueString,
+    out_operation: &[u8; 64],
+    out_operation_len: &mut u64
+) -> DeanonymizeValueOutcome {
+    out_operation_len = 0;
+    transition self.privileged_registry_cache.is_registered_data_type_ref(data_type_ref) {
+        true -> parse(data_type_ref, anonymous_value_string)
+        false -> refuse(data_type_ref)
+        _ -> refuse(data_type_ref)
+    }
+    state parse(&self, data_type_ref: &DataTypeRef, anonymous_value_string: &AnonymousValueString) -> DeanonymizeValueOutcome {
+        let mut out_bytes: [u8; 4096];
+        let parser: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let unit_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let signed: bool = data_type_ref.is_signed();
+        let result: DeanonymizeResult = parser.deanonymize(
+            anonymous_value_string,
+            big_endian,
+            unit_size,
+            signed,
+            &mut out_bytes);
+        transition result {
+            DeanonymizeResult::Bytes { count } -> wrap_gate(data_type_ref, &out_bytes, count)
+            _ -> refuse(data_type_ref)
+        }
+    }
+    state wrap_gate(&self, data_type_ref: &DataTypeRef, out_bytes: &[u8; 4096], count: u64) -> DeanonymizeValueOutcome {
+        // An over-long producer payload cannot happen upstream (the buffer is
+        // the type ceiling); refusing keeps the bound honest at the slice.
+        transition count <= 4096 {
+            true -> wrap(data_type_ref, &out_bytes, count)
+            _ -> refuse(data_type_ref)
+        }
+    }
+    state wrap(&self, data_type_ref: &DataTypeRef, out_bytes: &[u8; 4096], count: u64) -> DeanonymizeValueOutcome
+        requires count <= 4096;
+    {
+        let data_value: DataValue = DataValue::new(data_type_ref, &out_bytes[0..count]);
+        (DeanonymizeValueOutcome::Value { data_value: data_value })
+    }
+    state refuse(&self, data_type_ref: &DataTypeRef) -> DeanonymizeValueOutcome {
+        let mut data_type_id: [u8; 128];
+        let data_type_id_len: u64 = copy_bounded(data_type_ref.get_data_type_id(), &mut data_type_id);
+        let mut operation: [u8; 64];
+        let operation_len: u64 = copy_bounded("deanonymize_value", &mut operation);
+        (DeanonymizeValueOutcome::NotRegistered {
+            operation: operation,
+            operation_len: operation_len,
+            data_type_id: data_type_id,
+            data_type_id_len: data_type_id_len
+        })
+    }
+}
+
+// Upstream `anonymize_value` — numeric-route port.
+pub machine EngineUnprivilegedState::anonymize_value(
+    &self,
+    data_value: &DataValue,
+    anonymous_value_string_format: AnonymousValueStringFormat
+) -> AnonymizeValueOutcome {
+    let data_type_ref: DataTypeRef = data_value.get_data_type_ref();
+    transition self.privileged_registry_cache.is_registered_data_type_ref(&data_type_ref) {
+        true -> render(&data_type_ref, data_value, anonymous_value_string_format)
+        false -> refuse(&data_type_ref)
+        _ -> refuse(&data_type_ref)
+    }
+    state render(&self,
+        data_type_ref: &DataTypeRef,
+        data_value: &DataValue,
+        anonymous_value_string_format: AnonymousValueStringFormat
+    ) -> AnonymizeValueOutcome {
+        let mut out_text: [u8; 4096];
+        let parser: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let value_bytes: &[u8] = data_value.get_value_bytes();
+        let unit_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let signed: bool = data_type_ref.is_signed();
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let result: AnonymizeResult = parser.anonymize(
+            value_bytes,
+            unit_size,
+            signed,
+            big_endian,
+            anonymous_value_string_format,
+            &mut out_text);
+        transition result {
+            AnonymizeResult::Text { value } -> (AnonymizeValueOutcome::Value { anonymous_value_string: value })
+            _ -> refuse(data_type_ref)
+        }
+    }
+    state refuse(&self, data_type_ref: &DataTypeRef) -> AnonymizeValueOutcome {
+        let mut data_type_id: [u8; 128];
+        let data_type_id_len: u64 = copy_bounded(data_type_ref.get_data_type_id(), &mut data_type_id);
+        let mut operation: [u8; 64];
+        let operation_len: u64 = copy_bounded("anonymize_value", &mut operation);
+        (AnonymizeValueOutcome::NotRegistered {
+            operation: operation,
+            operation_len: operation_len,
+            data_type_id: data_type_id,
+            data_type_id_len: data_type_id_len
+        })
+    }
+}
+
+// Upstream `anonymize_value_to_supported_formats` — renders the value in
+// every supported format; bounded [8].
+pub machine EngineUnprivilegedState::anonymize_value_to_supported_formats(
+    &self,
+    data_value: &DataValue,
+    out_values: &mut [AnonymousValueString; 8]
+) -> u64 {
+    let data_type_ref: DataTypeRef = data_value.get_data_type_ref();
+    let count: u64 = self.get_supported_anonymous_value_string_format_count(&data_type_ref);
+    transition { _ -> walk(&data_type_ref, data_value, out_values, count, 0, 0) }
+    state walk(&self,
+        data_type_ref: &DataTypeRef,
+        data_value: &DataValue,
+        out_values: &mut [AnonymousValueString; 8],
+        count: u64,
+        position: u64,
+        accepted: u64
+    ) -> u64
+    {
+        transition position < count && position < 8 && accepted < 8 {
+            true -> render_at(data_type_ref, data_value, out_values, count, position, accepted)
+            false -> (accepted)
+        }
+    }
+    state render_at(&self,
+        data_type_ref: &DataTypeRef,
+        data_value: &DataValue,
+        out_values: &mut [AnonymousValueString; 8],
+        count: u64,
+        position: u64,
+        accepted: u64
+    ) -> u64
+        requires position < count && position < 8 && accepted < 8;
+    {
+        let format: AnonymousValueStringFormat = self.get_supported_anonymous_value_string_format_at(data_type_ref, position);
+        let mut out_text: [u8; 4096];
+        let parser: PrimitiveDataTypeNumeric = PrimitiveDataTypeNumeric {};
+        let value_bytes: &[u8] = data_value.get_value_bytes();
+        let unit_size: u64 = data_type_ref.get_unit_size_in_bytes();
+        let signed: bool = data_type_ref.is_signed();
+        let big_endian: bool = data_type_ref.is_big_endian();
+        let result: AnonymizeResult = parser.anonymize(
+            value_bytes,
+            unit_size,
+            signed,
+            big_endian,
+            format,
+            &mut out_text);
+        transition result {
+            AnonymizeResult::Text { value } -> store(data_type_ref, data_value, out_values, value, count, position, accepted)
+            _ -> skip(data_type_ref, data_value, out_values, count, position, accepted)
+        }
+    }
+    state store(&self,
+        data_type_ref: &DataTypeRef,
+        data_value: &DataValue,
+        out_values: &mut [AnonymousValueString; 8],
+        anonymous_value_string: &AnonymousValueString,
+        count: u64,
+        position: u64,
+        accepted: u64
+    ) -> u64
+        requires position < count && position < 8 && accepted < 8;
+    {
+        out_values[accepted] = AnonymousValueString::clone(anonymous_value_string);
+        let next_accepted: u64 = accepted + 1;
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(data_type_ref, data_value, out_values, count, next_position, next_accepted) }
+    }
+    state skip(&self,
+        data_type_ref: &DataTypeRef,
+        data_value: &DataValue,
+        out_values: &mut [AnonymousValueString; 8],
+        count: u64,
+        position: u64,
+        accepted: u64
+    ) -> u64
+        requires position < count && position < 8 && accepted < 8;
+    {
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(data_type_ref, data_value, out_values, count, next_position, accepted) }
+    }
+}
+
+// Upstream `supports_scalar_integer_values` — dyn type impl; the port's
+// honest reduction is the descriptor's signedness (floating-point types and
+// unregistered ids report false, matching upstream's `is_some_and` shape
+// for the dominant numeric family).
+pub machine EngineUnprivilegedState::supports_scalar_integer_values(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> bool {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.privileged_registry_cache.find_data_type_descriptor(data_type_ref.get_data_type_id(), &mut descriptor) {
+        true -> check(&descriptor)
+        false -> (false)
+        _ -> (false)
+    }
+    state check(&self, descriptor: &DataTypeDescriptor) -> bool {
+        (descriptor.get_is_signed() && !descriptor.get_is_floating_point())
+    }
+}
+
+// Upstream `read_scalar_integer_value` — dyn per-type reader reduced to the
+// numeric deanonymize of the rendered bytes is not what upstream does
+// (upstream reads the DataValue's stored bytes directly). The port reads
+// the stored value bytes little-endian into u64 magnitude + sign — the
+// i128 read's honest reduction, documented.
+pub machine EngineUnprivilegedState::read_scalar_integer_value(
+    &self,
+    data_value: &DataValue
+) -> ScalarIntegerReadOutcome {
+    let data_type_ref: DataTypeRef = data_value.get_data_type_ref();
+    transition self.privileged_registry_cache.is_registered_data_type_ref(&data_type_ref) {
+        true -> read(&data_type_ref, data_value)
+        false -> refuse(&data_type_ref)
+        _ -> refuse(&data_type_ref)
+    }
+    state read(&self, data_type_ref: &DataTypeRef, data_value: &DataValue) -> ScalarIntegerReadOutcome {
+        transition data_type_ref.get_unit_size_in_bytes() >= 1 && data_type_ref.get_unit_size_in_bytes() <= 8 {
+            true -> assemble(data_type_ref, data_value)
+            false -> (ScalarIntegerReadOutcome::Absent)
+        }
+    }
+    state assemble(&self, data_type_ref: &DataTypeRef, data_value: &DataValue) -> ScalarIntegerReadOutcome {
+        let mut value: u64 = 0;
+        let mut position: u64 = 0;
+        let size: u64 = data_type_ref.get_unit_size_in_bytes();
+        transition data_type_ref.is_big_endian() {
+            true -> be(data_value, size, 0, value)
+            false -> le(data_value, size, 0, value)
+        }
+    }
+    state le(&self, data_value: &DataValue, size: u64, position: u64, value: u64) -> ScalarIntegerReadOutcome
+
+    {
+        let bytes: &[u8] = data_value.get_value_bytes();
+        transition position < size && position < bytes.len && position < 8 {
+            true -> le_byte(data_value, bytes, size, position, value)
+            false -> finish_le(data_value, size, value)
+        }
+    }
+    state le_byte(&self, data_value: &DataValue, bytes: &[u8], size: u64, position: u64, value: u64) -> ScalarIntegerReadOutcome
+        requires position < bytes.len && position < size && position < 8;
+    {
+        let byte_value: u64 = bytes[position] as u64;
+        let shift: u64 = position * 8;
+        let next_value: u64 = value | (byte_value << shift);
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> le(data_value, size, next_position, next_value) }
+    }
+    state be(&self, data_value: &DataValue, size: u64, position: u64, value: u64) -> ScalarIntegerReadOutcome
+
+    {
+        let bytes: &[u8] = data_value.get_value_bytes();
+        transition position < size && position < bytes.len && position < 8 {
+            true -> be_byte(data_value, bytes, size, position, value)
+            false -> finish_be(data_value, size, value)
+        }
+    }
+    state be_byte(&self, data_value: &DataValue, bytes: &[u8], size: u64, position: u64, value: u64) -> ScalarIntegerReadOutcome
+        requires position < bytes.len && position < size && position < 8;
+    {
+        let byte_value: u64 = bytes[position] as u64;
+        let next_value: u64 = (((value as u64 in Wrapping) << 8) | (byte_value as u64 in Wrapping)) as u64;
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> be(data_value, size, next_position, next_value) }
+    }
+    state finish_le(&self, data_value: &DataValue, size: u64, value: u64) -> ScalarIntegerReadOutcome {
+        // Sign-extend when the type is signed and the top bit is set.
+        let sign_bit: u64 = 128;
+        transition data_value.get_data_type_ref().is_signed() && size > 0 && size < 8
+            && (value >> ((size * 8) - 1)) & 1 == 1 {
+            true -> negative(value, size)
+            false -> positive(value, size)
+            _ -> positive(value, size)
+        }
+    }
+    state finish_be(&self, data_value: &DataValue, size: u64, value: u64) -> ScalarIntegerReadOutcome {
+        transition data_value.get_data_type_ref().is_signed() && size > 0 && size < 8
+            && (value >> ((size * 8) - 1)) & 1 == 1 {
+            true -> negative(value, size)
+            false -> positive(value, size)
+            _ -> positive(value, size)
+        }
+    }
+    state negative(&self, value: u64, size: u64) -> ScalarIntegerReadOutcome {
+        // Two's-complement magnitude for the stored width — wrapping negate.
+        let magnitude: u64 = ((0 as u64 in Wrapping) - (value as u64 in Wrapping)) as u64;
+        (ScalarIntegerReadOutcome::Value { magnitude: magnitude, negative: true })
+    }
+    state positive(&self, value: u64, size: u64) -> ScalarIntegerReadOutcome {
+        (ScalarIntegerReadOutcome::Value { magnitude: value, negative: false })
+    }
+    state refuse(&self, data_type_ref: &DataTypeRef) -> ScalarIntegerReadOutcome {
+        let mut data_type_id: [u8; 128];
+        let data_type_id_len: u64 = copy_bounded(data_type_ref.get_data_type_id(), &mut data_type_id);
+        let mut operation: [u8; 64];
+        let operation_len: u64 = copy_bounded("read_scalar_integer_value", &mut operation);
+        (ScalarIntegerReadOutcome::NotRegistered {
+            operation: operation,
+            operation_len: operation_len,
+            data_type_id: data_type_id,
+            data_type_id_len: data_type_id_len
+        })
+    }
+}
+
+pub machine EngineUnprivilegedState::get_unit_size_in_bytes(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> u64 {
+    self.privileged_registry_cache.get_unit_size_in_bytes(data_type_ref.get_data_type_id())
+}
+
+pub machine EngineUnprivilegedState::get_data_type_descriptor(
+    &self,
+    data_type_ref: &DataTypeRef,
+    out_descriptor: &mut DataTypeDescriptor
+) -> bool {
+    self.privileged_registry_cache.find_data_type_descriptor(data_type_ref.get_data_type_id(), out_descriptor)
+}
+
+// Upstream `get_icon_id` — descriptor icon or empty.
+pub machine EngineUnprivilegedState::get_icon_id(
+    &self,
+    data_type_ref: &DataTypeRef,
+    out_icon_id: &mut [u8; 256],
+    out_icon_id_len: &mut u64
+) -> bool {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.privileged_registry_cache.find_data_type_descriptor(data_type_ref.get_data_type_id(), &mut descriptor) {
+        true -> copy_icon(&descriptor, out_icon_id, out_icon_id_len)
+        false -> empty_icon(out_icon_id_len)
+        _ -> empty_icon(out_icon_id_len)
+    }
+    state copy_icon(&self, descriptor: &DataTypeDescriptor, out_icon_id: &mut [u8; 256], out_icon_id_len: &mut u64) -> bool {
+        let written: u64 = copy_icon_bytes(descriptor.get_icon_id(), out_icon_id);
+        out_icon_id_len = written;
+        (true)
+    }
+    state empty_icon(&self, out_icon_id_len: &mut u64) -> bool {
+        out_icon_id_len = 0;
+        (false)
+    }
+}
+
+pub machine EngineUnprivilegedState::is_signed(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> bool {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.privileged_registry_cache.find_data_type_descriptor(data_type_ref.get_data_type_id(), &mut descriptor) {
+        true -> (descriptor.get_is_signed())
+        false -> (false)
+        _ -> (false)
+    }
+}
+
+pub machine EngineUnprivilegedState::is_floating_point(
+    &self,
+    data_type_ref: &DataTypeRef
+) -> bool {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.privileged_registry_cache.find_data_type_descriptor(data_type_ref.get_data_type_id(), &mut descriptor) {
+        true -> (descriptor.get_is_floating_point())
+        false -> (false)
+        _ -> (false)
+    }
+}
+
+// Upstream `resolve_struct_layout_definition` — local project catalog first
+// (project-authored resolvers stay unprivileged-owned), then the privileged
+// cache. The local catalog leg hasn't landed the opened-project symbol
+// catalog reader, so the project arm is the documented residual; the cache
+// arm is the real port.
+pub machine EngineUnprivilegedState::resolve_struct_layout_definition(
+    &self,
+    symbolic_struct_ref_id: &[u8],
+    out_definition: &mut SymbolicStructDefinition
+) -> bool {
+    self.privileged_registry_cache.resolve_struct_layout_definition(symbolic_struct_ref_id, out_definition)
+}
+
+// ==== Virtual snapshots ====
+
+// Upstream `set_virtual_snapshot_queries` — find-or-create the snapshot,
+// then store the interval and query set.
+pub machine EngineUnprivilegedState::set_virtual_snapshot_queries(
+    &mut self,
+    virtual_snapshot_id: &[u8],
+    refresh_interval_millis: u64,
+    queries: &[VirtualSnapshotQuery; 16],
+    query_count: u64
+) -> bool {
+    transition { _ -> find(virtual_snapshot_id, refresh_interval_millis, queries, query_count, 0) }
+    state find(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        refresh_interval_millis: u64,
+        queries: &[VirtualSnapshotQuery; 16],
+        query_count: u64,
+        position: u64
+    ) -> bool
+
+    {
+        transition position < self.virtual_snapshot_count && position < 8 {
+            true -> compare(virtual_snapshot_id, refresh_interval_millis, queries, query_count, position)
+            false -> insert(virtual_snapshot_id, refresh_interval_millis, queries, query_count)
+        }
+    }
+    state compare(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        refresh_interval_millis: u64,
+        queries: &[VirtualSnapshotQuery; 16],
+        query_count: u64,
+        position: u64
+    ) -> bool
+        requires position < self.virtual_snapshot_count && position < 8;
+    {
+        transition key_equals(&self.virtual_snapshot_keys[position], self.virtual_snapshot_key_lens[position], virtual_snapshot_id) {
+            true -> store(position, refresh_interval_millis, queries, query_count)
+            false -> find(virtual_snapshot_id, refresh_interval_millis, queries, query_count, position + 1)
+        }
+    }
+    state store(
+        &mut self,
+        position: u64,
+        refresh_interval_millis: u64,
+        queries: &[VirtualSnapshotQuery; 16],
+        query_count: u64
+    ) -> bool
+        requires position < 8;
+    {
+        self.virtual_snapshot_values[position].set_refresh_interval(refresh_interval_millis);
+        _ = snapshot_set_queries(&mut self.virtual_snapshot_values[position], queries, query_count);
+        (true)
+    }
+    state insert(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        refresh_interval_millis: u64,
+        queries: &[VirtualSnapshotQuery; 16],
+        query_count: u64
+    ) -> bool {
+        transition self.virtual_snapshot_count < 8 {
+            true -> write(virtual_snapshot_id, refresh_interval_millis, queries, query_count)
+            false -> (false)
+        }
+    }
+    state write(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        refresh_interval_millis: u64,
+        queries: &[VirtualSnapshotQuery; 16],
+        query_count: u64
+    ) -> bool
+        requires self.virtual_snapshot_count < 8;
+    {
+        let slot: u64 = self.virtual_snapshot_count;
+        let written: u64 = copy_key64(virtual_snapshot_id, &mut self.virtual_snapshot_keys[slot]);
+        self.virtual_snapshot_key_lens[slot] = written;
+        self.virtual_snapshot_values[slot] = VirtualSnapshot::new(refresh_interval_millis);
+        _ = snapshot_set_queries(&mut self.virtual_snapshot_values[slot], queries, query_count);
+        self.virtual_snapshot_count = self.virtual_snapshot_count + 1;
+        (true)
+    }
+}
+
+// Upstream `get_virtual_snapshot` — clones the snapshot out.
+pub machine EngineUnprivilegedState::get_virtual_snapshot(
+    &self,
+    virtual_snapshot_id: &[u8],
+    out_snapshot: &mut VirtualSnapshot
+) -> bool {
+    transition { _ -> find(virtual_snapshot_id, out_snapshot, 0) }
+    state find(&self, virtual_snapshot_id: &[u8], out_snapshot: &mut VirtualSnapshot, position: u64) -> bool
+
+    {
+        transition position < self.virtual_snapshot_count && position < 8 {
+            true -> compare(virtual_snapshot_id, out_snapshot, position)
+            false -> (false)
+        }
+    }
+    state compare(&self, virtual_snapshot_id: &[u8], out_snapshot: &mut VirtualSnapshot, position: u64) -> bool
+        requires position < self.virtual_snapshot_count && position < 8;
+    {
+        transition key_equals(&self.virtual_snapshot_keys[position], self.virtual_snapshot_key_lens[position], virtual_snapshot_id) {
+            true -> copy(position, out_snapshot)
+            false -> find(virtual_snapshot_id, out_snapshot, position + 1)
+        }
+    }
+    state copy(&self, position: u64, out_snapshot: &mut VirtualSnapshot) -> bool
+        requires position < 8;
+    {
+        out_snapshot.copy_from(&self.virtual_snapshot_values[position]);
+        (true)
+    }
+}
+
+// Upstream `request_virtual_snapshot_refresh` — `force=false`.
+pub machine EngineUnprivilegedState::request_virtual_snapshot_refresh(
+    &mut self,
+    virtual_snapshot_id: &[u8],
+    now_millis: u64,
+    out_materializer: &mut VirtualSnapshotMaterializer,
+    out_refresh_query_version: &mut u64
+) -> bool {
+    (self.request_virtual_snapshot_refresh_with_mode(
+        virtual_snapshot_id, now_millis, false, out_materializer, out_refresh_query_version))
+}
+
+// Upstream `force_virtual_snapshot_refresh` — `force=true`.
+pub machine EngineUnprivilegedState::force_virtual_snapshot_refresh(
+    &mut self,
+    virtual_snapshot_id: &[u8],
+    now_millis: u64,
+    out_materializer: &mut VirtualSnapshotMaterializer,
+    out_refresh_query_version: &mut u64
+) -> bool {
+    (self.request_virtual_snapshot_refresh_with_mode(
+        virtual_snapshot_id, now_millis, true, out_materializer, out_refresh_query_version))
+}
+
+// Upstream `request_virtual_snapshot_refresh_with_mode` — decides and marks
+// the refresh in the snapshot under the caller's clock, then hands a
+// prepared materializer back; the caller pumps it and feeds the results to
+// `finish_virtual_snapshot_refresh` (the spawned thread's apply path).
+pub machine EngineUnprivilegedState::request_virtual_snapshot_refresh_with_mode(
+    &mut self,
+    virtual_snapshot_id: &[u8],
+    now_millis: u64,
+    force_refresh: bool,
+    out_materializer: &mut VirtualSnapshotMaterializer,
+    out_refresh_query_version: &mut u64
+) -> bool {
+    transition { _ -> find(virtual_snapshot_id, now_millis, force_refresh, out_materializer, out_refresh_query_version, 0) }
+    state find(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        now_millis: u64,
+        force_refresh: bool,
+        out_materializer: &mut VirtualSnapshotMaterializer,
+        out_refresh_query_version: &mut u64,
+        position: u64
+    ) -> bool
+
+    {
+        transition position < self.virtual_snapshot_count && position < 8 {
+            true -> compare(virtual_snapshot_id, now_millis, force_refresh, out_materializer, out_refresh_query_version, position)
+            false -> (false)
+        }
+    }
+    state compare(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        now_millis: u64,
+        force_refresh: bool,
+        out_materializer: &mut VirtualSnapshotMaterializer,
+        out_refresh_query_version: &mut u64,
+        position: u64
+    ) -> bool
+        requires position < self.virtual_snapshot_count && position < 8;
+    {
+        transition key_equals(&self.virtual_snapshot_keys[position], self.virtual_snapshot_key_lens[position], virtual_snapshot_id) {
+            true -> decide(position, now_millis, force_refresh, out_materializer, out_refresh_query_version)
+            false -> find(virtual_snapshot_id, now_millis, force_refresh, out_materializer, out_refresh_query_version, position + 1)
+        }
+    }
+    state decide(
+        &mut self,
+        position: u64,
+        now_millis: u64,
+        force_refresh: bool,
+        out_materializer: &mut VirtualSnapshotMaterializer,
+        out_refresh_query_version: &mut u64
+    ) -> bool
+        requires position < 8;
+    {
+        transition force_refresh {
+            true -> force(position, now_millis, out_materializer, out_refresh_query_version)
+            false -> decide_should(position, now_millis, out_materializer, out_refresh_query_version)
+        }
+    }
+    state force(
+        &mut self,
+        position: u64,
+        now_millis: u64,
+        out_materializer: &mut VirtualSnapshotMaterializer,
+        out_refresh_query_version: &mut u64
+    ) -> bool
+        requires position < 8;
+    {
+        self.virtual_snapshot_values[position].mark_dirty();
+        transition self.virtual_snapshot_values[position].can_force_refresh() {
+            true -> start(position, now_millis, out_materializer, out_refresh_query_version)
+            false -> (false)
+        }
+    }
+    state decide_should(
+        &mut self,
+        position: u64,
+        now_millis: u64,
+        out_materializer: &mut VirtualSnapshotMaterializer,
+        out_refresh_query_version: &mut u64
+    ) -> bool
+        requires position < 8;
+    {
+        transition self.virtual_snapshot_values[position].should_refresh(now_millis) {
+            true -> start(position, now_millis, out_materializer, out_refresh_query_version)
+            false -> (false)
+        }
+    }
+    state start(
+        &mut self,
+        position: u64,
+        now_millis: u64,
+        out_materializer: &mut VirtualSnapshotMaterializer,
+        out_refresh_query_version: &mut u64
+    ) -> bool
+        requires position < 8;
+    {
+        out_refresh_query_version = self.virtual_snapshot_values[position].mark_refresh_started(now_millis);
+        _ = out_materializer.begin(&self.virtual_snapshot_values[position]);
+        (true)
+    }
+}
+
+// Upstream's spawned-thread tail — applies the materializer's results under
+// the version taken at `start` (a newer `set_queries` drops the stale
+// results exactly as upstream's `apply_refresh_results` version check).
+pub machine EngineUnprivilegedState::finish_virtual_snapshot_refresh(
+    &mut self,
+    virtual_snapshot_id: &[u8],
+    refresh_query_version: u64,
+    materializer: &VirtualSnapshotMaterializer,
+    now_millis: u64
+) -> bool {
+    transition { _ -> find(virtual_snapshot_id, refresh_query_version, materializer, now_millis, 0) }
+    state find(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        refresh_query_version: u64,
+        materializer: &VirtualSnapshotMaterializer,
+        now_millis: u64,
+        position: u64
+    ) -> bool
+
+    {
+        transition position < self.virtual_snapshot_count && position < 8 {
+            true -> compare(virtual_snapshot_id, refresh_query_version, materializer, now_millis, position)
+            false -> (false)
+        }
+    }
+    state compare(
+        &mut self,
+        virtual_snapshot_id: &[u8],
+        refresh_query_version: u64,
+        materializer: &VirtualSnapshotMaterializer,
+        now_millis: u64,
+        position: u64
+    ) -> bool
+        requires position < self.virtual_snapshot_count && position < 8;
+    {
+        transition key_equals(&self.virtual_snapshot_keys[position], self.virtual_snapshot_key_lens[position], virtual_snapshot_id) {
+            true -> apply(position, refresh_query_version, materializer, now_millis)
+            false -> find(virtual_snapshot_id, refresh_query_version, materializer, now_millis, position + 1)
+        }
+    }
+    state apply(
+        &mut self,
+        position: u64,
+        refresh_query_version: u64,
+        materializer: &VirtualSnapshotMaterializer,
+        now_millis: u64
+    ) -> bool
+        requires position < 8;
+    {
+        let mut result_ids: [[u8; 128]; 16];
+        let mut result_id_lens: [u64; 16];
+        let mut query_results: [VirtualSnapshotQueryResult; 16];
+        let count: u64 = materializer.get_result_count();
+        _ = copy_result_ids(materializer.get_result_ids(), materializer.get_result_id_lens(), &mut result_ids, &mut result_id_lens);
+        _ = copy_results(materializer.get_results(), &mut query_results);
+        _ = snapshot_apply_refresh_results(
+            &mut self.virtual_snapshot_values[position],
+            refresh_query_version,
+            &result_ids,
+            &result_id_lens,
+            &query_results,
+            count,
+            now_millis);
+        (true)
+    }
+}
+
+// ==== Event listeners ====
+
+// Upstream `listen_for_engine_event<E>` — the typed registration collapses
+// to the leaf-interest mask (each leaf event type owns one bit; see
+// `engine_event_interest_mask` in event_subscriber_table.omg).
+pub machine EngineUnprivilegedState::subscribe_engine_events(
+    &mut self,
+    interest_mask: u64
+) -> u64 {
+    self.event_subscribers.subscribe(interest_mask)
+}
+
+// Upstream's TypeId-keyed dispatch — the subscriber drains its queue.
+pub machine EngineUnprivilegedState::get_subscriber_event_count(
+    &self,
+    subscriber_index: u64
+) -> u64 {
+    self.event_subscribers.get_queued_event_count(subscriber_index)
+}
+
+pub machine EngineUnprivilegedState::get_subscriber_event(
+    &self,
+    subscriber_index: u64,
+    position: u64,
+    out_event: &mut EngineEvent
+) -> bool {
+    let queued_event: EngineEvent = self.event_subscribers.get_queued_event(subscriber_index, position);
+    out_event.clone_from(&queued_event);
+    (true)
+}
+
+pub machine EngineUnprivilegedState::clear_subscriber_events(
+    &mut self,
+    subscriber_index: u64
+) {
+    self.event_subscribers.clear_queued_events(subscriber_index);
+}
+
+// ==== Middleware + listener registration ====
+
+// Upstream `register_command_invocation_middleware` — the callback becomes
+// a kind tag; `run_invocation_middleware` interprets kinds.
+pub machine EngineUnprivilegedState::register_command_invocation_middleware(
+    &mut self,
+    middleware_kind: u64
+) -> bool {
+    transition self.invocation_middleware_count < 16 {
+        true -> store(middleware_kind)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, middleware_kind: u64) -> bool {
+        self.invocation_middleware_kinds[self.invocation_middleware_count] = middleware_kind;
+        self.invocation_middleware_count = self.invocation_middleware_count + 1;
+        (true)
+    }
+}
+
+pub machine EngineUnprivilegedState::register_command_response_middleware(
+    &mut self,
+    middleware_kind: u64
+) -> bool {
+    transition self.response_middleware_count < 16 {
+        true -> store(middleware_kind)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, middleware_kind: u64) -> bool {
+        self.response_middleware_kinds[self.response_middleware_count] = middleware_kind;
+        self.response_middleware_count = self.response_middleware_count + 1;
+        (true)
+    }
+}
+
+pub machine EngineUnprivilegedState::listen_for_command_response(
+    &mut self,
+    listener_kind: u64
+) -> bool {
+    transition self.response_listener_count < 16 {
+        true -> store(listener_kind)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, listener_kind: u64) -> bool {
+        self.response_listener_kinds[self.response_listener_count] = listener_kind;
+        self.response_listener_count = self.response_listener_count + 1;
+        (true)
+    }
+}
+
+// ==== Command invocation pipeline ====
+
+// Upstream `create_command_invocation` — the `fetch_add(1) + 1` allocator.
+pub machine EngineUnprivilegedState::create_command_invocation(
+    &mut self,
+    source: CommandInvocationSource,
+    command: EngineCommand
+) -> CommandInvocation {
+    let invocation_id: u64 = ((self.next_command_invocation_id as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    self.next_command_invocation_id = invocation_id;
+    CommandInvocation::new(invocation_id, source, command)
+}
+
+// Upstream `prepare_command_invocation` — runs the middleware table over
+// the invocation. `ReplaceCommand` rebuilds through the consuming builder
+// (upstream `invocation.replace_command(command)`); `Reject`/`Respond`
+// short-circuit exactly as upstream's early returns. Values flow by-value
+// through the walk — there is no union clone machinery.
+pub machine EngineUnprivilegedState::prepare_command_invocation(
+    &mut self,
+    command_invocation: CommandInvocation
+) -> CommandDispatchPlan {
+    transition { _ -> walk(command_invocation, 0) }
+    state walk(&mut self, command_invocation: CommandInvocation, position: u64) -> CommandDispatchPlan
+
+    {
+        transition position < self.invocation_middleware_count && position < 16 {
+            true -> run_at(command_invocation, position)
+            false -> (CommandDispatchPlan::Dispatch { invocation: command_invocation })
+        }
+    }
+    state run_at(&mut self, command_invocation: CommandInvocation, position: u64) -> CommandDispatchPlan
+        requires position < self.invocation_middleware_count && position < 16;
+    {
+        let middleware_kind: u64 = self.invocation_middleware_kinds[position];
+        let plan: CommandDispatchPlan = self.run_invocation_middleware(middleware_kind, command_invocation);
+        transition plan {
+            CommandDispatchPlan::Dispatch { invocation } -> next(invocation, position)
+            CommandDispatchPlan::Respond { invocation, response } -> (plan)
+            CommandDispatchPlan::Reject { invocation, reason, reason_len } -> (plan)
+            _ -> (plan)
+        }
+    }
+    state next(&mut self, command_invocation: CommandInvocation, position: u64) -> CommandDispatchPlan
+        requires position < self.invocation_middleware_count && position < 16;
+    {
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(command_invocation, next_position) }
+    }
+}
+
+// Kind-tag invocation-middleware dispatch — receives the invocation by
+// value and returns the plan it implies. The recorded kinds are the ported
+// consumer hooks; until a consumer leg registers a concrete kind, every
+// kind continues like upstream middleware returning `Continue`.
+pub machine EngineUnprivilegedState::run_invocation_middleware(
+    &self,
+    middleware_kind: u64,
+    command_invocation: CommandInvocation
+) -> CommandDispatchPlan {
+    (CommandDispatchPlan::Dispatch { invocation: command_invocation })
+}
+
+// Upstream `publish_command_response` — response middleware may replace or
+// suppress; listeners observe the accepted outcome before it reaches the
+// caller's callback. `ResponseMiddlewareStep` is the port-local carrier
+// replacing upstream's middleware union inside the walk (the api's
+// `CommandResponseDecision` stays the wire shape for concrete kinds).
+pub data ResponseMiddlewareStep {
+    case Continue(response: EngineCommandResponse);
+    case Suppressed(reason: [u8; 256], reason_len: u64);
+}
+
+pub machine EngineUnprivilegedState::publish_command_response(
+    &mut self,
+    command_invocation: &CommandInvocation,
+    response: EngineCommandResponse
+) -> CommandPublicationResult {
+    transition { _ -> walk_middleware(command_invocation, response, 0) }
+    state walk_middleware(
+        &mut self,
+        command_invocation: &CommandInvocation,
+        response: EngineCommandResponse,
+        position: u64
+    ) -> CommandPublicationResult
+
+    {
+        transition position < self.response_middleware_count && position < 16 {
+            true -> run_at(command_invocation, response, position)
+            false -> deliver(command_invocation, response)
+        }
+    }
+    state deliver(
+        &mut self,
+        command_invocation: &CommandInvocation,
+        response: EngineCommandResponse
+    ) -> CommandPublicationResult {
+        // Upstream runs response listeners over the accepted outcome before
+        // returning it — observers see (&invocation, &response).
+        self.run_response_listeners(command_invocation, &response);
+        (CommandPublicationResult::Delivered { response: response })
+    }
+    state run_at(
+        &mut self,
+        command_invocation: &CommandInvocation,
+        response: EngineCommandResponse,
+        position: u64
+    ) -> CommandPublicationResult
+        requires position < self.response_middleware_count && position < 16;
+    {
+        let middleware_kind: u64 = self.response_middleware_kinds[position];
+        let step: ResponseMiddlewareStep = self.run_response_middleware(middleware_kind, command_invocation, response);
+        transition step {
+            ResponseMiddlewareStep::Continue { response } -> next_middleware(command_invocation, response, position)
+            ResponseMiddlewareStep::Suppressed { reason, reason_len } -> suppress(reason, reason_len)
+            _ -> suppress_empty()
+        }
+    }
+    state next_middleware(
+        &mut self,
+        command_invocation: &CommandInvocation,
+        response: EngineCommandResponse,
+        position: u64
+    ) -> CommandPublicationResult
+        requires position < self.response_middleware_count && position < 16;
+    {
+        let next_position: u64 = position + 1;
+        transition { _ -> walk_middleware(command_invocation, response, next_position) }
+    }
+    state suppress(&mut self, reason: [u8; 256], reason_len: u64) -> CommandPublicationResult {
+        // Upstream logs a warn on suppression before returning None.
+        let mut record: LogRecordedEvent = LogRecordedEvent::default();
+        _ = self.log_dispatcher.log(LogLevel::Warn, "squalr::unprivileged", "command response suppressed", &mut record);
+        let engine_event: EngineEvent = EngineEvent::Logging {
+            event: LoggingEvent::LogRecorded { log_recorded_event: record.clone() },
+        };
+        self.event_subscribers.route_engine_event(&engine_event);
+        (CommandPublicationResult::Suppressed { reason: reason, reason_len: reason_len })
+    }
+    state suppress_empty(&mut self) -> CommandPublicationResult {
+        let mut reason: [u8; 256];
+        _ = zero_reason(&mut reason);
+        (CommandPublicationResult::Suppressed { reason: reason, reason_len: 0 })
+    }
+}
+
+// Kind-tag response-middleware dispatch — sees the invocation + response by
+// ref, hands the (possibly replaced) response back by value. No concrete
+// kinds yet: everything continues, same as upstream middleware returning
+// `Continue`.
+pub machine EngineUnprivilegedState::run_response_middleware(
+    &self,
+    middleware_kind: u64,
+    command_invocation: &CommandInvocation,
+    response: EngineCommandResponse
+) -> ResponseMiddlewareStep {
+    (ResponseMiddlewareStep::Continue { response: response })
+}
+
+// Upstream's listener fan-out — kind-tagged listeners observe refs; the
+// walk is a no-op until consumer kinds register, matching an empty
+// `command_response_listeners` table.
+pub machine EngineUnprivilegedState::run_response_listeners(
+    &mut self,
+    command_invocation: &CommandInvocation,
+    response: &EngineCommandResponse
+) {
+    transition { _ -> walk(command_invocation, response, 0) }
+    state walk(&mut self, command_invocation: &CommandInvocation, response: &EngineCommandResponse, position: u64)
+
+    {
+        transition position < self.response_listener_count && position < 16 {
+            true -> run_at(command_invocation, response, position)
+            false -> done()
+        }
+    }
+    state run_at(&mut self, command_invocation: &CommandInvocation, response: &EngineCommandResponse, position: u64)
+        requires position < self.response_listener_count && position < 16;
+    {
+        self.run_response_listener(self.response_listener_kinds[position], command_invocation, response);
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(command_invocation, response, next_position) }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Kind-dispatch for one listener — observer semantics (unit). Concrete
+// kinds land with the consumers that register them; kind 0 and unhandled
+// kinds are the upstream "no listeners registered" case.
+pub machine EngineUnprivilegedState::run_response_listener(
+    &mut self,
+    listener_kind: u64,
+    command_invocation: &CommandInvocation,
+    response: &EngineCommandResponse
+) {
+}
+
+// Upstream `log::warn!("Command invocation {} rejected before dispatch:
+// {}", ...)` — the reason text is the middleware's own bounded message.
+pub machine EngineUnprivilegedState::log_rejected_invocation(
+    &mut self,
+    command_invocation: &CommandInvocation,
+    reason: [u8; 256],
+    reason_len: u64
+) {
+    transition reason_len <= 256 {
+        true -> write(command_invocation, reason, reason_len)
+        _ -> write_empty(command_invocation)
+    }
+    state write(&mut self, command_invocation: &CommandInvocation, reason: [u8; 256], reason_len: u64)
+        requires reason_len <= 256;
+    {
+        let reason_slice: &[u8] = reason[0..reason_len];
+        let mut record: LogRecordedEvent = LogRecordedEvent::default();
+        _ = self.log_dispatcher.log(LogLevel::Warn, "squalr::unprivileged", reason_slice, &mut record);
+        let engine_event: EngineEvent = EngineEvent::Logging {
+            event: LoggingEvent::LogRecorded { log_recorded_event: record.clone() },
+        };
+        self.event_subscribers.route_engine_event(&engine_event);
+    }
+    state write_empty(&mut self, command_invocation: &CommandInvocation) {
+        let mut record: LogRecordedEvent = LogRecordedEvent::default();
+        _ = self.log_dispatcher.log(LogLevel::Warn, "squalr::unprivileged", "command invocation rejected before dispatch", &mut record);
+        let engine_event: EngineEvent = EngineEvent::Logging {
+            event: LoggingEvent::LogRecorded { log_recorded_event: record.clone() },
+        };
+        self.event_subscribers.route_engine_event(&engine_event);
+    }
+}
+
+// Upstream `log::error!("... produced a mismatched synthetic response")` —
+// a Respond plan whose response is not the dispatched arm's type.
+pub machine EngineUnprivilegedState::log_mismatched_invocation_response(
+    &mut self,
+    command_invocation: &CommandInvocation
+) {
+    let mut record: LogRecordedEvent = LogRecordedEvent::default();
+    _ = self.log_dispatcher.log(LogLevel::Error, "squalr::unprivileged", "command invocation produced a mismatched synthetic response", &mut record);
+    let engine_event: EngineEvent = EngineEvent::Logging {
+        event: LoggingEvent::LogRecorded { log_recorded_event: record.clone() },
+    };
+    self.event_subscribers.route_engine_event(&engine_event);
+}
+
+// ==== Event routing ====
+// ==== Event routing ====
+
+// Upstream `route_engine_event` — the dispatcher-thread body, pumped
+// synchronously: a stale catalog logs an error (upstream logs the failure
+// and still dispatches), then the event broadcasts to subscribers. The
+// Logging arm also lands in the log history — upstream's `log!` macro
+// routed it back through the dispatcher's own log4rs appender.
+pub machine EngineUnprivilegedState::route_engine_event(
+    &mut self,
+    engine_event_envelope: &EngineEventEnvelope
+) -> bool {
+    let expected_generation: u64 = engine_event_envelope.get_registry_generation();
+    let catalog_current: bool = !self.get_needs_privileged_registry_refresh(expected_generation);
+    transition catalog_current {
+        true -> dispatch(engine_event_envelope)
+        false -> log_stale(engine_event_envelope)
+    }
+    state log_stale(&mut self, engine_event_envelope: &EngineEventEnvelope) -> bool {
+        let mut record: LogRecordedEvent = LogRecordedEvent::default();
+        _ = self.log_dispatcher.log(LogLevel::Error, "squalr::unprivileged", "failed to refresh privileged registry cache before dispatching engine event", &mut record);
+        let engine_event: EngineEvent = EngineEvent::Logging {
+            event: LoggingEvent::LogRecorded { log_recorded_event: record.clone() },
+        };
+        self.event_subscribers.route_engine_event(&engine_event);
+        transition { _ -> dispatch(engine_event_envelope) }
+    }
+    state dispatch(&mut self, engine_event_envelope: &EngineEventEnvelope) -> bool {
+        let engine_event: &EngineEvent = engine_event_envelope.get_engine_event();
+        _ = self.event_subscribers.route_engine_event(engine_event);
+        transition engine_event {
+            EngineEvent::Logging { event } -> log(event)
+            _ -> (true)
+        }
+    }
+    state log(&mut self, event: &LoggingEvent) -> bool {
+        transition event {
+            LoggingEvent::LogRecorded { log_recorded_event } -> record(log_recorded_event)
+            _ -> (true)
+        }
+    }
+    state record(&mut self, event: &LogRecordedEvent) -> bool {
+        _ = self.log_dispatcher.append_record(event);
+        (true)
+    }
+}
+
+// Upstream `install_project_event_emitter` — the emitter is not stored (no
+// closures); the project notify paths thread `&mut self.event_subscribers`
+// directly at every call site, which the project_manager wrappers below
+// encode.
+pub machine EngineUnprivilegedState::notify_project_items_changed(&mut self) {
+    self.project_manager.notify_project_items_changed(&mut self.event_subscribers);
+}
+
+pub machine EngineUnprivilegedState::notify_project_created(&mut self, project_info: &ProjectInfo) {
+    self.project_manager.notify_project_created(project_info, &mut self.event_subscribers);
+}
+
+pub machine EngineUnprivilegedState::notify_project_deleted(&mut self, project_info: &ProjectInfo) {
+    self.project_manager.notify_project_deleted(project_info, &mut self.event_subscribers);
+}
+
+pub machine EngineUnprivilegedState::notify_project_closed(&mut self) {
+    self.project_manager.notify_project_closed(&mut self.event_subscribers);
+}
+
+pub machine EngineUnprivilegedState::watch_projects_root(&mut self, root_path: &[u8]) {
+    self.project_manager.watch_projects_root(root_path);
+}
+
+// Upstream `watch_opened_project` passes the opened project's directory
+// path (empty + false when no project is open).
+pub machine EngineUnprivilegedState::watch_opened_project(&mut self, project_path: &[u8], has_project_path: bool) {
+    self.project_manager.watch_opened_project(project_path, has_project_path);
+}
+
+pub machine EngineUnprivilegedState::set_project_file_system_watch_enabled(&mut self, enabled: bool) {
+    self.project_manager.set_project_file_system_watch_enabled(enabled);
+}
+
+// ==== Privileged registry sync (caller-pumped) ====
+
+// Upstream `ensure_privileged_registry_catalog_current`'s staleness check —
+// the synchronous fetch+wait collapses to a predicate the composition root
+// drives: dispatch a RegistryGetMetadataRequest, then
+// `apply_privileged_registry_catalog` on the response.
+pub machine EngineUnprivilegedState::get_needs_privileged_registry_refresh(
+    &self,
+    expected_generation: u64
+) -> bool {
+    (self.privileged_registry_cache.get_generation() < expected_generation)
+}
+
+pub machine EngineUnprivilegedState::apply_privileged_registry_catalog(
+    &mut self,
+    privileged_registry_catalog: &PrivilegedRegistryCatalog
+) {
+    self.privileged_registry_cache.apply_registry_catalog(privileged_registry_catalog);
+}
+
+// ==== Free helpers ====
+
+// Bounded byte copy for [u8;128] destinations (data_type_id payloads).
+machine copy_bounded(source: &[u8], destination: &mut [u8; 128]) -> u64 {
+    transition { _ -> walk(source, destination, 0) }
+    state walk(source: &[u8], destination: &mut [u8; 128], position: u64) -> u64
+
+    {
+        transition position < source.len && position < 128 {
+            true -> step(source, destination, position)
+            false -> (position)
+        }
+    }
+    state step(source: &[u8], destination: &mut [u8; 128], position: u64) -> u64
+        requires position < source.len && position < 128;
+    {
+        destination[position] = source[position];
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(source, destination, next_position) }
+    }
+}
+
+// Bounded byte copy for [u8;256] destinations (icon ids).
+machine copy_icon_bytes(source: &[u8], destination: &mut [u8; 256]) -> u64 {
+    transition { _ -> walk(source, destination, 0) }
+    state walk(source: &[u8], destination: &mut [u8; 256], position: u64) -> u64
+
+    {
+        transition position < source.len && position < 256 {
+            true -> step(source, destination, position)
+            false -> (position)
+        }
+    }
+    state step(source: &[u8], destination: &mut [u8; 256], position: u64) -> u64
+        requires position < source.len && position < 256;
+    {
+        destination[position] = source[position];
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(source, destination, next_position) }
+    }
+}
+
+// Bounded byte copy for [u8;64] destinations (snapshot keys).
+machine copy_key64(source: &[u8], destination: &mut [u8; 64]) -> u64 {
+    transition { _ -> walk(source, destination, 0) }
+    state walk(source: &[u8], destination: &mut [u8; 64], position: u64) -> u64
+
+    {
+        transition position < source.len && position < 64 {
+            true -> step(source, destination, position)
+            false -> (position)
+        }
+    }
+    state step(source: &[u8], destination: &mut [u8; 64], position: u64) -> u64
+        requires position < source.len && position < 64;
+    {
+        destination[position] = source[position];
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(source, destination, next_position) }
+    }
+}
+
+// Key equality — stored key bytes + len against a caller slice.
+machine key_equals(stored: &[u8; 64], stored_len: u64, candidate: &[u8]) -> bool {
+    transition stored_len == candidate.len && stored_len <= 64 {
+        true -> walk(stored, candidate, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state walk(stored: &[u8; 64], candidate: &[u8], position: u64) -> bool
+
+    {
+        transition position < candidate.len && position < 64 {
+            true -> compare(stored, candidate, position)
+            false -> (true)
+        }
+    }
+    state compare(stored: &[u8; 64], candidate: &[u8], position: u64) -> bool
+        requires position < candidate.len && position < 64;
+    {
+        transition stored[position] == candidate[position] {
+            true -> walk(stored, candidate, position + 1)
+            false -> (false)
+        }
+    }
+}
+
+// Copies the materializer's result-id parallel tables for the snapshot's
+// apply call (bounded [128] ids).
+machine copy_result_ids(
+    source_ids: &[[u8; 128]; 16],
+    source_lens: &[u64; 16],
+    out_ids: &mut [[u8; 128]; 16],
+    out_lens: &mut [u64; 16]
+) -> bool {
+    transition { _ -> walk(source_ids, source_lens, out_ids, out_lens, 0) }
+    state walk(
+        source_ids: &[[u8; 128]; 16],
+        source_lens: &[u64; 16],
+        out_ids: &mut [[u8; 128]; 16],
+        out_lens: &mut [u64; 16],
+        position: u64
+    ) -> bool
+    {
+        transition position < 16 {
+            true -> step(source_ids, source_lens, out_ids, out_lens, position)
+            false -> (true)
+        }
+    }
+    state step(
+        source_ids: &[[u8; 128]; 16],
+        source_lens: &[u64; 16],
+        out_ids: &mut [[u8; 128]; 16],
+        out_lens: &mut [u64; 16],
+        position: u64
+    ) -> bool
+        requires position < 16;
+    {
+        out_ids[position] = source_ids[position];
+        out_lens[position] = source_lens[position];
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(source_ids, source_lens, out_ids, out_lens, next_position) }
+    }
+}
+
+// Copies the materializer's bounded result table for the snapshot apply.
+machine copy_results(
+    source_results: &[VirtualSnapshotQueryResult; 16],
+    out_results: &mut [VirtualSnapshotQueryResult; 16]
+) -> bool {
+    transition { _ -> walk(source_results, out_results, 0) }
+    state walk(
+        source_results: &[VirtualSnapshotQueryResult; 16],
+        out_results: &mut [VirtualSnapshotQueryResult; 16],
+        position: u64
+    ) -> bool
+    {
+        transition position < 16 {
+            true -> step(source_results, out_results, position)
+            false -> (true)
+        }
+    }
+    state step(
+        source_results: &[VirtualSnapshotQueryResult; 16],
+        out_results: &mut [VirtualSnapshotQueryResult; 16],
+        position: u64
+    ) -> bool
+        requires position < 16;
+    {
+        out_results[position].clone_from(&source_results[position]);
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(source_results, out_results, next_position) }
+    }
+}
+
+// Zero-fills a suppression reason — uninit-then-element-write is the
+// definite-init idiom the checker accepts for bounded arrays.
+machine zero_reason(out: &mut [u8; 256]) -> bool {
+    transition { _ -> walk(out, 0) }
+    state walk(out: &mut [u8; 256], position: u64) -> bool
+    {
+        transition position < 256 {
+            true -> write(out, position)
+            false -> (true)
+        }
+    }
+    state write(out: &mut [u8; 256], position: u64) -> bool
+        requires position < 256;
+    {
+        out[position] = 0;
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(out, next_position) }
+    }
+}
+
+// Indexed-element receivers do not parse under `_ =` — element helpers.
+machine snapshot_set_queries(
+    snapshot: &mut VirtualSnapshot,
+    queries: &[VirtualSnapshotQuery; 16],
+    query_count: u64
+) -> bool {
+    snapshot.set_queries(queries, query_count)
+}
+
+machine snapshot_apply_refresh_results(
+    snapshot: &mut VirtualSnapshot,
+    refresh_query_version: u64,
+    result_ids: &[[u8; 128]; 16],
+    result_id_lens: &[u64; 16],
+    query_results: &[VirtualSnapshotQueryResult; 16],
+    query_result_count: u64,
+    now_millis: u64
+) -> bool {
+    snapshot.apply_refresh_results(
+        refresh_query_version,
+        result_ids,
+        result_id_lens,
+        query_results,
+        query_result_count,
+        now_millis)
+}

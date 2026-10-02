@@ -1,0 +1,158 @@
+module src::engine_bindings::standalone_engine_api_unprivileged_bindings;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::commands::privileged_command_result::PrivilegedCommandResult;
+use squalr_engine_api::src::registries::symbols::privileged_registry_catalog::PrivilegedRegistryCatalog;
+use squalr_engine_api::src::engine::engine_api_unprivileged_bindings::EngineApiUnprivilegedBindings;
+use squalr_engine_api::src::engine::engine_event_envelope::EngineEventEnvelope;
+use squalr_engine_api::src::events::engine_event::EngineEvent;
+use squalr_engine_api::src::engine::engine_event_envelope::EngineEventEnvelopeQueue;
+use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use src::command_executors::privileged_command_executor::PrivilegedCommandExecutor;
+
+// Port of engine_bindings/standalone/standalone_engine_api_unprivileged_bindings.rs.
+// Upstream holds `Arc<EnginePrivilegedState>` shared with SqualrEngine's own
+// handle; the port's single-owner collapse makes the bindings record the sole
+// owner — SqualrEngine borrows the state back through the accessors below.
+// Upstream's spawned dispatch thread and crossbeam callback collapse to the
+// caller-owned `PrivilegedResponseMailbox` (the api trait's documented
+// respelling); commands still complete before `dispatch_privileged_command`
+// returns, matching the synchronous wire the headless leg drives.
+pub data StandaloneEngineApiUnprivilegedBindings {
+    engine_privileged_state: EnginePrivilegedState;
+}
+
+// Re-entrant initializer for hosts whose engine slot already exists (the
+// headless entry context — see `SqualrEngine::init_privileged_shell`).
+pub machine StandaloneEngineApiUnprivilegedBindings::init(&mut self) {
+    self.engine_privileged_state.init();
+}
+
+pub machine StandaloneEngineApiUnprivilegedBindings::new() -> StandaloneEngineApiUnprivilegedBindings {
+    StandaloneEngineApiUnprivilegedBindings {
+        engine_privileged_state: EnginePrivilegedState::new(),
+    }
+}
+
+pub machine StandaloneEngineApiUnprivilegedBindings::get_engine_privileged_state(
+    &self
+) -> &EnginePrivilegedState {
+    &self.engine_privileged_state
+}
+
+pub machine StandaloneEngineApiUnprivilegedBindings::borrow_engine_privileged_state_mut(
+    &mut self
+) -> &mut EnginePrivilegedState {
+    &mut self.engine_privileged_state
+}
+
+// Upstream `dispatch_privileged_command` verbatim — the worker thread that
+// runs `create_privileged_command_result` against the privileged state and
+// answers through the callback collapses to a synchronous evaluate here.
+// Upstream order preserved: the `should_include_privileged_registry_catalog`
+// probe runs BEFORE `execute`, the result bundles through
+// `PrivilegedCommandResult::new`, and `into_privileged_command_response`
+// drops the catalog before the callback fires — the standalone hop only
+// ever serializes the response (documented upstream semantics: the catalog
+// exists for the interprocess bindings' wire).
+pub machine StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(
+    &mut self,
+    command: &PrivilegedCommand,
+    mailbox: &mut PrivilegedResponseMailbox
+) -> bool
+satisfies EngineApiUnprivilegedBindings::dispatch_privileged_command
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let should_include_catalog: bool = command.should_include_privileged_registry_catalog();
+    let response: PrivilegedCommandResponse = PrivilegedCommandExecutor::execute(
+        &mut self.engine_privileged_state,
+        command);
+    transition should_include_catalog {
+        true -> with_catalog(response, mailbox)
+        false -> without_catalog(response, mailbox)
+    }
+
+    state with_catalog(
+        &mut self,
+        response: PrivilegedCommandResponse,
+        mailbox: &mut PrivilegedResponseMailbox
+    ) -> bool {
+        let catalog: PrivilegedRegistryCatalog =
+            self.engine_privileged_state.get_privileged_registry_catalog();
+        let result: PrivilegedCommandResult = PrivilegedCommandResult::new(response, true, catalog);
+        let final_response: PrivilegedCommandResponse =
+            PrivilegedCommandResult::into_privileged_command_response(result);
+        mailbox.deliver(final_response);
+        (true)
+    }
+    state without_catalog(
+        &mut self,
+        response: PrivilegedCommandResponse,
+        mailbox: &mut PrivilegedResponseMailbox
+    ) -> bool {
+        let result: PrivilegedCommandResult = PrivilegedCommandResult::new(
+            response,
+            false,
+            PrivilegedRegistryCatalog::default());
+        let final_response: PrivilegedCommandResponse =
+            PrivilegedCommandResult::into_privileged_command_response(result);
+        mailbox.deliver(final_response);
+        (true)
+    }
+}
+
+// Upstream `subscribe_to_engine_events` — the channel receiver respells as
+// a drain of the privileged state's pending queue into the caller's
+// bounded envelope queue (64 slots, drop-on-full like the channel's
+// fire-and-forget consumers).
+pub machine StandaloneEngineApiUnprivilegedBindings::drain_engine_events(
+    &mut self,
+    out: &mut EngineEventEnvelopeQueue
+) -> bool
+satisfies EngineApiUnprivilegedBindings::drain_engine_events
+{
+    let generation: u64 = self.engine_privileged_state.get_registry_generation();
+    let count: u64 = self.engine_privileged_state.get_pending_event_count();
+    transition { _ -> walk(generation, count, out, 0) }
+    state walk(
+        &mut self,
+        generation: u64,
+        count: u64,
+        out: &mut EngineEventEnvelopeQueue,
+        position: u64
+    ) -> bool
+    {
+        transition position < count {
+            true -> pump(generation, count, out, position)
+            false -> finish(out)
+        }
+    }
+    state pump(
+        &mut self,
+        generation: u64,
+        count: u64,
+        out: &mut EngineEventEnvelopeQueue,
+        position: u64
+    ) -> bool
+        requires position < count;
+    {
+        let engine_event: EngineEvent = self.engine_privileged_state.get_pending_event(position);
+        let envelope: EngineEventEnvelope = EngineEventEnvelope::new(generation, engine_event);
+        _ = out.push(&envelope);
+        let next_position: u64 = position + 1;
+        transition { _ -> walk(generation, count, out, next_position) }
+    }
+    state finish(&mut self, out: &mut EngineEventEnvelopeQueue) -> bool {
+        self.engine_privileged_state.drain_pending_events();
+        (true)
+    }
+}

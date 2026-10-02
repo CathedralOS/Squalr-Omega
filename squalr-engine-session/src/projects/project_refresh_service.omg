@@ -1,0 +1,261 @@
+module src::projects::project_refresh_service;
+
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::events::project::created::project_created_event::ProjectCreatedEvent;
+use squalr_engine_api::src::events::project::deleted::project_deleted_event::ProjectDeletedEvent;
+use squalr_engine_api::src::events::project::closed::project_closed_event::ProjectClosedEvent;
+use squalr_engine_api::src::events::project::catalog_changed::project_catalog_changed_event::ProjectCatalogChangedEvent;
+use squalr_engine_api::src::events::project_items::changed::project_items_changed_event::ProjectItemsChangedEvent;
+use src::event_subscribers::event_subscriber_table::EventSubscriberTable;
+
+// Port of projects/project_refresh/project_refresh_service.rs. Upstream
+// owns a `ProjectRefreshConfig { emit_internal_project_events,
+// watch_file_system }` (both defaulting true), the watched root/opened
+// paths, and a `notify`-crate debounced watcher per path feeding a
+// callback that emits catalog-change events and clears the opened
+// project on delete. The port keeps the config + watched paths + every
+// notify/watch machine; the file-system watcher internals (crate-level
+// debounced watching) are deferred — `watch_*` records the paths and the
+// enabled flag honestly, and `refresh_file_system_watchers` collapses to
+// updating which watch slots are live. The `event_emitter` indirection
+// also collapses: upstream emits `&dyn Any` through a stored callback
+// into the unprivileged state's listener map; the port passes the
+// subscriber table straight into `notify_*`, which routes the produced
+// `EngineEvent` to matching queues.
+pub data ProjectRefreshService {
+    emit_internal_project_events: bool;
+    watch_file_system: bool;
+    has_projects_root_path: bool;
+    projects_root_path: [u8; 512];
+    projects_root_path_len: u64;
+    has_opened_project_directory_path: bool;
+    opened_project_directory_path: [u8; 512];
+    opened_project_directory_path_len: u64;
+    projects_root_watch_live: bool;
+    opened_project_watch_live: bool;
+}
+
+pub machine ProjectRefreshService::new() -> ProjectRefreshService {
+    ProjectRefreshService {
+        emit_internal_project_events: true,
+        watch_file_system: true,
+        has_projects_root_path: false,
+        projects_root_path_len: 0,
+        has_opened_project_directory_path: false,
+        opened_project_directory_path_len: 0,
+        projects_root_watch_live: false,
+        opened_project_watch_live: false,
+    }
+}
+
+pub machine ProjectRefreshService::new_with_config(&mut self, emit_internal_project_events: bool, watch_file_system: bool) {
+    self.emit_internal_project_events = emit_internal_project_events;
+    self.watch_file_system = watch_file_system;
+}
+
+pub machine ProjectRefreshService::get_emit_internal_project_events(&self) -> bool {
+    self.emit_internal_project_events
+}
+
+pub machine ProjectRefreshService::get_watch_file_system(&self) -> bool {
+    self.watch_file_system
+}
+
+pub machine ProjectRefreshService::get_should_watch_file_system(&self) -> bool {
+    self.watch_file_system
+}
+
+// Upstream `notify_project_items_changed` — emits a lightweight
+// invalidation (empty path list) when internal events are enabled.
+pub machine ProjectRefreshService::notify_project_items_changed(&self, subscribers: &mut EventSubscriberTable) {
+    transition self.emit_internal_project_events {
+        true -> emit(subscribers)
+        false -> done()
+        _ -> done()
+    }
+    state emit(&self, subscribers: &mut EventSubscriberTable) {
+        let changed_project_paths: ProjectPathList = ProjectPathList::empty();
+        let project_items_changed_event: ProjectItemsChangedEvent = ProjectItemsChangedEvent::new(&changed_project_paths);
+        subscribers.route_engine_event(&project_items_changed_event.to_engine_event());
+        transition { _ -> done() }
+    }
+    state done(&self) {
+    }
+}
+
+// Upstream `notify_project_created` — emits `ProjectCreated` then
+// `ProjectCatalogChanged` for the new project's directory.
+pub machine ProjectRefreshService::notify_project_created(&self, project_info: &ProjectInfo, subscribers: &mut EventSubscriberTable) {
+    transition self.emit_internal_project_events {
+        true -> emit_created(project_info, subscribers)
+        false -> done()
+        _ -> done()
+    }
+    state emit_created(&self, project_info: &ProjectInfo, subscribers: &mut EventSubscriberTable) {
+        let project_created_event: ProjectCreatedEvent = ProjectCreatedEvent::new(project_info);
+        subscribers.route_engine_event(&project_created_event.to_engine_event());
+        transition { _ -> emit_catalog(project_info, subscribers) }
+    }
+    state emit_catalog(&self, project_info: &ProjectInfo, subscribers: &mut EventSubscriberTable) {
+        let mut project_catalog_changed_event: ProjectCatalogChangedEvent = ProjectCatalogChangedEvent::default();
+        let mut project_directory: [u8; 512];
+        transition project_info.get_project_directory(&mut project_directory) {
+            true -> with_directory(&mut project_catalog_changed_event, &project_directory, subscribers)
+            false -> done()
+        }
+    }
+    state with_directory(&self, project_catalog_changed_event: &mut ProjectCatalogChangedEvent, project_directory: &[u8], subscribers: &mut EventSubscriberTable) {
+        project_catalog_changed_event.set_changed_project_directory_path(project_directory);
+        subscribers.route_engine_event(&project_catalog_changed_event.to_engine_event());
+        transition { _ -> done() }
+    }
+    state done(&self) {
+    }
+}
+
+// Upstream `notify_project_deleted` — `ProjectDeleted` + catalog change.
+pub machine ProjectRefreshService::notify_project_deleted(&self, project_info: &ProjectInfo, subscribers: &mut EventSubscriberTable) {
+    transition self.emit_internal_project_events {
+        true -> emit_deleted(project_info, subscribers)
+        false -> done()
+        _ -> done()
+    }
+    state emit_deleted(&self, project_info: &ProjectInfo, subscribers: &mut EventSubscriberTable) {
+        let project_deleted_event: ProjectDeletedEvent = ProjectDeletedEvent::new(project_info);
+        subscribers.route_engine_event(&project_deleted_event.to_engine_event());
+        transition { _ -> emit_catalog(project_info, subscribers) }
+    }
+    state emit_catalog(&self, project_info: &ProjectInfo, subscribers: &mut EventSubscriberTable) {
+        let mut project_catalog_changed_event: ProjectCatalogChangedEvent = ProjectCatalogChangedEvent::default();
+        let mut project_directory: [u8; 512];
+        transition project_info.get_project_directory(&mut project_directory) {
+            true -> with_directory(&mut project_catalog_changed_event, &project_directory, subscribers)
+            false -> done()
+        }
+    }
+    state with_directory(&self, project_catalog_changed_event: &mut ProjectCatalogChangedEvent, project_directory: &[u8], subscribers: &mut EventSubscriberTable) {
+        project_catalog_changed_event.set_changed_project_directory_path(project_directory);
+        subscribers.route_engine_event(&project_catalog_changed_event.to_engine_event());
+        transition { _ -> done() }
+    }
+    state done(&self) {
+    }
+}
+
+// Upstream `notify_project_closed` — `ProjectClosed` only.
+pub machine ProjectRefreshService::notify_project_closed(&self, subscribers: &mut EventSubscriberTable) {
+    transition self.emit_internal_project_events {
+        true -> emit_closed(subscribers)
+        false -> done()
+        _ -> done()
+    }
+    state emit_closed(&self, subscribers: &mut EventSubscriberTable) {
+        let project_closed_event: ProjectClosedEvent = ProjectClosedEvent {};
+        subscribers.route_engine_event(&project_closed_event.to_engine_event());
+        transition { _ -> done() }
+    }
+    state done(&self) {
+    }
+}
+
+// Upstream `watch_projects_root` — records the catalog root and refreshes
+// the watcher set (watcher internals deferred; see file comment).
+pub machine ProjectRefreshService::watch_projects_root(&mut self, projects_root: &[u8]) {
+    _ = bounded_copy(&mut self.projects_root_path, &mut self.projects_root_path_len, projects_root);
+    self.has_projects_root_path = true;
+    self.refresh_file_system_watchers();
+}
+
+// Upstream `watch_opened_project` — records the opened project directory.
+pub machine ProjectRefreshService::watch_opened_project(&mut self, opened_project_directory_path: &[u8], has_opened_project_directory_path: bool) {
+    transition has_opened_project_directory_path {
+        true -> store_path(opened_project_directory_path)
+        false -> clear_path()
+        _ -> clear_path()
+    }
+    state store_path(&mut self, opened_project_directory_path: &[u8]) {
+        _ = bounded_copy(&mut self.opened_project_directory_path, &mut self.opened_project_directory_path_len, opened_project_directory_path);
+        self.has_opened_project_directory_path = true;
+        self.refresh_file_system_watchers();
+        transition { _ -> done() }
+    }
+    state clear_path(&mut self) {
+        self.has_opened_project_directory_path = false;
+        self.opened_project_directory_path_len = 0;
+        self.refresh_file_system_watchers();
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `set_file_system_watch_enabled` — no-op when unchanged.
+pub machine ProjectRefreshService::set_file_system_watch_enabled(&mut self, watch_file_system: bool) {
+    transition self.watch_file_system == watch_file_system {
+        true -> done()
+        false -> apply(watch_file_system)
+        _ -> apply(watch_file_system)
+    }
+    state apply(&mut self, watch_file_system: bool) {
+        self.watch_file_system = watch_file_system;
+        self.refresh_file_system_watchers();
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `refresh_file_system_watchers` — upstream drops both watchers
+// and recreates the live set from `should_watch_file_system` + recorded
+// paths. The port keeps the same live-flag bookkeeping; the actual
+// `notify` watchers stand in as flags until the file-watch leg lands.
+pub machine ProjectRefreshService::refresh_file_system_watchers(&mut self) {
+    self.projects_root_watch_live = false;
+    self.opened_project_watch_live = false;
+    transition self.get_should_watch_file_system() {
+        true -> arm()
+        false -> done()
+        _ -> done()
+    }
+    state arm(&mut self) {
+        self.projects_root_watch_live = self.has_projects_root_path;
+        self.opened_project_watch_live = self.has_opened_project_directory_path;
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
+    }
+}
+
+pub machine ProjectRefreshService::get_projects_root_watch_live(&self) -> bool {
+    self.projects_root_watch_live
+}
+
+pub machine ProjectRefreshService::get_opened_project_watch_live(&self) -> bool {
+    self.opened_project_watch_live
+}
+
+machine bounded_copy(destination: &mut [u8; 512], destination_len: &mut u64, source: &[u8]) -> bool {
+    transition source.len <= 512 {
+        true -> copy(destination, destination_len, source, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state copy(destination: &mut [u8; 512], destination_len: &mut u64, source: &[u8], position: u64) -> bool
+    {
+        transition position < source.len && position < 512 {
+            true -> copy_one(destination, destination_len, source, position)
+            false -> finish(destination_len, source)
+        }
+    }
+    state copy_one(destination: &mut [u8; 512], destination_len: &mut u64, source: &[u8], position: u64) -> bool
+        requires position < source.len && position < 512;
+    {
+        destination[position] = source[position];
+        transition { _ -> copy(destination, destination_len, source, position + 1) }
+    }
+    state finish(destination_len: &mut u64, source: &[u8]) -> bool {
+        destination_len = source.len;
+        (true)
+    }
+}
