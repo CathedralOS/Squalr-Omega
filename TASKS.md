@@ -25,6 +25,19 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   before live I/O; no Rust FFI scan shortcut or fixed-capacity substitute.
   Acceptance: ordinary native headless input produces exact addresses/ranges
   matching Rust and independent cases, including overlap/tails/empty input.
+  The parameter-carrier residual is ported: `DataTypeScanPreference`,
+  `DataTypeSizingData`, `ScalarIntegerValue::read_{unsigned,signed}`
+  (narrows upstream's 16-byte u128/i128 read window to 8-byte u64/i64 —
+  named deviation) `StructScanParameters` and the
+  `DataValuePreviewFormatter` surface (bounded [u8;4096] text carriers,
+  byte-domain limits, a 64-element split window table — named deviations).
+  The remaining dispatch rows wall on trait-object machinery: upstream's
+  `DataType` is `pub trait` implementations behind `Arc<RwLock<dyn>>`
+  bindings (same `dyn` facility class as `ProjectItemType` and the JSON
+  codec — no `dyn` mechanism in the pin). The ported substitute is concrete
+  enums + match dispatch (the `ScanCompareType` precedent); the blocked
+  rows are the built_in_types scalar/vector comparators and registry
+  tables, not the carrier layer.
 - **CLI-COMMANDS.** Port the existing request/response model through
   squalr-engine-session, squalr-engine and squalr-cli. The CLI main entry is
   intentionally absent until this work starts; do not substitute a success stub.

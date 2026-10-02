@@ -1,0 +1,988 @@
+module src::structures::data_values::data_value_preview_formatter;
+
+use src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::container_type::ContainerType;
+
+// Upstream `pub struct DataValuePreviewFormatter;` — a marker namespace for
+// the free formatter functions. No instances are constructed; the union
+// exists so `DataValuePreviewFormatter::` machine paths resolve.
+pub data DataValuePreviewFormatter [copy] {
+    case DataValuePreviewFormatter;
+}
+
+// Port of structures/data_values/data_value_preview_formatter.rs — compact
+// previews of anonymized value strings: scalar passthrough, string
+// truncation, array element limiting with a trailing "...".
+//
+// Deviations (all follow the package's bounded-inline convention):
+// - `String` previews become a [u8; 4096] carrier + length — the same bound
+//   the AnonymousValueString they render already holds, so passthrough
+//   previews never truncate against the bound.
+// - upstream counts `chars()` for truncation; authored text is a byte
+//   domain, so limits apply in bytes (ASCII previews are upstream-exact;
+//   multi-byte characters may cut mid-codepoint — named deviation).
+// - `split_preview_elements`' Vec<&str> becomes a bounded [start, end)
+//   window table of 64 elements — the formatter displays at most
+//   `max_array_preview_display_element_count` (default 4) elements anyway,
+//   so a >64-element value only changes the hidden-element signal to
+//   "present", which the display already emits as "...".
+// - `format_preview_from_elements` returns Optional upstream; Optional is
+//   unmatchable in this pin, so the refusal rides PreviewFormatResult
+//   (Refused / Formatted) like the package's other parse unions.
+
+pub data DataValuePreviewFormatOptions [copy] {
+    max_array_preview_display_element_count: u64;
+    max_array_preview_character_count: u64;
+    max_string_preview_character_count: u64;
+}
+
+pub machine DataValuePreviewFormatOptions::new(
+    max_array_preview_display_element_count: u64,
+    max_array_preview_character_count: u64,
+    max_string_preview_character_count: u64
+) -> DataValuePreviewFormatOptions {
+    (DataValuePreviewFormatOptions {
+        max_array_preview_display_element_count: max_array_preview_display_element_count,
+        max_array_preview_character_count: max_array_preview_character_count,
+        max_string_preview_character_count: max_string_preview_character_count,
+    })
+}
+
+pub machine DataValuePreviewFormatOptions::get_max_array_preview_display_element_count(&self) -> u64 {
+    (self.max_array_preview_display_element_count)
+}
+
+pub machine DataValuePreviewFormatOptions::get_max_array_preview_character_count(&self) -> u64 {
+    (self.max_array_preview_character_count)
+}
+
+pub machine DataValuePreviewFormatOptions::get_max_string_preview_character_count(&self) -> u64 {
+    (self.max_string_preview_character_count)
+}
+
+// The preview carrier — bounded inline text plus a length.
+pub data DataValuePreview {
+    text: [u8; 4096];
+    text_len: u64;
+}
+
+pub machine DataValuePreview::get_text_len(&self) -> u64 {
+    (self.text_len)
+}
+
+pub machine DataValuePreview::copy_text(&self, out: &mut [u8; 4096]) -> u64 {
+    transition {
+        _ -> copy(out, 0)
+    }
+    state copy(&self, out: &mut [u8; 4096], position: u64) -> u64 {
+        transition position < self.text_len && position < 4096 {
+            true -> store(out, position)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+    state store(&self, out: &mut [u8; 4096], position: u64) -> u64
+        requires position < self.text_len && position < 4096;
+    {
+        out[position] = self.text[position];
+        transition {
+            _ -> copy(out, position + 1)
+        }
+    }
+}
+
+// Upstream's `Option` carrier for `format_preview_from_elements` — Refused
+// is upstream's None (fewer than two elements split out of the text).
+pub data PreviewFormatResult {
+    case Refused;
+    case Formatted(preview: DataValuePreview);
+}
+
+// Module-private split table — upstream's `Vec<&str>` of trimmed
+// non-empty element windows.
+data PreviewElements {
+    starts: [u64; 64];
+    ends: [u64; 64];
+    count: u64;
+}
+
+machine PreviewElements::empty() -> PreviewElements {
+    let start_table: [u64; 64];
+    let end_table: [u64; 64];
+    (PreviewElements {
+        starts: start_table,
+        ends: end_table,
+        count: 0,
+    })
+}
+
+machine PreviewElements::get_count(&self) -> u64 {
+    (self.count)
+}
+
+// The count relationship is the caller's discipline — module-private
+// callers index only below the count they already read.
+machine PreviewElements::get_start(&self, index: u64) -> u64
+    requires index < 64;
+{
+    (self.starts[index])
+}
+
+machine PreviewElements::get_end(&self, index: u64) -> u64
+    requires index < 64;
+{
+    (self.ends[index])
+}
+
+// upstream `char::is_whitespace` for the string-preview trim.
+machine is_space(byte: u8) -> bool {
+    transition byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+        true -> (true)
+        false -> (false)
+        _ -> (false)
+    }
+}
+
+// upstream `is_ascii_whitespace() || matches!(',' | ';')` for the
+// array-preview trims.
+machine is_trimmable(byte: u8) -> bool {
+    transition byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 44 || byte == 59 {
+        true -> (true)
+        false -> (false)
+        _ -> (false)
+    }
+}
+
+// upstream `str::trim` left edge — first non-whitespace position of the
+// [start, end) window (end itself when all whitespace).
+machine trim_lead(display: &[u8; 4096], start: u64, end: u64) -> u64
+    requires end <= 4096;
+{
+    transition {
+        _ -> walk(display, start, end)
+    }
+    state walk(display: &[u8; 4096], start: u64, end: u64) -> u64
+        requires end <= 4096;
+    {
+        transition start < end {
+            true -> peek(display, start, end)
+            false -> (start)
+            _ -> (start)
+        }
+    }
+    state peek(display: &[u8; 4096], start: u64, end: u64) -> u64
+        requires start < end && end <= 4096;
+    {
+        let byte: u8 = display[start];
+        transition is_space(byte) {
+            true -> next(display, start, end)
+            false -> (start)
+            _ -> (start)
+        }
+    }
+    state next(display: &[u8; 4096], start: u64, end: u64) -> u64
+        requires start < end && end <= 4096;
+    {
+        transition {
+            _ -> walk(display, start + 1, end)
+        }
+    }
+}
+
+// upstream `trim_end_matches` — walk the end down while the byte before it
+// trims. `separators` selects the `,`/`;` arm of the predicate.
+machine trim_tail(display: &[u8; 4096], start: u64, end: u64, separators: bool) -> u64
+    requires end <= 4096;
+{
+    transition {
+        _ -> walk(display, start, end, separators)
+    }
+    state walk(display: &[u8; 4096], start: u64, end: u64, separators: bool) -> u64
+        requires end <= 4096;
+    {
+        transition start < end {
+            true -> index(display, start, end, separators)
+            false -> (end)
+            _ -> (end)
+        }
+    }
+    state index(display: &[u8; 4096], start: u64, end: u64, separators: bool) -> u64
+        requires start < end && end <= 4096;
+    {
+        let prior: u64 = end - 1;
+        transition prior < 4096 {
+            true -> peek(display, start, end, prior, separators)
+            false -> (end)
+            _ -> (end)
+        }
+    }
+    state peek(display: &[u8; 4096], start: u64, end: u64, prior: u64, separators: bool) -> u64
+        requires start < end && prior < 4096;
+    {
+        let byte: u8 = display[prior];
+        transition separators {
+            true -> check_trimmable(display, start, prior, byte)
+            false -> check_space(display, start, prior, byte)
+            _ -> check_space(display, start, prior, byte)
+        }
+    }
+    state check_trimmable(display: &[u8; 4096], start: u64, prior: u64, byte: u8) -> u64
+        requires prior < 4096;
+    {
+        transition is_trimmable(byte) {
+            true -> rebind(display, start, prior, true)
+            false -> done(prior)
+            _ -> done(prior)
+        }
+    }
+    state check_space(display: &[u8; 4096], start: u64, prior: u64, byte: u8) -> u64
+        requires prior < 4096;
+    {
+        transition is_space(byte) {
+            true -> rebind(display, start, prior, false)
+            false -> done(prior)
+            _ -> done(prior)
+        }
+    }
+    // `end < 4096` doesn't transport into `end <= 4096` — mint it.
+    state rebind(display: &[u8; 4096], start: u64, end: u64, separators: bool) -> u64
+        requires end < 4096;
+    {
+        transition end <= 4096 {
+            true -> walk(display, start, end, separators)
+            false -> (end)
+            _ -> (end)
+        }
+    }
+    // `prior + 1` is the trimmed end — the byte at prior still belonged to
+    // the kept span.
+    state done(prior: u64) -> u64 {
+        (prior + 1)
+    }
+}
+
+// Copy `source[0..count]` into `out` starting at `cursor`; returns the
+// cursor after the last written byte.
+machine copy_bytes(source: &[u8; 4096], count: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+    requires count <= 4096;
+{
+    transition {
+        _ -> copy(source, count, out, cursor, 0)
+    }
+    state copy(source: &[u8; 4096], count: u64, out: &mut [u8; 4096], cursor: u64, written: u64) -> u64
+        requires count <= 4096;
+    {
+        transition written < count && cursor < 4096 {
+            true -> store(source, count, out, cursor, written)
+            false -> (cursor)
+            _ -> (cursor)
+        }
+    }
+    state store(source: &[u8; 4096], count: u64, out: &mut [u8; 4096], cursor: u64, written: u64) -> u64
+        requires written < count && count <= 4096 && cursor < 4096;
+    {
+        out[cursor] = source[written];
+        transition {
+            _ -> copy(source, count, out, cursor + 1, written + 1)
+        }
+    }
+}
+
+// Copy `source[start..end]` into `out` starting at `cursor`; returns the
+// cursor after the last written byte.
+machine copy_window(source: &[u8; 4096], start: u64, end: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+    requires end <= 4096 && start <= end;
+{
+    transition {
+        _ -> copy(source, start, end, out, cursor)
+    }
+    state copy(source: &[u8; 4096], start: u64, end: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires end <= 4096;
+    {
+        transition start < end && cursor < 4096 {
+            true -> store(source, start, end, out, cursor)
+            false -> (cursor)
+            _ -> (cursor)
+        }
+    }
+    state store(source: &[u8; 4096], start: u64, end: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires start < end && end <= 4096 && cursor < 4096;
+    {
+        out[cursor] = source[start];
+        transition {
+            _ -> copy(source, start + 1, end, out, cursor + 1)
+        }
+    }
+}
+
+// Write `remaining` '.' bytes into `out` starting at `cursor`; returns the
+// cursor after the last written byte.
+machine write_dots(out: &mut [u8; 4096], cursor: u64, remaining: u64) -> u64 {
+    transition {
+        _ -> walk(out, cursor, remaining)
+    }
+    state walk(out: &mut [u8; 4096], cursor: u64, remaining: u64) -> u64 {
+        transition 0 < remaining && cursor < 4096 {
+            true -> store(out, cursor, remaining)
+            false -> (cursor)
+            _ -> (cursor)
+        }
+    }
+    state store(out: &mut [u8; 4096], cursor: u64, remaining: u64) -> u64
+        requires cursor < 4096 && 0 < remaining;
+    {
+        out[cursor] = 46;
+        transition {
+            _ -> walk(out, cursor + 1, remaining - 1)
+        }
+    }
+}
+
+// upstream `split_preview_elements` — [start, end) windows of the trimmed
+// non-empty segments between `,`/`;` separators, bounded at 64.
+machine split_preview_elements(display: &[u8; 4096], len: u64) -> PreviewElements
+    requires len <= 4096;
+{
+    transition {
+        _ -> scan(display, len, 0, 0, PreviewElements::empty())
+    }
+    // `cursor` walks the text; `seg_start` opens the current segment. At a
+    // separator or the end the [seg_start, cursor) segment trims and, if
+    // non-empty, enrolls.
+    state scan(display: &[u8; 4096], len: u64, cursor: u64, seg_start: u64, elements: PreviewElements) -> PreviewElements
+        requires len <= 4096;
+    {
+        transition cursor < len {
+            true -> byte(display, len, cursor, seg_start, elements)
+            false -> emit_final(display, seg_start, len, elements)
+            _ -> emit_final(display, seg_start, len, elements)
+        }
+    }
+    state byte(display: &[u8; 4096], len: u64, cursor: u64, seg_start: u64, elements: PreviewElements) -> PreviewElements
+        requires cursor < len && len <= 4096;
+    {
+        transition display[cursor] == 44 || display[cursor] == 59 {
+            true -> emit_gate(display, len, cursor, seg_start, elements)
+            false -> advance(display, len, cursor, seg_start, elements)
+            _ -> advance(display, len, cursor, seg_start, elements)
+        }
+    }
+    // `cursor < len` doesn't transport into `cursor <= len` — mint it.
+    state emit_gate(display: &[u8; 4096], len: u64, cursor: u64, seg_start: u64, elements: PreviewElements) -> PreviewElements
+        requires cursor < len && len <= 4096;
+    {
+        transition cursor <= len {
+            true -> emit(display, len, cursor, seg_start, elements)
+            false -> (elements)
+            _ -> (elements)
+        }
+    }
+    state emit(display: &[u8; 4096], len: u64, cursor: u64, seg_start: u64, elements: PreviewElements) -> PreviewElements
+        requires len <= 4096 && cursor <= len;
+    {
+        let lead: u64 = trim_lead(display, seg_start, cursor);
+        let tail: u64 = trim_tail(display, lead, cursor, true);
+        transition lead < tail {
+            true -> enroll(display, len, cursor, lead, tail, elements)
+            false -> resume(display, len, cursor, elements)
+            _ -> resume(display, len, cursor, elements)
+        }
+    }
+    state enroll(display: &[u8; 4096], len: u64, cursor: u64, lead: u64, tail: u64, elements: PreviewElements) -> PreviewElements
+        requires len <= 4096;
+    {
+        let count: u64 = elements.get_count();
+        transition count < 64 {
+            true -> enroll_store(display, len, cursor, lead, tail, elements)
+            false -> resume(display, len, cursor, elements)
+            _ -> resume(display, len, cursor, elements)
+        }
+    }
+    state enroll_store(display: &[u8; 4096], len: u64, cursor: u64, lead: u64, tail: u64, elements: PreviewElements) -> PreviewElements
+        requires len <= 4096;
+    {
+        let mut carried: PreviewElements = elements;
+        let count: u64 = carried.get_count();
+        transition count < 64 {
+            true -> enroll_write(display, len, cursor, lead, tail, carried, count)
+            false -> resume(display, len, cursor, carried)
+            _ -> resume(display, len, cursor, carried)
+        }
+    }
+    state enroll_write(display: &[u8; 4096], len: u64, cursor: u64, lead: u64, tail: u64, elements: PreviewElements, count: u64) -> PreviewElements
+        requires count < 64 && len <= 4096;
+    {
+        let mut carried: PreviewElements = elements;
+        carried.starts[count] = lead;
+        carried.ends[count] = tail;
+        carried.count = ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> resume(display, len, cursor, carried)
+        }
+    }
+    state resume(display: &[u8; 4096], len: u64, cursor: u64, elements: PreviewElements) -> PreviewElements
+        requires len <= 4096;
+    {
+        transition cursor < len {
+            true -> resume_next(display, len, cursor, elements)
+            false -> (elements)
+            _ -> (elements)
+        }
+    }
+    state resume_next(display: &[u8; 4096], len: u64, cursor: u64, elements: PreviewElements) -> PreviewElements
+        requires cursor < len && len <= 4096;
+    {
+        transition {
+            _ -> scan(display, len, cursor + 1, cursor + 1, elements)
+        }
+    }
+    state advance(display: &[u8; 4096], len: u64, cursor: u64, seg_start: u64, elements: PreviewElements) -> PreviewElements
+        requires cursor < len && len <= 4096;
+    {
+        transition {
+            _ -> scan(display, len, cursor + 1, seg_start, elements)
+        }
+    }
+    // Trailing segment after the last separator.
+    state emit_final(display: &[u8; 4096], seg_start: u64, seg_end: u64, elements: PreviewElements) -> PreviewElements
+        requires seg_end <= 4096;
+    {
+        let lead: u64 = trim_lead(display, seg_start, seg_end);
+        let tail: u64 = trim_tail(display, lead, seg_end, true);
+        transition lead < tail {
+            true -> enroll_final(lead, tail, elements)
+            false -> (elements)
+            _ -> (elements)
+        }
+    }
+    state enroll_final(lead: u64, tail: u64, elements: PreviewElements) -> PreviewElements {
+        let count: u64 = elements.get_count();
+        transition count < 64 {
+            true -> enroll_final_store(lead, tail, elements, count)
+            false -> (elements)
+            _ -> (elements)
+        }
+    }
+    state enroll_final_store(lead: u64, tail: u64, elements: PreviewElements, count: u64) -> PreviewElements
+        requires count < 64;
+    {
+        let mut carried: PreviewElements = elements;
+        carried.starts[count] = lead;
+        carried.ends[count] = tail;
+        carried.count = ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (carried)
+    }
+}
+
+// Join elements [0..visible) of `elements` into `out` starting at `cursor`
+// — ", " between elements and a trailing ", ..." element when `has_hidden`.
+// Returns the cursor after the last written byte.
+machine join_elements(
+    display: &[u8; 4096],
+    elements: &PreviewElements,
+    count: u64,
+    visible: u64,
+    has_hidden: bool,
+    out: &mut [u8; 4096],
+    cursor: u64
+) -> u64
+    requires visible <= count;
+{
+    transition {
+        _ -> join(display, elements, count, visible, has_hidden, 0, out, cursor)
+    }
+    state join(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires visible <= count;
+    {
+        transition index < visible {
+            true -> leading(display, elements, count, visible, has_hidden, index, out, cursor)
+            false -> tail(elements, count, visible, has_hidden, out, cursor)
+            _ -> tail(elements, count, visible, has_hidden, out, cursor)
+        }
+    }
+    // A ", " separator leads every element after the first.
+    state leading(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires index < visible && visible <= count;
+    {
+        transition 0 < index {
+            true -> comma(display, elements, count, visible, has_hidden, index, out, cursor)
+            false -> element(display, elements, count, visible, has_hidden, index, out, cursor)
+            _ -> element(display, elements, count, visible, has_hidden, index, out, cursor)
+        }
+    }
+    state comma(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires index < visible && visible <= count;
+    {
+        transition cursor < 4096 {
+            true -> comma_store(display, elements, count, visible, has_hidden, index, out, cursor)
+            false -> element(display, elements, count, visible, has_hidden, index, out, cursor)
+            _ -> element(display, elements, count, visible, has_hidden, index, out, cursor)
+        }
+    }
+    state comma_store(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires cursor < 4096 && index < visible && visible <= count;
+    {
+        out[cursor] = 44;
+        transition {
+            _ -> space(display, elements, count, visible, has_hidden, index, out, cursor + 1)
+        }
+    }
+    state space(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires index < visible && visible <= count;
+    {
+        transition cursor < 4096 {
+            true -> space_store(display, elements, count, visible, has_hidden, index, out, cursor)
+            false -> element(display, elements, count, visible, has_hidden, index, out, cursor)
+            _ -> element(display, elements, count, visible, has_hidden, index, out, cursor)
+        }
+    }
+    state space_store(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires cursor < 4096 && index < visible && visible <= count;
+    {
+        out[cursor] = 32;
+        transition {
+            _ -> element(display, elements, count, visible, has_hidden, index, out, cursor + 1)
+        }
+    }
+    // Write element `index`'s trimmed window.
+    state element(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires index < visible && visible <= count;
+    {
+        transition index < count && index < 64 {
+            true -> window(display, elements, count, visible, has_hidden, index, out, cursor)
+            false -> join_next(display, elements, count, visible, has_hidden, index, out, cursor)
+            _ -> join_next(display, elements, count, visible, has_hidden, index, out, cursor)
+        }
+    }
+    state window(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires index < count && index < 64 && index < visible && visible <= count;
+    {
+        let start: u64 = elements.get_start(index);
+        let end: u64 = elements.get_end(index);
+        transition end <= 4096 && start <= end {
+            true -> element_write(display, elements, count, visible, has_hidden, index, out, cursor, start, end)
+            false -> join_next(display, elements, count, visible, has_hidden, index, out, cursor)
+            _ -> join_next(display, elements, count, visible, has_hidden, index, out, cursor)
+        }
+    }
+    state element_write(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64, start: u64, end: u64) -> u64
+        requires end <= 4096 && start <= end && index < visible && visible <= count;
+    {
+        let written: u64 = copy_window(display, start, end, out, cursor);
+        transition {
+            _ -> join_next(display, elements, count, visible, has_hidden, index, out, written)
+        }
+    }
+    state join_next(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires visible <= count;
+    {
+        transition index < visible {
+            true -> join_step(display, elements, count, visible, has_hidden, index, out, cursor)
+            false -> tail(elements, count, visible, has_hidden, out, cursor)
+            _ -> tail(elements, count, visible, has_hidden, out, cursor)
+        }
+    }
+    state join_step(display: &[u8; 4096], elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, index: u64, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires index < visible && visible <= count;
+    {
+        transition {
+            _ -> join(display, elements, count, visible, has_hidden, index + 1, out, cursor)
+        }
+    }
+    // Trailing "..." element — upstream pushed it into the element list
+    // before the ", " join, so it is preceded by a separator only when
+    // visible elements already wrote.
+    state tail(elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, out: &mut [u8; 4096], cursor: u64) -> u64 {
+        transition has_hidden {
+            true -> tail_sep(elements, count, visible, has_hidden, out, cursor)
+            false -> (cursor)
+            _ -> (cursor)
+        }
+    }
+    state tail_sep(elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, out: &mut [u8; 4096], cursor: u64) -> u64 {
+        transition 0 < cursor {
+            true -> tail_comma(elements, count, visible, has_hidden, out, cursor)
+            false -> tail_dots(out, cursor)
+            _ -> tail_dots(out, cursor)
+        }
+    }
+    state tail_comma(elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, out: &mut [u8; 4096], cursor: u64) -> u64 {
+        transition cursor < 4096 {
+            true -> tail_comma_store(elements, count, visible, has_hidden, out, cursor)
+            false -> tail_dots(out, cursor)
+            _ -> tail_dots(out, cursor)
+        }
+    }
+    state tail_comma_store(elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires cursor < 4096;
+    {
+        out[cursor] = 44;
+        transition {
+            _ -> tail_space(elements, count, visible, has_hidden, out, cursor + 1)
+        }
+    }
+    state tail_space(elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, out: &mut [u8; 4096], cursor: u64) -> u64 {
+        transition cursor < 4096 {
+            true -> tail_space_store(elements, count, visible, has_hidden, out, cursor)
+            false -> tail_dots(out, cursor)
+            _ -> tail_dots(out, cursor)
+        }
+    }
+    state tail_space_store(elements: &PreviewElements, count: u64, visible: u64, has_hidden: bool, out: &mut [u8; 4096], cursor: u64) -> u64
+        requires cursor < 4096;
+    {
+        out[cursor] = 32;
+        transition {
+            _ -> tail_dots(out, cursor + 1)
+        }
+    }
+    state tail_dots(out: &mut [u8; 4096], cursor: u64) -> u64 {
+        transition {
+            _ -> dots_write(out, cursor)
+        }
+    }
+    state dots_write(out: &mut [u8; 4096], cursor: u64) -> u64 {
+        let written: u64 = write_dots(out, cursor, 3);
+        transition {
+            _ -> (written)
+        }
+    }
+}
+
+pub machine DataValuePreviewFormatter::limit_array_container_type(
+    container_type: ContainerType
+) -> ContainerType {
+    transition container_type {
+        ContainerType::ArrayFixed { length } -> limit(container_type, length)
+        _ -> (container_type)
+    }
+    state limit(container_type: ContainerType, length: u64) -> ContainerType {
+        transition length > 4 {
+            true -> (ContainerType::ArrayFixed { length: 4 })
+            false -> (container_type)
+            _ -> (container_type)
+        }
+    }
+}
+
+pub machine DataValuePreviewFormatter::array_preview_was_truncated(
+    container_type: ContainerType
+) -> bool {
+    transition container_type {
+        ContainerType::ArrayFixed { length } -> check(length)
+        _ -> (false)
+    }
+    state check(length: u64) -> bool {
+        transition length > 4 {
+            true -> (true)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// upstream `format_preview_from_elements`: Refused when fewer than two
+// elements split out; otherwise the first
+// `min(count, max_display)` windows joined with ", " plus a trailing
+// "..." element when elements hide (force_ellipsis || visible < count).
+pub machine DataValuePreviewFormatter::format_preview_from_elements(
+    display: &[u8; 4096],
+    display_len: u64,
+    force_ellipsis: bool,
+    format_options: DataValuePreviewFormatOptions
+) -> PreviewFormatResult {
+    transition display_len <= 4096 {
+        true -> split(display, display_len, force_ellipsis, format_options)
+        false -> (PreviewFormatResult::Refused)
+        _ -> (PreviewFormatResult::Refused)
+    }
+    state split(display: &[u8; 4096], display_len: u64, force_ellipsis: bool, format_options: DataValuePreviewFormatOptions) -> PreviewFormatResult
+        requires display_len <= 4096;
+    {
+        let elements: PreviewElements = split_preview_elements(display, display_len);
+        transition {
+            _ -> decide(display, display_len, force_ellipsis, format_options, elements)
+        }
+    }
+    state decide(display: &[u8; 4096], display_len: u64, force_ellipsis: bool, format_options: DataValuePreviewFormatOptions, elements: PreviewElements) -> PreviewFormatResult
+        requires display_len <= 4096;
+    {
+        let count: u64 = elements.get_count();
+        transition 1 < count {
+            true -> bound(display, display_len, force_ellipsis, format_options, elements, count)
+            false -> (PreviewFormatResult::Refused)
+            _ -> (PreviewFormatResult::Refused)
+        }
+    }
+    state bound(display: &[u8; 4096], display_len: u64, force_ellipsis: bool, format_options: DataValuePreviewFormatOptions, elements: PreviewElements, count: u64) -> PreviewFormatResult
+        requires display_len <= 4096;
+    {
+        let max: u64 = format_options.get_max_array_preview_display_element_count();
+        transition count <= max {
+            true -> hidden(display, display_len, force_ellipsis, elements, count, count)
+            false -> bound_max(display, display_len, force_ellipsis, elements, count, max)
+            _ -> (PreviewFormatResult::Refused)
+        }
+    }
+    // `visible = max` needs `max <= count` — the guard mints it.
+    state bound_max(display: &[u8; 4096], display_len: u64, force_ellipsis: bool, elements: PreviewElements, count: u64, max: u64) -> PreviewFormatResult
+        requires display_len <= 4096;
+    {
+        transition max <= count {
+            true -> hidden(display, display_len, force_ellipsis, elements, count, max)
+            false -> (PreviewFormatResult::Refused)
+            _ -> (PreviewFormatResult::Refused)
+        }
+    }
+    state hidden(display: &[u8; 4096], display_len: u64, force_ellipsis: bool, elements: PreviewElements, count: u64, visible: u64) -> PreviewFormatResult
+        requires display_len <= 4096 && visible <= count;
+    {
+        transition force_ellipsis || visible < count {
+            true -> open(display, elements, count, visible, true)
+            false -> open(display, elements, count, visible, false)
+            _ -> open(display, elements, count, visible, false)
+        }
+    }
+    state open(display: &[u8; 4096], elements: PreviewElements, count: u64, visible: u64, has_hidden: bool) -> PreviewFormatResult
+        requires visible <= count;
+    {
+        let mut out: [u8; 4096];
+        let cursor: u64 = join_elements(display, &elements, count, visible, has_hidden, &mut out, 0);
+        (PreviewFormatResult::Formatted {
+            preview: DataValuePreview { text: out, text_len: cursor },
+        })
+    }
+}
+
+// upstream `format_anonymous_value_preview`.
+pub machine DataValuePreviewFormatter::format_anonymous_value_preview(
+    anonymous_value_string: &AnonymousValueString,
+    contextual_container_type: ContainerType,
+    preview_was_truncated: bool,
+    format_options: DataValuePreviewFormatOptions
+) -> DataValuePreview {
+    let mut display: [u8; 4096];
+    let display_len: u64 = anonymous_value_string.copy_anonymous_value_string(&mut display);
+    transition display_len <= 4096 {
+        true -> formats(anonymous_value_string, contextual_container_type, preview_was_truncated, format_options, display, display_len)
+        false -> empty()
+        _ -> empty()
+    }
+    state formats(
+        anonymous_value_string: &AnonymousValueString,
+        contextual_container_type: ContainerType,
+        preview_was_truncated: bool,
+        format_options: DataValuePreviewFormatOptions,
+        display: [u8; 4096],
+        display_len: u64
+    ) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        let format: AnonymousValueStringFormat = anonymous_value_string.get_anonymous_value_string_format();
+        transition format {
+            AnonymousValueStringFormat::String -> string_arm(&display, display_len, format_options)
+            _ -> shape(anonymous_value_string, contextual_container_type, preview_was_truncated, format_options, display, display_len)
+        }
+    }
+    // upstream `truncate_string_preview_value`.
+    state string_arm(display: &[u8; 4096], display_len: u64, format_options: DataValuePreviewFormatOptions) -> DataValuePreview {
+        let limit: u64 = format_options.get_max_string_preview_character_count();
+        transition display_len <= limit && display_len <= 4096 {
+            true -> verbatim(display, display_len)
+            false -> string_bound(display, limit)
+            _ -> string_bound(display, limit)
+        }
+    }
+    state verbatim(display: &[u8; 4096], display_len: u64) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        let mut out: [u8; 4096];
+        let written: u64 = copy_bytes(display, display_len, &mut out, 0);
+        (DataValuePreview { text: out, text_len: written })
+    }
+    state empty() -> DataValuePreview {
+        let text: [u8; 4096];
+        (DataValuePreview { text: text, text_len: 0 })
+    }
+    state string_bound(display: &[u8; 4096], limit: u64) -> DataValuePreview {
+        transition limit <= 4096 {
+            true -> string_trim(display, limit)
+            false -> empty()
+            _ -> empty()
+        }
+    }
+    // Keep `limit` leading bytes, then drop trailing whitespace; upstream
+    // appends "..." unconditionally.
+    state string_trim(display: &[u8; 4096], limit: u64) -> DataValuePreview
+        requires limit <= 4096;
+    {
+        let trimmed: u64 = trim_tail(display, 0, limit, false);
+        transition trimmed <= 4096 {
+            true -> ellipsized_write(display, trimmed)
+            false -> empty()
+            _ -> empty()
+        }
+    }
+    state ellipsized_write(display: &[u8; 4096], trimmed: u64) -> DataValuePreview
+        requires trimmed <= 4096;
+    {
+        let mut out: [u8; 4096];
+        let cursor: u64 = copy_bytes(display, trimmed, &mut out, 0);
+        let written: u64 = write_dots(&mut out, cursor, 3);
+        (DataValuePreview { text: out, text_len: written })
+    }
+    // upstream's non-String path: the effective container is the value's
+    // own when it says array, otherwise the contextual one.
+    state shape(
+        anonymous_value_string: &AnonymousValueString,
+        contextual_container_type: ContainerType,
+        preview_was_truncated: bool,
+        format_options: DataValuePreviewFormatOptions,
+        display: [u8; 4096],
+        display_len: u64
+    ) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        let own_container: ContainerType = anonymous_value_string.get_container_type();
+        transition own_container {
+            ContainerType::Array -> array_arm(preview_was_truncated, format_options, display, display_len)
+            ContainerType::ArrayFixed { length } -> array_arm(preview_was_truncated, format_options, display, display_len)
+            _ -> contextual(contextual_container_type, preview_was_truncated, format_options, display, display_len)
+        }
+    }
+    state contextual(
+        contextual_container_type: ContainerType,
+        preview_was_truncated: bool,
+        format_options: DataValuePreviewFormatOptions,
+        display: [u8; 4096],
+        display_len: u64
+    ) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        transition contextual_container_type {
+            ContainerType::Array -> array_arm(preview_was_truncated, format_options, display, display_len)
+            ContainerType::ArrayFixed { length } -> array_arm(preview_was_truncated, format_options, display, display_len)
+            _ -> verbatim(&display, display_len)
+        }
+    }
+    // Array shapes render `[inner]`; upstream passes empty display values
+    // straight through.
+    state array_arm(preview_was_truncated: bool, format_options: DataValuePreviewFormatOptions, display: [u8; 4096], display_len: u64) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        transition 0 < display_len {
+            true -> inner_or_ellipsis(preview_was_truncated, format_options, display, display_len)
+            false -> verbatim(&display, display_len)
+            _ -> verbatim(&display, display_len)
+        }
+    }
+    state inner_or_ellipsis(preview_was_truncated: bool, format_options: DataValuePreviewFormatOptions, display: [u8; 4096], display_len: u64) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        transition preview_was_truncated {
+            true -> ellipsized(&display, display_len, format_options)
+            false -> element_preview(&display, display_len, format_options)
+            _ -> element_preview(&display, display_len, format_options)
+        }
+    }
+    // upstream `append_preview_ellipsis`: element-joined preview or the
+    // trim-and-append fallback, then brackets.
+    state ellipsized(display: &[u8; 4096], display_len: u64, format_options: DataValuePreviewFormatOptions) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        let inner: PreviewFormatResult = DataValuePreviewFormatter::format_preview_from_elements(display, display_len, true, format_options);
+        transition inner {
+            PreviewFormatResult::Formatted { preview } -> bracket(preview)
+            PreviewFormatResult::Refused -> trim_for_ellipsis(display, display_len)
+            _ -> trim_for_ellipsis(display, display_len)
+        }
+    }
+    // upstream `truncate_preview_value`: element-joined preview or the
+    // byte-limit + trim + "..." fallback, then brackets.
+    state element_preview(display: &[u8; 4096], display_len: u64, format_options: DataValuePreviewFormatOptions) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        let inner: PreviewFormatResult = DataValuePreviewFormatter::format_preview_from_elements(display, display_len, false, format_options);
+        transition inner {
+            PreviewFormatResult::Formatted { preview } -> bracket(preview)
+            PreviewFormatResult::Refused -> truncate_fallback(display, display_len, format_options)
+            _ -> truncate_fallback(display, display_len, format_options)
+        }
+    }
+    // `append_preview_ellipsis`' fallback arm: trim trailing whitespace and
+    // separators; empty stays "...", otherwise trimmed + "...".
+    state trim_for_ellipsis(display: &[u8; 4096], display_len: u64) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        let trimmed: u64 = trim_tail(display, 0, display_len, true);
+        transition trimmed <= 4096 {
+            true -> ellipsized_write(display, trimmed)
+            false -> empty()
+            _ -> empty()
+        }
+    }
+    // `truncate_preview_value`'s fallback arm: byte-limit, trim trailing
+    // whitespace/separators, "...".
+    state truncate_fallback(display: &[u8; 4096], display_len: u64, format_options: DataValuePreviewFormatOptions) -> DataValuePreview
+        requires display_len <= 4096;
+    {
+        let limit: u64 = format_options.get_max_array_preview_character_count();
+        transition display_len <= limit {
+            true -> verbatim(display, display_len)
+            false -> truncate_bound(display, limit)
+            _ -> truncate_bound(display, limit)
+        }
+    }
+    state truncate_bound(display: &[u8; 4096], limit: u64) -> DataValuePreview {
+        transition limit <= 4096 {
+            true -> truncate_trim(display, limit)
+            false -> empty()
+            _ -> empty()
+        }
+    }
+    state truncate_trim(display: &[u8; 4096], limit: u64) -> DataValuePreview
+        requires limit <= 4096;
+    {
+        let trimmed: u64 = trim_tail(display, 0, limit, true);
+        transition trimmed <= 4096 {
+            true -> ellipsized_write(display, trimmed)
+            false -> empty()
+            _ -> empty()
+        }
+    }
+    // Wrap the element-joined preview in `[` `]`.
+    state bracket(preview: DataValuePreview) -> DataValuePreview {
+        let mut inner: [u8; 4096];
+        let inner_len: u64 = preview.copy_text(&mut inner);
+        transition inner_len <= 4094 {
+            true -> bracket_write(inner, inner_len)
+            false -> (preview)
+            _ -> (preview)
+        }
+    }
+    state bracket_write(inner: [u8; 4096], inner_len: u64) -> DataValuePreview
+        requires inner_len <= 4094;
+    {
+        let mut out: [u8; 4096];
+        out[0] = 91;
+        let cursor: u64 = copy_window(&inner, 0, inner_len, &mut out, 1);
+        transition {
+            _ -> bracket_close(out, cursor)
+        }
+    }
+    state bracket_close(out: [u8; 4096], cursor: u64) -> DataValuePreview {
+        transition cursor < 4096 {
+            true -> bracket_store(out, cursor)
+            false -> (DataValuePreview { text: out, text_len: cursor })
+            _ -> (DataValuePreview { text: out, text_len: cursor })
+        }
+    }
+    state bracket_store(out: [u8; 4096], cursor: u64) -> DataValuePreview
+        requires cursor < 4096;
+    {
+        let mut carried: [u8; 4096] = out;
+        carried[cursor] = 93;
+        (DataValuePreview { text: carried, text_len: cursor + 1 })
+    }
+}
