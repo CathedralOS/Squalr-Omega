@@ -1,0 +1,136 @@
+module src::command_executors::debugger_trace_start_request_executor;
+
+use squalr_engine_api::src::commands::debugger::trace_start::debugger_trace_start_request::DebuggerTraceStartRequest;
+use squalr_engine_api::src::commands::debugger::trace_start::debugger_trace_start_response::DebuggerTraceStartResponse;
+use squalr_engine_api::src::structures::debugger::debugger_command_status::DebuggerCommandStatus;
+use squalr_engine_api::src::structures::debugger::debugger_data_breakpoint_access::DebuggerDataBreakpointAccess;
+use squalr_engine_api::src::structures::debugger::debugger_trace_session_descriptor::DebuggerTraceSessionDescriptor;
+use squalr_engine_api::src::structures::debugger::debugger_trace_target_kind::DebuggerTraceTargetKind;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_session::src::debugger::debugger_service::DebuggerOperationOutcome;
+use squalr_engine_session::src::debugger::debugger_service::DebuggerTraceOutcome;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+
+// Port of command_executors/debugger/mod.rs::DebuggerTraceStartRequest —
+// opened-process guard, service.attach(plugin_id None) first, then
+// start_trace_session / start_instruction_trace_session by target_kind.
+// `size_in_bytes` narrows u64 -> u8 per upstream's request field type.
+pub data DebuggerTraceStartRequestExecutor {}
+
+pub machine DebuggerTraceStartRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    debugger_trace_start_request: &DebuggerTraceStartRequest
+) -> DebuggerTraceStartResponse {
+    transition engine_privileged_state.has_opened_process() {
+        true -> attach(engine_privileged_state, debugger_trace_start_request)
+        _ -> absent()
+    }
+
+    state absent() -> DebuggerTraceStartResponse {
+        let mut response: DebuggerTraceStartResponse = DebuggerTraceStartResponse::new();
+        let mut status: DebuggerCommandStatus = DebuggerCommandStatus::failure();
+        status.set_message("No opened process to debug.");
+        response.set_status(status);
+        (response)
+    }
+
+    state attach(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        debugger_trace_start_request: &DebuggerTraceStartRequest
+    ) -> DebuggerTraceStartResponse {
+        let opened_process_info: OpenedProcessInfo = engine_privileged_state.get_opened_process();
+        let attach_outcome: DebuggerOperationOutcome = engine_privileged_state.debugger_attach(
+            &opened_process_info, false, "");
+        transition attach_outcome.succeeded {
+            true -> dispatch(engine_privileged_state, debugger_trace_start_request)
+            _ -> attach_failed(attach_outcome)
+        }
+    }
+
+    state attach_failed(outcome: DebuggerOperationOutcome) -> DebuggerTraceStartResponse {
+        let mut response: DebuggerTraceStartResponse = DebuggerTraceStartResponse::new();
+        let mut status: DebuggerCommandStatus = DebuggerCommandStatus::failure();
+        status.set_message(outcome.get_error_message());
+        response.set_status(status);
+        (response)
+    }
+
+    state dispatch(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        debugger_trace_start_request: &DebuggerTraceStartRequest
+    ) -> DebuggerTraceStartResponse {
+        transition debugger_trace_start_request.get_target_kind() {
+            DebuggerTraceTargetKind::Address -> start_address(engine_privileged_state, debugger_trace_start_request)
+            DebuggerTraceTargetKind::Instruction -> start_instruction(engine_privileged_state, debugger_trace_start_request)
+            _ -> start_address(engine_privileged_state, debugger_trace_start_request)
+        }
+    }
+
+    state start_address(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        debugger_trace_start_request: &DebuggerTraceStartRequest
+    ) -> DebuggerTraceStartResponse {
+        let address: u64 = debugger_trace_start_request.get_address();
+        let size_in_bytes: u8 = debugger_trace_start_request.get_size_in_bytes() as u8;
+        let access: DebuggerDataBreakpointAccess = debugger_trace_start_request.get_access();
+        let has_label: bool = debugger_trace_start_request.has_label();
+        let label: &[u8] = debugger_trace_start_request.get_label();
+        let outcome: DebuggerTraceOutcome = engine_privileged_state.debugger_start_trace_session(
+            address,
+            size_in_bytes,
+            access,
+            has_label,
+            label);
+        transition outcome.succeeded && outcome.has_trace_session {
+            true -> fill(outcome)
+            _ -> failed(outcome)
+        }
+    }
+
+    state start_instruction(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        debugger_trace_start_request: &DebuggerTraceStartRequest
+    ) -> DebuggerTraceStartResponse {
+        let instruction_address: u64 = debugger_trace_start_request.get_address();
+        let access: DebuggerDataBreakpointAccess = debugger_trace_start_request.get_access();
+        let has_label: bool = debugger_trace_start_request.has_label();
+        let label: &[u8] = debugger_trace_start_request.get_label();
+        let outcome: DebuggerTraceOutcome = engine_privileged_state.debugger_start_instruction_trace_session(
+            instruction_address,
+            access,
+            has_label,
+            label);
+        transition outcome.succeeded && outcome.has_trace_session {
+            true -> fill(outcome)
+            _ -> failed(outcome)
+        }
+    }
+
+    state fill(outcome: DebuggerTraceOutcome) -> DebuggerTraceStartResponse {
+        let mut response: DebuggerTraceStartResponse = DebuggerTraceStartResponse::new();
+        response.set_trace_session(DebuggerTraceSessionDescriptor::clone(&outcome.trace_session));
+        transition { _ -> records(response, outcome, 0) }
+    }
+
+    state records(response: DebuggerTraceStartResponse, outcome: DebuggerTraceOutcome, position: u64) -> DebuggerTraceStartResponse {
+        transition position < outcome.instruction_record_count && position < 16 {
+            true -> record(response, outcome, position)
+            _ -> (response)
+        }
+    }
+
+    state record(mut response: DebuggerTraceStartResponse, outcome: DebuggerTraceOutcome, position: u64) -> DebuggerTraceStartResponse
+        requires position < 16
+    {
+        _ = response.add_instruction_record(&outcome.instruction_records[position]);
+        transition { _ -> records(response, outcome, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state failed(outcome: DebuggerTraceOutcome) -> DebuggerTraceStartResponse {
+        let mut response: DebuggerTraceStartResponse = DebuggerTraceStartResponse::new();
+        let mut status: DebuggerCommandStatus = DebuggerCommandStatus::failure();
+        status.set_message(outcome.get_error_message());
+        response.set_status(status);
+        (response)
+    }
+}
