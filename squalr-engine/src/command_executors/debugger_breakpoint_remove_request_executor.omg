@@ -1,0 +1,154 @@
+module src::command_executors::debugger_breakpoint_remove_request_executor;
+
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::debugger::breakpoint_remove::debugger_breakpoint_remove_request::DebuggerBreakpointRemoveRequest;
+use squalr_engine_api::src::commands::debugger::breakpoint_remove::debugger_breakpoint_remove_response::DebuggerBreakpointRemoveResponse;
+use squalr_engine_api::src::structures::debugger::debugger_command_status::DebuggerCommandStatus;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use squalr_engine_session::src::debugger::debugger_service::DebuggerVoidOutcome;
+use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
+use squalr_engine_session::src::patches::patch_service::PatchServiceError;
+use squalr_engine_session::src::patches::patch_service::PatchServiceResult;
+
+// Port of command_executors/debugger/mod.rs::DebuggerBreakpointRemoveRequest —
+// a `patch:`-prefixed breakpoint id routes to patch_service.restore_patch
+// with the prefix stripped (software breakpoints are patch-backed); every
+// other id goes to debugger_service.remove_breakpoint.
+// Empty receiver carrying the machines — mirrors upstream's `impl` namespace.
+pub data DebuggerBreakpointRemoveRequestExecutor {}
+
+// PATCH_SOFTWARE_BREAKPOINT_ID_PREFIX: "patch:" — 112 97 116 99 104 58.
+machine debugger_breakpoint_id_has_patch_prefix(breakpoint_id: &[u8]) -> bool {
+    transition breakpoint_id.len > 5 {
+        true -> check(breakpoint_id)
+        _ -> (false)
+    }
+    state check(breakpoint_id: &[u8]) -> bool
+        requires breakpoint_id.len > 5
+    {
+        (breakpoint_id[0] == 112 && breakpoint_id[1] == 97 && breakpoint_id[2] == 116 && breakpoint_id[3] == 99 && breakpoint_id[4] == 104 && breakpoint_id[5] == 58)
+    }
+}
+
+// `strip_prefix("patch:")` — copies breakpoint_id[6..] into `out` bounded,
+// returning the tail length. Indices run off `position + 6` so the requires
+// bound stays a plain param comparison.
+machine debugger_breakpoint_id_patch_tail(breakpoint_id: &[u8], out: &mut [u8; 64]) -> u64 {
+    transition { _ -> copy(breakpoint_id, out, 0) }
+    state copy(breakpoint_id: &[u8], out: &mut [u8; 64], position: u64) -> u64 {
+        let source_position: u64 = ((position as u64 in Wrapping) + (6 as u64 in Wrapping)) as u64;
+        transition source_position < breakpoint_id.len && position < 64 {
+            true -> store(breakpoint_id, out, position, source_position)
+            _ -> (position)
+        }
+    }
+    state store(breakpoint_id: &[u8], out: &mut [u8; 64], position: u64, source_position: u64) -> u64
+        requires position < 64 && source_position < breakpoint_id.len
+    {
+        out[position] = breakpoint_id[source_position];
+        transition { _ -> copy(breakpoint_id, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+pub machine DebuggerBreakpointRemoveRequestExecutor::execute(
+    engine_privileged_state: &mut EnginePrivilegedState,
+    debugger_breakpoint_remove_request: &DebuggerBreakpointRemoveRequest
+) -> DebuggerBreakpointRemoveResponse
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition debugger_breakpoint_id_has_patch_prefix(debugger_breakpoint_remove_request.get_breakpoint_id()) {
+        true -> guarded_patch(engine_privileged_state, debugger_breakpoint_remove_request)
+        _ -> call_service(engine_privileged_state, debugger_breakpoint_remove_request)
+    }
+
+    state absent() -> DebuggerBreakpointRemoveResponse {
+        let mut response: DebuggerBreakpointRemoveResponse = DebuggerBreakpointRemoveResponse::new();
+        let mut status: DebuggerCommandStatus = DebuggerCommandStatus::failure();
+        status.set_message("No opened process to debug.");
+        response.set_status(status);
+        (response)
+    }
+
+    state guarded_patch(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        debugger_breakpoint_remove_request: &DebuggerBreakpointRemoveRequest
+    ) -> DebuggerBreakpointRemoveResponse
+    {
+        transition engine_privileged_state.has_opened_process() {
+            true -> restore_patch(engine_privileged_state, debugger_breakpoint_remove_request)
+            _ -> absent()
+        }
+    }
+
+    state restore_patch(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        debugger_breakpoint_remove_request: &DebuggerBreakpointRemoveRequest
+    ) -> DebuggerBreakpointRemoveResponse
+    {
+        let mut patch_id_tail: [u8; 64];
+        let breakpoint_id: &[u8] = debugger_breakpoint_remove_request.get_breakpoint_id();
+        let tail_len: u64 = debugger_breakpoint_id_patch_tail(
+            breakpoint_id,
+            &mut patch_id_tail);
+        transition tail_len <= 64 {
+            true -> restore_tail(engine_privileged_state, &patch_id_tail, tail_len)
+            _ -> restore_tail(engine_privileged_state, &patch_id_tail, 64)
+        }
+    }
+
+    state restore_tail(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        patch_id_tail: &[u8; 64],
+        tail_len: u64
+    ) -> DebuggerBreakpointRemoveResponse
+    requires tail_len < 65
+    {
+        let opened_process_info: OpenedProcessInfo = engine_privileged_state.get_opened_process();
+        let result: PatchServiceResult = engine_privileged_state.restore_patch(
+            &opened_process_info,
+            &patch_id_tail[0..tail_len]);
+        transition result {
+            PatchServiceResult::Ok { patch } -> ok_result()
+            PatchServiceResult::Err { error } -> patch_failed(error)
+            _ -> ok_result()
+        }
+    }
+
+    state ok_result() -> DebuggerBreakpointRemoveResponse {
+        (DebuggerBreakpointRemoveResponse::new())
+    }
+
+    state patch_failed(error: PatchServiceError) -> DebuggerBreakpointRemoveResponse {
+        let mut response: DebuggerBreakpointRemoveResponse = DebuggerBreakpointRemoveResponse::new();
+        let mut status: DebuggerCommandStatus = DebuggerCommandStatus::failure();
+        status.set_message(error.get_message());
+        response.set_status(status);
+        (response)
+    }
+
+    state call_service(
+        engine_privileged_state: &mut EnginePrivilegedState,
+        debugger_breakpoint_remove_request: &DebuggerBreakpointRemoveRequest
+    ) -> DebuggerBreakpointRemoveResponse {
+        let breakpoint_id: &[u8] = debugger_breakpoint_remove_request.get_breakpoint_id();
+        let outcome: DebuggerVoidOutcome = engine_privileged_state.debugger_remove_breakpoint(
+            breakpoint_id);
+        transition outcome.succeeded {
+            true -> removed()
+            _ -> failed(outcome)
+        }
+    }
+
+    state removed() -> DebuggerBreakpointRemoveResponse {
+        (DebuggerBreakpointRemoveResponse::new())
+    }
+
+    state failed(outcome: DebuggerVoidOutcome) -> DebuggerBreakpointRemoveResponse {
+        let mut response: DebuggerBreakpointRemoveResponse = DebuggerBreakpointRemoveResponse::new();
+        let mut status: DebuggerCommandStatus = DebuggerCommandStatus::failure();
+        status.set_message(outcome.get_error_message());
+        response.set_status(status);
+        (response)
+    }
+}
