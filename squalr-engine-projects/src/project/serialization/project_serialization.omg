@@ -1,0 +1,266 @@
+module src::project::serialization::project_serialization;
+
+use squalr_engine_api::src::structures::projects::project::Project;
+
+// Port of project/serialization/project_serialization.rs — the free helper
+// surface is fully portable; the `SerializableProjectFile for Project`
+// impls are downstream of the serde_json-equivalent codec (TASKS.md
+// PROJECT-SERIALIZATION): `save_to_path` writes pretty JSON per item and
+// `load_from_path`'s directory walk ends in a JSON parse per item file —
+// named blockers, not placeholder bodies.
+
+// Upstream `resolve_project_root_directory_path` — directory joined with
+// `Project::PROJECT_DIR` ("project_items"), bounded-carrier spelling.
+pub machine resolve_project_root_directory_path(
+    directory: &[u8],
+    out_path: &mut [u8; 512]
+) -> u64 {
+    let component: &[u8] = Project::get_project_directory_name();
+    (append_path_component(directory, component, out_path))
+}
+
+// The project-info file's path inside a project directory — upstream
+// `directory.join(Project::PROJECT_FILE)` ("project.json").
+pub machine resolve_project_info_file_path(
+    directory: &[u8],
+    out_path: &mut [u8; 512]
+) -> u64 {
+    let component: &[u8] = Project::get_project_file_name();
+    (append_path_component(directory, component, out_path))
+}
+
+// `Path::join` on bounded carriers — copies `base`, one separator unless
+// `base` already ends in one (upstream join semantics), then `component`;
+// returns the stored byte count, truncating past the 512 bound as the
+// package's path-carrier convention does elsewhere.
+pub machine append_path_component(
+    base: &[u8],
+    component: &[u8],
+    out_path: &mut [u8; 512]
+) -> u64 {
+    transition {
+        _ -> copy_base(base, component, out_path, 0)
+    }
+    state copy_base(base: &[u8], component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64 {
+        transition position < base.len && position < 512 {
+            true -> store_base(base, component, out_path, position)
+            false -> bound_base(component, out_path, position)
+            _ -> bound_base(component, out_path, position)
+        }
+    }
+    // The copy loop's exit leaves `position` at min(base.len, 512) — the
+    // guard mints the `<= 512` fact the separator phase contracts on.
+    state bound_base(component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64 {
+        transition position <= 512 {
+            true -> separator(component, out_path, position)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+    state store_base(base: &[u8], component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < base.len && position < 512;
+    {
+        out_path[position] = base[position];
+        transition {
+            _ -> copy_base(base, component, out_path, position + 1)
+        }
+    }
+    // separator — writes '/' at `position` unless the byte before it is
+    // already a separator (`Path::join` does not double a trailing one).
+    state separator(component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64
+        requires position <= 512;
+    {
+        transition position > 0 {
+            true -> inspect(component, out_path, position)
+            false -> write_separator(component, out_path, position)
+            _ -> copy_component(component, out_path, position)
+        }
+    }
+    state inspect(component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64
+        requires position <= 512 && 0 < position;
+    {
+        let index: u64 = position - 1;
+        transition index < 512 {
+            true -> decide(component, out_path, position, index)
+            false -> copy_component(component, out_path, position)
+            _ -> copy_component(component, out_path, position)
+        }
+    }
+    state decide(component: &[u8], out_path: &mut [u8; 512], position: u64, index: u64) -> u64
+        requires position <= 512 && index < 512;
+    {
+        let byte: u8 = out_path[index];
+        transition byte == 47 || byte == 92 {
+            true -> copy_component(component, out_path, position)
+            false -> write_separator(component, out_path, position)
+            _ -> write_separator(component, out_path, position)
+        }
+    }
+    state write_separator(component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64
+        requires position <= 512;
+    {
+        transition position < 512 {
+            true -> stamp(component, out_path, position)
+            false -> copy_component(component, out_path, position)
+            _ -> copy_component(component, out_path, position)
+        }
+    }
+    state stamp(component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < 512;
+    {
+        out_path[position] = 47;
+        transition {
+            _ -> copy_component(component, out_path, position + 1)
+        }
+    }
+    state copy_component(component: &[u8], out_path: &mut [u8; 512], position: u64) -> u64
+        requires position <= 512;
+    {
+        transition position < 512 {
+            true -> stream_component(component, out_path, position, 0)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+    state stream_component(component: &[u8], out_path: &mut [u8; 512], position: u64, component_position: u64) -> u64
+        requires position <= 512;
+    {
+        transition component_position < component.len && position < 512 {
+            true -> store_component(component, out_path, position, component_position)
+            false -> (position)
+            _ -> (position)
+        }
+    }
+    state store_component(component: &[u8], out_path: &mut [u8; 512], position: u64, component_position: u64) -> u64
+        requires position < 512 && component_position < component.len;
+    {
+        out_path[position] = component[component_position];
+        transition {
+            _ -> stream_component(component, out_path, position + 1, component_position + 1)
+        }
+    }
+}
+
+// Upstream `is_project_item_file_path` — the file name's extension matches
+// ".json" case-insensitively (`eq_ignore_ascii_case`). A file name whose
+// only '.' is its first byte carries no extension upstream (hidden files).
+pub machine is_project_item_file_path(project_item_path: &[u8]) -> bool {
+    transition {
+        _ -> scan(project_item_path, project_item_path.len)
+    }
+    // scan — walk back for the file name's last '.', stopping at a
+    // separator (extensions do not span directories).
+    state scan(project_item_path: &[u8], position: u64) -> bool {
+        transition 0 < position && position <= project_item_path.len {
+            true -> prior(project_item_path, position)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    // `position - 1` as a call argument cannot carry the bound the callee
+    // contracts on — bind it and guard it into the proof.
+    state prior(project_item_path: &[u8], position: u64) -> bool
+        requires 0 < position && position <= project_item_path.len;
+    {
+        let index: u64 = position - 1;
+        transition index < project_item_path.len {
+            true -> probe(project_item_path, index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state probe(project_item_path: &[u8], index: u64) -> bool
+        requires index < project_item_path.len;
+    {
+        let byte: u8 = project_item_path[index];
+        transition byte == 46 {
+            true -> match_dot(project_item_path, index)
+            false -> check_separator(project_item_path, index)
+            _ -> (false)
+        }
+    }
+    state check_separator(project_item_path: &[u8], index: u64) -> bool
+        requires index < project_item_path.len;
+    {
+        let byte: u8 = project_item_path[index];
+        transition byte == 47 || byte == 92 {
+            true -> (false)
+            false -> scan(project_item_path, index)
+            _ -> scan(project_item_path, index)
+        }
+    }
+    // match_dot — '.' must not be the file name's first byte (hidden
+    // files carry no extension upstream) and must tail exactly "json".
+    state match_dot(project_item_path: &[u8], index: u64) -> bool
+        requires index < project_item_path.len;
+    {
+        transition index > 0 {
+            true -> first_byte(project_item_path, index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state first_byte(project_item_path: &[u8], index: u64) -> bool
+        requires 0 < index && index < project_item_path.len;
+    {
+        let previous_index: u64 = index - 1;
+        transition previous_index < project_item_path.len {
+            true -> peek(project_item_path, index, previous_index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state peek(project_item_path: &[u8], index: u64, previous_index: u64) -> bool
+        requires index < project_item_path.len && previous_index < project_item_path.len;
+    {
+        let previous: u8 = project_item_path[previous_index];
+        transition previous == 47 || previous == 92 {
+            true -> scan(project_item_path, index)
+            false -> next(project_item_path, index)
+            _ -> next(project_item_path, index)
+        }
+    }
+    state next(project_item_path: &[u8], index: u64) -> bool
+        requires index < project_item_path.len;
+    {
+        let next_index: u64 = index + 1;
+        transition next_index <= project_item_path.len {
+            true -> match_extension(project_item_path, next_index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state match_extension(project_item_path: &[u8], start: u64) -> bool
+        requires start <= project_item_path.len;
+    {
+        let extension_len: u64 = project_item_path.len - start;
+        transition extension_len == 4 {
+            true -> extension_view(project_item_path, start)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state extension_view(project_item_path: &[u8], start: u64) -> bool
+        requires start <= project_item_path.len;
+    {
+        let tail: &[u8] = &project_item_path[start..project_item_path.len];
+        transition 4 <= tail.len {
+            true -> letters(tail)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state letters(tail: &[u8]) -> bool
+        requires 4 <= tail.len;
+    {
+        let j: u8 = tail[0] | 32;
+        let s: u8 = tail[1] | 32;
+        let o: u8 = tail[2] | 32;
+        let n: u8 = tail[3] | 32;
+        transition j == 106 && s == 115 && o == 111 && n == 110 {
+            true -> (true)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
