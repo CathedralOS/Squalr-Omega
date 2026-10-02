@@ -1,0 +1,218 @@
+module src::registries::privileged_registry_cache;
+
+use squalr_engine_api::src::plugins::plugin_metadata::PluginMetadata;
+use squalr_engine_api::src::registries::symbols::data_type_descriptor::DataTypeDescriptor;
+use squalr_engine_api::src::registries::symbols::privileged_registry_catalog::PrivilegedRegistryCatalog;
+use squalr_engine_api::src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
+use squalr_engine_api::src::registries::symbols::symbol_registry::SymbolRegistry;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use src::plugins::plugin_registry::PluginRegistry;
+
+// Port of registries/privileged_registry_cache.rs — the unprivileged
+// side's cache of privileged-owned registry state. Upstream seeds
+// `built_in_symbol_registry` from get_builtin_plugin_packages() by
+// dyn-dispatching `as_data_type_plugin().contributed_data_types()` —
+// port-side the PluginRegistry materializes the same 10 descriptors
+// from package constants (contributed_data_type_descriptor), and the
+// dyn DataType operations (validate/deanonymize/anonymize/compare)
+// remain the deferred residual named in the registry leg.
+pub data PrivilegedRegistryCache {
+    has_latest_privileged_registry_catalog: bool;
+    latest_privileged_registry_catalog: PrivilegedRegistryCatalog;
+    built_in_symbol_registry: SymbolRegistry;
+}
+
+pub machine PrivilegedRegistryCache::default() -> PrivilegedRegistryCache {
+    (PrivilegedRegistryCache {
+        has_latest_privileged_registry_catalog: false,
+        latest_privileged_registry_catalog: PrivilegedRegistryCatalog::default(),
+        built_in_symbol_registry: SymbolRegistry::new(),
+    })
+}
+
+// Upstream `create_builtin_symbol_registry` — the base registry (21
+// builtin descriptors seeded by SymbolRegistry::new) plus every DataType-
+// capable builtin package's contributed descriptors.
+pub machine PrivilegedRegistryCache::new() -> PrivilegedRegistryCache {
+    let mut cache: PrivilegedRegistryCache = PrivilegedRegistryCache::default();
+    cache.seed_builtins();
+    (cache)
+}
+
+pub machine PrivilegedRegistryCache::seed_builtins(&mut self) {
+    let plugin_registry: PluginRegistry = PluginRegistry::new();
+    transition { _ -> seed_package(&plugin_registry, 0) }
+    state seed_package(&mut self, plugin_registry: &PluginRegistry, plugin_position: u64) {
+        transition plugin_position < plugin_registry.get_plugin_count() && plugin_position < 8 {
+            true -> seed_types(plugin_registry, plugin_position, 0)
+            false -> finish()
+        }
+    }
+    state seed_types(&mut self, plugin_registry: &PluginRegistry, plugin_position: u64, index: u64) {
+        transition index < plugin_registry.contributed_data_type_count(plugin_position) && index < 16 {
+            true -> materialize(plugin_registry, plugin_position, index)
+            false -> seed_package(plugin_registry, ((plugin_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state materialize(&mut self, plugin_registry: &PluginRegistry, plugin_position: u64, index: u64) {
+        let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+        transition plugin_registry.contributed_data_type_descriptor(plugin_position, index, &mut descriptor) {
+            true -> register(plugin_registry, plugin_position, index, &descriptor)
+            false -> seed_types(plugin_registry, plugin_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state register(&mut self, plugin_registry: &PluginRegistry, plugin_position: u64, index: u64, descriptor: &DataTypeDescriptor) {
+        _ = self.built_in_symbol_registry.register_data_type_descriptor(descriptor);
+        transition { _ -> seed_types(plugin_registry, plugin_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state finish(&mut self) {
+    }
+}
+
+pub machine PrivilegedRegistryCache::apply_registry_catalog(&mut self, privileged_registry_catalog: &PrivilegedRegistryCatalog) {
+    self.latest_privileged_registry_catalog.clone_from(privileged_registry_catalog);
+    self.has_latest_privileged_registry_catalog = true;
+}
+
+pub machine PrivilegedRegistryCache::get_has_registry_catalog(&self) -> bool {
+    self.has_latest_privileged_registry_catalog
+}
+
+pub machine PrivilegedRegistryCache::get_registry_catalog(&self) -> &PrivilegedRegistryCatalog {
+    (&self.latest_privileged_registry_catalog)
+}
+
+// Upstream `get_generation` — the catalog's generation, 0 when absent.
+pub machine PrivilegedRegistryCache::get_generation(&self) -> u64 {
+    transition self.has_latest_privileged_registry_catalog {
+        true -> (self.latest_privileged_registry_catalog.get_generation())
+        false -> (0)
+    }
+}
+
+// Upstream `get_registered_data_type_refs` — descriptor-at-position
+// access over whichever table is authoritative (catalog when present,
+// else the builtin registry), the same Vec<DataTypeRef> iteration
+// upstream callers perform.
+pub machine PrivilegedRegistryCache::get_registered_data_type_descriptor_count(&self) -> u64 {
+    transition self.has_latest_privileged_registry_catalog {
+        true -> (self.latest_privileged_registry_catalog.get_data_type_descriptor_count())
+        false -> (self.built_in_symbol_registry.get_data_type_descriptor_count())
+    }
+}
+
+pub machine PrivilegedRegistryCache::get_registered_data_type_descriptor_at(&self, position: u64, out_descriptor: &mut DataTypeDescriptor) -> bool {
+    transition self.has_latest_privileged_registry_catalog {
+        true -> catalog(position, out_descriptor)
+        false -> builtin(position, out_descriptor)
+    }
+    state catalog(&self, position: u64, out_descriptor: &mut DataTypeDescriptor) -> bool {
+        transition position < self.latest_privileged_registry_catalog.get_data_type_descriptor_count() && position < 128 {
+            true -> read(position, out_descriptor)
+            false -> (false)
+        }
+    }
+    state read(&self, position: u64, out_descriptor: &mut DataTypeDescriptor) -> bool
+        requires position < 128;
+    {
+        out_descriptor.clone_from(&self.latest_privileged_registry_catalog.data_type_descriptors[position]);
+        (true)
+    }
+    state builtin(&self, position: u64, out_descriptor: &mut DataTypeDescriptor) -> bool {
+        (self.built_in_symbol_registry.get_registered_data_type_descriptor_at(position, out_descriptor))
+    }
+}
+
+// Upstream `find_data_type_descriptor` — catalog first, builtin fallback.
+pub machine PrivilegedRegistryCache::find_data_type_descriptor(&self, data_type_id: &[u8], out_descriptor: &mut DataTypeDescriptor) -> bool {
+    transition self.has_latest_privileged_registry_catalog {
+        true -> in_catalog(data_type_id, out_descriptor)
+        false -> in_builtin(data_type_id, out_descriptor)
+    }
+    state in_catalog(&self, data_type_id: &[u8], out_descriptor: &mut DataTypeDescriptor) -> bool {
+        transition self.latest_privileged_registry_catalog.find_data_type_descriptor(data_type_id, out_descriptor) {
+            true -> (true)
+            false -> in_builtin(data_type_id, out_descriptor)
+        }
+    }
+    state in_builtin(&self, data_type_id: &[u8], out_descriptor: &mut DataTypeDescriptor) -> bool {
+        (self.built_in_symbol_registry.find_data_type_descriptor(data_type_id, out_descriptor))
+    }
+}
+
+pub machine PrivilegedRegistryCache::is_registered_data_type_ref(&self, data_type_ref: &DataTypeRef) -> bool {
+    let mut scratch: DataTypeDescriptor = DataTypeDescriptor::default();
+    (self.find_data_type_descriptor(data_type_ref.get_data_type_id(), &mut scratch))
+}
+
+// Upstream `get_supported_anonymous_value_string_formats` — the
+// descriptor's format table on a hit; empty count on a miss mirrors
+// upstream's builtin-registry fallback only being needed when the
+// catalog ALSO misses (builtin is always consulted second).
+pub machine PrivilegedRegistryCache::get_supported_anonymous_value_string_format_count(&self, data_type_id: &[u8]) -> u64 {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.find_data_type_descriptor(data_type_id, &mut descriptor) {
+        true -> (descriptor.get_supported_format_count())
+        false -> (0)
+    }
+}
+
+pub machine PrivilegedRegistryCache::get_supported_anonymous_value_string_format(&self, data_type_id: &[u8], position: u64) -> AnonymousValueStringFormat {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.find_data_type_descriptor(data_type_id, &mut descriptor) {
+        true -> format_of(&descriptor, position)
+        false -> (AnonymousValueStringFormat::default())
+    }
+    state format_of(&self, descriptor: &DataTypeDescriptor, position: u64) -> AnonymousValueStringFormat {
+        transition position < descriptor.get_supported_format_count() && position < 8 {
+            true -> format_at(descriptor, position)
+            false -> (AnonymousValueStringFormat::default())
+        }
+    }
+    state format_at(&self, descriptor: &DataTypeDescriptor, position: u64) -> AnonymousValueStringFormat
+        requires position < 8;
+    {
+        (descriptor.supported_anonymous_value_string_formats[position])
+    }
+}
+
+pub machine PrivilegedRegistryCache::get_default_anonymous_value_string_format(&self, data_type_id: &[u8]) -> AnonymousValueStringFormat {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.find_data_type_descriptor(data_type_id, &mut descriptor) {
+        true -> (descriptor.get_default_anonymous_value_string_format())
+        false -> (AnonymousValueStringFormat::default())
+    }
+}
+
+pub machine PrivilegedRegistryCache::get_unit_size_in_bytes(&self, data_type_id: &[u8]) -> u64 {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition self.find_data_type_descriptor(data_type_id, &mut descriptor) {
+        true -> (descriptor.get_unit_size_in_bytes())
+        false -> (0)
+    }
+}
+
+// Upstream `resolve_struct_layout_definition` — catalog layout hit,
+// then the builtin registry's symbolic-struct table.
+pub machine PrivilegedRegistryCache::resolve_struct_layout_definition(&self, symbolic_struct_id: &[u8], out: &mut SymbolicStructDefinition) -> bool {
+    transition self.has_latest_privileged_registry_catalog {
+        true -> in_catalog(symbolic_struct_id, out)
+        false -> in_builtin(symbolic_struct_id, out)
+    }
+    state in_catalog(&self, symbolic_struct_id: &[u8], out: &mut SymbolicStructDefinition) -> bool {
+        let mut descriptor: StructLayoutDescriptor = StructLayoutDescriptor::default();
+        transition self.latest_privileged_registry_catalog.find_struct_layout_descriptor(symbolic_struct_id, &mut descriptor) {
+            true -> read(&descriptor, out)
+            false -> in_builtin(symbolic_struct_id, out)
+        }
+    }
+    state read(&self, descriptor: &StructLayoutDescriptor, out: &mut SymbolicStructDefinition) -> bool {
+        out.clone_from(descriptor.get_struct_layout_definition());
+        (true)
+    }
+    state in_builtin(&self, symbolic_struct_id: &[u8], out: &mut SymbolicStructDefinition) -> bool {
+        (self.built_in_symbol_registry.get_symbolic_struct_definition(symbolic_struct_id, out))
+    }
+}
