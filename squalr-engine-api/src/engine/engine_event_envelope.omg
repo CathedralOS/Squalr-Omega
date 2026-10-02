@@ -1,0 +1,119 @@
+module src::engine::engine_event_envelope;
+
+use src::events::engine_event::EngineEvent;
+use src::events::logging::log_level::LogLevel;
+
+// Port of engine/engine_event_envelope.rs — the per-event generation stamp
+// upstream attaches so listeners can detect a stale privileged registry
+// catalog. `{ registry_generation: u64, engine_event: EngineEvent }`.
+//
+// Deviation: upstream wraps the event at EMIT time inside a RwLock-locked
+// publish; port-side the queue carries raw EngineEvent values and the
+// currency check happens at route time against the caller-supplied
+// generation — the collapse is documented on EngineUnprivilegedState.
+pub data EngineEventEnvelope {
+    registry_generation: u64;
+    engine_event: EngineEvent;
+}
+
+pub machine EngineEventEnvelope::default() -> EngineEventEnvelope {
+    (EngineEventEnvelope {
+        registry_generation: 0,
+        engine_event: EngineEvent::default(),
+    })
+}
+
+pub machine EngineEventEnvelope::new(registry_generation: u64, engine_event: EngineEvent) -> EngineEventEnvelope {
+    (EngineEventEnvelope {
+        registry_generation: registry_generation,
+        engine_event: engine_event,
+    })
+}
+
+pub machine EngineEventEnvelope::get_registry_generation(&self) -> u64 {
+    self.registry_generation
+}
+
+pub machine EngineEventEnvelope::get_engine_event(&self) -> &EngineEvent {
+    (&self.engine_event)
+}
+
+pub machine EngineEventEnvelope::clone(&self) -> EngineEventEnvelope {
+    (EngineEventEnvelope {
+        registry_generation: self.registry_generation,
+        engine_event: self.engine_event.clone(),
+    })
+}
+
+pub machine EngineEventEnvelope::clone_from(&mut self, source: &EngineEventEnvelope) {
+    self.registry_generation = source.registry_generation;
+    self.engine_event.clone_from(&source.engine_event);
+}
+
+// Bounded queue of envelopes — the port-side carrier the unprivileged
+// bindings surface hands to subscribers (upstream: crossbeam channel of
+// envelopes; port: bounded insertion-order ring drained by route calls).
+pub data EngineEventEnvelopeQueue {
+    envelopes: [EngineEventEnvelope; 64];
+    envelope_count: u64;
+}
+
+pub machine EngineEventEnvelopeQueue::default() -> EngineEventEnvelopeQueue {
+    (EngineEventEnvelopeQueue {
+        envelope_count: 0,
+    })
+}
+
+pub machine EngineEventEnvelopeQueue::empty() -> EngineEventEnvelopeQueue {
+    (EngineEventEnvelopeQueue::default())
+}
+
+pub machine EngineEventEnvelopeQueue::get_envelope_count(&self) -> u64 {
+    self.envelope_count
+}
+
+pub machine EngineEventEnvelopeQueue::get_envelope(&self, position: u64) -> &EngineEventEnvelope {
+    transition position < self.envelope_count && position < 64 {
+        true -> at(position)
+        false -> head()
+        _ -> head()
+    }
+    state at(&self, position: u64) -> &EngineEventEnvelope
+        requires position < 64;
+    {
+        (&self.envelopes[position])
+    }
+    state head(&self) -> &EngineEventEnvelope {
+        (&self.envelopes[0])
+    }
+}
+
+// Upstream `Sender::send` — appends; refuses past the bound (bounded-table
+// discipline; a full queue drops the event, matching "lossy under
+// backpressure" semantics upstream's try_send has at capacity).
+pub machine EngineEventEnvelopeQueue::push(&mut self, engine_event: &EngineEventEnvelope) -> bool {
+    transition self.envelope_count < 64 {
+        true -> store(engine_event)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, engine_event: &EngineEventEnvelope) -> bool {
+        let index: u64 = self.envelope_count;
+        transition index < 64 {
+            true -> write(engine_event, index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state write(&mut self, engine_event: &EngineEventEnvelope, index: u64) -> bool
+        requires index < 64;
+    {
+        self.envelopes[index].clone_from(engine_event);
+        self.envelope_count = index + 1;
+        (true)
+    }
+}
+
+pub machine EngineEventEnvelopeQueue::clear(&mut self) {
+    self.envelope_count = 0;
+}

@@ -1,0 +1,207 @@
+module src::event_subscribers::event_subscriber_table;
+
+use squalr_engine_api::src::events::engine_event::EngineEvent;
+use squalr_engine_api::src::events::scan_results::scan_results_event::ScanResultsEvent;
+use squalr_engine_api::src::events::registry::registry_event::RegistryEvent;
+use squalr_engine_api::src::events::plugins::plugins_event::PluginsEvent;
+use squalr_engine_api::src::events::debugger::debugger_event::DebuggerEvent;
+use squalr_engine_api::src::events::logging::logging_event::LoggingEvent;
+use squalr_engine_api::src::events::process::process_event::ProcessEvent;
+use squalr_engine_api::src::events::project::project_event::ProjectEvent;
+use squalr_engine_api::src::events::project_items::project_items_event::ProjectItemsEvent;
+use squalr_engine_api::src::events::trackable_task::trackable_task_event::TrackableTaskEvent;
+use src::pending_engine_events::PendingEngineEvents;
+
+// Upstream's event-listener surface is a `HashMap<TypeId, Vec<Box<dyn
+// Fn(&dyn Any)>>>` — each subscriber registers under the concrete event
+// type it wants (`subscribe_to_event::<T>`), and dispatch downcasts the
+// `EngineEvent` arm into the typed leaf before invoking the callbacks.
+// Omega has no TypeId map and no stored closures, so the port makes the
+// subscription contract value-shaped: every leaf event type owns a bit in
+// a 64-bit interest mask; a subscriber registers the bits of the leaf
+// events it wants and receives a bounded queue. `route_engine_event`
+// computes the event's leaf bit and enqueues it for every matching
+// subscriber — the same dispatch semantics with masks standing in for
+// TypeIds and per-subscriber queues standing in for callback invocations.
+pub data EventSubscriberTable {
+    interest_masks: [u64; 16];
+    queues: [PendingEngineEvents; 16];
+    active: [bool; 16];
+    subscriber_count: u64;
+}
+
+pub machine EventSubscriberTable::new() -> EventSubscriberTable {
+    EventSubscriberTable {
+        subscriber_count: 0,
+    }
+}
+
+// Upstream `subscribe_to_event::<T>` — returns the subscriber slot index.
+pub machine EventSubscriberTable::subscribe(&mut self, interest_mask: u64) -> u64 {
+    transition self.subscriber_count < 16 {
+        true -> claim(interest_mask)
+        false -> (16)
+        _ -> (16)
+    }
+    state claim(&mut self, interest_mask: u64) -> u64 {
+        let position: u64 = self.subscriber_count;
+        self.interest_masks[position] = interest_mask;
+        _ = subscriber_queue_clear(&mut self.queues[position]);
+        self.active[position] = true;
+        self.subscriber_count = position + 1;
+        position
+    }
+}
+
+// The leaf-event interest bit for an `EngineEvent` value — one bit per
+// concrete leaf type, matching upstream's `TypeId` registration keys.
+pub machine engine_event_interest_mask(event: &EngineEvent) -> u64 {
+    transition event {
+        EngineEvent::ScanResults { event } -> mask_of_scan_results(event)
+        EngineEvent::Registry { event } -> mask_of_registry(event)
+        EngineEvent::Plugins { event } -> mask_of_plugins(event)
+        EngineEvent::Debugger { event } -> mask_of_debugger(event)
+        EngineEvent::Logging { event } -> mask_of_logging(event)
+        EngineEvent::Process { event } -> mask_of_process(event)
+        EngineEvent::Project { event } -> mask_of_project(event)
+        EngineEvent::ProjectItems { event } -> mask_of_project_items(event)
+        EngineEvent::TrackableTask { event } -> mask_of_trackable_task(event)
+        _ -> (0)
+    }
+    state mask_of_scan_results(&self, event: &ScanResultsEvent) -> u64 {
+        transition event {
+            ScanResultsEvent::ScanResultsUpdated { scan_results_updated_event } -> (1)
+            _ -> (0)
+        }
+    }
+    state mask_of_registry(&self, event: &RegistryEvent) -> u64 {
+        transition event {
+            RegistryEvent::Changed { registry_changed_event } -> (2)
+            _ -> (0)
+        }
+    }
+    state mask_of_plugins(&self, event: &PluginsEvent) -> u64 {
+        transition event {
+            PluginsEvent::PluginsChanged { plugins_changed_event } -> (4)
+            _ -> (0)
+        }
+    }
+    state mask_of_debugger(&self, event: &DebuggerEvent) -> u64 {
+        transition event {
+            DebuggerEvent::SessionStateChanged { debugger_session_state_changed_event } -> (8)
+            DebuggerEvent::TraceRecorded { debugger_trace_recorded_event } -> (16)
+            DebuggerEvent::TraceSessionUpdated { debugger_trace_session_updated_event } -> (32)
+            _ -> (0)
+        }
+    }
+    state mask_of_logging(&self, event: &LoggingEvent) -> u64 {
+        transition event {
+            LoggingEvent::LogRecorded { log_recorded_event } -> (64)
+            _ -> (0)
+        }
+    }
+    state mask_of_process(&self, event: &ProcessEvent) -> u64 {
+        transition event {
+            ProcessEvent::ProcessChanged { process_changed_event } -> (128)
+            _ -> (0)
+        }
+    }
+    state mask_of_project(&self, event: &ProjectEvent) -> u64 {
+        transition event {
+            ProjectEvent::ProjectCatalogChanged { project_catalog_changed_event } -> (256)
+            ProjectEvent::ProjectClosed { project_closed_event } -> (512)
+            ProjectEvent::ProjectCreated { project_created_event } -> (1024)
+            ProjectEvent::ProjectDeleted { project_deleted_event } -> (2048)
+            _ -> (0)
+        }
+    }
+    state mask_of_project_items(&self, event: &ProjectItemsEvent) -> u64 {
+        transition event {
+            ProjectItemsEvent::ProjectItemsChanged { project_items_changed_event } -> (4096)
+            _ -> (0)
+        }
+    }
+    state mask_of_trackable_task(&self, event: &TrackableTaskEvent) -> u64 {
+        transition event {
+            TrackableTaskEvent::ProgressChanged { progress_changed_event } -> (8192)
+            _ -> (0)
+        }
+    }
+}
+
+// Upstream `dispatch_engine_event_by_variant` — pushes the event onto
+// every active subscriber queue whose interest mask covers the leaf bit.
+pub machine EventSubscriberTable::route_engine_event(&mut self, event: &EngineEvent) {
+    let interest_mask: u64 = engine_event_interest_mask(event);
+    transition { _ -> walk(event, interest_mask, 0) }
+    state walk(&mut self, event: &EngineEvent, interest_mask: u64, position: u64) {
+        transition position < self.subscriber_count && position < 16 {
+            true -> check(event, interest_mask, position)
+            false -> done()
+        }
+    }
+    state check(&mut self, event: &EngineEvent, interest_mask: u64, position: u64) {
+        transition self.active[position] && (interest_mask & self.interest_masks[position]) != 0 {
+            true -> deliver(event, interest_mask, position)
+            false -> walk(event, interest_mask, position + 1)
+        }
+    }
+    state deliver(&mut self, event: &EngineEvent, interest_mask: u64, position: u64) {
+        _ = subscriber_queue_push(&mut self.queues[position], event);
+        transition { _ -> walk(event, interest_mask, position + 1) }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Subscriber-side drains: upstream the callback receives the event; here
+// the subscriber pulls queued events and clears.
+pub machine EventSubscriberTable::get_queued_event_count(&self, subscriber_position: u64) -> u64 {
+    transition subscriber_position < self.subscriber_count && subscriber_position < 16 {
+        true -> (subscriber_queue_count(&self.queues[subscriber_position]))
+        false -> (0)
+        _ -> (0)
+    }
+}
+
+pub machine EventSubscriberTable::get_queued_event(&self, subscriber_position: u64, event_position: u64) -> EngineEvent {
+    transition subscriber_position < self.subscriber_count && subscriber_position < 16 {
+        true -> (subscriber_queue_get(&self.queues[subscriber_position], event_position))
+        false -> (EngineEvent::default())
+        _ -> (EngineEvent::default())
+    }
+}
+
+// Indexed-element machine calls are not recognized as calls by the
+// checker, so queue operations route through free helpers taking the
+// element as a `&mut`/`&` argument.
+machine subscriber_queue_push(queue: &mut PendingEngineEvents, event: &EngineEvent) -> bool {
+    queue.push(event)
+}
+
+machine subscriber_queue_clear(queue: &mut PendingEngineEvents) -> bool {
+    queue.clear();
+    (true)
+}
+
+machine subscriber_queue_count(queue: &PendingEngineEvents) -> u64 {
+    queue.get_count()
+}
+
+machine subscriber_queue_get(queue: &PendingEngineEvents, event_position: u64) -> EngineEvent {
+    queue.get(event_position)
+}
+
+pub machine EventSubscriberTable::clear_queued_events(&mut self, subscriber_position: u64) {
+    transition subscriber_position < self.subscriber_count && subscriber_position < 16 {
+        true -> clear_at(subscriber_position)
+        false -> done()
+        _ -> done()
+    }
+    state clear_at(&mut self, subscriber_position: u64) {
+        self.queues[subscriber_position].clear();
+        transition { _ -> done() }
+    }
+    state done(&mut self) {
+    }
+}

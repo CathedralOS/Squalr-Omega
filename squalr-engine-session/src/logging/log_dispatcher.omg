@@ -1,0 +1,89 @@
+module src::logging::log_dispatcher;
+
+use squalr_engine_api::src::events::logging::log_level::LogLevel;
+use squalr_engine_api::src::events::logging::log_recorded_event::LogRecordedEvent;
+
+// Port of logging/log_dispatcher.rs. Upstream keeps a process-wide
+// `VecDeque<LogEvent>` history and pipes each record through log4rs
+// appenders (console + file + a remote event appender). The port keeps
+// the bounded history verbatim (128 entries, refuse-on-full — upstream's
+// queue is unbounded but an undrained 128-deep backlog signals a dead
+// consumer) and the options record; the appender pipeline collapses —
+// console output is a CLI-facing choice carried by `enable_console_output`,
+// and the file/remote sinks are deferred to the file-sink leg (the remote
+// appender's job — emitting `LogRecorded` engine events — is done by the
+// caller routing the produced event through the event-subscriber table).
+pub data LogDispatcher {
+    log_history: [LogRecordedEvent; 128];
+    log_history_count: u64;
+    enable_console_output: bool;
+}
+
+pub machine LogDispatcher::new() -> LogDispatcher {
+    LogDispatcher {
+        log_history_count: 0,
+        enable_console_output: true,
+    }
+}
+
+pub machine LogDispatcher::new_with_options(enable_console_output: bool) -> LogDispatcher {
+    LogDispatcher {
+        log_history_count: 0,
+        enable_console_output: enable_console_output,
+    }
+}
+
+pub machine LogDispatcher::get_log_history_count(&self) -> u64 {
+    self.log_history_count
+}
+
+pub machine LogDispatcher::get_enable_console_output(&self) -> bool {
+    self.enable_console_output
+}
+
+pub machine LogDispatcher::get_log_history(&self, position: u64, out_record: &mut LogRecordedEvent) -> bool {
+    transition position < self.log_history_count && position < 128 {
+        true -> read(position, out_record)
+        false -> (false)
+        _ -> (false)
+    }
+    state read(&self, position: u64, out_record: &mut LogRecordedEvent) -> bool
+        requires position < 128;
+    {
+        out_record.clone_from(&self.log_history[position]);
+        (true)
+    }
+}
+
+// Upstream `log` — records the entry in history and hands the produced
+// event back so the caller can route it (the remote appender's emit).
+pub machine LogDispatcher::log(&mut self, level: LogLevel, target: &[u8], message: &[u8], out_event: &mut LogRecordedEvent) -> bool {
+    let record: LogRecordedEvent = LogRecordedEvent::new(level, target, message);
+    out_event.clone_from(&record);
+    transition self.log_history_count < 128 {
+        true -> store(out_event)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, out_event: &LogRecordedEvent) -> bool {
+        self.log_history[self.log_history_count].clone_from(out_event);
+        self.log_history_count = self.log_history_count + 1;
+        (true)
+    }
+}
+
+// Appends an already-recorded event — the engine's Logging-event route
+// lands records produced by the privileged side (upstream's remote log4rs
+// appender emit).
+pub machine LogDispatcher::append_record(&mut self, event: &LogRecordedEvent) -> bool {
+    transition self.log_history_count < 128 {
+        true -> store(event)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, event: &LogRecordedEvent) -> bool {
+        self.log_history[self.log_history_count].clone_from(event);
+        self.log_history_count = self.log_history_count + 1;
+        (true)
+    }
+}
