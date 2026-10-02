@@ -1,0 +1,1823 @@
+module src::debugger::debugger_service;
+
+use squalr_engine_api::src::events::debugger::session_state_changed::debugger_session_state_changed_event::DebuggerSessionStateChangedEvent;
+use squalr_engine_api::src::events::debugger::trace_session_updated::debugger_trace_session_updated_event::DebuggerTraceSessionUpdatedEvent;
+use squalr_engine_api::src::events::engine_event::EngineEvent;
+use squalr_engine_api::src::structures::debugger::debugger_breakpoint_descriptor::DebuggerBreakpointDescriptor;
+use squalr_engine_api::src::structures::debugger::debugger_breakpoint_kind::DebuggerBreakpointKind;
+use squalr_engine_api::src::structures::debugger::debugger_data_breakpoint_access::DebuggerDataBreakpointAccess;
+use squalr_engine_api::src::structures::debugger::debugger_register_snapshot::DebuggerRegisterSnapshot;
+use squalr_engine_api::src::structures::debugger::debugger_session_state::DebuggerSessionState;
+use squalr_engine_api::src::structures::debugger::debugger_trace_event::DebuggerTraceEvent;
+use squalr_engine_api::src::structures::debugger::debugger_trace_instruction_record::DebuggerTraceInstructionRecord;
+use squalr_engine_api::src::structures::debugger::debugger_trace_session_descriptor::DebuggerTraceSessionDescriptor;
+use squalr_engine_api::src::structures::debugger::debugger_trace_target_kind::DebuggerTraceTargetKind;
+use squalr_engine_api::src::structures::processes::opened_process_info::OpenedProcessInfo;
+use src::pending_engine_events::PendingEngineEvents;
+
+// Port of debugger/debugger_service.rs (upstream rev
+// 568aa7589b68b2fd4621cc66c6dde23fa14c7f50).
+//
+// Named deviations (documented per AGENTS.md):
+// - The dyn `DebuggerSession` plugin backend has no headless correspondent
+//   (plugin-host surface, deferred to the plugin-host leg — same precedent as
+//   the patches leg's `find_instruction_set`). Every plugin call site
+//   (`attach` after the plugin lookup, `pause`/`resume`, breakpoint and
+//   register ops) is unreachable absent a backend, so the port surfaces the
+//   upstream pre-call guards verbatim: "No enabled debugger plugin can attach
+//   to the opened process." / "No active debugger session." The cached-session
+//   bookkeeping (process identity match, plugin id, last-known state), the
+//   bounded trace session store, the trace-id allocator, default-label
+//   formatting, dedupe/aggregate record logic, and event emission are real
+//   ported code — they run unchanged once a backend exists.
+// - `HashMap` stores become bounded insertion-order tables: 16 trace
+//   sessions x 16 instruction records each (the wire bound the api response
+//   pages carry). The breakpoint->session map collapses into a session scan
+//   over the 16 slots (descriptors already carry their breakpoint ids).
+// - `RwLock`/`Mutex`/`AtomicU64` disappear into the single-owner session
+//   field; the id counter uses the Wrapping-domain bump.
+// - Event emission pushes onto `PendingEngineEvents` (the headless
+//   subscriber queue used by `notify_registry_changed`); upstream's dyn
+//   Fn emitter is that queue's consumer side.
+// - The disassembly/register-lookup enrichment of `create_trace_event_sink`
+//   is deferred to the plugin-host leg (it calls instruction-set plugin
+//   surfaces); `record_trace_event` keeps the store bookkeeping real.
+// - `Vec` payloads fold into bounded result records carrying `succeeded` +
+//   a verbatim bounded error span — the upstream `Result<_, String>` shape.
+
+// Internal store slot — upstream `DebuggerTraceSessionState` {descriptor,
+// instruction_records}.
+pub data DebuggerTraceSessionState {
+    in_use: bool;
+    descriptor: DebuggerTraceSessionDescriptor;
+    instruction_records: [DebuggerTraceInstructionRecord; 16];
+    instruction_record_count: u64;
+}
+
+pub machine DebuggerTraceSessionState::new() -> DebuggerTraceSessionState {
+    DebuggerTraceSessionState {
+        in_use: false,
+        descriptor: DebuggerTraceSessionDescriptor::new(0, 0, DebuggerDataBreakpointAccess::Read, false),
+        instruction_record_count: 0,
+    }
+}
+
+// Upstream `Result<(descriptor, records), String>`.
+pub data DebuggerTraceOutcome {
+    succeeded: bool;
+    has_trace_session: bool;
+    trace_session: DebuggerTraceSessionDescriptor;
+    instruction_records: [DebuggerTraceInstructionRecord; 16];
+    instruction_record_count: u64;
+    has_error_message: bool;
+    error_message: [u8; 256];
+    error_message_len: u64;
+}
+
+pub machine DebuggerTraceOutcome::new() -> DebuggerTraceOutcome {
+    DebuggerTraceOutcome {
+        succeeded: false,
+        has_trace_session: false,
+        trace_session: DebuggerTraceSessionDescriptor::new(0, 0, DebuggerDataBreakpointAccess::Read, false),
+        instruction_record_count: 0,
+        has_error_message: false,
+        error_message_len: 0,
+    }
+}
+
+pub machine DebuggerTraceOutcome::set_error(&mut self, message: &[u8]) {
+    self.has_error_message = true;
+    transition { _ -> copy(message, 0) }
+    state copy(&mut self, message: &[u8], position: u64) {
+        transition position < message.len && position < 256 {
+            true -> store(message, position)
+            _ -> (self)
+        }
+    }
+    state store(&mut self, message: &[u8], position: u64)
+        requires position < 256
+    {
+        self.error_message[position] = message[position];
+        self.error_message_len = position + 1;
+        transition { _ -> copy(message, position + 1) }
+    }
+}
+
+pub machine DebuggerTraceOutcome::get_error_message(&self) -> &[u8] {
+    transition self.has_error_message && self.error_message_len <= 256 {
+        true -> (&self.error_message[0..self.error_message_len])
+        _ -> (&self.error_message[0..0])
+    }
+}
+
+pub machine DebuggerTraceOutcome::add_instruction_record(&mut self, instruction_record: &DebuggerTraceInstructionRecord) -> bool {
+    transition self.instruction_record_count < 16 {
+        true -> store(instruction_record)
+        _ -> (false)
+    }
+    state store(&mut self, instruction_record: &DebuggerTraceInstructionRecord) -> bool {
+        self.instruction_records[self.instruction_record_count].clone_from(instruction_record);
+        self.instruction_record_count = ((self.instruction_record_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> (true) }
+    }
+}
+
+// Upstream `Result<DebuggerOperationStatus, String>` —
+// {session_state, active_plugin_id} + error span.
+pub data DebuggerOperationOutcome {
+    succeeded: bool;
+    session_state: DebuggerSessionState;
+    has_active_plugin_id: bool;
+    active_plugin_id: [u8; 256];
+    active_plugin_id_len: u64;
+    has_error_message: bool;
+    error_message: [u8; 256];
+    error_message_len: u64;
+}
+
+pub machine DebuggerOperationOutcome::new() -> DebuggerOperationOutcome {
+    DebuggerOperationOutcome {
+        succeeded: false,
+        session_state: DebuggerSessionState::Detached,
+        has_active_plugin_id: false,
+        active_plugin_id_len: 0,
+        has_error_message: false,
+        error_message_len: 0,
+    }
+}
+
+pub machine DebuggerOperationOutcome::set_error(&mut self, message: &[u8]) {
+    self.has_error_message = true;
+    transition { _ -> copy(message, 0) }
+    state copy(&mut self, message: &[u8], position: u64) {
+        transition position < message.len && position < 256 {
+            true -> store(message, position)
+            _ -> (self)
+        }
+    }
+    state store(&mut self, message: &[u8], position: u64)
+        requires position < 256
+    {
+        self.error_message[position] = message[position];
+        self.error_message_len = position + 1;
+        transition { _ -> copy(message, position + 1) }
+    }
+}
+
+pub machine DebuggerOperationOutcome::get_error_message(&self) -> &[u8] {
+    transition self.has_error_message && self.error_message_len <= 256 {
+        true -> (&self.error_message[0..self.error_message_len])
+        _ -> (&self.error_message[0..0])
+    }
+}
+
+pub machine DebuggerOperationOutcome::set_active_plugin_id(&mut self, plugin_id: &[u8]) {
+    self.has_active_plugin_id = true;
+    transition { _ -> copy(plugin_id, 0) }
+    state copy(&mut self, plugin_id: &[u8], position: u64) {
+        transition position < plugin_id.len && position < 256 {
+            true -> store(plugin_id, position)
+            _ -> (self)
+        }
+    }
+    state store(&mut self, plugin_id: &[u8], position: u64)
+        requires position < 256
+    {
+        self.active_plugin_id[position] = plugin_id[position];
+        self.active_plugin_id_len = position + 1;
+        transition { _ -> copy(plugin_id, position + 1) }
+    }
+}
+
+pub machine DebuggerOperationOutcome::get_active_plugin_id(&self) -> &[u8] {
+    transition self.active_plugin_id_len <= 256 {
+        true -> (&self.active_plugin_id[0..self.active_plugin_id_len])
+        _ -> (&self.active_plugin_id[0..256])
+    }
+}
+
+// Upstream `Result<(), String>` / descriptor / register payloads — same
+// fold: success flag + bounded error span + payload slot.
+pub data DebuggerVoidOutcome {
+    succeeded: bool;
+    has_error_message: bool;
+    error_message: [u8; 256];
+    error_message_len: u64;
+}
+
+pub machine DebuggerVoidOutcome::new() -> DebuggerVoidOutcome {
+    DebuggerVoidOutcome {
+        succeeded: false,
+        has_error_message: false,
+        error_message_len: 0,
+    }
+}
+
+pub machine DebuggerVoidOutcome::set_error(&mut self, message: &[u8]) {
+    self.has_error_message = true;
+    transition { _ -> copy(message, 0) }
+    state copy(&mut self, message: &[u8], position: u64) {
+        transition position < message.len && position < 256 {
+            true -> store(message, position)
+            _ -> (self)
+        }
+    }
+    state store(&mut self, message: &[u8], position: u64)
+        requires position < 256
+    {
+        self.error_message[position] = message[position];
+        self.error_message_len = position + 1;
+        transition { _ -> copy(message, position + 1) }
+    }
+}
+
+pub machine DebuggerVoidOutcome::get_error_message(&self) -> &[u8] {
+    transition self.has_error_message && self.error_message_len <= 256 {
+        true -> (&self.error_message[0..self.error_message_len])
+        _ -> (&self.error_message[0..0])
+    }
+}
+
+pub data DebuggerBreakpointOutcome {
+    succeeded: bool;
+    has_breakpoint: bool;
+    breakpoint: DebuggerBreakpointDescriptor;
+    has_error_message: bool;
+    error_message: [u8; 256];
+    error_message_len: u64;
+}
+
+pub machine DebuggerBreakpointOutcome::new() -> DebuggerBreakpointOutcome {
+    DebuggerBreakpointOutcome {
+        succeeded: false,
+        has_breakpoint: false,
+        breakpoint: DebuggerBreakpointDescriptor::new(0, DebuggerBreakpointKind::Software, false),
+        has_error_message: false,
+        error_message_len: 0,
+    }
+}
+
+pub machine DebuggerBreakpointOutcome::set_error(&mut self, message: &[u8]) {
+    self.has_error_message = true;
+    transition { _ -> copy(message, 0) }
+    state copy(&mut self, message: &[u8], position: u64) {
+        transition position < message.len && position < 256 {
+            true -> store(message, position)
+            _ -> (self)
+        }
+    }
+    state store(&mut self, message: &[u8], position: u64)
+        requires position < 256
+    {
+        self.error_message[position] = message[position];
+        self.error_message_len = position + 1;
+        transition { _ -> copy(message, position + 1) }
+    }
+}
+
+pub machine DebuggerBreakpointOutcome::get_error_message(&self) -> &[u8] {
+    transition self.has_error_message && self.error_message_len <= 256 {
+        true -> (&self.error_message[0..self.error_message_len])
+        _ -> (&self.error_message[0..0])
+    }
+}
+
+pub data DebuggerRegisterOutcome {
+    succeeded: bool;
+    register_snapshot: DebuggerRegisterSnapshot;
+    has_error_message: bool;
+    error_message: [u8; 256];
+    error_message_len: u64;
+}
+
+pub machine DebuggerRegisterOutcome::new() -> DebuggerRegisterOutcome {
+    DebuggerRegisterOutcome {
+        succeeded: false,
+        register_snapshot: DebuggerRegisterSnapshot::new(),
+        has_error_message: false,
+        error_message_len: 0,
+    }
+}
+
+pub machine DebuggerRegisterOutcome::set_error(&mut self, message: &[u8]) {
+    self.has_error_message = true;
+    transition { _ -> copy(message, 0) }
+    state copy(&mut self, message: &[u8], position: u64) {
+        transition position < message.len && position < 256 {
+            true -> store(message, position)
+            _ -> (self)
+        }
+    }
+    state store(&mut self, message: &[u8], position: u64)
+        requires position < 256
+    {
+        self.error_message[position] = message[position];
+        self.error_message_len = position + 1;
+        transition { _ -> copy(message, position + 1) }
+    }
+}
+
+pub machine DebuggerRegisterOutcome::get_error_message(&self) -> &[u8] {
+    transition self.has_error_message && self.error_message_len <= 256 {
+        true -> (&self.error_message[0..self.error_message_len])
+        _ -> (&self.error_message[0..0])
+    }
+}
+
+// Upstream `list_sessions` product — both collected pages + a sort surface
+// (insertion sort by trace_session_id; records by (id, instruction_address)).
+pub data DebuggerTraceListOutcome {
+    trace_sessions: [DebuggerTraceSessionDescriptor; 16];
+    trace_session_count: u64;
+    instruction_records: [DebuggerTraceInstructionRecord; 16];
+    instruction_record_count: u64;
+}
+
+pub machine DebuggerTraceListOutcome::new() -> DebuggerTraceListOutcome {
+    DebuggerTraceListOutcome {
+        trace_session_count: 0,
+        instruction_record_count: 0,
+    }
+}
+
+pub machine DebuggerTraceListOutcome::add_trace_session(&mut self, trace_session: &DebuggerTraceSessionDescriptor) -> bool {
+    transition self.trace_session_count < 16 {
+        true -> store(trace_session)
+        _ -> (false)
+    }
+    state store(&mut self, trace_session: &DebuggerTraceSessionDescriptor) -> bool {
+        self.trace_sessions[self.trace_session_count].clone_from(trace_session);
+        self.trace_session_count = ((self.trace_session_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> (true) }
+    }
+}
+
+pub machine DebuggerTraceListOutcome::add_instruction_record(&mut self, instruction_record: &DebuggerTraceInstructionRecord) -> bool {
+    transition self.instruction_record_count < 16 {
+        true -> store(instruction_record)
+        _ -> (false)
+    }
+    state store(&mut self, instruction_record: &DebuggerTraceInstructionRecord) -> bool {
+        self.instruction_records[self.instruction_record_count].clone_from(instruction_record);
+        self.instruction_record_count = ((self.instruction_record_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> (true) }
+    }
+}
+
+// Insertion sort over collected sessions by trace_session_id (ascending).
+pub machine DebuggerTraceListOutcome::sort_trace_sessions(&mut self) {
+    transition { _ -> scan(1) }
+    state scan(&mut self, position: u64) {
+        transition position < self.trace_session_count && position < 16 {
+            true -> sift(position)
+            _ -> (self)
+        }
+    }
+    state sift(&mut self, position: u64)
+        requires position < 16
+    {
+        // Move element left while its id < the previous slot's id.
+        transition position > 0 {
+            true -> compare(position)
+            _ -> advance(position)
+        }
+    }
+    state compare(&mut self, position: u64)
+        requires position < 16
+    {
+        let previous: u64 = position - 1;
+        transition previous < 16 {
+            true -> test(position, previous)
+            _ -> advance(position)
+        }
+    }
+    state test(&mut self, position: u64, previous: u64)
+        requires position < 16 && previous < 16
+    {
+        let left_id: &[u8] = self.trace_sessions[position].get_trace_session_id();
+        let right_id: &[u8] = self.trace_sessions[previous].get_trace_session_id();
+        let swap: bool = DebuggerService::span_less(left_id, right_id);
+        transition swap {
+            true -> swap_slots(position, previous)
+            _ -> advance(position)
+        }
+    }
+    state swap_slots(&mut self, position: u64, previous: u64)
+        requires position < 16 && previous < 16
+    {
+        let moved: DebuggerTraceSessionDescriptor = self.trace_sessions[position].clone();
+        let displaced: DebuggerTraceSessionDescriptor = self.trace_sessions[previous].clone();
+        self.trace_sessions[position].clone_from(&displaced);
+        self.trace_sessions[previous].clone_from(&moved);
+        transition { _ -> sift(previous) }
+    }
+    state advance(&mut self, position: u64)
+        requires position < 16
+    {
+        transition { _ -> scan(position + 1) }
+    }
+}
+
+// Insertion sort over collected records by (trace_session_id,
+// instruction_address) — upstream's two-key comparator.
+pub machine DebuggerTraceListOutcome::sort_instruction_records(&mut self) {
+    transition { _ -> scan(1) }
+    state scan(&mut self, position: u64) {
+        transition position < self.instruction_record_count && position < 16 {
+            true -> sift(position)
+            _ -> (self)
+        }
+    }
+    state sift(&mut self, position: u64)
+        requires position < 16
+    {
+        transition position > 0 {
+            true -> compare(position)
+            _ -> advance(position)
+        }
+    }
+    state compare(&mut self, position: u64)
+        requires position < 16
+    {
+        let previous: u64 = position - 1;
+        transition previous < 16 {
+            true -> test(position, previous)
+            _ -> advance(position)
+        }
+    }
+    state test(&mut self, position: u64, previous: u64)
+        requires position < 16 && previous < 16
+    {
+        let left_id: &[u8] = self.instruction_records[position].get_trace_session_id();
+        let right_id: &[u8] = self.instruction_records[previous].get_trace_session_id();
+        let id_less: bool = DebuggerService::span_less(left_id, right_id);
+        let id_equal: bool = DebuggerService::span_equals(left_id, right_id);
+        let address_less: bool = self.instruction_records[position].instruction_address
+            < self.instruction_records[previous].instruction_address;
+        let swap: bool = id_less || (id_equal && address_less);
+        transition swap {
+            true -> swap_slots(position, previous)
+            _ -> advance(position)
+        }
+    }
+    state swap_slots(&mut self, position: u64, previous: u64)
+        requires position < 16 && previous < 16
+    {
+        let moved: DebuggerTraceInstructionRecord = self.instruction_records[position].clone();
+        let displaced: DebuggerTraceInstructionRecord = self.instruction_records[previous].clone();
+        self.instruction_records[position].clone_from(&displaced);
+        self.instruction_records[previous].clone_from(&moved);
+        transition { _ -> sift(previous) }
+    }
+    state advance(&mut self, position: u64)
+        requires position < 16
+    {
+        transition { _ -> scan(position + 1) }
+    }
+}
+
+// Upstream `list_breakpoints` product — a bounded page of descriptors plus
+// the error carrier; the executor merges patch-derived software-breakpoint
+// descriptors into this page (upstream merges into the same `Vec`).
+pub data DebuggerBreakpointListOutcome {
+    succeeded: bool;
+    breakpoints: [DebuggerBreakpointDescriptor; 32];
+    breakpoint_count: u64;
+    has_error_message: bool;
+    error_message: [u8; 256];
+    error_message_len: u64;
+}
+
+pub machine DebuggerBreakpointListOutcome::new() -> DebuggerBreakpointListOutcome {
+    DebuggerBreakpointListOutcome {
+        succeeded: false,
+        breakpoint_count: 0,
+        has_error_message: false,
+        error_message_len: 0,
+    }
+}
+
+pub machine DebuggerBreakpointListOutcome::set_error(&mut self, message: &[u8]) {
+    self.has_error_message = true;
+    transition { _ -> copy(message, 0) }
+    state copy(&mut self, message: &[u8], position: u64) {
+        transition position < message.len && position < 256 {
+            true -> store(message, position)
+            _ -> (self)
+        }
+    }
+    state store(&mut self, message: &[u8], position: u64)
+        requires position < 256
+    {
+        self.error_message[position] = message[position];
+        self.error_message_len = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> copy(message, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+pub machine DebuggerBreakpointListOutcome::get_error_message(&self) -> &[u8] {
+    transition self.has_error_message && self.error_message_len <= 256 {
+        true -> (&self.error_message[0..self.error_message_len])
+        _ -> (&self.error_message[0..0])
+    }
+}
+
+pub machine DebuggerBreakpointListOutcome::add_breakpoint(&mut self, breakpoint: &DebuggerBreakpointDescriptor) -> bool {
+    transition self.breakpoint_count < 32 {
+        true -> store(breakpoint)
+        _ -> (false)
+    }
+    state store(&mut self, breakpoint: &DebuggerBreakpointDescriptor) -> bool {
+        self.breakpoints[self.breakpoint_count].clone_from(breakpoint);
+        self.breakpoint_count = ((self.breakpoint_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> (true) }
+    }
+}
+
+// Insertion sort on the merged page by (address, breakpoint_id) — upstream's
+// `sort_by(address.cmp.then(id.cmp))`; ids compare lexicographic bytes.
+pub machine DebuggerBreakpointListOutcome::sort_breakpoints(&mut self) {
+    transition { _ -> scan(1) }
+    state scan(&mut self, position: u64) {
+        transition position < self.breakpoint_count && position < 32 {
+            true -> sift(position, position)
+            _ -> (self)
+        }
+    }
+    // Insertion sift: `current` walks the element down while the previous
+    // slot compares greater; `scan_position` resumes the outer pass.
+    state sift(&mut self, current: u64, scan_position: u64)
+        requires current < 32 && scan_position < 32
+    {
+        let previous: u64 = ((current as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition current > 0 && previous < 32 {
+            true -> compare(current, previous, scan_position)
+            _ -> advance(scan_position)
+        }
+    }
+    state compare(&mut self, current: u64, previous: u64, scan_position: u64)
+        requires current < 32 && previous < 32 && scan_position < 32
+    {
+        transition self.less_at(current, previous) {
+            true -> swap_slots(current, previous, scan_position)
+            _ -> advance(scan_position)
+        }
+    }
+    state swap_slots(&mut self, position: u64, previous: u64, scan_position: u64)
+        requires position < 32 && previous < 32 && scan_position < 32
+    {
+        let moved: DebuggerBreakpointDescriptor = self.breakpoints[position].clone();
+        let displaced: DebuggerBreakpointDescriptor = self.breakpoints[previous].clone();
+        self.breakpoints[position].clone_from(&displaced);
+        self.breakpoints[previous].clone_from(&moved);
+        transition { _ -> sift(previous, scan_position) }
+    }
+    state advance(&mut self, position: u64)
+        requires position < 32
+    {
+        transition { _ -> scan(((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine DebuggerBreakpointListOutcome::less_at(&self, left: u64, right: u64) -> bool
+    requires left < 32 && right < 32
+{
+    transition self.breakpoints[left].address == self.breakpoints[right].address {
+        true -> ids(left, right, 0)
+        _ -> (self.breakpoints[left].address < self.breakpoints[right].address)
+    }
+    state ids(&self, left: u64, right: u64, position: u64) -> bool
+        requires left < 32 && right < 32
+    {
+        let left_len: u64 = self.breakpoints[left].get_breakpoint_id_len();
+        let right_len: u64 = self.breakpoints[right].get_breakpoint_id_len();
+        transition position < left_len && position < right_len && position < 256 {
+            true -> bytes(left, right, position)
+            _ -> (left_len < right_len)
+        }
+    }
+    state bytes(&self, left: u64, right: u64, position: u64) -> bool
+        requires left < 32 && right < 32 && position < 256
+    {
+        let left_byte: u8 = self.breakpoints[left].get_breakpoint_id_byte(position);
+        let right_byte: u8 = self.breakpoints[right].get_breakpoint_id_byte(position);
+        transition left_byte == right_byte {
+            true -> ids(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (left_byte < right_byte)
+        }
+    }
+}
+
+pub data DebuggerService {
+    // Upstream `active_session: Option<CachedDebuggerSession>` — the dyn
+    // session object itself is absent headless; the bookkeeping fields it
+    // carried (process identity, plugin id, last-known session state) are
+    // the real port surface.
+    has_cached_session: bool;
+    cached_process_id: u32;
+    cached_process_name: [u8; 256];
+    cached_process_name_len: u64;
+    cached_process_handle: u64;
+    cached_plugin_id: [u8; 256];
+    cached_plugin_id_len: u64;
+    cached_session_state: DebuggerSessionState;
+    // Upstream `DebuggerTraceSessionStore` — the sessions map bounded at 16;
+    // its breakpoint->session map collapses into a session scan.
+    trace_sessions: [DebuggerTraceSessionState; 16];
+    trace_session_count: u64;
+    next_trace_session_number: u64;
+}
+
+pub machine DebuggerService::new() -> DebuggerService {
+    DebuggerService {
+        has_cached_session: false,
+        cached_process_id: 0,
+        cached_process_name_len: 0,
+        cached_process_handle: 0,
+        cached_plugin_id_len: 0,
+        cached_session_state: DebuggerSessionState::Detached,
+        trace_session_count: 0,
+        next_trace_session_number: 1,
+    }
+}
+
+// Byte-span equality over two slices.
+pub machine DebuggerService::span_equals(left: &[u8], right: &[u8]) -> bool {
+    transition left.len == right.len {
+        true -> compare(left, right, 0)
+        _ -> (false)
+    }
+    state compare(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> check(left, right, position)
+            _ -> (true)
+        }
+    }
+    state check(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] == right[position] {
+            true -> compare(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Lexicographic compare for the upstream `sort_by(id)` orderings.
+pub machine DebuggerService::span_less(left: &[u8], right: &[u8]) -> bool {
+    transition { _ -> compare(left, right, 0) }
+    state compare(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> check(left, right, position)
+            _ -> (position < right.len)
+        }
+    }
+    state check(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left[position] == right[position] {
+            true -> compare(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (left[position] < right[position])
+        }
+    }
+}
+
+// Writes `source` into `target` at `offset`; refuses nothing (bounded by
+// both ends) and returns the bytes written's tail position.
+pub machine DebuggerService::copy_span_prefix(source: &[u8], target: &mut [u8; 256], offset: u64) {
+    transition { _ -> copy(source, target, offset, 0) }
+    state copy(source: &[u8], target: &mut [u8; 256], offset: u64, position: u64) {
+        let target_position: u64 = ((offset as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition position < source.len && target_position < 256 {
+            true -> store(source, target, offset, position, target_position)
+            _ -> done(source, target, offset)
+        }
+    }
+    state store(source: &[u8], target: &mut [u8; 256], offset: u64, position: u64, target_position: u64)
+        requires position < source.len && target_position < 256
+    {
+        target[target_position] = source[position];
+        transition { _ -> copy(source, target, offset, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done(source: &[u8], target: &mut [u8; 256], offset: u64) {}
+}
+
+// "Debugger trace session '<id>' does not exist." / "... is stopped." —
+// composed into `target`; returns the message length.
+pub machine DebuggerService::compose_session_error(target: &mut [u8; 256], trace_session_id: &[u8], suffix: &[u8]) -> u64 {
+    DebuggerService::copy_span_prefix("Debugger trace session '", target, 0);
+    DebuggerService::copy_span_prefix(trace_session_id, target, 23);
+    DebuggerService::copy_span_prefix(suffix, target, 23 + trace_session_id.len);
+    (23 + trace_session_id.len + suffix.len)
+}
+
+// Uppercase minimal-width hex for the default trace labels ({:X} payload).
+// Measure-then-emit (MSB-first, shifts off the u64 width) — the tail-only
+// runtime forbids result-feeding recursion, and exact arithmetic is a proof
+// obligation, so every index rides the Wrapping domain.
+pub machine DebuggerService::format_hex_upper(value: u64, target: &mut [u8; 256], offset: u64) -> u64 {
+    transition value == 0 {
+        true -> emit_zero(target, offset)
+        _ -> measure(value, target, offset, 0)
+    }
+    state emit_zero(target: &mut [u8; 256], offset: u64) -> u64 {
+        transition offset < 256 {
+            true -> store_zero(target, offset)
+            _ -> (0)
+        }
+    }
+    state store_zero(target: &mut [u8; 256], offset: u64)
+        requires offset < 256
+    {
+        target[offset] = 48;
+        (1)
+    }
+    // Count the significant nibbles so emission stays MSB-first.
+    state measure(value: u64, target: &mut [u8; 256], offset: u64, width: u64) -> u64
+        requires width < 17
+    {
+        let shift: u64 = (((width as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64);
+        let shifted: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) != 0) as u64;
+        let next_width: u64 = ((width as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition shifted == 1 && next_width < 17 {
+            true -> measure(value, target, offset, next_width)
+            _ -> emit(value, target, offset, width, 0)
+        }
+    }
+    state emit(value: u64, target: &mut [u8; 256], offset: u64, width: u64, position: u64) -> u64
+        requires width < 17
+    {
+        let target_position: u64 = ((offset as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition position < width && position < 16 && target_position < 256 {
+            true -> emit_digit(value, target, offset, width, position, target_position)
+            _ -> (position)
+        }
+    }
+    state emit_digit(value: u64, target: &mut [u8; 256], offset: u64, width: u64, position: u64, target_position: u64) -> u64
+        requires position < width && position < 16 && width < 17 && target_position < 256
+    {
+        // `width <= 16 && width > position` — subtraction stays in range.
+        let shift_base: u64 = ((width as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let shift: u64 = (((((shift_base as u64 in Wrapping) - (position as u64 in Wrapping)) as u64 in Wrapping) * (4 as u64 in Wrapping)) as u64);
+        let digit: u64 = (((((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) % (16 as u64 in Wrapping))) as u64);
+        target[target_position] = debugger_hex_digit_upper(digit);
+        transition {
+            _ -> emit(value, target, offset, width, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// 0-15 -> '0'-'9' / 'A'-'F' for the trace-label hex payloads.
+machine debugger_hex_digit_upper(digit: u64) -> u8 {
+    transition digit < 10 {
+        true -> ((((48 as u64 in Wrapping) + (digit as u64 in Wrapping)) as u64) as u8)
+        _ -> upper(digit)
+    }
+    // Callers only produce digit in 0-15; `digit >= 16` is unreachable —
+    // the arm returns '?' rather than widen the contract to a masked char.
+    state upper(digit: u64) -> u8 {
+        transition digit >= 10 && digit < 16 {
+            true -> (alpha(digit))
+            _ -> (63)
+        }
+    }
+    state alpha(digit: u64) -> u8
+        requires digit >= 10 && digit < 16
+    {
+        ((((55 as u64 in Wrapping) + ((digit as u64 in Wrapping) - (10 as u64 in Wrapping))) as u64) as u8)
+    }
+}
+
+// Minimal-width decimal — the "trace-N" allocator's N. Divisor-forward
+// measure-then-emit (no index arithmetic, tail-only runtime).
+pub machine DebuggerService::format_decimal(value: u64, target: &mut [u8; 256], offset: u64) -> u64 {
+    transition value == 0 {
+        true -> emit_zero(target, offset)
+        _ -> measure(value, target, offset, 1)
+    }
+    state emit_zero(target: &mut [u8; 256], offset: u64) -> u64 {
+        transition offset < 256 {
+            true -> store_zero(target, offset)
+            _ -> (0)
+        }
+    }
+    state store_zero(target: &mut [u8; 256], offset: u64)
+        requires offset < 256
+    {
+        target[offset] = 48;
+        (1)
+    }
+    // `divisor` grows to the largest 10^k <= value (10^19 is the u64 cap).
+    state measure(value: u64, target: &mut [u8; 256], offset: u64, divisor: u64) -> u64 {
+        transition divisor <= value / 10 && divisor < 10000000000000000000 {
+            true -> measure(value, target, offset, ((divisor as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64)
+            _ -> emit(value, target, offset, divisor, 0)
+        }
+    }
+    state emit(value: u64, target: &mut [u8; 256], offset: u64, divisor: u64, count: u64) -> u64 {
+        let target_position: u64 = ((offset as u64 in Wrapping) + (count as u64 in Wrapping)) as u64;
+        transition divisor != 0 && target_position < 256 {
+            true -> digit(value, target, offset, divisor, count, target_position)
+            _ -> (count)
+        }
+    }
+    state digit(value: u64, target: &mut [u8; 256], offset: u64, divisor: u64, count: u64, target_position: u64) -> u64
+        requires divisor != 0 && target_position < 256
+    {
+        let quotient: u64 = value / divisor;
+        let digit_value: u64 = quotient % 10;
+        transition digit_value < 10 {
+            true -> store(value, target, offset, divisor, count, target_position, digit_value)
+            _ -> (count)
+        }
+    }
+    state store(value: u64, target: &mut [u8; 256], offset: u64, divisor: u64, count: u64, target_position: u64, digit_value: u64) -> u64
+        requires divisor != 0 && target_position < 256 && digit_value < 10
+    {
+        target[target_position] = ((((48 as u64 in Wrapping) + (digit_value as u64 in Wrapping)) as u64) as u8);
+        let next_divisor: u64 = divisor / 10;
+        transition {
+            _ -> emit(value, target, offset, next_divisor, ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// "trace-N" into `target` — upstream's format!("trace-{}", fetch_add(1))
+// product; the caller bumps `next_trace_session_number` (Wrapping domain).
+pub machine DebuggerService::format_trace_session_id(trace_session_number: u64, target: &mut [u8; 256]) -> u64 {
+    DebuggerService::copy_span_prefix("trace-", target, 0);
+    let digits: u64 = DebuggerService::format_decimal(trace_session_number, target, 6);
+    (((6 as u64 in Wrapping) + (digits as u64 in Wrapping)) as u64)
+}
+
+// Default upstream label: "{cli_label} data|instruction trace at 0x{address:X}".
+pub machine DebuggerService::compose_default_trace_label(access: &DebuggerDataBreakpointAccess, address: u64, instruction_directed: bool, target: &mut [u8; 256]) -> u64 {
+    let cli_label: &[u8] = access.get_cli_label();
+    DebuggerService::copy_span_prefix(cli_label, target, 0);
+    transition instruction_directed {
+        true -> instruction(cli_label, target, address)
+        _ -> data(cli_label, target, address)
+    }
+    state instruction(cli_label: &[u8], target: &mut [u8; 256], address: u64) -> u64 {
+        DebuggerService::copy_span_prefix(" instruction trace at 0x", target, cli_label.len);
+        let tail: u64 = ((cli_label.len as u64 in Wrapping) + (25 as u64 in Wrapping)) as u64;
+        let hex: u64 = DebuggerService::format_hex_upper(address, target, tail);
+        (((tail as u64 in Wrapping) + (hex as u64 in Wrapping)) as u64)
+    }
+    state data(cli_label: &[u8], target: &mut [u8; 256], address: u64) -> u64 {
+        DebuggerService::copy_span_prefix(" data trace at 0x", target, cli_label.len);
+        let tail: u64 = ((cli_label.len as u64 in Wrapping) + (18 as u64 in Wrapping)) as u64;
+        let hex: u64 = DebuggerService::format_hex_upper(address, target, tail);
+        (((tail as u64 in Wrapping) + (hex as u64 in Wrapping)) as u64)
+    }
+}
+
+// --- cached-session bookkeeping ------------------------------------------
+
+// Upstream `CachedDebuggerSession::matches` — process id + handle + name.
+pub machine DebuggerService::cached_matches(&self, process_info: &OpenedProcessInfo) -> bool {
+    transition self.has_cached_session
+        && self.cached_process_id == process_info.process_id
+        && self.cached_process_handle == process_info.get_handle()
+        && self.cached_process_name_len == process_info.get_name_len() {
+        true -> names(process_info, 0)
+        _ -> (false)
+    }
+    state names(&self, process_info: &OpenedProcessInfo, position: u64) -> bool {
+        transition position < self.cached_process_name_len && position < 256 {
+            true -> byte(process_info, position)
+            _ -> (true)
+        }
+    }
+    state byte(&self, process_info: &OpenedProcessInfo, position: u64) -> bool
+        requires position < 256
+    {
+        transition self.cached_process_name[position] == process_info.get_name_byte(position) {
+            true -> names(process_info, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `get_matching_cached_session`'s plugin filter — a requested id
+// must equal the cached one when present.
+pub machine DebuggerService::cached_plugin_matches(&self, has_requested_plugin_id: bool, requested_plugin_id: &[u8]) -> bool {
+    transition has_requested_plugin_id {
+        false -> (true)
+        _ -> length(requested_plugin_id)
+    }
+    state length(&self, requested_plugin_id: &[u8]) -> bool {
+        transition self.cached_plugin_id_len == requested_plugin_id.len {
+            true -> bytes(requested_plugin_id, 0)
+            _ -> (false)
+        }
+    }
+    state bytes(&self, requested_plugin_id: &[u8], position: u64) -> bool {
+        transition position < self.cached_plugin_id_len && position < 256 && position < requested_plugin_id.len {
+            true -> check(requested_plugin_id, position)
+            _ -> (true)
+        }
+    }
+    state check(&self, requested_plugin_id: &[u8], position: u64) -> bool
+        requires position < 256 && position < requested_plugin_id.len
+    {
+        transition self.cached_plugin_id[position] == requested_plugin_id[position] {
+            true -> bytes(requested_plugin_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// --- session operations ---------------------------------------------------
+
+// Upstream `attach`. A cached-session hit returns the cached status; the
+// miss falls through to `find_debugger_plugin_package` — the plugin-host
+// surface — so absent a backend the upstream Err surfaces verbatim.
+pub machine DebuggerService::attach(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    has_requested_plugin_id: bool,
+    requested_plugin_id: &[u8],
+    events: &mut PendingEngineEvents
+) -> DebuggerOperationOutcome {
+    let outcome: DebuggerOperationOutcome = DebuggerOperationOutcome::new();
+    let cache_hit: bool = self.cached_matches(process_info)
+        && self.cached_plugin_matches(has_requested_plugin_id, requested_plugin_id);
+    transition cache_hit {
+        true -> cached(events, outcome)
+        _ -> absent(outcome)
+    }
+
+    state cached(&mut self, events: &mut PendingEngineEvents, mut outcome: DebuggerOperationOutcome) -> DebuggerOperationOutcome {
+        outcome.succeeded = true;
+        outcome.session_state = self.cached_session_state;
+        transition { _ -> fill_id(events, outcome, 0) }
+    }
+
+    state fill_id(&mut self, events: &mut PendingEngineEvents, mut outcome: DebuggerOperationOutcome, position: u64) -> DebuggerOperationOutcome {
+        transition position < self.cached_plugin_id_len && position < 256 {
+            true -> put_id(events, outcome, position)
+            _ -> emit(events, outcome)
+        }
+    }
+
+    state put_id(&mut self, events: &mut PendingEngineEvents, mut outcome: DebuggerOperationOutcome, position: u64) -> DebuggerOperationOutcome
+        requires position < 256
+    {
+        let byte: u8 = self.cached_plugin_id[position];
+        outcome.active_plugin_id[position] = byte;
+        outcome.active_plugin_id_len = position + 1;
+        outcome.has_active_plugin_id = true;
+        transition { _ -> fill_id(events, outcome, position + 1) }
+    }
+
+    state emit(&mut self, events: &mut PendingEngineEvents, mut outcome: DebuggerOperationOutcome) -> DebuggerOperationOutcome {
+        let mut event: DebuggerSessionStateChangedEvent = DebuggerSessionStateChangedEvent::new(outcome.session_state);
+        transition outcome.has_active_plugin_id {
+            true -> fill_plugin(events, outcome, event)
+            _ -> push(events, outcome, event)
+        }
+    }
+
+    state fill_plugin(&mut self, events: &mut PendingEngineEvents, mut outcome: DebuggerOperationOutcome, mut event: DebuggerSessionStateChangedEvent) -> DebuggerOperationOutcome {
+        let plugin_id: &[u8] = outcome.get_active_plugin_id();
+        event.set_active_plugin_id(plugin_id);
+        transition { _ -> push(events, outcome, event) }
+    }
+
+    state push(&mut self, events: &mut PendingEngineEvents, outcome: DebuggerOperationOutcome, event: DebuggerSessionStateChangedEvent) -> DebuggerOperationOutcome {
+        let engine_event: EngineEvent = event.to_engine_event();
+        _ = events.push(&engine_event);
+        (outcome)
+    }
+
+    // `find_debugger_plugin_package` absent -> upstream Err verbatim; the
+    // create_session + cache-store leg behind it is the deferred
+    // plugin-host surface — nothing populates the cache fields until then.
+    state absent(outcome: DebuggerOperationOutcome) -> DebuggerOperationOutcome {
+        let mut outcome_failed: DebuggerOperationOutcome = outcome;
+        outcome_failed.set_error("No enabled debugger plugin can attach to the opened process.");
+        (outcome_failed)
+    }
+}
+
+// Upstream `detach`: take the cached session, plugin-detach (absent call
+// site), clear the trace store, emit Detached.
+pub machine DebuggerService::detach(&mut self, events: &mut PendingEngineEvents) -> DebuggerOperationOutcome {
+    let outcome: DebuggerOperationOutcome = DebuggerOperationOutcome::new();
+    transition self.has_cached_session {
+        true -> taken(events, outcome)
+        _ -> no_session(outcome)
+    }
+
+    state taken(&mut self, events: &mut PendingEngineEvents, mut outcome: DebuggerOperationOutcome) -> DebuggerOperationOutcome {
+        self.has_cached_session = false;
+        self.cached_plugin_id_len = 0;
+        self.cached_process_name_len = 0;
+        self.cached_session_state = DebuggerSessionState::Detached;
+        self.clear_trace_sessions();
+        outcome.succeeded = true;
+        outcome.session_state = DebuggerSessionState::Detached;
+        let event: DebuggerSessionStateChangedEvent = DebuggerSessionStateChangedEvent::new(DebuggerSessionState::Detached);
+        let engine_event: EngineEvent = event.to_engine_event();
+        _ = events.push(&engine_event);
+        (outcome)
+    }
+
+    state no_session(outcome: DebuggerOperationOutcome) -> DebuggerOperationOutcome {
+        let mut outcome_failed: DebuggerOperationOutcome = outcome;
+        outcome_failed.set_error("No active debugger session.");
+        (outcome_failed)
+    }
+}
+
+// Upstream `pause`/`resume` — the `get_cached_session` guard ("No active
+// debugger session.") then the absent plugin call site.
+pub machine DebuggerService::pause(&mut self, events: &mut PendingEngineEvents) -> DebuggerOperationOutcome {
+    let mut outcome: DebuggerOperationOutcome = DebuggerOperationOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+pub machine DebuggerService::resume(&mut self, events: &mut PendingEngineEvents) -> DebuggerOperationOutcome {
+    let mut outcome: DebuggerOperationOutcome = DebuggerOperationOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+// Upstream `set_breakpoint`/`remove_breakpoint`/`set_breakpoint_enabled`/
+// `read_registers`/`write_register` — all begin with the same
+// `get_cached_session` guard; their plugin call sites are the deferred
+// plugin-host surface.
+pub machine DebuggerService::set_breakpoint(&mut self, address: u64, kind: DebuggerBreakpointKind, has_label: bool, label: &[u8]) -> DebuggerBreakpointOutcome {
+    let mut outcome: DebuggerBreakpointOutcome = DebuggerBreakpointOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+pub machine DebuggerService::remove_breakpoint(&mut self, breakpoint_id: &[u8]) -> DebuggerVoidOutcome {
+    let mut outcome: DebuggerVoidOutcome = DebuggerVoidOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+pub machine DebuggerService::set_breakpoint_enabled(&mut self, breakpoint_id: &[u8], is_enabled: bool) -> DebuggerVoidOutcome {
+    let mut outcome: DebuggerVoidOutcome = DebuggerVoidOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+pub machine DebuggerService::read_registers(&mut self) -> DebuggerRegisterOutcome {
+    let mut outcome: DebuggerRegisterOutcome = DebuggerRegisterOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+pub machine DebuggerService::write_register(&mut self, register_name: &[u8], value: u64) -> DebuggerRegisterOutcome {
+    let mut outcome: DebuggerRegisterOutcome = DebuggerRegisterOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+// Upstream `get_active_session_state_for_process` — a cache match returns
+// the last-known state (the absent backend's live read is deferred).
+pub machine DebuggerService::get_active_session_state_for_process(&self, process_info: &OpenedProcessInfo) -> DebuggerSessionState {
+    transition self.cached_matches(process_info) {
+        true -> (self.cached_session_state)
+        _ -> (DebuggerSessionState::Detached)
+    }
+}
+
+// Upstream `get_active_plugin_id_for_process` — writes the cached id into
+// `plugin_id_out`; returns its length (0 = no matching session).
+pub machine DebuggerService::get_active_plugin_id_for_process(&self, process_info: &OpenedProcessInfo, plugin_id_out: &mut [u8; 256]) -> u64 {
+    transition self.cached_matches(process_info) {
+        true -> copy(plugin_id_out, 0)
+        _ -> (0)
+    }
+    state copy(&self, plugin_id_out: &mut [u8; 256], position: u64) -> u64 {
+        transition position < self.cached_plugin_id_len && position < 256 {
+            true -> put(plugin_id_out, position)
+            _ -> (self.cached_plugin_id_len)
+        }
+    }
+    state put(&self, plugin_id_out: &mut [u8; 256], position: u64) -> u64
+        requires position < 256
+    {
+        plugin_id_out[position] = self.cached_plugin_id[position];
+        transition { _ -> copy(plugin_id_out, position + 1) }
+    }
+}
+
+// Upstream `clear_active_session` — the process-change hook body: clear
+// bookkeeping + trace store + emit Detached.
+pub machine DebuggerService::clear_active_session(&mut self, events: &mut PendingEngineEvents) {
+    transition self.has_cached_session {
+        true -> clear(events)
+        _ -> done(events)
+    }
+    state done(&mut self, events: &mut PendingEngineEvents) {}
+    state clear(&mut self, events: &mut PendingEngineEvents) {
+        self.has_cached_session = false;
+        self.cached_plugin_id_len = 0;
+        self.cached_process_name_len = 0;
+        self.cached_session_state = DebuggerSessionState::Detached;
+        self.clear_trace_sessions();
+        let event: DebuggerSessionStateChangedEvent = DebuggerSessionStateChangedEvent::new(DebuggerSessionState::Detached);
+        let engine_event: EngineEvent = event.to_engine_event();
+        _ = events.push(&engine_event);
+    }
+}
+
+// --- trace session store ---------------------------------------------------
+
+// Position of a live session by id, or 16 (absent) — replaces the
+// HashMap lookup; bounded linear scan over the insertion-order table.
+pub machine DebuggerService::find_trace_session_position(&self, trace_session_id: &[u8]) -> u64 {
+    transition { _ -> scan(trace_session_id, 0) }
+    state scan(&self, trace_session_id: &[u8], position: u64) -> u64 {
+        transition position < self.trace_session_count && position < 16 {
+            true -> check(trace_session_id, position)
+            _ -> (16)
+        }
+    }
+    state check(&self, trace_session_id: &[u8], position: u64) -> u64
+        requires position < 16
+    {
+        transition self.trace_sessions[position].in_use
+            && self.trace_sessions[position].descriptor.trace_session_id_len == trace_session_id.len {
+            true -> bytes(trace_session_id, position, 0)
+            _ -> scan(trace_session_id, position + 1)
+        }
+    }
+    state bytes(&self, trace_session_id: &[u8], position: u64, index: u64) -> u64
+        requires position < 16
+    {
+        transition index < trace_session_id.len && index < 64 {
+            true -> byte(trace_session_id, position, index)
+            _ -> (position)
+        }
+    }
+    state byte(&self, trace_session_id: &[u8], position: u64, index: u64) -> u64
+        requires position < 16 && index < 64
+    {
+        transition self.trace_sessions[position].descriptor.trace_session_id[index] == trace_session_id[index] {
+            true -> bytes(trace_session_id, position, index + 1)
+            _ -> (16)
+        }
+    }
+}
+
+// Same scan keyed on the stored breakpoint id — the collapsed
+// breakpoint->session map.
+pub machine DebuggerService::find_trace_session_by_breakpoint_id(&self, breakpoint_id: &[u8]) -> u64 {
+    transition { _ -> scan(breakpoint_id, 0) }
+    state scan(&self, breakpoint_id: &[u8], position: u64) -> u64 {
+        transition position < self.trace_session_count && position < 16 {
+            true -> check(breakpoint_id, position)
+            _ -> (16)
+        }
+    }
+    state check(&self, breakpoint_id: &[u8], position: u64) -> u64
+        requires position < 16
+    {
+        transition self.trace_sessions[position].in_use
+            && self.trace_sessions[position].descriptor.breakpoint.breakpoint_id_len == breakpoint_id.len {
+            true -> bytes(breakpoint_id, position, 0)
+            _ -> scan(breakpoint_id, position + 1)
+        }
+    }
+    state bytes(&self, breakpoint_id: &[u8], position: u64, index: u64) -> u64
+        requires position < 16
+    {
+        transition index < breakpoint_id.len && index < 256 {
+            true -> byte(breakpoint_id, position, index)
+            _ -> (position)
+        }
+    }
+    state byte(&self, breakpoint_id: &[u8], position: u64, index: u64) -> u64
+        requires position < 16 && index < 256
+    {
+        transition self.trace_sessions[position].descriptor.breakpoint.breakpoint_id[index] == breakpoint_id[index] {
+            true -> bytes(breakpoint_id, position, index + 1)
+            _ -> (16)
+        }
+    }
+}
+
+// Upstream `insert_session` — append into the bounded table.
+pub machine DebuggerService::insert_trace_session(&mut self, descriptor: &DebuggerTraceSessionDescriptor) -> bool {
+    transition self.trace_session_count < 16 {
+        true -> store(descriptor)
+        _ -> (false)
+    }
+    state store(&mut self, descriptor: &DebuggerTraceSessionDescriptor) -> bool {
+        self.trace_sessions[self.trace_session_count].in_use = true;
+        self.trace_sessions[self.trace_session_count].descriptor.clone_from(descriptor);
+        self.trace_sessions[self.trace_session_count].instruction_record_count = 0;
+        self.trace_session_count = ((self.trace_session_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> (true) }
+    }
+}
+
+// Upstream `start_trace_session` — the `get_cached_session` guard surfaces
+// "No active debugger session." absent a backend; the post-guard flow
+// (id alloc, default label, store insert, emit) is the real port behind it.
+pub machine DebuggerService::start_trace_session(
+    &mut self,
+    address: u64,
+    size_in_bytes: u8,
+    access: DebuggerDataBreakpointAccess,
+    has_label: bool,
+    label: &[u8],
+    events: &mut PendingEngineEvents
+) -> DebuggerTraceOutcome {
+    let outcome: DebuggerTraceOutcome = DebuggerTraceOutcome::new();
+    transition self.has_cached_session {
+        true -> create(address, size_in_bytes, access, has_label, label, events, outcome)
+        _ -> no_session(outcome)
+    }
+
+    state no_session(outcome: DebuggerTraceOutcome) -> DebuggerTraceOutcome {
+        let mut outcome_failed: DebuggerTraceOutcome = outcome;
+        outcome_failed.set_error("No active debugger session.");
+        (outcome_failed)
+    }
+
+    state create(&mut self, address: u64, size_in_bytes: u8, access: DebuggerDataBreakpointAccess, has_label: bool, label: &[u8], events: &mut PendingEngineEvents, mut outcome: DebuggerTraceOutcome) -> DebuggerTraceOutcome {
+        let mut trace_session_id: [u8; 256];
+        let id_len: u64 = DebuggerService::format_trace_session_id(self.next_trace_session_number, &mut trace_session_id);
+        self.next_trace_session_number = ((self.next_trace_session_number as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let mut descriptor: DebuggerTraceSessionDescriptor = DebuggerTraceSessionDescriptor::new(address, size_in_bytes as u64, access, true);
+        transition id_len <= 64 {
+            true -> with_id(outcome, descriptor, &trace_session_id[0..id_len], has_label, label, access, address, events)
+            _ -> (outcome)
+        }
+    }
+
+    state with_id(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, trace_session_id: &[u8], has_label: bool, label: &[u8], access: DebuggerDataBreakpointAccess, address: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        descriptor.set_trace_session_id(trace_session_id);
+        transition has_label {
+            true -> with_label(outcome, descriptor, label, events)
+            _ -> default_label(outcome, descriptor, access, address, events)
+        }
+    }
+
+    state with_label(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, label: &[u8], events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        descriptor.set_label(label);
+        transition { _ -> commit(outcome, descriptor, events) }
+    }
+
+    state default_label(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, access: DebuggerDataBreakpointAccess, address: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        let mut formatted: [u8; 256];
+        let formatted_len: u64 = DebuggerService::compose_default_trace_label(&access, address, false, &mut formatted);
+        transition formatted_len <= 256 {
+            true -> apply_label(outcome, descriptor, &formatted[0..formatted_len], events)
+            _ -> commit(outcome, descriptor, events)
+        }
+    }
+
+    state apply_label(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, label: &[u8], events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        descriptor.set_label(label);
+        transition { _ -> commit(outcome, descriptor, events) }
+    }
+
+    // Plugin `set_breakpoint` + resume are the deferred call sites; the
+    // insert + `emit_trace_session_updated` half is the real port.
+    state commit(&mut self, mut outcome: DebuggerTraceOutcome, descriptor: DebuggerTraceSessionDescriptor, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        _ = self.insert_trace_session(&descriptor);
+        outcome.succeeded = true;
+        outcome.has_trace_session = true;
+        outcome.trace_session.clone_from(&descriptor);
+        let event: DebuggerTraceSessionUpdatedEvent = DebuggerTraceSessionUpdatedEvent::new(descriptor);
+        let engine_event: EngineEvent = event.to_engine_event();
+        _ = events.push(&engine_event);
+        (outcome)
+    }
+}
+
+// Upstream `start_instruction_trace_session` — same flow on
+// `new_for_instruction` + the instruction-directed default label.
+pub machine DebuggerService::start_instruction_trace_session(
+    &mut self,
+    instruction_address: u64,
+    access: DebuggerDataBreakpointAccess,
+    has_label: bool,
+    label: &[u8],
+    events: &mut PendingEngineEvents
+) -> DebuggerTraceOutcome {
+    let outcome: DebuggerTraceOutcome = DebuggerTraceOutcome::new();
+    transition self.has_cached_session {
+        true -> create(instruction_address, access, has_label, label, events, outcome)
+        _ -> no_session(outcome)
+    }
+
+    state no_session(outcome: DebuggerTraceOutcome) -> DebuggerTraceOutcome {
+        let mut outcome_failed: DebuggerTraceOutcome = outcome;
+        outcome_failed.set_error("No active debugger session.");
+        (outcome_failed)
+    }
+
+    state create(&mut self, instruction_address: u64, access: DebuggerDataBreakpointAccess, has_label: bool, label: &[u8], events: &mut PendingEngineEvents, mut outcome: DebuggerTraceOutcome) -> DebuggerTraceOutcome {
+        let mut trace_session_id: [u8; 256];
+        let id_len: u64 = DebuggerService::format_trace_session_id(self.next_trace_session_number, &mut trace_session_id);
+        self.next_trace_session_number = ((self.next_trace_session_number as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let mut descriptor: DebuggerTraceSessionDescriptor = DebuggerTraceSessionDescriptor::new_for_instruction(instruction_address, access, true);
+        transition id_len <= 64 {
+            true -> with_id(outcome, descriptor, &trace_session_id[0..id_len], has_label, label, access, instruction_address, events)
+            _ -> (outcome)
+        }
+    }
+
+    state with_id(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, trace_session_id: &[u8], has_label: bool, label: &[u8], access: DebuggerDataBreakpointAccess, instruction_address: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        descriptor.set_trace_session_id(trace_session_id);
+        transition has_label {
+            true -> with_label(outcome, descriptor, label, events)
+            _ -> default_label(outcome, descriptor, access, instruction_address, events)
+        }
+    }
+
+    state with_label(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, label: &[u8], events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        descriptor.set_label(label);
+        transition { _ -> commit(outcome, descriptor, events) }
+    }
+
+    state default_label(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, access: DebuggerDataBreakpointAccess, instruction_address: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        let mut formatted: [u8; 256];
+        let formatted_len: u64 = DebuggerService::compose_default_trace_label(&access, instruction_address, true, &mut formatted);
+        transition formatted_len <= 256 {
+            true -> apply_label(outcome, descriptor, &formatted[0..formatted_len], events)
+            _ -> commit(outcome, descriptor, events)
+        }
+    }
+
+    state apply_label(&mut self, mut outcome: DebuggerTraceOutcome, mut descriptor: DebuggerTraceSessionDescriptor, label: &[u8], events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        descriptor.set_label(label);
+        transition { _ -> commit(outcome, descriptor, events) }
+    }
+
+    state commit(&mut self, mut outcome: DebuggerTraceOutcome, descriptor: DebuggerTraceSessionDescriptor, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        _ = self.insert_trace_session(&descriptor);
+        outcome.succeeded = true;
+        outcome.has_trace_session = true;
+        outcome.trace_session.clone_from(&descriptor);
+        let event: DebuggerTraceSessionUpdatedEvent = DebuggerTraceSessionUpdatedEvent::new(descriptor);
+        let engine_event: EngineEvent = event.to_engine_event();
+        _ = events.push(&engine_event);
+        (outcome)
+    }
+}
+
+// Upstream `stop_trace_session`: find the backing breakpoint id (missing
+// -> "...does not exist."), best-effort `remove_breakpoint` (upstream logs
+// a warn and continues — the port absorbs it), then store removal + emit.
+pub machine DebuggerService::stop_trace_session(&mut self, trace_session_id: &[u8], events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+    let outcome: DebuggerTraceOutcome = DebuggerTraceOutcome::new();
+    let position: u64 = self.find_trace_session_position(trace_session_id);
+    transition position < 16 {
+        true -> remove(outcome, position, events)
+        _ -> absent(outcome, trace_session_id)
+    }
+
+    state absent(outcome: DebuggerTraceOutcome, trace_session_id: &[u8]) -> DebuggerTraceOutcome {
+        let mut outcome_failed: DebuggerTraceOutcome = outcome;
+        let mut message: [u8; 256];
+        let message_len: u64 = DebuggerService::compose_session_error(&mut message, trace_session_id, "' does not exist.");
+        transition message_len <= 256 {
+            true -> fill(outcome_failed, &message[0..message_len])
+            _ -> (outcome_failed)
+        }
+    }
+    state fill(mut outcome: DebuggerTraceOutcome, message: &[u8]) -> DebuggerTraceOutcome {
+        outcome.set_error(message);
+        (outcome)
+    }
+
+    // The store-side stop: mark the breakpoint disabled + the session
+    // inactive, keep collected records, then compact the table.
+    state remove(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16
+    {
+        self.trace_sessions[position].descriptor.set_is_active(false);
+        let mut breakpoint: DebuggerBreakpointDescriptor = self.trace_sessions[position].descriptor.get_breakpoint().clone();
+        breakpoint.set_is_enabled(false);
+        self.trace_sessions[position].descriptor.set_breakpoint(breakpoint);
+        outcome.succeeded = true;
+        outcome.has_trace_session = true;
+        outcome.trace_session.clone_from(&self.trace_sessions[position].descriptor);
+        transition { _ -> drain(outcome, position, events, 0) }
+    }
+
+    state drain(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, events: &mut PendingEngineEvents, index: u64) -> DebuggerTraceOutcome
+        requires position < 16
+    {
+        transition index < self.trace_sessions[position].instruction_record_count && index < 16 {
+            true -> copy_record(outcome, position, index, events)
+            _ -> shift(outcome, position, events)
+        }
+    }
+
+    state copy_record(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, index: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16 && index < 16
+    {
+        let record: DebuggerTraceInstructionRecord = self.trace_sessions[position].instruction_records[index].clone();
+        _ = outcome.add_instruction_record(&record);
+        transition { _ -> drain(outcome, position, events, index + 1) }
+    }
+
+    // Slot compaction: shift trailing sessions over the removed slot
+    // (insertion-order table, same idiom as the plugin order tables).
+    state shift(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16
+    {
+        let next: u64 = position + 1;
+        transition next < self.trace_session_count && next < 16 {
+            true -> move_slot(outcome, position, next, events)
+            _ -> finish(outcome, position, events)
+        }
+    }
+
+    state move_slot(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, next: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16 && next < 16
+    {
+        let in_use: bool = self.trace_sessions[next].in_use;
+        let record_count: u64 = self.trace_sessions[next].instruction_record_count;
+        let descriptor: DebuggerTraceSessionDescriptor = self.trace_sessions[next].descriptor.clone();
+        self.trace_sessions[position].in_use = in_use;
+        self.trace_sessions[position].instruction_record_count = record_count;
+        self.trace_sessions[position].descriptor.clone_from(&descriptor);
+        transition { _ -> copy_records(outcome, position, next, events, 0) }
+    }
+
+    state copy_records(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, next: u64, events: &mut PendingEngineEvents, index: u64) -> DebuggerTraceOutcome
+        requires position < 16 && next < 16
+    {
+        transition index < self.trace_sessions[position].instruction_record_count && index < 16 {
+            true -> move_record(outcome, position, next, index, events)
+            _ -> shifted(outcome, position, next, events)
+        }
+    }
+
+    state move_record(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, next: u64, index: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16 && next < 16 && index < 16
+    {
+        let record: DebuggerTraceInstructionRecord = self.trace_sessions[next].instruction_records[index].clone();
+        self.trace_sessions[position].instruction_records[index].clone_from(&record);
+        transition { _ -> copy_records(outcome, position, next, events, index + 1) }
+    }
+
+    state shifted(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, next: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16 && next < 16
+    {
+        self.trace_sessions[next].in_use = false;
+        self.trace_sessions[next].instruction_record_count = 0;
+        transition { _ -> shift(outcome, next, events) }
+    }
+
+    state finish(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        transition self.trace_session_count > 0 {
+            true -> decrement(outcome, events)
+            _ -> emit(outcome, events)
+        }
+    }
+
+    state decrement(&mut self, mut outcome: DebuggerTraceOutcome, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        self.trace_session_count = self.trace_session_count - 1;
+        transition { _ -> emit(outcome, events) }
+    }
+
+    state emit(&mut self, outcome: DebuggerTraceOutcome, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        let event: DebuggerTraceSessionUpdatedEvent = DebuggerTraceSessionUpdatedEvent::new(outcome.trace_session.clone());
+        let engine_event: EngineEvent = event.to_engine_event();
+        _ = events.push(&engine_event);
+        (outcome)
+    }
+}
+
+// Upstream `set_trace_session_collection_enabled` — pause/resume share it.
+pub machine DebuggerService::set_trace_session_collection_enabled(&mut self, trace_session_id: &[u8], is_enabled: bool, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+    let outcome: DebuggerTraceOutcome = DebuggerTraceOutcome::new();
+    let position: u64 = self.find_trace_session_position(trace_session_id);
+    transition position < 16 {
+        true -> found(outcome, position, is_enabled, events)
+        _ -> absent(outcome, trace_session_id)
+    }
+
+    state absent(outcome: DebuggerTraceOutcome, trace_session_id: &[u8]) -> DebuggerTraceOutcome {
+        let mut outcome_failed: DebuggerTraceOutcome = outcome;
+        let mut message: [u8; 256];
+        let message_len: u64 = DebuggerService::compose_session_error(&mut message, trace_session_id, "' does not exist.");
+        transition message_len <= 256 {
+            true -> fill(outcome_failed, &message[0..message_len])
+            _ -> (outcome_failed)
+        }
+    }
+    state fill(mut outcome: DebuggerTraceOutcome, message: &[u8]) -> DebuggerTraceOutcome {
+        outcome.set_error(message);
+        (outcome)
+    }
+
+    state found(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, is_enabled: bool, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16
+    {
+        transition self.trace_sessions[position].descriptor.is_active {
+            true -> apply(outcome, position, is_enabled, events)
+            _ -> stopped(outcome, position, events)
+        }
+    }
+
+    state stopped(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16
+    {
+        let session_id: &[u8] = self.trace_sessions[position].descriptor.get_trace_session_id();
+        let mut message: [u8; 256];
+        let message_len: u64 = DebuggerService::compose_session_error(&mut message, session_id, "' is stopped.");
+        transition message_len <= 256 {
+            true -> fill_stopped(outcome, &message[0..message_len])
+            _ -> (outcome)
+        }
+    }
+    state fill_stopped(mut outcome: DebuggerTraceOutcome, message: &[u8]) -> DebuggerTraceOutcome {
+        outcome.set_error(message);
+        (outcome)
+    }
+
+    state apply(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, is_enabled: bool, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16
+    {
+        let mut breakpoint: DebuggerBreakpointDescriptor = self.trace_sessions[position].descriptor.get_breakpoint().clone();
+        breakpoint.set_is_enabled(is_enabled);
+        self.trace_sessions[position].descriptor.set_breakpoint(breakpoint);
+        outcome.succeeded = true;
+        outcome.has_trace_session = true;
+        outcome.trace_session.clone_from(&self.trace_sessions[position].descriptor);
+        transition { _ -> drain(outcome, position, events, 0) }
+    }
+
+    state drain(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, events: &mut PendingEngineEvents, index: u64) -> DebuggerTraceOutcome
+        requires position < 16
+    {
+        transition index < self.trace_sessions[position].instruction_record_count && index < 16 {
+            true -> copy_record(outcome, position, index, events)
+            _ -> emit(outcome, events)
+        }
+    }
+
+    state copy_record(&mut self, mut outcome: DebuggerTraceOutcome, position: u64, index: u64, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome
+        requires position < 16 && index < 16
+    {
+        let record: DebuggerTraceInstructionRecord = self.trace_sessions[position].instruction_records[index].clone();
+        _ = outcome.add_instruction_record(&record);
+        transition { _ -> drain(outcome, position, events, index + 1) }
+    }
+
+    state emit(&mut self, outcome: DebuggerTraceOutcome, events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+        let event: DebuggerTraceSessionUpdatedEvent = DebuggerTraceSessionUpdatedEvent::new(outcome.trace_session.clone());
+        let engine_event: EngineEvent = event.to_engine_event();
+        _ = events.push(&engine_event);
+        (outcome)
+    }
+}
+
+// Upstream `list_breakpoints` — the live session's descriptors come from the
+// backend's `list_breakpoints` (plugin-host surface); with no session the
+// upstream Err surfaces verbatim and the executor absorbs it into an empty
+// page before the patch merge.
+pub machine DebuggerService::list_breakpoints(&self) -> DebuggerBreakpointListOutcome {
+    let mut outcome: DebuggerBreakpointListOutcome = DebuggerBreakpointListOutcome::new();
+    outcome.set_error("No active debugger session.");
+    (outcome)
+}
+
+// Upstream `pause_trace_session`/`resume_trace_session`.
+pub machine DebuggerService::pause_trace_session(&mut self, trace_session_id: &[u8], events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+    self.set_trace_session_collection_enabled(trace_session_id, false, events)
+}
+
+pub machine DebuggerService::resume_trace_session(&mut self, trace_session_id: &[u8], events: &mut PendingEngineEvents) -> DebuggerTraceOutcome {
+    self.set_trace_session_collection_enabled(trace_session_id, true, events)
+}
+
+// Upstream `list_sessions` — collect both pages then sort (sessions by id;
+// records by (id, instruction_address)).
+pub machine DebuggerService::list_trace_sessions(&self) -> DebuggerTraceListOutcome {
+    let outcome: DebuggerTraceListOutcome = DebuggerTraceListOutcome::new();
+    transition { _ -> collect(outcome, 0) }
+
+    state collect(&self, mut outcome: DebuggerTraceListOutcome, position: u64) -> DebuggerTraceListOutcome {
+        transition position < self.trace_session_count && position < 16 {
+            true -> put(outcome, position)
+            _ -> collect_records(outcome, 0, 0)
+        }
+    }
+
+    state put(&self, mut outcome: DebuggerTraceListOutcome, position: u64) -> DebuggerTraceListOutcome
+        requires position < 16
+    {
+        let descriptor: DebuggerTraceSessionDescriptor = self.trace_sessions[position].descriptor.clone();
+        _ = outcome.add_trace_session(&descriptor);
+        transition { _ -> collect(outcome, position + 1) }
+    }
+
+    state collect_records(&self, mut outcome: DebuggerTraceListOutcome, position: u64, index: u64) -> DebuggerTraceListOutcome {
+        transition position < self.trace_session_count && position < 16 {
+            true -> drain(outcome, position, index)
+            _ -> sort(outcome)
+        }
+    }
+
+    state drain(&self, mut outcome: DebuggerTraceListOutcome, position: u64, index: u64) -> DebuggerTraceListOutcome
+        requires position < 16
+    {
+        transition index < self.trace_sessions[position].instruction_record_count && index < 16 {
+            true -> copy_record(outcome, position, index)
+            _ -> collect_records(outcome, position + 1, 0)
+        }
+    }
+
+    state copy_record(&self, mut outcome: DebuggerTraceListOutcome, position: u64, index: u64) -> DebuggerTraceListOutcome
+        requires position < 16 && index < 16
+    {
+        let record: DebuggerTraceInstructionRecord = self.trace_sessions[position].instruction_records[index].clone();
+        _ = outcome.add_instruction_record(&record);
+        transition { _ -> drain(outcome, position, index + 1) }
+    }
+
+    state sort(&self, mut outcome: DebuggerTraceListOutcome) -> DebuggerTraceListOutcome {
+        outcome.sort_trace_sessions();
+        outcome.sort_instruction_records();
+        (outcome)
+    }
+}
+
+// Upstream `clear` on the trace store.
+pub machine DebuggerService::clear_trace_sessions(&mut self) {
+    self.trace_session_count = 0;
+    transition { _ -> wipe(0) }
+    state wipe(&mut self, position: u64) {
+        transition position < 16 {
+            true -> clear_one(position)
+            _ -> (self)
+        }
+    }
+    state clear_one(&mut self, position: u64)
+        requires position < 16
+    {
+        self.trace_sessions[position].in_use = false;
+        self.trace_sessions[position].instruction_record_count = 0;
+        transition { _ -> wipe(position + 1) }
+    }
+}
+
+// Upstream `record_trace_event` (the sink's store half) — dedupe by
+// (instruction_address, instruction_bytes) for address-directed sessions or
+// accessed_address for instruction-directed ones; insert on miss. The
+// disassembly enrichment + session-state emit sides are plugin-host.
+pub machine DebuggerService::record_trace_event(&mut self, trace_event: &DebuggerTraceEvent) -> bool {
+    transition trace_event.has_breakpoint {
+        false -> (false)
+        _ -> lookup(trace_event)
+    }
+
+    state lookup(&mut self, trace_event: &DebuggerTraceEvent) -> bool {
+        let breakpoint: &DebuggerBreakpointDescriptor = trace_event.get_breakpoint();
+        let breakpoint_id: &[u8] = breakpoint.get_breakpoint_id();
+        let position: u64 = self.find_trace_session_by_breakpoint_id(breakpoint_id);
+        transition position < 16 {
+            true -> found(trace_event, position)
+            _ -> (false)
+        }
+    }
+
+    state found(&mut self, trace_event: &DebuggerTraceEvent, position: u64) -> bool
+        requires position < 16
+    {
+        transition self.trace_sessions[position].descriptor.is_active
+            && self.trace_sessions[position].descriptor.breakpoint.is_enabled {
+            true -> kind(trace_event, position)
+            _ -> (false)
+        }
+    }
+
+    state kind(&mut self, trace_event: &DebuggerTraceEvent, position: u64) -> bool
+        requires position < 16
+    {
+        transition self.trace_sessions[position].descriptor.target_kind {
+            DebuggerTraceTargetKind::Instruction -> instruction(trace_event, position)
+            _ -> address(trace_event, position)
+        }
+    }
+
+    // Instruction-directed: an unresolved accessed address drops the hit.
+    state instruction(&mut self, trace_event: &DebuggerTraceEvent, position: u64) -> bool
+        requires position < 16
+    {
+        transition trace_event.has_accessed_address {
+            false -> (false)
+            _ -> match_instruction(trace_event, position, 0)
+        }
+    }
+
+    state match_instruction(&mut self, trace_event: &DebuggerTraceEvent, position: u64, index: u64) -> bool
+        requires position < 16
+    {
+        transition index < self.trace_sessions[position].instruction_record_count && index < 16 {
+            true -> check_instruction(trace_event, position, index)
+            _ -> insert(trace_event, position)
+        }
+    }
+
+    state check_instruction(&mut self, trace_event: &DebuggerTraceEvent, position: u64, index: u64) -> bool
+        requires position < 16 && index < 16
+    {
+        transition self.trace_sessions[position].instruction_records[index].has_accessed_address
+            && self.trace_sessions[position].instruction_records[index].accessed_address == trace_event.accessed_address {
+            true -> hit(trace_event, position, index)
+            _ -> match_instruction(trace_event, position, index + 1)
+        }
+    }
+
+    // Address-directed: dedupe on (instruction_address, instruction_bytes).
+    state address(&mut self, trace_event: &DebuggerTraceEvent, position: u64) -> bool
+        requires position < 16
+    {
+        transition { _ -> match_address(trace_event, position, 0) }
+    }
+
+    state match_address(&mut self, trace_event: &DebuggerTraceEvent, position: u64, index: u64) -> bool
+        requires position < 16
+    {
+        transition index < self.trace_sessions[position].instruction_record_count && index < 16 {
+            true -> check_address(trace_event, position, index)
+            _ -> insert(trace_event, position)
+        }
+    }
+
+    state check_address(&mut self, trace_event: &DebuggerTraceEvent, position: u64, index: u64) -> bool
+        requires position < 16 && index < 16
+    {
+        let address_match: bool = self.trace_sessions[position].instruction_records[index].has_instruction_address
+            && self.trace_sessions[position].instruction_records[index].instruction_address == trace_event.instruction_address;
+        transition address_match
+            && self.trace_sessions[position].instruction_records[index].instruction_bytes_len == trace_event.instruction_bytes_len {
+            true -> bytes_match(trace_event, position, index, 0)
+            _ -> match_address(trace_event, position, index + 1)
+        }
+    }
+
+    state bytes_match(&mut self, trace_event: &DebuggerTraceEvent, position: u64, index: u64, byte_index: u64) -> bool
+        requires position < 16 && index < 16
+    {
+        transition byte_index < trace_event.instruction_bytes_len && byte_index < 32 {
+            true -> byte_check(trace_event, position, index, byte_index)
+            _ -> hit(trace_event, position, index)
+        }
+    }
+
+    state byte_check(&mut self, trace_event: &DebuggerTraceEvent, position: u64, index: u64, byte_index: u64) -> bool
+        requires position < 16 && index < 16 && byte_index < 32
+    {
+        let record: DebuggerTraceInstructionRecord = self.trace_sessions[position].instruction_records[index].clone();
+        transition record.instruction_bytes[byte_index] == trace_event.instruction_bytes[byte_index] {
+            true -> bytes_match(trace_event, position, index, ((byte_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> match_address(trace_event, position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state hit(&mut self, trace_event: &DebuggerTraceEvent, position: u64, index: u64) -> bool
+        requires position < 16 && index < 16
+    {
+        self.trace_sessions[position].instruction_records[index].record_hit(trace_event);
+        (true)
+    }
+
+    state insert(&mut self, trace_event: &DebuggerTraceEvent, position: u64) -> bool
+        requires position < 16
+    {
+        transition self.trace_sessions[position].instruction_record_count < 16 {
+            true -> store_record(trace_event, position)
+            _ -> (false)
+        }
+    }
+
+    state store_record(&mut self, trace_event: &DebuggerTraceEvent, position: u64) -> bool
+        requires position < 16
+    {
+        let mut record: DebuggerTraceInstructionRecord = DebuggerTraceInstructionRecord::new(trace_event);
+        let session_id: &[u8] = self.trace_sessions[position].descriptor.get_trace_session_id();
+        record.set_trace_session_id(session_id);
+        let count: u64 = self.trace_sessions[position].instruction_record_count;
+        transition count < 16 {
+            true -> write_record(position, count, record)
+            _ -> (false)
+        }
+    }
+
+    state write_record(&mut self, position: u64, count: u64, record: DebuggerTraceInstructionRecord) -> bool
+        requires position < 16 && count < 16
+    {
+        self.trace_sessions[position].instruction_records[count].clone_from(&record);
+        self.trace_sessions[position].instruction_record_count = ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
