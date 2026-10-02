@@ -11,6 +11,14 @@ use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
 use squalr_engine_api::src::structures::snapshots::snapshot_region::DataTypeRefSet;
 use squalr_engine_api::src::structures::memory::normalized_module::NormalizedModule;
 use src::os::engine_os_provider::EngineOsProviders;
+use src::debugger::debugger_service::DebuggerService;
+use src::debugger::debugger_service::DebuggerOperationOutcome;
+use src::debugger::debugger_service::DebuggerBreakpointOutcome;
+use src::debugger::debugger_service::DebuggerVoidOutcome;
+use src::debugger::debugger_service::DebuggerRegisterOutcome;
+use src::debugger::debugger_service::DebuggerTraceOutcome;
+use src::debugger::debugger_service::DebuggerTraceListOutcome;
+use src::debugger::debugger_service::DebuggerBreakpointListOutcome;
 use src::patches::patch_service::PatchService;
 use src::patches::patch_service::PatchServiceResult;
 use src::plugins::plugin_registry::PluginRegistry;
@@ -29,6 +37,9 @@ use squalr_engine_api::src::registries::symbols::data_type_descriptor::DataTypeD
 use squalr_engine_api::src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
 use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
 use squalr_engine_api::src::events::registry::changed::registry_changed_event::RegistryChangedEvent;
+use squalr_engine_api::src::structures::debugger::debugger_breakpoint_kind::DebuggerBreakpointKind;
+use squalr_engine_api::src::structures::debugger::debugger_data_breakpoint_access::DebuggerDataBreakpointAccess;
+use squalr_engine_api::src::structures::debugger::debugger_session_state::DebuggerSessionState;
 
 // Port of engine_privileged_state.rs for the headless command leg. Upstream
 // holds `Arc<RwLock<...>>` fields behind a singleton; the port keeps the same
@@ -93,6 +104,13 @@ pub data EnginePrivilegedState {
     // (seed table + flags + order + data-type ownership; see
     // src/plugins/plugin_registry.omg for the dropped dyn surfaces).
     plugin_registry: PluginRegistry;
+    // Upstream `DebuggerService` — the bounded port carries the
+    // cached-session bookkeeping + trace-session store; its dyn plugin
+    // backend is the deferred plugin-host surface (see
+    // src/debugger/debugger_service.omg). `clear_active_session` fires
+    // from upstream's ProcessChanged event hook; headless calls it inline
+    // at the open/close setters below, alongside patch_service.
+    debugger_service: DebuggerService;
 }
 
 // Entry-plan variant of `new`: only the non-zero-initialized scalar is
@@ -118,6 +136,8 @@ pub machine EnginePrivilegedState::init(&mut self) {
     // PluginRegistry::new seeds the 7 builtin packages + the ownership
     // table — mirrors the symbol-registry seed call above.
     self.plugin_registry = PluginRegistry::new();
+    // DebuggerService::new's only non-zero field is the trace-id counter.
+    self.debugger_service.next_trace_session_number = 1;
 }
 
 pub machine EnginePrivilegedState::new() -> EnginePrivilegedState {
@@ -139,6 +159,7 @@ pub machine EnginePrivilegedState::new() -> EnginePrivilegedState {
         symbol_registry_generation: 1,
         patch_service: PatchService::new(),
         plugin_registry: PluginRegistry::new(),
+        debugger_service: DebuggerService::new(),
     }
 }
 
@@ -160,6 +181,9 @@ pub machine EnginePrivilegedState::set_opened_process(&mut self, opened_process:
         true,
         self.opened_process.get_process_id_raw() as u64,
         self.opened_process.get_handle());
+    // Upstream's ProcessChanged event also reaches the debugger service's
+    // clear hook; disjoint field borrows into the event queue.
+    self.debugger_service.clear_active_session(&mut self.pending_engine_events);
 }
 
 // Fixture form of `set_opened_process` for entry contexts that cannot move
@@ -172,6 +196,7 @@ pub machine EnginePrivilegedState::set_opened_process_fixture(&mut self, process
     self.opened_process.handle = process_id as u64;
     self.has_opened_process = true;
     self.patch_service.clear_if_process_changed(true, process_id as u64, process_id as u64);
+    self.debugger_service.clear_active_session(&mut self.pending_engine_events);
 }
 
 // One zeroed supplied region — the fixture form of `supply_memory` for
@@ -188,6 +213,7 @@ pub machine EnginePrivilegedState::make_fixture_source(
 pub machine EnginePrivilegedState::clear_opened_process(&mut self) {
     self.has_opened_process = false;
     self.patch_service.clear_if_process_changed(false, 0, 0);
+    self.debugger_service.clear_active_session(&mut self.pending_engine_events);
 }
 
 // Upstream `get_patch_service()` / the patch-command wrappers — receiver
@@ -196,6 +222,108 @@ pub machine EnginePrivilegedState::clear_opened_process(&mut self) {
 // take two borrows of `self`).
 pub machine EnginePrivilegedState::borrow_patch_service_mut(&mut self) -> &mut PatchService {
     &mut self.patch_service
+}
+
+// Upstream `get_debugger_service()` / the debugger-command wrappers — the
+// event-emitting ops need `&mut self.pending_engine_events` alongside
+// `&mut self.debugger_service` in one call, so they wrap here (the same
+// disjoint-field-borrow shape as `apply_patch`).
+pub machine EnginePrivilegedState::get_debugger_service(&self) -> &DebuggerService {
+    &self.debugger_service
+}
+
+pub machine EnginePrivilegedState::borrow_debugger_service_mut(&mut self) -> &mut DebuggerService {
+    &mut self.debugger_service
+}
+
+pub machine EnginePrivilegedState::debugger_attach(
+    &mut self,
+    process_info: &OpenedProcessInfo,
+    has_requested_plugin_id: bool,
+    requested_plugin_id: &[u8]
+) -> DebuggerOperationOutcome {
+    self.debugger_service.attach(process_info, has_requested_plugin_id, requested_plugin_id, &mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_detach(&mut self) -> DebuggerOperationOutcome {
+    self.debugger_service.detach(&mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_pause(&mut self) -> DebuggerOperationOutcome {
+    self.debugger_service.pause(&mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_resume(&mut self) -> DebuggerOperationOutcome {
+    self.debugger_service.resume(&mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_start_trace_session(
+    &mut self,
+    address: u64,
+    size_in_bytes: u8,
+    access: DebuggerDataBreakpointAccess,
+    has_label: bool,
+    label: &[u8]
+) -> DebuggerTraceOutcome {
+    self.debugger_service.start_trace_session(address, size_in_bytes, access, has_label, label, &mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_start_instruction_trace_session(
+    &mut self,
+    instruction_address: u64,
+    access: DebuggerDataBreakpointAccess,
+    has_label: bool,
+    label: &[u8]
+) -> DebuggerTraceOutcome {
+    self.debugger_service.start_instruction_trace_session(instruction_address, access, has_label, label, &mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_stop_trace_session(&mut self, trace_session_id: &[u8]) -> DebuggerTraceOutcome {
+    self.debugger_service.stop_trace_session(trace_session_id, &mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_pause_trace_session(&mut self, trace_session_id: &[u8]) -> DebuggerTraceOutcome {
+    self.debugger_service.pause_trace_session(trace_session_id, &mut self.pending_engine_events)
+}
+
+pub machine EnginePrivilegedState::debugger_resume_trace_session(&mut self, trace_session_id: &[u8]) -> DebuggerTraceOutcome {
+    self.debugger_service.resume_trace_session(trace_session_id, &mut self.pending_engine_events)
+}
+
+// The remaining leaf calls emit no events, so they ride the field through
+// the same wrappers instead of `borrow_debugger_service_mut` call sites.
+pub machine EnginePrivilegedState::debugger_set_breakpoint(&mut self, address: u64, kind: DebuggerBreakpointKind, has_label: bool, label: &[u8]) -> DebuggerBreakpointOutcome {
+    self.debugger_service.set_breakpoint(address, kind, has_label, label)
+}
+
+pub machine EnginePrivilegedState::debugger_remove_breakpoint(&mut self, breakpoint_id: &[u8]) -> DebuggerVoidOutcome {
+    self.debugger_service.remove_breakpoint(breakpoint_id)
+}
+
+pub machine EnginePrivilegedState::debugger_read_registers(&mut self) -> DebuggerRegisterOutcome {
+    self.debugger_service.read_registers()
+}
+
+pub machine EnginePrivilegedState::debugger_write_register(&mut self, register_name: &[u8], value: u64) -> DebuggerRegisterOutcome {
+    self.debugger_service.write_register(register_name, value)
+}
+
+pub machine EnginePrivilegedState::debugger_list_trace_sessions(&self) -> DebuggerTraceListOutcome {
+    self.debugger_service.list_trace_sessions()
+}
+
+pub machine EnginePrivilegedState::debugger_list_breakpoints(&self) -> DebuggerBreakpointListOutcome {
+    self.debugger_service.list_breakpoints()
+}
+
+// Upstream `get_active_plugin_id_for_process` — bounded copy into the
+// caller's span; returns the id length (0 = no matching session).
+pub machine EnginePrivilegedState::get_active_plugin_id_for_process(
+    &self,
+    process_info: &OpenedProcessInfo,
+    plugin_id_out: &mut [u8; 256]
+) -> u64 {
+    self.debugger_service.get_active_plugin_id_for_process(process_info, plugin_id_out)
 }
 
 pub machine EnginePrivilegedState::apply_patch(
