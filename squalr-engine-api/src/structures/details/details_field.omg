@@ -1,0 +1,198 @@
+module src::structures::details::details_field;
+
+use src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::data_value::DataValue;
+
+// Port of structures/details/details_field.rs — the details-pane field
+// vocabulary: a field id carrier, the editor-hint enum, the field-source
+// union the update-details request routes on, and the value union it writes.
+
+// Upstream `DetailsFieldId(String)` — bounded id carrier.
+pub data DetailsFieldId {
+    field_id: [u8; 256];
+    field_id_len: u64;
+}
+
+pub machine DetailsFieldId::new(field_id: &[u8]) -> DetailsFieldId {
+    let mut created: DetailsFieldId = DetailsFieldId {
+        field_id_len: 0,
+    };
+    created.set_field_id(field_id);
+    (created)
+}
+
+pub machine DetailsFieldId::default() -> DetailsFieldId {
+    DetailsFieldId::new(&[])
+}
+
+pub machine DetailsFieldId::get_field_id(&self) -> &[u8] {
+    transition self.field_id_len <= 256 {
+        true -> (&self.field_id[0..self.field_id_len])
+        false -> (&self.field_id[0..256])
+        _ -> (&self.field_id[0..256])
+    }
+}
+
+pub machine DetailsFieldId::set_field_id(&mut self, field_id: &[u8]) {
+    self.field_id_len = 0;
+    transition {
+        _ -> copy(field_id, 0)
+    }
+    state copy(&mut self, field_id: &[u8], position: u64) {
+        transition position < field_id.len && position < 256 {
+            true -> store(field_id, position)
+            false -> finish(position)
+        }
+    }
+    state store(&mut self, field_id: &[u8], position: u64) {
+        self.field_id[position] = field_id[position];
+        transition {
+            _ -> copy(field_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(&mut self, count: u64) {
+        self.field_id_len = count;
+    }
+}
+
+// Upstream `DetailsEditorHint` — how a details editor presents a field.
+pub data DetailsEditorHint [copy] {
+    case Value;
+    case Address;
+    case DataType;
+    case DisplayFormat;
+    case PointerOffsets;
+    case PointerSize;
+    case Text;
+    case Boolean;
+}
+
+pub machine DetailsEditorHint::default() -> DetailsEditorHint {
+    DetailsEditorHint::Value
+}
+
+// Bounded `Vec<String>` field-path segments — the runtime-value arms carry
+// a path into a nested item/symbol (upstream unbounded; 16 segments covers
+// authored field paths; add_segment refuses past the bound).
+pub data DetailsFieldPath {
+    segments: [[u8; 128]; 16];
+    segment_lens: [u64; 16];
+    segment_count: u64;
+}
+
+pub machine DetailsFieldPath::empty() -> DetailsFieldPath {
+    DetailsFieldPath {
+        segment_count: 0,
+    }
+}
+
+pub machine DetailsFieldPath::get_segment_count(&self) -> u64 {
+    self.segment_count
+}
+
+pub machine DetailsFieldPath::get_segment(&self, position: u64) -> &[u8] {
+    transition position < self.segment_count && position < 16 {
+        true -> at(position)
+        false -> head()
+        _ -> head()
+    }
+    state at(&self, position: u64) -> &[u8]
+        requires 0 <= position && position < 16;
+    {
+        let len: u64 = self.segment_lens[position];
+        transition len <= 128 {
+            true -> (&self.segments[position][0..len])
+            false -> (&self.segments[position][0..128])
+            _ -> (&self.segments[position][0..128])
+        }
+    }
+    state head(&self) -> &[u8] {
+        transition self.segment_lens[0] <= 128 {
+            true -> (&self.segments[0][0..self.segment_lens[0]])
+            false -> (&self.segments[0][0..128])
+            _ -> (&self.segments[0][0..128])
+        }
+    }
+}
+
+pub machine DetailsFieldPath::add_segment(&mut self, segment: &[u8]) -> bool {
+    transition self.segment_count < 16 {
+        true -> store(segment)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, segment: &[u8]) -> bool {
+        let index: u64 = self.segment_count;
+        transition index < 16 {
+            true -> fill(segment, index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state fill(&mut self, segment: &[u8], index: u64) -> bool
+        requires 0 <= index && index < 16
+    {
+        self.segment_lens[index] = 0;
+        transition {
+            _ -> copy(segment, index, 0)
+        }
+    }
+    state copy(&mut self, segment: &[u8], index: u64, position: u64) -> bool
+        requires 0 <= index && index < 16
+    {
+        transition position < segment.len && position < 128 {
+            true -> write(segment, index, position)
+            false -> finish(index, position)
+        }
+    }
+    state write(&mut self, segment: &[u8], index: u64, position: u64) -> bool
+        requires 0 <= index && index < 16 && position < 128
+    {
+        self.segments[index][position] = segment[position];
+        transition {
+            _ -> copy(segment, index, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(&mut self, index: u64, count: u64) -> bool
+        requires 0 <= index && index < 16
+    {
+        self.segment_lens[index] = count;
+        self.segment_count = index + 1;
+        (true)
+    }
+}
+
+// Upstream `DetailsFieldSource` — where an update-details request resolves
+// its target field. String payloads carry as bounded bytes + len; the
+// Vec<String> field paths carry as DetailsFieldPath.
+pub data DetailsFieldSource {
+    case Unknown;
+    case ProjectItemProperty(property_name: [u8; 256], property_name_len: u64);
+    case ProjectItemRuntimeValue(field_path: DetailsFieldPath);
+    case ProjectItemAddressTarget(property_name: [u8; 256], property_name_len: u64);
+    case ProjectSymbolRuntimeValue(field_path: DetailsFieldPath);
+    case SymbolLayoutMetadata(metadata_name: [u8; 256], metadata_name_len: u64);
+    case SymbolResolverMetadata(metadata_name: [u8; 256], metadata_name_len: u64);
+}
+
+pub machine DetailsFieldSource::default() -> DetailsFieldSource {
+    DetailsFieldSource::Unknown
+}
+
+// Upstream `DetailsValue` — the value leg of an update-details write.
+// `Text`'s String bounds at 512; longer authored text refuses at the caller.
+pub data DetailsValue {
+    case Empty;
+    case AnonymousValue(value: AnonymousValueString);
+    case DisplayFormat(format: AnonymousValueStringFormat);
+    case DataValue(value: DataValue);
+    case Text(text: [u8; 512], text_len: u64);
+    case Boolean(value: bool);
+    case UnsignedInteger(value: u64);
+    case SignedInteger(value: i64);
+}
+
+pub machine DetailsValue::default() -> DetailsValue {
+    DetailsValue::Empty
+}
