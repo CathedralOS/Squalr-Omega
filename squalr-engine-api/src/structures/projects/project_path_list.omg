@@ -1,0 +1,101 @@
+module src::structures::projects::project_path_list;
+
+// Port-side bounded `Vec<PathBuf>` carrier shared by the project command
+// surface (project_item_paths, duplicated paths, manifest sort order).
+// 64 entries of 512 bytes each — path bound documented like the other
+// bounded carriers; `add_path` refuses past the bound.
+pub data ProjectPathList {
+    paths: [[u8; 512]; 64];
+    path_lens: [u64; 64];
+    path_count: u64;
+}
+
+pub machine ProjectPathList::default() -> ProjectPathList {
+    (ProjectPathList::empty())
+}
+
+pub machine ProjectPathList::empty() -> ProjectPathList {
+    ProjectPathList {
+        path_count: 0,
+    }
+}
+
+pub machine ProjectPathList::get_path_count(&self) -> u64 {
+    self.path_count
+}
+
+// Upstream `paths[index]` — byte-slice read of one stored path;
+// out-of-range reads fall back to the head entry (callers gate on
+// get_path_count).
+pub machine ProjectPathList::get_path(&self, position: u64) -> &[u8] {
+    transition position < self.path_count && position < 64 {
+        true -> at(position)
+        false -> head()
+        _ -> head()
+    }
+    state at(&self, position: u64) -> &[u8]
+        requires 0 <= position && position < 64;
+    {
+        let len: u64 = self.path_lens[position];
+        transition len <= 512 {
+            true -> (&self.paths[position][0..len])
+            false -> (&self.paths[position][0..512])
+            _ -> (&self.paths[position][0..512])
+        }
+    }
+    state head(&self) -> &[u8] {
+        transition self.path_lens[0] <= 512 {
+            true -> (&self.paths[0][0..self.path_lens[0]])
+            false -> (&self.paths[0][0..512])
+            _ -> (&self.paths[0][0..512])
+        }
+    }
+}
+
+// Upstream Vec::push — appends one bounded path; refuses past 64.
+pub machine ProjectPathList::add_path(&mut self, path: &[u8]) -> bool {
+    transition self.path_count < 64 {
+        true -> store(path)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(&mut self, path: &[u8]) -> bool {
+        let index: u64 = self.path_count;
+        transition index < 64 {
+            true -> fill(path, index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state fill(&mut self, path: &[u8], index: u64) -> bool
+        requires 0 <= index && index < 64
+    {
+        self.path_lens[index] = 0;
+        transition {
+            _ -> copy(path, index, 0)
+        }
+    }
+    state copy(&mut self, path: &[u8], index: u64, position: u64) -> bool
+        requires 0 <= index && index < 64
+    {
+        transition position < path.len && position < 512 {
+            true -> write(path, index, position)
+            false -> finish(index, position)
+        }
+    }
+    state write(&mut self, path: &[u8], index: u64, position: u64) -> bool
+        requires 0 <= index && index < 64 && position < 512
+    {
+        self.paths[index][position] = path[position];
+        transition {
+            _ -> copy(path, index, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(&mut self, index: u64, count: u64) -> bool
+        requires 0 <= index && index < 64
+    {
+        self.path_lens[index] = count;
+        self.path_count = index + 1;
+        (true)
+    }
+}

@@ -1,0 +1,478 @@
+module src::plugins::plugin_configuration;
+
+use src::plugins::plugin_id::PluginId;
+
+// Port of plugins/plugin_configuration.rs — the per-project enabled/
+// disabled/priority plugin-id lists persisted in ProjectInfo. Upstream's
+// Vec<String> lists bound at 32 ids each (7 builtin packages ship today;
+// 32 leaves headroom without a result-shaping cap). `new` keeps upstream's
+// normalize semantics verbatim: enabled/disabled lists are
+// retain-nonempty + sort + dedup; the priority list is retain-nonempty +
+// dedup preserving order.
+pub data PluginConfiguration {
+    enabled_plugin_ids: [PluginId; 32];
+    enabled_plugin_id_count: u64;
+    disabled_plugin_ids: [PluginId; 32];
+    disabled_plugin_id_count: u64;
+    priority_plugin_ids: [PluginId; 32];
+    priority_plugin_id_count: u64;
+}
+
+// Upstream `new` — the caller fills each list via add_* then the explicit
+// normalize machines run the upstream sort/dedup pass.
+pub machine PluginConfiguration::new() -> PluginConfiguration {
+    PluginConfiguration {
+        enabled_plugin_id_count: 0,
+        disabled_plugin_id_count: 0,
+        priority_plugin_id_count: 0,
+    }
+}
+
+pub machine PluginConfiguration::default() -> PluginConfiguration {
+    PluginConfiguration::new()
+}
+
+// Upstream `is_empty` — all three lists empty.
+pub machine PluginConfiguration::is_empty(&self) -> bool {
+    (self.enabled_plugin_id_count == 0 && self.disabled_plugin_id_count == 0
+        && self.priority_plugin_id_count == 0)
+}
+
+pub machine PluginConfiguration::get_enabled_plugin_id_count(&self) -> u64 {
+    self.enabled_plugin_id_count
+}
+
+pub machine PluginConfiguration::get_disabled_plugin_id_count(&self) -> u64 {
+    self.disabled_plugin_id_count
+}
+
+pub machine PluginConfiguration::get_priority_plugin_id_count(&self) -> u64 {
+    self.priority_plugin_id_count
+}
+
+pub machine PluginConfiguration::get_enabled_plugin_id(&self, index: u64) -> &PluginId
+    requires 0 <= index && index < 32
+{
+    &self.enabled_plugin_ids[index]
+}
+
+pub machine PluginConfiguration::get_disabled_plugin_id(&self, index: u64) -> &PluginId
+    requires 0 <= index && index < 32
+{
+    &self.disabled_plugin_ids[index]
+}
+
+pub machine PluginConfiguration::get_priority_plugin_id(&self, index: u64) -> &PluginId
+    requires 0 <= index && index < 32
+{
+    &self.priority_plugin_ids[index]
+}
+
+// Vec::push legs folded with upstream's normalize semantics: `new` runs
+// retain(|id| !id.is_empty()) + sort + dedup on enabled/disabled and
+// retain + order-preserving dedup on priority. `locate_*_insert` (&self
+// probes — reading array elements to compare is a read edge) locates the
+// sorted slot or flags the duplicate; the &mut insert then moves the tail
+// via local-clone element swaps (a self.field-rooted arg cannot loan into
+// a callee under &mut self — elements clone to a local first).
+pub data EnabledInsertProbe {
+    position: u64;
+    duplicate: bool;
+}
+
+pub data DisabledInsertProbe {
+    position: u64;
+    duplicate: bool;
+}
+
+pub machine PluginConfiguration::locate_enabled_insert(&self, plugin_id: &PluginId) -> EnabledInsertProbe {
+    transition {
+        _ -> scan(plugin_id, 0)
+    }
+    state scan(&self, plugin_id: &PluginId, position: u64) -> EnabledInsertProbe {
+        transition position < self.enabled_plugin_id_count && position < 32 {
+            true -> compare(plugin_id, position)
+            false -> (EnabledInsertProbe { position: position, duplicate: false })
+        }
+    }
+    state compare(&self, plugin_id: &PluginId, position: u64) -> EnabledInsertProbe
+        requires position < 32;
+    {
+        let existing: &PluginId = &self.enabled_plugin_ids[position];
+        let duplicate: bool = plugin_id_equal(existing, plugin_id);
+        transition duplicate {
+            true -> (EnabledInsertProbe { position: position, duplicate: true })
+            false -> advance(plugin_id, existing, position)
+        }
+    }
+    state advance(&self, plugin_id: &PluginId, existing: &PluginId, position: u64) -> EnabledInsertProbe {
+        let existing_less: bool = plugin_id_less(existing, plugin_id);
+        transition existing_less {
+            true -> next(plugin_id, position)
+            false -> (EnabledInsertProbe { position: position, duplicate: false })
+        }
+    }
+    state next(&self, plugin_id: &PluginId, position: u64) -> EnabledInsertProbe {
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> scan(plugin_id, next_position)
+        }
+    }
+}
+
+pub machine PluginConfiguration::locate_disabled_insert(&self, plugin_id: &PluginId) -> DisabledInsertProbe {
+    transition {
+        _ -> scan(plugin_id, 0)
+    }
+    state scan(&self, plugin_id: &PluginId, position: u64) -> DisabledInsertProbe {
+        transition position < self.disabled_plugin_id_count && position < 32 {
+            true -> compare(plugin_id, position)
+            false -> (DisabledInsertProbe { position: position, duplicate: false })
+        }
+    }
+    state compare(&self, plugin_id: &PluginId, position: u64) -> DisabledInsertProbe
+        requires position < 32;
+    {
+        let existing: &PluginId = &self.disabled_plugin_ids[position];
+        let duplicate: bool = plugin_id_equal(existing, plugin_id);
+        transition duplicate {
+            true -> (DisabledInsertProbe { position: position, duplicate: true })
+            false -> advance(plugin_id, existing, position)
+        }
+    }
+    state advance(&self, plugin_id: &PluginId, existing: &PluginId, position: u64) -> DisabledInsertProbe {
+        let existing_less: bool = plugin_id_less(existing, plugin_id);
+        transition existing_less {
+            true -> next(plugin_id, position)
+            false -> (DisabledInsertProbe { position: position, duplicate: false })
+        }
+    }
+    state next(&self, plugin_id: &PluginId, position: u64) -> DisabledInsertProbe {
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> scan(plugin_id, next_position)
+        }
+    }
+}
+
+// Upstream Vec::push on the enabled list — retain+sort+dedup folded in.
+pub machine PluginConfiguration::add_enabled_plugin_id(&mut self, plugin_id: &PluginId) -> bool {
+    let id_bytes: &[u8] = plugin_id.get_plugin_id();
+    let len: u64 = id_bytes.len;
+    transition len > 0 && self.enabled_plugin_id_count < 32 {
+        true -> locate(plugin_id)
+        false -> (false)
+        _ -> (false)
+    }
+    state locate(&mut self, plugin_id: &PluginId) -> bool {
+        let probe: EnabledInsertProbe = self.locate_enabled_insert(plugin_id);
+        transition probe.duplicate {
+            true -> (false)
+            false -> shift(plugin_id, probe.position)
+        }
+    }
+    state shift(&mut self, plugin_id: &PluginId, position: u64) -> bool {
+        let end: u64 = self.enabled_plugin_id_count;
+        transition position <= end && position < 32 && end < 32 {
+            true -> move_tail(plugin_id, position, end)
+            false -> (false)
+        }
+    }
+    state move_tail(&mut self, plugin_id: &PluginId, position: u64, cursor: u64) -> bool
+        requires position < 32 && cursor < 33;
+    {
+        transition position < cursor && cursor < 33 && 0 < cursor {
+            true -> move_one(plugin_id, position, cursor)
+            false -> insert(plugin_id, position)
+        }
+    }
+    state move_one(&mut self, plugin_id: &PluginId, position: u64, cursor: u64) -> bool
+        requires position < 32 && cursor < 33 && 0 < cursor;
+    {
+        let source: u64 = cursor - 1;
+        transition source < 32 && cursor < 32 {
+            true -> copy_slot(plugin_id, position, cursor, source)
+            false -> (false)
+        }
+    }
+    state copy_slot(&mut self, plugin_id: &PluginId, position: u64, cursor: u64, source: u64) -> bool
+        requires position < 32 && cursor < 32 && source < 32;
+    {
+        let slot: PluginId = self.enabled_plugin_ids[source].clone();
+        self.enabled_plugin_ids[cursor].clone_from(&slot);
+        transition {
+            _ -> move_tail(plugin_id, position, source)
+        }
+    }
+    state insert(&mut self, plugin_id: &PluginId, position: u64) -> bool
+        requires position < 32;
+    {
+        self.enabled_plugin_ids[position].clone_from(plugin_id);
+        self.enabled_plugin_id_count = ((self.enabled_plugin_id_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+// Upstream Vec::push on the disabled list — same retain+sort+dedup fold.
+pub machine PluginConfiguration::add_disabled_plugin_id(&mut self, plugin_id: &PluginId) -> bool {
+    let id_bytes: &[u8] = plugin_id.get_plugin_id();
+    let len: u64 = id_bytes.len;
+    transition len > 0 && self.disabled_plugin_id_count < 32 {
+        true -> locate(plugin_id)
+        false -> (false)
+        _ -> (false)
+    }
+    state locate(&mut self, plugin_id: &PluginId) -> bool {
+        let probe: DisabledInsertProbe = self.locate_disabled_insert(plugin_id);
+        transition probe.duplicate {
+            true -> (false)
+            false -> shift(plugin_id, probe.position)
+        }
+    }
+    state shift(&mut self, plugin_id: &PluginId, position: u64) -> bool {
+        let end: u64 = self.disabled_plugin_id_count;
+        transition position <= end && position < 32 && end < 32 {
+            true -> move_tail(plugin_id, position, end)
+            false -> (false)
+        }
+    }
+    state move_tail(&mut self, plugin_id: &PluginId, position: u64, cursor: u64) -> bool
+        requires position < 32 && cursor < 33;
+    {
+        transition position < cursor && cursor < 33 && 0 < cursor {
+            true -> move_one(plugin_id, position, cursor)
+            false -> insert(plugin_id, position)
+        }
+    }
+    state move_one(&mut self, plugin_id: &PluginId, position: u64, cursor: u64) -> bool
+        requires position < 32 && cursor < 33 && 0 < cursor;
+    {
+        let source: u64 = cursor - 1;
+        transition source < 32 && cursor < 32 {
+            true -> copy_slot(plugin_id, position, cursor, source)
+            false -> (false)
+        }
+    }
+    state copy_slot(&mut self, plugin_id: &PluginId, position: u64, cursor: u64, source: u64) -> bool
+        requires position < 32 && cursor < 32 && source < 32;
+    {
+        let slot: PluginId = self.disabled_plugin_ids[source].clone();
+        self.disabled_plugin_ids[cursor].clone_from(&slot);
+        transition {
+            _ -> move_tail(plugin_id, position, source)
+        }
+    }
+    state insert(&mut self, plugin_id: &PluginId, position: u64) -> bool
+        requires position < 32;
+    {
+        self.disabled_plugin_ids[position].clone_from(plugin_id);
+        self.disabled_plugin_id_count = ((self.disabled_plugin_id_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+// Priority list: order-preserving dedup — refuse empties and duplicates,
+// append otherwise (upstream retain + normalize_ordered_plugin_ids). The
+// membership probe is &self (reading elements to compare is a read edge).
+pub machine PluginConfiguration::contains_priority_plugin_id(&self, plugin_id: &PluginId) -> bool {
+    transition {
+        _ -> probe(plugin_id, 0)
+    }
+    state probe(&self, plugin_id: &PluginId, position: u64) -> bool {
+        transition position < self.priority_plugin_id_count && position < 32 {
+            true -> compare(plugin_id, position)
+            false -> (false)
+        }
+    }
+    state compare(&self, plugin_id: &PluginId, position: u64) -> bool
+        requires position < 32;
+    {
+        let existing: &PluginId = &self.priority_plugin_ids[position];
+        let duplicate: bool = plugin_id_equal(existing, plugin_id);
+        transition duplicate {
+            true -> (true)
+            false -> next(plugin_id, position)
+        }
+    }
+    state next(&self, plugin_id: &PluginId, position: u64) -> bool {
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> probe(plugin_id, next_position)
+        }
+    }
+}
+
+pub machine PluginConfiguration::add_priority_plugin_id(&mut self, plugin_id: &PluginId) -> bool {
+    let id_bytes: &[u8] = plugin_id.get_plugin_id();
+    let len: u64 = id_bytes.len;
+    transition len > 0 && self.priority_plugin_id_count < 32 {
+        true -> check(plugin_id)
+        false -> (false)
+        _ -> (false)
+    }
+    state check(&mut self, plugin_id: &PluginId) -> bool {
+        let duplicate: bool = self.contains_priority_plugin_id(plugin_id);
+        transition duplicate {
+            true -> (false)
+            false -> append(plugin_id)
+        }
+    }
+    state append(&mut self, plugin_id: &PluginId) -> bool {
+        let index: u64 = self.priority_plugin_id_count;
+        transition index < 32 {
+            true -> fill(plugin_id, index)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state fill(&mut self, plugin_id: &PluginId, index: u64) -> bool
+        requires 0 <= index && index < 32
+    {
+        self.priority_plugin_ids[index].clone_from(plugin_id);
+        self.priority_plugin_id_count = index + 1;
+        (true)
+    }
+}
+
+// Whole-record clone — element-wise through each bounded table (the
+// session legs copy configurations across the project boundary).
+pub machine PluginConfiguration::clone(source: &PluginConfiguration) -> PluginConfiguration {
+    let mut out: PluginConfiguration = PluginConfiguration::new();
+    out.clone_from(source);
+    (out)
+}
+
+pub machine PluginConfiguration::clone_from(&mut self, source: &PluginConfiguration) {
+    self.enabled_plugin_id_count = source.enabled_plugin_id_count;
+    self.disabled_plugin_id_count = source.disabled_plugin_id_count;
+    self.priority_plugin_id_count = source.priority_plugin_id_count;
+    transition {
+        _ -> copy_enabled(source, 0)
+    }
+    state copy_enabled(&mut self, source: &PluginConfiguration, index: u64) {
+        transition index < source.enabled_plugin_id_count && index < 32 {
+            true -> write_enabled(source, index)
+            false -> copy_disabled_start(source)
+        }
+    }
+    state write_enabled(&mut self, source: &PluginConfiguration, index: u64)
+        requires index < 32;
+    {
+        let element: PluginId = source.enabled_plugin_ids[index].clone();
+        self.enabled_plugin_ids[index].clone_from(&element);
+        let next_index: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_enabled(source, next_index)
+        }
+    }
+    state copy_disabled_start(&mut self, source: &PluginConfiguration) {
+        transition {
+            _ -> copy_disabled(source, 0)
+        }
+    }
+    state copy_disabled(&mut self, source: &PluginConfiguration, index: u64) {
+        transition index < source.disabled_plugin_id_count && index < 32 {
+            true -> write_disabled(source, index)
+            false -> copy_priority_start(source)
+        }
+    }
+    state write_disabled(&mut self, source: &PluginConfiguration, index: u64)
+        requires index < 32;
+    {
+        let element: PluginId = source.disabled_plugin_ids[index].clone();
+        self.disabled_plugin_ids[index].clone_from(&element);
+        let next_index: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_disabled(source, next_index)
+        }
+    }
+    state copy_priority_start(&mut self, source: &PluginConfiguration) {
+        transition {
+            _ -> copy_priority(source, 0)
+        }
+    }
+    state copy_priority(&mut self, source: &PluginConfiguration, index: u64) {
+        transition index < source.priority_plugin_id_count && index < 32 {
+            true -> write_priority(source, index)
+            false -> finish()
+        }
+    }
+    state write_priority(&mut self, source: &PluginConfiguration, index: u64)
+        requires index < 32;
+    {
+        let element: PluginId = source.priority_plugin_ids[index].clone();
+        self.priority_plugin_ids[index].clone_from(&element);
+        let next_index: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_priority(source, next_index)
+        }
+    }
+    state finish(&mut self) {
+    }
+}
+
+// plugin_id_equal — length equality plus byte equality across the live slice.
+pub machine plugin_id_equal(left: &PluginId, right: &PluginId) -> bool {
+    let left_bytes: &[u8] = left.get_plugin_id();
+    let right_bytes: &[u8] = right.get_plugin_id();
+    transition left_bytes.len == right_bytes.len {
+        true -> scan(left_bytes, right_bytes, 0)
+        false -> (false)
+    }
+    state scan(left_bytes: &[u8], right_bytes: &[u8], position: u64) -> bool {
+        transition position < left_bytes.len && position < right_bytes.len && position < 256 {
+            true -> compare(left_bytes, right_bytes, position)
+            false -> (true)
+        }
+    }
+    state compare(left_bytes: &[u8], right_bytes: &[u8], position: u64) -> bool
+        requires position < left_bytes.len && position < right_bytes.len;
+    {
+        let left_byte: u8 = left_bytes[position];
+        let right_byte: u8 = right_bytes[position];
+        transition left_byte == right_byte {
+            true -> next(left_bytes, right_bytes, position)
+            false -> (false)
+        }
+    }
+    state next(left_bytes: &[u8], right_bytes: &[u8], position: u64) -> bool {
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_position < left_bytes.len && next_position < right_bytes.len {
+            true -> compare(left_bytes, right_bytes, next_position)
+            false -> (true)
+        }
+    }
+}
+
+// plugin_id_less — lexicographic byte order on the two ids' live slices,
+// shorter-prefix-is-smaller at exhaustion (upstream sort() order on String).
+pub machine plugin_id_less(left: &PluginId, right: &PluginId) -> bool {
+    transition {
+        _ -> differ(left, right, 0)
+    }
+    state differ(left: &PluginId, right: &PluginId, position: u64) -> bool {
+        let left_bytes: &[u8] = left.get_plugin_id();
+        let right_bytes: &[u8] = right.get_plugin_id();
+        transition position < left_bytes.len && position < right_bytes.len && position < 256 {
+            true -> compare_bytes(left_bytes, right_bytes, position)
+            false -> (left_bytes.len < right_bytes.len)
+        }
+    }
+    state compare_bytes(left_bytes: &[u8], right_bytes: &[u8], position: u64) -> bool
+        requires position < left_bytes.len && position < right_bytes.len;
+    {
+        let left_byte: u8 = left_bytes[position];
+        let right_byte: u8 = right_bytes[position];
+        transition left_byte == right_byte {
+            true -> next(left_bytes, right_bytes, position)
+            false -> (left_byte < right_byte)
+        }
+    }
+    state next(left_bytes: &[u8], right_bytes: &[u8], position: u64) -> bool {
+        let next_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_position < left_bytes.len && next_position < right_bytes.len {
+            true -> compare_bytes(left_bytes, right_bytes, next_position)
+            false -> (left_bytes.len < right_bytes.len)
+        }
+    }
+}
