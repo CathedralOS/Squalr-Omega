@@ -1,0 +1,157 @@
+module src::structures::data_values::scalar_integer_value;
+
+use src::structures::memory::endian::Endian;
+
+// Upstream `pub struct ScalarIntegerValue;` — a marker namespace for the
+// free read functions. No instances are constructed; the union exists so
+// `ScalarIntegerValue::` machine paths resolve.
+pub data ScalarIntegerValue [copy] {
+    case ScalarIntegerValue;
+}
+
+// Port of structures/data_values/scalar_integer_value.rs — the byte-window
+// decode for scalar integer scan values.
+//
+// Named deviation: upstream's read window is up to 16 bytes into u128/i128;
+// this pin's widest primitives are u64/i64 (the headroom declaration lives
+// in data_types/built_in_types/primitive_data_type_numeric.omg), so the
+// read bound narrows to 8 bytes and wider windows refuse.
+//
+// `Result<T, DataTypeError>` rides the package's refusal convention —
+// Refused covers upstream's NoBytes / InvalidByteCount / ParseError shapes;
+// all are terminal refusals whose payload no caller consumes.
+pub data ScalarIntegerRead [copy] {
+    case Refused;
+    case Value(value: u64);
+}
+
+// Upstream `read_unsigned` — little-endian places bytes[len-1] most
+// significant (walked downward), big-endian places bytes[0] most
+// significant (walked upward).
+pub machine ScalarIntegerValue::read_unsigned(
+    value_bytes: &[u8],
+    endian: Endian
+) -> ScalarIntegerRead {
+    transition 0 < value_bytes.len && value_bytes.len <= 8 {
+        true -> dispatch(value_bytes, endian)
+        false -> (ScalarIntegerRead::Refused)
+        _ -> (ScalarIntegerRead::Refused)
+    }
+    state dispatch(value_bytes: &[u8], endian: Endian) -> ScalarIntegerRead {
+        transition endian {
+            Endian::Little -> little(value_bytes, value_bytes.len, 0)
+            Endian::Big -> big(value_bytes, 0, 0)
+            _ -> (ScalarIntegerRead::Refused)
+        }
+    }
+    state little(value_bytes: &[u8], position: u64, accumulated: u64) -> ScalarIntegerRead {
+        transition 0 < position && position <= value_bytes.len {
+            true -> little_index(value_bytes, position, accumulated)
+            false -> (ScalarIntegerRead::Value { value: accumulated })
+            _ -> (ScalarIntegerRead::Value { value: accumulated })
+        }
+    }
+    // `position - 1` cannot carry the bound the index read contracts on —
+    // the guard mints it.
+    state little_index(value_bytes: &[u8], position: u64, accumulated: u64) -> ScalarIntegerRead
+        requires 0 < position && position <= value_bytes.len;
+    {
+        let index: u64 = position - 1;
+        transition index < value_bytes.len {
+            true -> little_store(value_bytes, index, accumulated)
+            false -> (ScalarIntegerRead::Value { value: accumulated })
+            _ -> (ScalarIntegerRead::Value { value: accumulated })
+        }
+    }
+    state little_store(value_bytes: &[u8], index: u64, accumulated: u64) -> ScalarIntegerRead
+        requires index < value_bytes.len;
+    {
+        let byte_value: u64 = value_bytes[index] as u64;
+        let next: u64 = (((accumulated as u64 in Wrapping) << 8) as u64) | byte_value;
+        transition {
+            _ -> little(value_bytes, index, next)
+        }
+    }
+    state big(value_bytes: &[u8], position: u64, accumulated: u64) -> ScalarIntegerRead {
+        transition position < value_bytes.len {
+            true -> big_store(value_bytes, position, accumulated)
+            false -> (ScalarIntegerRead::Value { value: accumulated })
+            _ -> (ScalarIntegerRead::Value { value: accumulated })
+        }
+    }
+    state big_store(value_bytes: &[u8], position: u64, accumulated: u64) -> ScalarIntegerRead
+        requires position < value_bytes.len;
+    {
+        let byte_value: u64 = value_bytes[position] as u64;
+        let next: u64 = (((accumulated as u64 in Wrapping) << 8) as u64) | byte_value;
+        transition {
+            _ -> big(value_bytes, position + 1, next)
+        }
+    }
+}
+
+// Upstream `read_signed` — the unsigned read followed by sign extension
+// into the full carrier width. Upstream widens into i128; here the carrier
+// is u64 and the sign-extended bit pattern IS the i64 bit pattern, so the
+// consumer's `as i64` reinterpretation recovers upstream's value.
+pub machine ScalarIntegerValue::read_signed(
+    value_bytes: &[u8],
+    endian: Endian
+) -> ScalarIntegerRead {
+    transition {
+        _ -> dispatch(value_bytes, ScalarIntegerValue::read_unsigned(value_bytes, endian))
+    }
+    state dispatch(value_bytes: &[u8], read: ScalarIntegerRead) -> ScalarIntegerRead {
+        transition read {
+            ScalarIntegerRead::Value { value } -> width(value_bytes, value)
+            ScalarIntegerRead::Refused -> (ScalarIntegerRead::Refused)
+            _ -> (ScalarIntegerRead::Refused)
+        }
+    }
+    state width(value_bytes: &[u8], value: u64) -> ScalarIntegerRead {
+        transition 0 < value_bytes.len && value_bytes.len < 8 {
+            true -> bit_count(value_bytes, value)
+            false -> (ScalarIntegerRead::Value { value: value })
+            _ -> (ScalarIntegerRead::Value { value: value })
+        }
+    }
+    state bit_count(value_bytes: &[u8], value: u64) -> ScalarIntegerRead
+        requires 0 < value_bytes.len;
+    {
+        let count: u64 = ((value_bytes.len as u64 in Wrapping) * (8 as u64 in Wrapping)) as u64;
+        transition 0 < count && count < 64 {
+            true -> sign_bit(value, count)
+            false -> (ScalarIntegerRead::Value { value: value })
+            _ -> (ScalarIntegerRead::Value { value: value })
+        }
+    }
+    state sign_bit(value: u64, count: u64) -> ScalarIntegerRead
+        requires 0 < count && count < 64;
+    {
+        let index: u64 = count - 1;
+        transition index < 64 {
+            true -> probe(value, count, index)
+            false -> (ScalarIntegerRead::Value { value: value })
+            _ -> (ScalarIntegerRead::Value { value: value })
+        }
+    }
+    state probe(value: u64, count: u64, index: u64) -> ScalarIntegerRead
+        requires index < 64 && 0 < count && count < 64;
+    {
+        let mask: u64 = ((1 as u64 in Wrapping) << index) as u64;
+        transition (value & mask) == 0 {
+            true -> (ScalarIntegerRead::Value { value: value })
+            false -> extend(value, count)
+            _ -> (ScalarIntegerRead::Value { value: value })
+        }
+    }
+    // Sign bit set: upstream `value | (!0 << bit_count)` — the carrier's
+    // bits above the read width become ones.
+    state extend(value: u64, count: u64) -> ScalarIntegerRead
+        requires 0 < count && count < 64;
+    {
+        let mask: u64 = ((0 as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        let high: u64 = ((mask as u64 in Wrapping) << count) as u64;
+        (ScalarIntegerRead::Value { value: (value | high) })
+    }
+}
