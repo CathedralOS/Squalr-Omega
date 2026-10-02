@@ -63,3 +63,27 @@ execution, not a substitute feature set. See PORTING.md and upstream.json.
   an app-owned polling model. Land the PrivilegedCommand/Response arms,
   dispatcher arm and executors together once both are decided; unreachable arms
   or fake-success bodies are not acceptable substitutes.
+- **PROJECT-SERIALIZATION.** (new-scope) squalr-engine-projects is authored:
+  the module tree, `SerializableProjectFile`'s save contract, the
+  `ProjectInfoStub` carrier, the bounded path helpers
+  (`append_path_component`, `is_project_item_file_path`,
+  `resolve_project_*_path`), `ProjectSettingsConfig`'s instance-carried
+  record + accessors, and the api structures they stand on (`Project`,
+  `ProjectSettings`, `ProjectItemTypeDirectory`, `ProjectItem`'s upstream
+  2-arg `new` + `set_field_name`/`get_field_name`,
+  `ProjectItemRef::path_equals`/`get_file_or_directory_name`,
+  `ProjectInfo::new_with_symbol_catalog`). Blocked rows — all downstream of
+  a serde_json-equivalent project-file codec, which no ordinary Omega
+  package provides: `ProjectItem`/`Project`/`ProjectInfo` save_to_path +
+  load_from_path impls, `ProjectInfoStub`'s deserialize-side application,
+  the `load_recursive` directory walk, and `ProjectSettingsConfig`'s
+  read-at-new + save-on-set arms (mutations preserve upstream semantics;
+  the persistence arms land with the codec). Host-facility deviations:
+  `directories::UserDirs` and `current_exe()` have no boundary provider —
+  `default_projects_root`/`default_config_path` store upstream's own
+  relative fallbacks. `Project`'s `HashMap<ProjectItemRef, ProjectItem>`
+  carries as a bounded 256-pair table (insert refuses past the bound;
+  HashMap iteration order is unspecified upstream). `OnceLock`+`Arc<RwLock>`
+  global singleton deviates to instance-carried config (no process-global
+  mutable storage). `ProjectItemType`'s trait-object tick/activation arms
+  defer to the registry leg (upstream bodies are commented-out anyway).

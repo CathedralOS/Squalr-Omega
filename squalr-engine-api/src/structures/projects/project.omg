@@ -1,0 +1,252 @@
+module src::structures::projects::project;
+
+use src::structures::processes::process_icon::ProcessIcon;
+use src::structures::projects::project_info::ProjectInfo;
+use src::structures::projects::project_items::project_item::ProjectItem;
+use src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use src::structures::projects::project_manifest::ProjectManifest;
+
+// Port of structures/projects/project.rs — a full project in memory plus the
+// file-layout constants its serializer uses. Upstream
+// `HashMap<ProjectItemRef, ProjectItem>` carries as a bounded pair table +
+// count (named deviation: inserts refuse past 256 where the HashMap grows;
+// HashMap iteration order is unspecified upstream, so pair order is the
+// caller's insertion order). Option<&ProjectItem> lookups carry as the
+// package's Found/Refused convention — Optional<T> is unmatchable in this
+// pin. Machines that consume a whole record upstream (info, pair, root ref)
+// take by-value parameters — the HashMap keys/values moved into upstream's
+// map the same way.
+pub data ProjectItemLookup {
+    case Refused;
+    case Found(index: u64);
+}
+
+pub data Project {
+    project_info: ProjectInfo;
+    project_items: [ProjectItemPair; 256];
+    project_items_len: u64;
+    project_root_ref: ProjectItemRef;
+}
+
+// Upstream `Project::PROJECT_FILE` — "project.json".
+pub machine Project::get_project_file_name() -> &[u8] {
+    ("project.json")
+}
+
+// Upstream `Project::PROJECT_DIR` — "project_items".
+pub machine Project::get_project_directory_name() -> &[u8] {
+    ("project_items")
+}
+
+// Upstream `Project::PROJECT_ITEM_EXTENSION` — ".json".
+pub machine Project::get_project_item_extension() -> &[u8] {
+    (".json")
+}
+
+// Upstream `Project::new` — the item table starts empty upstream of any
+// load; `insert_project_item` plays the HashMap's `insert` role.
+pub machine Project::new(
+    project_info: ProjectInfo,
+    project_root_ref: ProjectItemRef
+) -> Project {
+    (Project {
+        project_info: project_info,
+        project_items_len: 0,
+        project_root_ref: project_root_ref,
+    })
+}
+
+pub machine Project::default() -> Project {
+    (Project {
+        project_info: ProjectInfo::default(),
+        project_items_len: 0,
+        project_root_ref: ProjectItemRef::default(),
+    })
+}
+
+// Upstream `HashMap::insert` — replaces the pair at a matching ref, else
+// appends; refuses past the table bound (named deviation — upstream grows).
+pub machine Project::insert_project_item(&mut self, pair: ProjectItemPair) -> bool {
+    let pair_ref: &ProjectItemRef = pair.get_project_item_ref();
+    let lookup: ProjectItemLookup = self.lookup_project_item_index(pair_ref);
+    transition lookup {
+        ProjectItemLookup::Found { index } -> replace(index, pair)
+        ProjectItemLookup::Refused -> append(pair)
+        _ -> (false)
+    }
+    state replace(&mut self, index: u64, pair: ProjectItemPair) -> bool {
+        transition index < self.project_items_len && index < 256 {
+            true -> store(index, pair)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state store(&mut self, index: u64, pair: ProjectItemPair) -> bool
+        requires 0 <= index && index < 256;
+    {
+        self.project_items[index] = pair;
+        (true)
+    }
+    state append(&mut self, pair: ProjectItemPair) -> bool {
+        transition self.project_items_len < 256 {
+            true -> grow(pair)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state grow(&mut self, pair: ProjectItemPair) -> bool
+        requires self.project_items_len < 256;
+    {
+        self.project_items[self.project_items_len] = pair;
+        self.project_items_len = ((self.project_items_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+pub machine Project::get_name(&self) -> &[u8] {
+    (self.project_info.get_name())
+}
+
+pub machine Project::get_project_manifest(&self) -> &ProjectManifest {
+    (self.project_info.get_project_manifest())
+}
+
+pub machine Project::borrow_project_manifest_mut(&mut self) -> &mut ProjectManifest {
+    (self.project_info.borrow_project_manifest_mut())
+}
+
+pub machine Project::get_project_info(&self) -> &ProjectInfo {
+    (&self.project_info)
+}
+
+pub machine Project::borrow_project_info_mut(&mut self) -> &mut ProjectInfo {
+    (&mut self.project_info)
+}
+
+pub machine Project::set_project_info(&mut self, project_info: ProjectInfo) {
+    self.project_info = project_info;
+}
+
+// Upstream `set_project_icon(Option<ProcessIcon>)` — Some carries here,
+// None's clear routes through `clear_project_icon` (Optional is unmatchable
+// in this pin, so the empty arm keeps its own machine — named deviation).
+pub machine Project::set_project_icon(&mut self, project_icon: &ProcessIcon) {
+    self.project_info.set_project_icon(project_icon);
+}
+
+pub machine Project::clear_project_icon(&mut self) {
+    self.project_info.clear_project_icon_rgba();
+}
+
+// Upstream `get_project_items`/`get_project_items_mut` HashMap exposure —
+// the bounded table publishes count + indexed views instead (named
+// deviation: no by-reference map view exists downstream of the pin).
+pub machine Project::get_project_items_len(&self) -> u64 {
+    (self.project_items_len)
+}
+
+pub machine Project::get_project_item_pair(&self, index: u64) -> &ProjectItemPair {
+    transition index < self.project_items_len && index < 256 {
+        true -> (&self.project_items[index])
+        false -> (&self.project_items[0])
+        _ -> (&self.project_items[0])
+    }
+}
+
+pub machine Project::borrow_project_item_pair_mut(&mut self, index: u64) -> &mut ProjectItemPair {
+    transition index < self.project_items_len && index < 256 {
+        true -> (&mut self.project_items[index])
+        false -> (&mut self.project_items[0])
+        _ -> (&mut self.project_items[0])
+    }
+}
+
+// Upstream `HashMap::get` keyed by ref — linear scan on path equality.
+pub machine Project::lookup_project_item_index(
+    &self,
+    project_item_ref: &ProjectItemRef
+) -> ProjectItemLookup {
+    transition {
+        _ -> scan(project_item_ref, 0)
+    }
+    state scan(&self, project_item_ref: &ProjectItemRef, position: u64) -> ProjectItemLookup {
+        transition position < self.project_items_len && position < 256 {
+            true -> compare(project_item_ref, position)
+            false -> (ProjectItemLookup::Refused)
+            _ -> (ProjectItemLookup::Refused)
+        }
+    }
+    state compare(&self, project_item_ref: &ProjectItemRef, position: u64) -> ProjectItemLookup
+        requires position < 256;
+    {
+        let stored_ref: &ProjectItemRef = self.project_items[position].get_project_item_ref();
+        transition stored_ref.path_equals(project_item_ref) {
+            true -> (ProjectItemLookup::Found { index: position })
+            false -> scan(project_item_ref, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (ProjectItemLookup::Refused)
+        }
+    }
+}
+
+// Upstream `get_has_unsaved_changes` — info flag OR any item flag.
+pub machine Project::get_has_unsaved_changes(&self) -> bool {
+    transition self.project_info.get_has_unsaved_changes() {
+        true -> (true)
+        false -> scan(0)
+        _ -> (false)
+    }
+    state scan(&self, position: u64) -> bool {
+        transition position < self.project_items_len && position < 256 {
+            true -> check(position)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state check(&self, position: u64) -> bool
+        requires position < 256;
+    {
+        let stored_item: &ProjectItem = self.project_items[position].get_project_item();
+        transition stored_item.get_has_unsaved_changes() {
+            true -> (true)
+            false -> scan(((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `set_has_unsaved_changes` — applies the flag to the info and
+// every item.
+pub machine Project::set_has_unsaved_changes(&mut self, has_unsaved_changes: bool) {
+    self.project_info.set_has_unsaved_changes(has_unsaved_changes);
+    transition {
+        _ -> apply(has_unsaved_changes, 0)
+    }
+    state apply(&mut self, has_unsaved_changes: bool, position: u64) {
+        transition position < self.project_items_len && position < 256 {
+            true -> mark(has_unsaved_changes, position)
+            false -> done()
+            _ -> done()
+        }
+    }
+    state mark(&mut self, has_unsaved_changes: bool, position: u64)
+        requires position < 256;
+    {
+        self.project_items[position].borrow_project_item_mut().set_has_unsaved_changes(has_unsaved_changes);
+        transition {
+            _ -> apply(has_unsaved_changes, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state done(&mut self) {
+    }
+}
+
+// Upstream `get_project_root` — Option<&&ProjectItem> via the stored root
+// ref; Refused carries the missing-root case.
+pub machine Project::get_project_root(&self) -> ProjectItemLookup {
+    (self.lookup_project_item_index(&self.project_root_ref))
+}
+
+pub machine Project::get_project_root_ref(&self) -> &ProjectItemRef {
+    (&self.project_root_ref)
+}
