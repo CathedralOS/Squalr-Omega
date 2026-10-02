@@ -2,6 +2,10 @@ module src::squalr_engine;
 
 use omega::language::core::wait_wake;
 use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::command_invocation::CommandInvocation;
+use squalr_engine_api::src::commands::command_invocation::CommandInvocationSource;
+use squalr_engine_api::src::commands::command_invocation::EngineCommand;
+use squalr_engine_api::src::commands::command_invocation::EngineCommandResponse;
 use squalr_engine_api::src::commands::command_line::command_line_command::CommandLineCommand;
 use squalr_engine_api::src::commands::command_line::command_line_parser::CommandLineParse;
 use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
@@ -13,6 +17,7 @@ use squalr_engine_api::src::structures::processes::opened_process_info::OpenedPr
 use squalr_engine_session::src::engine_privileged_state::EnginePrivilegedState;
 use squalr_engine_session::src::os::supplied_memory_source::SuppliedMemorySource;
 use src::command_executors::privileged_command_executor::PrivilegedCommandExecutor;
+use src::command_invocation_wire::CommandInvocationWireModule;
 use src::engine_mode::EngineMode;
 
 // Port of squalr_engine.rs for the headless leg: the engine is the
@@ -159,5 +164,49 @@ invokes FilesystemHost;
 
     state drive(&mut self, command: &PrivilegedCommand) -> ScanResultsListResponse {
         self.dispatch_list(command)
+    }
+}
+
+// Invocation-envelope wire for `Cli::run`: the parse owns the command and
+// union construction is admitted inside the engine's machines, so cli
+// moves the PrivilegedCommand payload through and the envelope mints here
+// — `CommandInvocation::new(id, Cli, EngineCommand::Privileged{command})` —
+// before the send_invocation seam. The id arrives as a scalar from the
+// caller until the unprivileged-state allocator port lands. Same
+// union-extraction discipline as `dispatch_parsed_list` on the way out.
+pub machine SqualrEngine::dispatch_invocation_list(
+    &mut self,
+    command: PrivilegedCommand,
+    invocation_id: u64
+) -> ScanResultsListResponse
+crashes Abort
+crashes Trap
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+{
+    let invocation: CommandInvocation = CommandInvocation::new(
+        invocation_id,
+        CommandInvocationSource::Cli,
+        EngineCommand::Privileged { command: command });
+    let response: EngineCommandResponse = CommandInvocationWireModule::send_invocation(self, &invocation);
+    transition response {
+        EngineCommandResponse::Privileged { response } -> walk(response)
+        _ -> (ScanResultsListResponse::default())
+    }
+
+    state walk(&mut self, response: PrivilegedCommandResponse) -> ScanResultsListResponse {
+        transition response {
+            PrivilegedCommandResponse::ScanResults { response } -> extract(response)
+            _ -> (ScanResultsListResponse::default())
+        }
+    }
+
+    state extract(response: ScanResultsResponse) -> ScanResultsListResponse {
+        transition response {
+            ScanResultsResponse::List { response } -> (response)
+            _ -> (ScanResultsListResponse::default())
+        }
     }
 }

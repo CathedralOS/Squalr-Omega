@@ -1,0 +1,247 @@
+module src::command_framer;
+
+// framer_v2 — a bounded byte-chunk command framer. v1 framing is
+// capability-level: `Console::read_line` blocks for a whole LF-terminated
+// line per call. The framer instead accepts byte chunks from any source
+// (the stdin `read_byte` loop today, IPC socket reads later) and emits one
+// `\n`-delimited frame per take, so every byte source shares one
+// command-feed path. Semantics port Rust `read_line`: the delimiter is
+// consumed and never emitted; EOF with pending bytes flushes one final
+// frame; empty frames surface as len 0.
+//
+// Take sentinel choice (spec: pick one and comment): `u64::MAX` = no frame
+// is buffered. One sentinel keeps the caller's loop a single compare;
+// `u64::MAX` can never collide with a real frame length because pending is
+// capped at 512.
+//
+// Self-contained emission: the taken frame lands in `frame` (a field the
+// framer owns) and callers read bytes back through `get_frame_byte` — no
+// `&mut` buffer arguments cross machine boundaries, the same discipline
+// `pad_line` documents for capability-bearing owners. Driver states carry
+// no `requires` and name every fact a worker needs in their transition
+// guard; worker states carry the matching `requires`.
+pub data CommandFramer {
+    pending: [u8; 512];
+    pending_len: u64;
+    frame: [u8; 512];
+    frame_len: u64;
+    closed: bool;
+}
+
+pub machine CommandFramer::new() -> CommandFramer {
+    CommandFramer { pending_len: 0, frame_len: 0, closed: false }
+}
+
+pub machine CommandFramer::default() -> CommandFramer {
+    CommandFramer::new()
+}
+
+pub machine CommandFramer::is_empty(&self) -> bool {
+    self.pending_len == 0
+}
+
+pub machine CommandFramer::get_pending_len(&self) -> u64 {
+    self.pending_len
+}
+
+pub machine CommandFramer::get_frame_len(&self) -> u64 {
+    self.frame_len
+}
+
+pub machine CommandFramer::is_closed(&self) -> bool {
+    self.closed
+}
+
+// Frame byte at `at`; out-of-range reads answer 0 — the caller bounds by
+// the returned frame length, and a defensive answer beats a contract the
+// caller cannot name (`at < self.frame_len` is the framer's own fact).
+pub machine CommandFramer::get_frame_byte(&self, at: u64) -> u8 {
+    transition at < self.frame_len && at < 512 {
+        true -> read(at)
+        _ -> (0)
+    }
+
+    state read(&self, at: u64) -> u8
+        requires at < 512;
+    {
+        (self.frame[at])
+    }
+}
+
+// All-or-nothing append: refuses without consuming when the chunk would
+// exceed the 512-byte pending extent — a partial append would silently
+// corrupt frame boundaries, and the caller may split its chunk. Offers
+// after `close` refuse the same way.
+pub machine CommandFramer::offer(&mut self, bytes: &[u8]) -> bool {
+    transition !self.closed && ((self.pending_len as u64 in Wrapping) + (bytes.len as u64 in Wrapping)) as u64 <= 512 {
+        true -> copy(0, bytes)
+        _ -> (false)
+    }
+
+    state copy(&mut self, at: u64, bytes: &[u8]) -> bool {
+        transition at < bytes.len && self.pending_len < 512 {
+            true -> store(at, bytes)
+            _ -> (true)
+        }
+    }
+
+    state store(&mut self, at: u64, bytes: &[u8]) -> bool
+        requires at < bytes.len && self.pending_len < 512;
+    {
+        self.pending[self.pending_len] = bytes[at];
+        self.pending_len = ((self.pending_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> copy(((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, bytes) }
+    }
+}
+
+// Single-byte offer — the `Console::read_byte` loop's chunk shape. Same
+// all-or-nothing discipline as `offer` (a 1-byte chunk only refuses when
+// the pending extent is saturated or the framer is closed).
+pub machine CommandFramer::offer_byte(&mut self, byte: u8) -> bool {
+    transition !self.closed && self.pending_len < 512 {
+        true -> append(byte)
+        _ -> (false)
+    }
+
+    state append(&mut self, byte: u8) -> bool
+        requires self.pending_len < 512;
+    {
+        self.pending[self.pending_len] = byte;
+        self.pending_len = ((self.pending_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+// Split-take: scans `pending[0..pending_len)` for the first 0x0a; on a hit
+// the frame is `pending[0..idx)` (delimiter consumed), the tail shifts
+// down, and the frame length is returned. Full-style overflow: a saturated
+// pending extent with no delimiter is itself a boundary — the 512-byte
+// partial emits so the caller can take the refused remainder next. Returns
+// `u64::MAX` when nothing frames. Emitted bytes land in `frame` with
+// `frame_len` set to the returned length.
+pub machine CommandFramer::try_take_frame(&mut self) -> u64 {
+    transition { _ -> scan(0) }
+
+    state scan(&mut self, at: u64) -> u64 {
+        transition at < self.pending_len && at < 512 {
+            true -> test(at)
+            _ -> full_check()
+        }
+    }
+
+    state test(&mut self, at: u64) -> u64
+        requires at < 512;
+    {
+        transition self.pending[at] == 10 {
+            true -> emit(at)
+            _ -> scan(((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+
+    state full_check(&mut self) -> u64 {
+        transition self.pending_len == 512 {
+            true -> emit_partial()
+            _ -> (18446744073709551615)
+        }
+    }
+
+    // Emit `pending[0..count)` into `frame`, then drop `count` bytes
+    // plus the consumed delimiter off the front of pending. `src` is the
+    // tail's first retained byte (count + 1).
+    state emit(&mut self, count: u64) -> u64 {
+        let after: u64 = ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition count > 0 {
+            true -> copy_check(0, count, after, count)
+            _ -> shift(0, after, count)
+        }
+    }
+
+    // Saturated-extent partial: all 512 pending bytes emit and nothing
+    // shifts (no delimiter was consumed).
+    state emit_partial(&mut self) -> u64 {
+        transition { _ -> copy_check(0, 512, 512, 512) }
+    }
+
+    // `at` walks the frame prefix; the guard supplies copy_out's `at < 512`
+    // and falls to `shift` at `count` — where `src` marks the retained
+    // tail's first byte.
+    state copy_check(&mut self, at: u64, count: u64, src: u64, reported: u64) -> u64 {
+        transition at < count && at < 512 {
+            true -> copy_out(at, count, src, reported)
+            _ -> shift(0, src, reported)
+        }
+    }
+
+    state copy_out(&mut self, at: u64, count: u64, src: u64, reported: u64) -> u64
+        requires at < 512;
+    {
+        self.frame[at] = self.pending[at];
+        let next: u64 = ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> copy_check(next, count, src, reported) }
+    }
+
+    // `dst`/`src` walk the retained tail down: pending[src] lands at
+    // pending[dst] until src reaches pending_len. The dst/src bounds are
+    // named in the guard so shift_copy's `requires` discharges.
+    state shift(&mut self, dst: u64, src: u64, reported: u64) -> u64 {
+        transition src < self.pending_len && dst < 512 && src < 512 {
+            true -> shift_copy(dst, src, reported)
+            _ -> finish(dst, reported)
+        }
+    }
+
+    state shift_copy(&mut self, dst: u64, src: u64, reported: u64) -> u64
+        requires dst < 512 && src < 512;
+    {
+        self.pending[dst] = self.pending[src];
+        let next_dst: u64 = ((dst as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let next_src: u64 = ((src as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> shift(next_dst, next_src, reported) }
+    }
+
+    // `dst` is exactly the number of retained bytes — it becomes the new
+    // pending_len. `reported` is the frame length handed back and recorded.
+    state finish(&mut self, dst: u64, reported: u64) -> u64 {
+        self.pending_len = dst;
+        self.frame_len = reported;
+        (reported)
+    }
+}
+
+// EOF flush: pending bytes emit as the final frame (upstream `read_line`
+// returns `Ok(n>0)` without the delimiter) and the framer closes; empty or
+// already-closed pending ends the stream with a 0-length report.
+pub machine CommandFramer::close(&mut self) -> u64 {
+    transition self.closed || self.pending_len == 0 {
+        true -> mark()
+        _ -> copy(0)
+    }
+
+    state mark(&mut self) -> u64 {
+        self.closed = true;
+        self.frame_len = 0;
+        (0)
+    }
+
+    state copy(&mut self, at: u64) -> u64 {
+        transition at < self.pending_len && at < 512 {
+            true -> store(at)
+            _ -> finish()
+        }
+    }
+
+    state store(&mut self, at: u64) -> u64
+        requires at < 512;
+    {
+        self.frame[at] = self.pending[at];
+        transition { _ -> copy(((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state finish(&mut self) -> u64 {
+        self.closed = true;
+        let len: u64 = self.pending_len;
+        self.frame_len = len;
+        self.pending_len = 0;
+        (len)
+    }
+}

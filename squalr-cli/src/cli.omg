@@ -1,6 +1,8 @@
 module src::cli;
 
+use squalr_engine_api::src::commands::command_line::command_line_command::CommandLineCommand;
 use squalr_engine_api::src::commands::command_line::command_line_parser::CommandLineParse;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
 use squalr_engine_api::src::commands::command_line::command_line_parser::CommandLineParser;
 use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultsListResponse;
 use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
@@ -8,6 +10,7 @@ use squalr_engine::src::squalr_engine::SqualrEngine;
 use omega_language_std::console;
 use omega_language_std::filesystem_host;
 use omega::language::core::wait_wake;
+use src::command_framer::CommandFramer;
 
 // Port of cli.rs `Cli::run_loop` for the headless leg: read stdin lines,
 // `exit`/`close`/`quit` (case-insensitive) breaks, each line parses to a
@@ -18,10 +21,14 @@ pub data Cli {
     engine: SqualrEngine;
     line_buffer: [u8; 512];
     last_list: ScanResultsListResponse;
+    framer: CommandFramer;
+    next_invocation_id: u64;
 }
 
 pub machine Cli::init(&mut self) {
     self.engine.init_privileged_shell();
+    self.framer = CommandFramer::new();
+    self.next_invocation_id = 0;
 }
 
 // `exit`/`close`/`quit` — case-insensitive per upstream.
@@ -130,20 +137,78 @@ crashes Trap
 {
     transition { _ -> read() }
 
+    // framer_v2: stdin arrives one byte per `Console::read_byte`; each
+    // offered byte may complete a frame — its own 0x0a delimiter, or a
+    // saturated pending extent (the Full-style partial boundary). The
+    // framer owns the buffering `read_line` used to do; the
+    // got_line/bound_count/parsed chain is unchanged.
     state read(&mut self) {
-        let result: LineReadResult = block Console::read_line(&mut self.line_buffer);
+        let observed: ByteRead = block Console::read_byte();
         // Union scrutinees are admitted on params, not let-bound locals —
         // the case split rides a hop state.
         transition {
-            _ -> read_kind(result)
+            _ -> read_kind(observed)
         }
     }
 
-    state read_kind(&mut self, result: LineReadResult) {
-        transition result {
-            LineReadResult::LineComplete { count } -> got_line(count, false)
-            LineReadResult::EndOfInput { count } -> got_line(count, true)
+    state read_kind(&mut self, observed: ByteRead) {
+        transition observed {
+            ByteRead::Byte { value } -> offer_byte(value)
+            ByteRead::Eof -> flush()
             _ -> read()
+        }
+    }
+
+    state offer_byte(&mut self, value: i32) {
+        // Offer refused means the pending extent is saturated — take emits
+        // the 512-byte Full-style partial so the refused byte re-offers
+        // next as the head of the retained remainder.
+        let accepted: bool = self.framer.offer_byte((value as u8));
+        transition accepted {
+            true -> check_boundary(value)
+            _ -> take_frame(false)
+        }
+    }
+
+    state check_boundary(&mut self, value: i32) {
+        // pending never holds a delimiter between takes (each 0x0a takes
+        // immediately), so only the just-offered byte can complete a frame.
+        transition value == 10 {
+            true -> take_frame(false)
+            _ -> read()
+        }
+    }
+
+    state take_frame(&mut self, end_after: bool) {
+        // The framer holds the emitted frame; bytes land in line_buffer
+        // through the admitted indexed field-store shape (no `&mut self.
+        // <field>` argument crosses a machine call — pad_line's deviation).
+        let count: u64 = self.framer.try_take_frame();
+        transition { _ -> copy_frame(0, count, end_after) }
+    }
+
+    state copy_frame(&mut self, at: u64, count: u64, end_after: bool) {
+        transition at < count && at < 512 {
+            true -> copy_byte(at, count, end_after)
+            _ -> got_line(count, end_after)
+        }
+    }
+
+    state copy_byte(&mut self, at: u64, count: u64, end_after: bool)
+        requires at < 512;
+    {
+        let byte: u8 = self.framer.get_frame_byte(at);
+        self.line_buffer[at] = byte;
+        transition { _ -> copy_frame(((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, count, end_after) }
+    }
+
+    state flush(&mut self) {
+        // EOF: `close` flushes pending bytes as the final frame (upstream's
+        // `Ok(n>0)` without the delimiter); empty pending ends the stream.
+        let count: u64 = self.framer.close();
+        transition count > 0 {
+            true -> copy_frame(0, count, true)
+            _ -> exit()
         }
     }
 
@@ -217,18 +282,33 @@ crashes Trap
     }
 
     state dispatched(&mut self, parse: CommandLineParse, end_after: bool) {
-        // `dispatch_parsed_list` walks the parse union inside the engine's
-        // machine boundary and returns the extracted scan-results list
-        // (defaulted for non-list responses — the print chain already treats
-        // a zero count as `next`). The response crosses to `storing` as a
-        // successor argument: this state may not assign it into
-        // `self.last_list` itself because the `&mut self.engine` call leaves
-        // the state's write frame opaque.
-        let list: ScanResultsListResponse = self.engine.dispatch_parsed_list(&parse);
+        // framer_v2 wire: the parse owns the command — decompose it into an
+        // owned CommandLineCommand here (union payloads move out of owned
+        // scrutinees only), then hand the privileged payload through the
+        // send_invocation seam.
         transition parse {
-            CommandLineParse::Parsed { command } -> storing(list, end_after)
+            CommandLineParse::Parsed { command } -> walk(command, end_after)
             _ -> refuse(end_after)
         }
+    }
+
+    state walk(&mut self, command: CommandLineCommand, end_after: bool) {
+        transition command {
+            CommandLineCommand::Privileged { command } -> send(command, end_after)
+        }
+    }
+
+    state send(&mut self, command: PrivilegedCommand, end_after: bool) {
+        // The CommandInvocation envelope mints inside the engine boundary —
+        // union construction on owned values is admitted there while union
+        // values cannot cross the entry's unit-plan edge, so cli moves the
+        // payload through and the envelope wraps it engine-side. The id
+        // rides a cli-local counter for now: upstream's allocator is
+        // `next_command_invocation_id.fetch_add(1)` on the unprivileged
+        // state — filed as the next sub-leg with that port.
+        let list: ScanResultsListResponse = self.engine.dispatch_invocation_list(command, self.next_invocation_id);
+        self.next_invocation_id = ((self.next_invocation_id as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> storing(list, end_after) }
     }
 
     state storing(&mut self, list: ScanResultsListResponse, end_after: bool) {
