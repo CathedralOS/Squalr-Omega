@@ -1,0 +1,973 @@
+module src::project::serialization::project_file_codec_item;
+
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use squalr_engine_api::src::structures::structs::symbolic_struct_ref::SymbolicStructRef;
+use squalr_engine_api::src::structures::structs::valued_struct::ValuedStruct;
+use squalr_engine_api::src::structures::structs::valued_struct::ValuedStructPool;
+use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructField;
+use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructFieldData;
+use src::project::serialization::project_file_codec::ProjectFileReader;
+use src::project::serialization::project_file_codec::ProjectFileWriter;
+use src::project::serialization::project_file_codec_types::decode_data_value;
+use src::project::serialization::project_file_codec_types::decode_item_type_ref;
+use src::project::serialization::project_file_codec_types::decode_layout_kind;
+use src::project::serialization::project_file_codec_types::decode_string256;
+use src::project::serialization::project_file_codec_types::encode_data_value;
+use src::project::serialization::project_file_codec_types::encode_item_type_ref;
+use src::project::serialization::project_file_codec_types::encode_layout_kind;
+use src::project::serialization::project_file_codec_types::encode_string256;
+
+// Port of the serde-derived serialize/deserialize on ValuedStruct and
+// ProjectItem. Upstream `ValuedStructFieldData::NestedStruct` holds a
+// `Box<ValuedStruct>` and serde writes the recursive tree inline; the
+// port flattens recursion into `ValuedStructPool` (the 32-slot arena
+// valued_struct.omg declares), so the file stores the child struct
+// inline at the tag position and the pool is encode/decode scratch —
+// wire semantics match upstream byte-for-byte at the value level.
+//
+// Recursive descent: runtime recursion is tail-only and the item walk is
+// accumulative, so both directions ride an explicit pending-frame stack
+// bounded at the arena's 32 slots — the same StructCursor precedent as
+// ValuedStructPool's own walkers; a tree deeper than the arena cannot
+// exist, and overflow refuses rather than truncates.
+//
+// Field order within a field frame mirrors upstream declaration order:
+// name, field-data tag + payload, is_read_only — so a NestedStruct's
+// child payload lands between the tag byte and the parent's read_only
+// byte, and the resumed parent frame writes read_only for the field it
+// was mid-way through.
+
+// Pending frame for the struct-tree walks: the suspended parent's
+// identity plus the field index it resumes at after the nested child
+// completes (the resume writes that field's read_only tail).
+pub data CodecStructFrame {
+    from_pool: bool;
+    struct_index: u64;
+    resume_field: u64;
+}
+
+// ============ encode ============
+
+pub machine encode_valued_struct_tree(
+    writer: &mut ProjectFileWriter,
+    root: &ValuedStruct,
+    pool: &ValuedStructPool
+) -> bool {
+    let pending: [CodecStructFrame; 32];
+    transition { _ -> header(writer, root, pool, false, 0, pending, 0) }
+
+    // Emit the current struct's header (ref + layout kind + field count),
+    // then walk fields. `from_pool` selects the arena slot over the root.
+    state header(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        from_pool: bool,
+        struct_index: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32 && struct_index < 32;
+    {
+        transition from_pool {
+            true -> header_pool(writer, root, pool, struct_index, pending, pending_count)
+            _ -> header_root(writer, root, pool, pending, pending_count)
+        }
+    }
+    state header_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32 && struct_index < 32;
+    {
+        transition struct_index < pool.struct_count && struct_index < 32 {
+            true -> emit_header_pool(writer, root, pool, struct_index, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state emit_header_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && pending_count <= 32;
+    {
+        let a: bool = encode_string256(writer, &pool.structs[struct_index].symbolic_struct_ref.symbolic_struct_namespace, pool.structs[struct_index].symbolic_struct_ref.symbolic_struct_namespace_len);
+        let b: bool = encode_layout_kind(writer, &pool.structs[struct_index].layout_kind);
+        let c: bool = writer.put_u64(pool.structs[struct_index].field_count);
+        transition a && b && c {
+            true -> fields(writer, root, pool, true, struct_index, 0, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state header_root(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        let a: bool = encode_string256(writer, &root.symbolic_struct_ref.symbolic_struct_namespace, root.symbolic_struct_ref.symbolic_struct_namespace_len);
+        let b: bool = encode_layout_kind(writer, &root.layout_kind);
+        let c: bool = writer.put_u64(root.field_count);
+        transition a && b && c {
+            true -> fields(writer, root, pool, false, 0, 0, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    // Field walk for the active frame: name + tag + payload; NestedStruct
+    // descends after writing tag 1, Value writes data + read_only inline.
+    state fields(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        from_pool: bool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32 && struct_index < 32;
+    {
+        transition from_pool {
+            true -> fields_pool(writer, root, pool, struct_index, position, pending, pending_count)
+            _ -> fields_root(writer, root, pool, position, pending, pending_count)
+        }
+    }
+    state fields_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && pending_count <= 32;
+    {
+        transition position < pool.structs[struct_index].field_count && position < 64 {
+            true -> field_head_pool(writer, root, pool, struct_index, position, pending, pending_count)
+            _ -> pop(writer, root, pool, pending, pending_count)
+        }
+    }
+    state fields_root(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition position < root.field_count && position < 64 {
+            true -> field_head_root(writer, root, pool, position, pending, pending_count)
+            _ -> pop(writer, root, pool, pending, pending_count)
+        }
+    }
+    state field_head_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        let emitted: bool = encode_string256(writer, &pool.structs[struct_index].fields[position].name, pool.structs[struct_index].fields[position].name_len);
+        transition emitted {
+            true -> field_data_pool(writer, root, pool, struct_index, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state field_data_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        transition pool.structs[struct_index].fields[position].field_data {
+            ValuedStructFieldData::Value { value } -> field_value_pool(writer, root, pool, struct_index, position, pending, pending_count, value)
+            ValuedStructFieldData::NestedStruct { nested_struct_index } -> field_nested(writer, root, pool, true, struct_index, position, pending, pending_count, nested_struct_index)
+        }
+    }
+    state field_value_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        value: &DataValue
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        let a: bool = writer.put_byte(0);
+        let b: bool = encode_data_value(writer, value);
+        transition a && b {
+            true -> read_only_pool(writer, root, pool, struct_index, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    // read_only lands after the payload per declared order — this state
+    // serves both the Value tail and the resumed-parent tail after a
+    // nested child returns.
+    state read_only_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        let stored: bool = writer.put_bool(pool.structs[struct_index].fields[position].is_read_only);
+        transition stored {
+            true -> fields(writer, root, pool, true, struct_index, position + 1, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state field_head_root(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        let emitted: bool = encode_string256(writer, &root.fields[position].name, root.fields[position].name_len);
+        transition emitted {
+            true -> field_data_root(writer, root, pool, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state field_data_root(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        transition root.fields[position].field_data {
+            ValuedStructFieldData::Value { value } -> field_value_root(writer, root, pool, position, pending, pending_count, value)
+            ValuedStructFieldData::NestedStruct { nested_struct_index } -> field_nested(writer, root, pool, false, 0, position, pending, pending_count, nested_struct_index)
+        }
+    }
+    state field_value_root(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        value: &DataValue
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        let a: bool = writer.put_byte(0);
+        let b: bool = encode_data_value(writer, value);
+        transition a && b {
+            true -> read_only_root(writer, root, pool, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state read_only_root(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        let stored: bool = writer.put_bool(root.fields[position].is_read_only);
+        transition stored {
+            true -> fields(writer, root, pool, false, 0, position + 1, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    // Tag 1 emitted; push the parent frame and descend into the child.
+    // The parent resumes at `resume_field` to write that field's
+    // read_only once the child's subtree is fully encoded.
+    state field_nested(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        parent_from_pool: bool,
+        parent_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        nested_struct_index: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition pending_count < 32 && nested_struct_index < pool.struct_count && nested_struct_index < 32 {
+            true -> push(writer, root, pool, parent_from_pool, parent_index, position, pending, pending_count, nested_struct_index)
+            _ -> (false)
+        }
+    }
+    state push(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        parent_from_pool: bool,
+        parent_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        nested_struct_index: u64
+    ) -> bool
+        requires pending_count < 32 && nested_struct_index < 32;
+    {
+        let tagged: bool = writer.put_byte(1);
+        let mut pending_next: [CodecStructFrame; 32] = pending;
+        pending_next[pending_count] = CodecStructFrame { from_pool: parent_from_pool, struct_index: parent_index, resume_field: position };
+        transition tagged {
+            true -> header(writer, root, pool, true, nested_struct_index, pending_next, pending_count + 1)
+            _ -> (false)
+        }
+    }
+    // Struct exhausted — resume the parent's pending field or finish.
+    state pop(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition pending_count > 0 {
+            true -> resume(writer, root, pool, pending, pending_count)
+            _ -> (true)
+        }
+    }
+    state resume(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count > 0 && pending_count <= 32;
+    {
+        let parent_index: u64 = pending_count - 1;
+        transition parent_index < 32 {
+            true -> take(writer, root, pool, pending, parent_index)
+            _ -> refuse(writer)
+        }
+    }
+    state take(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        parent_index: u64
+    ) -> bool
+        requires parent_index < 32;
+    {
+        let frame: CodecStructFrame = pending[parent_index];
+        transition frame.from_pool {
+            true -> resume_pool(writer, root, pool, frame.struct_index, frame.resume_field, pending, parent_index)
+            _ -> resume_root(writer, root, pool, frame.resume_field, pending, parent_index)
+        }
+    }
+    state refuse(writer: &mut ProjectFileWriter) -> bool {
+        writer.failed = true;
+        (false)
+    }
+    // The parent suspended mid-field on a NestedStruct: the child bytes
+    // are written, so emit that field's read_only and continue.
+    state resume_pool(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition struct_index < 32 && position < 64 {
+            true -> read_only_pool(writer, root, pool, struct_index, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state resume_root(
+        writer: &mut ProjectFileWriter,
+        root: &ValuedStruct,
+        pool: &ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition position < 64 {
+            true -> read_only_root(writer, root, pool, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+}
+
+// ============ decode ============
+
+// Decode mirrors encode: a frame stack of pending parents. The child
+// decodes into a fresh ValuedStruct local, then `set_struct` stores it
+// into its pool slot; the parent's suspended field already carries
+// NestedStruct(index) and completes with its read_only byte.
+pub machine decode_valued_struct_tree(
+    reader: &mut ProjectFileReader,
+    root: &mut ValuedStruct,
+    pool: &mut ValuedStructPool
+) -> bool {
+    let pending: [CodecStructFrame; 32];
+    transition { _ -> header(reader, root, pool, false, 0, pending, 0) }
+
+    state header(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        into_pool: bool,
+        struct_index: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32 && struct_index < 32;
+    {
+        transition into_pool {
+            true -> header_pool(reader, root, pool, struct_index, pending, pending_count)
+            _ -> header_root(reader, root, pool, pending, pending_count)
+        }
+    }
+    state header_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32 && struct_index < 32;
+    {
+        transition struct_index < pool.struct_count && struct_index < 32 {
+            true -> read_header_pool(reader, root, pool, struct_index, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state read_header_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && pending_count <= 32;
+    {
+        let mut namespace_len: u64 = 0;
+        let name_ok: bool = decode_string256(reader, &mut pool.structs[struct_index].symbolic_struct_ref.symbolic_struct_namespace, &mut namespace_len);
+        pool.structs[struct_index].symbolic_struct_ref.symbolic_struct_namespace_len = namespace_len;
+        let kind_ok: bool = decode_layout_kind(reader, &mut pool.structs[struct_index].layout_kind);
+        let count: u64 = reader.get_u64();
+        transition name_ok && kind_ok && count <= 64 {
+            true -> accept_count_pool(reader, root, pool, struct_index, count, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state accept_count_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        count: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && count <= 64 && pending_count <= 32;
+    {
+        pool.structs[struct_index].field_count = count;
+        transition {
+            _ -> fields(reader, root, pool, true, struct_index, 0, pending, pending_count)
+        }
+    }
+    state header_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        let mut namespace_len: u64 = 0;
+        let name_ok: bool = decode_string256(reader, &mut root.symbolic_struct_ref.symbolic_struct_namespace, &mut namespace_len);
+        root.symbolic_struct_ref.symbolic_struct_namespace_len = namespace_len;
+        let kind_ok: bool = decode_layout_kind(reader, &mut root.layout_kind);
+        let count: u64 = reader.get_u64();
+        transition name_ok && kind_ok && count <= 64 {
+            true -> accept_count_root(reader, root, pool, count, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state accept_count_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        count: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires count <= 64 && pending_count <= 32;
+    {
+        root.field_count = count;
+        transition {
+            _ -> fields(reader, root, pool, false, 0, 0, pending, pending_count)
+        }
+    }
+    state fields(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        into_pool: bool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32 && struct_index < 32;
+    {
+        transition into_pool {
+            true -> fields_pool(reader, root, pool, struct_index, position, pending, pending_count)
+            _ -> fields_root(reader, root, pool, position, pending, pending_count)
+        }
+    }
+    state fields_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && pending_count <= 32;
+    {
+        transition position < pool.structs[struct_index].field_count && position < 64 {
+            true -> field_head_pool(reader, root, pool, struct_index, position, pending, pending_count)
+            _ -> pop(reader, root, pool, pending, pending_count)
+        }
+    }
+    state fields_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition position < root.field_count && position < 64 {
+            true -> field_head_root(reader, root, pool, position, pending, pending_count)
+            _ -> pop(reader, root, pool, pending, pending_count)
+        }
+    }
+    // Field head: decode name, then the data tag selects value vs nested.
+    state field_head_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        let mut name_len: u64 = 0;
+        let name_ok: bool = decode_string256(reader, &mut pool.structs[struct_index].fields[position].name, &mut name_len);
+        pool.structs[struct_index].fields[position].name_len = name_len;
+        let tag: u8 = reader.get_u8();
+        transition name_ok && tag <= 1 {
+            true -> field_data_pool(reader, root, pool, struct_index, position, pending, pending_count, tag)
+            _ -> (false)
+        }
+    }
+    state field_data_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        tag: u8
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        transition tag {
+            0 -> field_value_pool(reader, root, pool, struct_index, position, pending, pending_count)
+            _ -> field_nested_pool(reader, root, pool, struct_index, position, pending, pending_count)
+        }
+    }
+    state field_value_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        let mut value: DataValue = DataValue::default();
+        let stored: bool = decode_data_value(reader, &mut value);
+        transition stored {
+            true -> assign_value_pool(reader, root, pool, struct_index, position, pending, pending_count, value)
+            _ -> (false)
+        }
+    }
+    state assign_value_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        value: DataValue
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        pool.structs[struct_index].fields[position].field_data = ValuedStructFieldData::Value { value: value };
+        transition {
+            _ -> read_only_pool(reader, root, pool, struct_index, position, pending, pending_count)
+        }
+    }
+    state field_nested_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        let nested_index: u64 = pool.push(&ValuedStruct::default());
+        transition nested_index < pool.struct_count && nested_index < 32 && pending_count < 32 {
+            true -> descend_pool(reader, root, pool, struct_index, position, pending, pending_count, nested_index)
+            _ -> (false)
+        }
+    }
+    state descend_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        nested_index: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && nested_index < 32 && pending_count < 32;
+    {
+        pool.structs[struct_index].fields[position].field_data = ValuedStructFieldData::NestedStruct { nested_struct_index: nested_index };
+        let mut pending_next: [CodecStructFrame; 32] = pending;
+        pending_next[pending_count] = CodecStructFrame { from_pool: true, struct_index: struct_index, resume_field: position };
+        transition {
+            _ -> header(reader, root, pool, true, nested_index, pending_next, pending_count + 1)
+        }
+    }
+    state read_only_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires struct_index < 32 && position < 64 && pending_count <= 32;
+    {
+        let read_only: bool = reader.get_bool();
+        pool.structs[struct_index].fields[position].is_read_only = read_only;
+        transition {
+            _ -> fields(reader, root, pool, true, struct_index, position + 1, pending, pending_count)
+        }
+    }
+    state field_head_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        let mut name_len: u64 = 0;
+        let name_ok: bool = decode_string256(reader, &mut root.fields[position].name, &mut name_len);
+        root.fields[position].name_len = name_len;
+        let tag: u8 = reader.get_u8();
+        transition name_ok && tag <= 1 {
+            true -> field_data_root(reader, root, pool, position, pending, pending_count, tag)
+            _ -> (false)
+        }
+    }
+    state field_data_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        tag: u8
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        transition tag {
+            0 -> field_value_root(reader, root, pool, position, pending, pending_count)
+            _ -> field_nested_root(reader, root, pool, position, pending, pending_count)
+        }
+    }
+    state field_value_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        let mut value: DataValue = DataValue::default();
+        let stored: bool = decode_data_value(reader, &mut value);
+        transition stored {
+            true -> assign_value_root(reader, root, pool, position, pending, pending_count, value)
+            _ -> (false)
+        }
+    }
+    state assign_value_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        value: DataValue
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        root.fields[position].field_data = ValuedStructFieldData::Value { value: value };
+        transition {
+            _ -> read_only_root(reader, root, pool, position, pending, pending_count)
+        }
+    }
+    state field_nested_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        let nested_index: u64 = pool.push(&ValuedStruct::default());
+        transition nested_index < pool.struct_count && nested_index < 32 && pending_count < 32 {
+            true -> descend_root(reader, root, pool, position, pending, pending_count, nested_index)
+            _ -> (false)
+        }
+    }
+    state descend_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64,
+        nested_index: u64
+    ) -> bool
+        requires position < 64 && nested_index < 32 && pending_count < 32;
+    {
+        root.fields[position].field_data = ValuedStructFieldData::NestedStruct { nested_struct_index: nested_index };
+        let mut pending_next: [CodecStructFrame; 32] = pending;
+        pending_next[pending_count] = CodecStructFrame { from_pool: false, struct_index: 0, resume_field: position };
+        transition {
+            _ -> header(reader, root, pool, true, nested_index, pending_next, pending_count + 1)
+        }
+    }
+    state read_only_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires position < 64 && pending_count <= 32;
+    {
+        let read_only: bool = reader.get_bool();
+        root.fields[position].is_read_only = read_only;
+        transition {
+            _ -> fields(reader, root, pool, false, 0, position + 1, pending, pending_count)
+        }
+    }
+    state pop(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition pending_count > 0 {
+            true -> resume(reader, root, pool, pending, pending_count)
+            _ -> (true)
+        }
+    }
+    state resume(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count > 0 && pending_count <= 32;
+    {
+        let parent_index: u64 = pending_count - 1;
+        transition parent_index < 32 {
+            true -> take(reader, root, pool, pending, parent_index)
+            _ -> refuse(reader)
+        }
+    }
+    state take(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        pending: [CodecStructFrame; 32],
+        parent_index: u64
+    ) -> bool
+        requires parent_index < 32;
+    {
+        let frame: CodecStructFrame = pending[parent_index];
+        transition frame.from_pool {
+            true -> resume_pool(reader, root, pool, frame.struct_index, frame.resume_field, pending, parent_index)
+            _ -> resume_root(reader, root, pool, frame.resume_field, pending, parent_index)
+        }
+    }
+    state refuse(reader: &mut ProjectFileReader) -> bool {
+        reader.failed = true;
+        (false)
+    }
+    // Child complete — the parent field's read_only byte is next on the
+    // wire, then the parent continues at resume_field + 1.
+    state resume_pool(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        struct_index: u64,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition struct_index < 32 && position < 64 {
+            true -> read_only_pool(reader, root, pool, struct_index, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+    state resume_root(
+        reader: &mut ProjectFileReader,
+        root: &mut ValuedStruct,
+        pool: &mut ValuedStructPool,
+        position: u64,
+        pending: [CodecStructFrame; 32],
+        pending_count: u64
+    ) -> bool
+        requires pending_count <= 32;
+    {
+        transition position < 64 {
+            true -> read_only_root(reader, root, pool, position, pending, pending_count)
+            _ -> (false)
+        }
+    }
+}
+
+// ============ project item ============
+
+// Upstream `save_to_path`'s serde surface: `item_type` + `properties`
+// (the serde skips — is_activated, has_unsaved_changes, interpreter —
+// never reach the file). The pool rides the item record.
+pub machine encode_project_item(
+    writer: &mut ProjectFileWriter,
+    item: &ProjectItem
+) -> bool {
+    let a: bool = encode_item_type_ref(writer, &item.item_type);
+    let b: bool = encode_valued_struct_tree(writer, &item.properties, &item.struct_pool);
+    (a && b)
+}
+
+pub machine decode_project_item(
+    reader: &mut ProjectFileReader,
+    item: &mut ProjectItem
+) -> bool {
+    let type_ok: bool = decode_item_type_ref(reader, &mut item.item_type);
+    transition type_ok {
+        true -> properties(reader, item)
+        _ -> (false)
+    }
+    state properties(
+        reader: &mut ProjectFileReader,
+        item: &mut ProjectItem
+    ) -> bool {
+        let mut pool: ValuedStructPool = ValuedStructPool::empty();
+        let stored: bool = decode_valued_struct_tree(reader, &mut item.properties, &mut pool);
+        transition stored {
+            true -> accept(reader, item, pool)
+            _ -> (false)
+        }
+    }
+    state accept(reader: &mut ProjectFileReader, 
+        item: &mut ProjectItem,
+        pool: ValuedStructPool
+    ) -> bool {
+        item.struct_pool = pool;
+        (true)
+    }
+}
