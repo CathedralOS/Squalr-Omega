@@ -5,15 +5,22 @@ use squalr_engine_api::src::structures::processes::process_icon::ProcessIcon;
 use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
 use squalr_engine_api::src::structures::projects::project_manifest::ProjectManifest;
 use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use src::project::serialization::project_file_codec::ProjectFileReader;
+use src::project::serialization::project_file_codec::ProjectFileWriter;
+use src::project::serialization::project_file_codec_types::decode_info_stub;
+use src::project::serialization::project_file_codec_types::encode_info_stub;
+use src::project::serialization::project_serialization::resolve_project_info_file_path;
+use src::project::serialization::serializable_project_file::ProjectFileSave;
+use src::project::serialization::serializable_project_file::SerializableProjectFile;
+use omega_language_std::filesystem_host;
 
 // Port of project/serialization/project_info_serialization.rs —
 // `ProjectInfoStub`, the condensed record that excludes everything a
 // project-info file must not persist (name, path, unsaved-changes flag —
 // `serde(skip)` is insufficient upstream because the fields still ride
-// commands, hence the stub). The record and its construction are the
-// portable half; the `SerializableProjectFile` impl — File::create/
-// File::open around `serde_json::to_writer`/`from_reader` — waits on the
-// project-file codec leg (TASKS.md PROJECT-SERIALIZATION).
+// commands, hence the stub). The `SerializableProjectFile` impls land
+// below — the stub is the serde-staging record upstream builds in
+// `save_to_path` and rebuilds from in `load_from_path`.
 pub data ProjectInfoStub {
     has_project_icon_rgba: bool;
     project_icon_rgba: ProcessIcon;
@@ -44,4 +51,195 @@ pub machine ProjectInfoStub::new(
         has_plugin_configuration: has_plugin_configuration,
         plugin_configuration: plugin_configuration,
     })
+}
+
+// The deserializer's starting stub — the file's `has_` flags begin false,
+// the payload records are defaults; decode overwrites what the file
+// carries (upstream's `default` serde arms).
+pub machine ProjectInfoStub::default() -> ProjectInfoStub {
+    (ProjectInfoStub {
+        has_project_icon_rgba: false,
+        project_icon_rgba: ProcessIcon::default(),
+        project_manifest: ProjectManifest::default(),
+        project_symbol_catalog: ProjectSymbolCatalog::new(),
+        has_plugin_configuration: false,
+        plugin_configuration: PluginConfiguration::new(),
+    })
+}
+
+// Upstream `anyhow::Result<ProjectInfo>` for the load half (the trait
+// keeps load per-type like upstream's `where Self: Sized`): `Loaded`
+// carries the rebuilt record, `Refused` covers open/parse failures.
+pub data ProjectInfoLoad {
+    case Refused;
+    case Loaded(project_info: ProjectInfo);
+}
+
+// Upstream `SerializableProjectFile for ProjectInfo::save_to_path` —
+// honors the unchanged fast-path, then writes the stub through the
+// codec (upstream's `to_writer`; the byte format is the recorded
+// deviation) to `directory/project.json`, truncating any prior file.
+pub linux_x86_64 machine ProjectInfo::save_to_path(
+    &mut self,
+    directory: &[u8] in Path,
+    save_even_if_unchanged: bool
+) -> ProjectFileSave
+satisfies SerializableProjectFile::save_to_path
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition save_even_if_unchanged || self.has_unsaved_changes {
+        true -> store(directory)
+        _ -> (ProjectFileSave::Stored)
+    }
+    state store(&mut self, directory: &[u8] in Path) -> ProjectFileSave {
+        let mut stub: ProjectInfoStub = ProjectInfoStub::new(
+            self.has_project_icon_rgba,
+            ProcessIcon::default(),
+            ProjectManifest::clone(&self.project_manifest),
+            ProjectSymbolCatalog::clone(&self.project_symbol_catalog),
+            self.has_plugin_configuration,
+            PluginConfiguration::clone(&self.plugin_configuration));
+        stub.project_icon_rgba.clone_from(&self.project_icon_rgba);
+        let mut writer: ProjectFileWriter = ProjectFileWriter::new();
+        let head_ok: bool = writer.put_header();
+        let body_ok: bool = encode_info_stub(&mut writer, &stub);
+        transition head_ok && body_ok {
+            true -> emit(directory, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state emit(&mut self, directory: &[u8] in Path, writer: ProjectFileWriter) -> ProjectFileSave {
+        // Upstream `File::create(directory.join(PROJECT_FILE))` spelled
+        // through the dirfd seam: open the project directory, then
+        // `open_at` the literal leaf name O_WRONLY|O_CREAT|O_TRUNC.
+        let dfd: i32 = FilesystemHost::open(directory, 0);
+        transition dfd >= 0 {
+            true -> create(dfd, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state create(&mut self, dfd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
+        let fd: i32 = FilesystemHost::open_at(dfd, "project.json", 577);
+        transition fd >= 0 {
+            true -> write(dfd, fd, writer)
+            _ -> close_dir(dfd)
+        }
+    }
+    state close_dir(&mut self, dfd: i32) -> ProjectFileSave {
+        let closed: i32 = FilesystemHost::close(dfd);
+        (ProjectFileSave::Refused)
+    }
+    state write(&mut self, dfd: i32, fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
+        let mut carried: ProjectFileWriter = writer;
+        let put: i64 = carried.flush_to_fd(fd);
+        let expected: i64 = ((carried.written as i64 in Wrapping) as i64);
+        let closed: i32 = FilesystemHost::close(fd);
+        let closed_dir: i32 = FilesystemHost::close(dfd);
+        transition put == expected && put >= 0 {
+            true -> clean()
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state clean(&mut self) -> ProjectFileSave {
+        self.has_unsaved_changes = false;
+        (ProjectFileSave::Stored)
+    }
+}
+
+// Upstream `ProjectInfo::load_from_path` — opens the project-info file,
+// decodes the stub, and rebuilds through `new_with_symbol_catalog` with
+// `has_unsaved_changes` cleared on success (upstream sets it post-load).
+// Deviation: upstream takes the info FILE path (`directory.join(PROJECT_FILE)`
+// spelled at its call site); the port takes the project directory and
+// opens the leaf through the dirfd seam — stored-path bytes cannot
+// re-prove `Path`, so callers pass the domained directory and the leaf
+// name stays a literal. The record still stores the identical joined
+// path bytes upstream's caller would have produced.
+pub linux_x86_64 machine ProjectInfo::load_from_path(
+    project_directory_path: &[u8] in Path
+) -> ProjectInfoLoad
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let dfd: i32 = FilesystemHost::open(project_directory_path, 0);
+    transition dfd >= 0 {
+        true -> open(dfd, project_directory_path)
+        _ -> (ProjectInfoLoad::Refused)
+    }
+    state open(dfd: i32, project_directory_path: &[u8] in Path) -> ProjectInfoLoad {
+        let fd: i32 = FilesystemHost::open_at(dfd, "project.json", 0);
+        transition fd >= 0 {
+            true -> fill(dfd, fd, project_directory_path)
+            _ -> close_dir(dfd)
+        }
+    }
+    state close_dir(dfd: i32) -> ProjectInfoLoad {
+        let closed: i32 = FilesystemHost::close(dfd);
+        (ProjectInfoLoad::Refused)
+    }
+    state fill(dfd: i32, fd: i32, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut reader: ProjectFileReader = ProjectFileReader::default();
+        let got: i64 = reader.fill_from_fd(fd);
+        let closed: i32 = FilesystemHost::close(fd);
+        let closed_dir: i32 = FilesystemHost::close(dfd);
+        transition got > 0 {
+            true -> decode(reader, project_directory_path)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state decode(reader: ProjectFileReader, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut carried: ProjectFileReader = reader;
+        let header_ok: bool = carried.check_header();
+        transition header_ok {
+            true -> stub(carried, project_directory_path)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state stub(reader: ProjectFileReader, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut carried: ProjectFileReader = reader;
+        let mut stub: ProjectInfoStub = ProjectInfoStub::default();
+        let body_ok: bool = decode_info_stub(&mut carried, &mut stub);
+        transition body_ok {
+            true -> build(stub, project_directory_path)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state build(stub: ProjectInfoStub, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut info_path: [u8; 512];
+        let info_len: u64 = resolve_project_info_file_path(project_directory_path, &mut info_path);
+        transition info_len <= 512 {
+            true -> build_info(stub, info_path, info_len)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state build_info(stub: ProjectInfoStub, info_path: [u8; 512], info_len: u64) -> ProjectInfoLoad
+        requires info_len <= 512;
+    {
+        let mut project_info: ProjectInfo = ProjectInfo::new_with_symbol_catalog(
+            &info_path[0..info_len],
+            stub.has_project_icon_rgba,
+            &stub.project_icon_rgba,
+            stub.project_manifest,
+            stub.project_symbol_catalog);
+        transition { _ -> plugin(project_info, stub) }
+    }
+    state plugin(project_info: ProjectInfo, stub: ProjectInfoStub) -> ProjectInfoLoad {
+        let mut carried_info: ProjectInfo = project_info;
+        let mut carried_stub: ProjectInfoStub = stub;
+        transition carried_stub.has_plugin_configuration {
+            true -> with_plugin(carried_info, carried_stub.plugin_configuration)
+            _ -> finish(carried_info)
+        }
+    }
+    state with_plugin(project_info: ProjectInfo, plugin_configuration: PluginConfiguration) -> ProjectInfoLoad {
+        let mut carried: ProjectInfo = project_info;
+        carried.set_plugin_configuration(&plugin_configuration);
+        transition { _ -> finish(carried) }
+    }
+    state finish(project_info: ProjectInfo) -> ProjectInfoLoad {
+        let mut carried: ProjectInfo = project_info;
+        carried.set_has_unsaved_changes(false);
+        (ProjectInfoLoad::Loaded { project_info: carried })
+    }
 }

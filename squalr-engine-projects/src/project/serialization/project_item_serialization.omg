@@ -1,15 +1,272 @@
 module src::project::serialization::project_item_serialization;
 
-// Port frontier for project_item_serialization.rs — upstream implements
-// `SerializableProjectFile` for `ProjectItem`: save creates the item's
-// directory (`fs::create_dir`) and writes pretty JSON; load refuses
-// directories/missing paths and reads JSON back, clearing
-// `has_unsaved_changes` on success.
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use src::project::serialization::project_file_codec::ProjectFileReader;
+use src::project::serialization::project_file_codec::ProjectFileWriter;
+use src::project::serialization::project_file_codec_item::decode_project_item;
+use src::project::serialization::project_file_codec_item::encode_project_item;
+use src::project::serialization::serializable_project_file::ProjectFileSave;
+use src::project::serialization::serializable_project_file::SerializableProjectFile;
+use omega_language_std::filesystem_host;
+
+// Port of project_item_serialization.rs — `SerializableProjectFile for
+// ProjectItem`: the save arm creates the item's own directory when the
+// path is absent (upstream `fs::create_dir` — directory-type items land
+// on disk as folders), then serializes only when the path resolves to a
+// regular file; the load arm refuses directories and missing paths, and
+// clears `has_unsaved_changes` on success. The file bytes are the codec's
+// deterministic positional encoding (recorded serde_json deviation).
 //
-// Both impls are downstream of the serde_json-equivalent project-file
-// codec — no ordinary Omega package provides that text-format reader or
-// writer today (PORTING.md: an unavailable library facility is a named
-// blocker, not a placeholder). The machines land with the codec leg
-// recorded on the port board (TASKS.md PROJECT-SERIALIZATION row); the
-// filesystem walks themselves (`Filesystem::exists`, `create_dir`,
-// `create`/`open`) are portable and ride along in that leg.
+// `project_item_path` carries the `Path` domain — upstream's `&Path`.
+// Paths built at runtime (stored on a ProjectItemRef, read back off a
+// directory walk) cannot re-prove the domain — the compiler only admits
+// `in Path` params, literals, concats of those, and subslices of those —
+// so the project walk reaches the same syscalls through the boundary's
+// trusted-name seam: `open_at` (dirfd + relative name, the read_dir
+// channel's own route) and `create_dir_name` (the plain-path create_dir
+// twin). `save_at`/`fill_and_decode`/`read_mode` are that seam; they
+// encode the identical upstream behavior against an open parent dirfd.
+pub data ProjectItemLoad {
+    case Refused;
+    case Loaded(project_item: ProjectItem);
+}
+
+// Shared stat decode — linux x86_64 `struct stat` carries `st_mode` u32
+// at byte 24; `S_IFMT == 61440` masks the kind, `S_IFREG == 32768`,
+// `S_IFDIR == 16384`. The buffer is the std Filesystem's 144-byte stat
+// carrier.
+pub data ProjectItemPathProbe {
+    stat_buf: [u8; 144];
+    stat_rc: i32;
+    mode: u32;
+}
+
+pub linux_x86_64 machine ProjectItem::save_to_path(
+    &mut self,
+    project_item_path: &[u8] in Path,
+    save_even_if_unchanged: bool
+) -> ProjectFileSave
+satisfies SerializableProjectFile::save_to_path
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition save_even_if_unchanged || self.has_unsaved_changes {
+        true -> probe(project_item_path)
+        _ -> (ProjectFileSave::Stored)
+    }
+    state probe(&mut self, project_item_path: &[u8] in Path) -> ProjectFileSave {
+        let mut probe: ProjectItemPathProbe = ProjectItemPathProbe {
+            stat_rc: -1,
+            mode: 0,
+        };
+        probe.stat_rc = FilesystemHost::read_metadata(project_item_path, &mut probe.stat_buf);
+        transition probe.stat_rc >= 0 {
+            true -> kind(project_item_path, probe)
+            _ -> make_dir(project_item_path)
+        }
+    }
+    state make_dir(&mut self, project_item_path: &[u8] in Path) -> ProjectFileSave {
+        // Upstream `fs::create_dir(&project_item_path)?` — the item's own
+        // path becomes a directory; the subsequent `is_file` reads false,
+        // so a directory item completes with nothing serialized.
+        let created: i32 = FilesystemHost::create_dir(project_item_path, 493);
+        transition created >= 0 {
+            true -> (ProjectFileSave::Stored)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state kind(&mut self, project_item_path: &[u8] in Path, probe: ProjectItemPathProbe) -> ProjectFileSave {
+        let mut carried: ProjectItemPathProbe = probe;
+        carried.mode = ((carried.stat_buf[24] as u32 in Wrapping)
+            | (((carried.stat_buf[25] as u32 in Wrapping)) << 8)
+            | (((carried.stat_buf[26] as u32 in Wrapping)) << 16)
+            | (((carried.stat_buf[27] as u32 in Wrapping)) << 24)) as u32;
+        transition (carried.mode & 61440) == 32768 {
+            true -> emit(project_item_path)
+            _ -> (ProjectFileSave::Stored)
+        }
+    }
+    state emit(&mut self, project_item_path: &[u8] in Path) -> ProjectFileSave {
+        let mut writer: ProjectFileWriter = ProjectFileWriter::new();
+        let head_ok: bool = writer.put_header();
+        let body_ok: bool = encode_project_item(&mut writer, &self);
+        transition head_ok && body_ok {
+            true -> open(project_item_path, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state open(&mut self, project_item_path: &[u8] in Path, writer: ProjectFileWriter) -> ProjectFileSave {
+        let fd: i32 = FilesystemHost::create(project_item_path, 438);
+        transition fd >= 0 {
+            true -> write(fd, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state write(&mut self, fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
+        let mut carried: ProjectFileWriter = writer;
+        let put: i64 = carried.flush_to_fd(fd);
+        let expected: i64 = ((carried.written as i64 in Wrapping) as i64);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition put == expected && put >= 0 {
+            true -> clean()
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state clean(&mut self) -> ProjectFileSave {
+        self.has_unsaved_changes = false;
+        (ProjectFileSave::Stored)
+    }
+}
+
+// The dirfd-relative save used by `Project::save_to_path` — identical
+// upstream behavior, routed through `open_at`/`create_dir_name` because
+// a stored item path cannot re-prove `Path`. `parent_fd` is the open
+// project-items directory; `item_path` is the item's stored path bytes
+// relative to that fd's directory (it may carry separators — `open_at`
+// accepts a relative path, the openat semantics the boundary documents);
+// `full_path` is the same path whole, for `create_dir_name` which runs
+// mkdir on the path itself relative to the caller's cwd like upstream's
+// own `fs::create_dir` call.
+pub linux_x86_64 machine ProjectItem::save_at(
+    &mut self,
+    parent_fd: i32,
+    item_path: &[u8],
+    full_path: &[u8],
+    save_even_if_unchanged: bool
+) -> ProjectFileSave
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition save_even_if_unchanged || self.has_unsaved_changes {
+        true -> probe(parent_fd, item_path, full_path)
+        _ -> (ProjectFileSave::Stored)
+    }
+    state probe(&mut self, parent_fd: i32, item_path: &[u8], full_path: &[u8]) -> ProjectFileSave {
+        let fd: i32 = FilesystemHost::open_at(parent_fd, item_path, 0);
+        transition fd >= 0 {
+            true -> kind(parent_fd, fd, item_path, full_path)
+            _ -> make_dir(full_path)
+        }
+    }
+    state make_dir(&mut self, full_path: &[u8]) -> ProjectFileSave {
+        // Upstream `fs::create_dir(&project_item_path)?` — full-path
+        // mkdir, the boundary's plain-bytes twin of `create_dir`.
+        let created: i32 = FilesystemHost::create_dir_name(full_path, 493);
+        transition created >= 0 {
+            true -> (ProjectFileSave::Stored)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state kind(&mut self, parent_fd: i32, fd: i32, item_path: &[u8], full_path: &[u8]) -> ProjectFileSave {
+        let mut probe: ProjectItemPathProbe = ProjectItemPathProbe {
+            stat_rc: -1,
+            mode: 0,
+        };
+        probe.stat_rc = FilesystemHost::read_file_metadata(fd, &mut probe.stat_buf);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition probe.stat_rc >= 0 {
+            true -> mode(parent_fd, item_path, probe)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state mode(&mut self, parent_fd: i32, item_path: &[u8], probe: ProjectItemPathProbe) -> ProjectFileSave {
+        let mut carried: ProjectItemPathProbe = probe;
+        carried.mode = ((carried.stat_buf[24] as u32 in Wrapping)
+            | (((carried.stat_buf[25] as u32 in Wrapping)) << 8)
+            | (((carried.stat_buf[26] as u32 in Wrapping)) << 16)
+            | (((carried.stat_buf[27] as u32 in Wrapping)) << 24)) as u32;
+        transition (carried.mode & 61440) == 32768 {
+            true -> emit(parent_fd, item_path)
+            _ -> (ProjectFileSave::Stored)
+        }
+    }
+    state emit(&mut self, parent_fd: i32, item_path: &[u8]) -> ProjectFileSave {
+        let mut writer: ProjectFileWriter = ProjectFileWriter::new();
+        let head_ok: bool = writer.put_header();
+        let body_ok: bool = encode_project_item(&mut writer, &self);
+        transition head_ok && body_ok {
+            true -> open(parent_fd, item_path, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state open(&mut self, parent_fd: i32, item_path: &[u8], writer: ProjectFileWriter) -> ProjectFileSave {
+        // O_WRONLY|O_CREAT|O_TRUNC (1|64|512) — upstream `File::create`.
+        let fd: i32 = FilesystemHost::open_at(parent_fd, item_path, 577);
+        transition fd >= 0 {
+            true -> write(fd, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state write(&mut self, fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
+        let mut carried: ProjectFileWriter = writer;
+        let put: i64 = carried.flush_to_fd(fd);
+        let expected: i64 = ((carried.written as i64 in Wrapping) as i64);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition put == expected && put >= 0 {
+            true -> clean()
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state clean(&mut self) -> ProjectFileSave {
+        self.has_unsaved_changes = false;
+        (ProjectFileSave::Stored)
+    }
+}
+
+pub linux_x86_64 machine ProjectItem::load_from_path(
+    project_item_path: &[u8] in Path
+) -> ProjectItemLoad
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let fd: i32 = FilesystemHost::open(project_item_path, 0);
+    transition fd >= 0 {
+        true -> fill(fd)
+        _ -> (ProjectItemLoad::Refused)
+    }
+    state fill(fd: i32) -> ProjectItemLoad {
+        let mut project_item: ProjectItem = ProjectItem::default();
+        let ok: bool = project_item.fill_and_decode(fd);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition ok {
+            true -> clean(project_item)
+            _ -> (ProjectItemLoad::Refused)
+        }
+    }
+    state clean(project_item: ProjectItem) -> ProjectItemLoad {
+        let mut carried: ProjectItem = project_item;
+        carried.set_has_unsaved_changes(false);
+        (ProjectItemLoad::Loaded { project_item: carried })
+    }
+}
+
+// The read half shared by `load_from_path` and the project walk: fill
+// the codec reader off an open fd, check the header, decode into self.
+// Returns false on any transport/format failure (upstream's `?` arms).
+pub linux_x86_64 machine ProjectItem::fill_and_decode(&mut self, fd: i32) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let mut reader: ProjectFileReader = ProjectFileReader::default();
+    let got: i64 = reader.fill_from_fd(fd);
+    transition got > 0 {
+        true -> decode(reader)
+        _ -> (false)
+    }
+    state decode(&mut self, reader: ProjectFileReader) -> bool {
+        let mut carried: ProjectFileReader = reader;
+        let header_ok: bool = carried.check_header();
+        transition header_ok {
+            true -> body(carried)
+            _ -> (false)
+        }
+    }
+    state body(&mut self, reader: ProjectFileReader) -> bool {
+        let mut carried: ProjectFileReader = reader;
+        let body_ok: bool = decode_project_item(&mut carried, &mut self);
+        transition body_ok {
+            true -> (true)
+            _ -> (false)
+        }
+    }
+}
