@@ -1,0 +1,516 @@
+module src::project::serialization::project_file_codec;
+
+use omega_language_std::filesystem_host;
+
+// Port frontier: the project-file codec. Upstream serializes the project
+// tree through serde_json (pretty text, field-name keyed); no JSON reader
+// or writer exists in the bundled library today (TASKS.md
+// PROJECT-SERIALIZATION), so the port stores a deterministic positional
+// binary encoding instead — every field in declared order, every union
+// prefixed by its case tag, every length-carrying value length-prefixed.
+// File names, locations and the save/load model stay 1:1 with upstream;
+// only the byte format deviates (recorded deviation: no interop with
+// upstream .json project files, none needed headless-first).
+//
+// Layout: 4-byte magic "SQPR" + u16 format version (1), then positional
+// fields. u8/u16/u32/u64 store little-endian; i64 stores its u64 bit
+// pattern; bool stores 0/1; slices and strings store a u64 length then
+// raw bytes; unions store a u8 case tag then the case's fields in order;
+// optional values store a u8 flag then the payload when present.
+//
+// Bound: files carry inside a 4 MiB buffer. The worst-case source graph
+// (a fully populated 128-descriptor symbol catalog) is ~2.8 MB upstream;
+// files past the bound refuse, matching the package's bounded-table
+// convention everywhere else.
+pub data ProjectFileWriter {
+    bytes: [u8; 4194304];
+    written: u64;
+    failed: bool;
+}
+
+pub machine ProjectFileWriter::new() -> ProjectFileWriter {
+    (ProjectFileWriter { written: 0, failed: false })
+}
+
+pub machine ProjectFileWriter::default() -> ProjectFileWriter {
+    (ProjectFileWriter { written: 0, failed: false })
+}
+
+pub machine ProjectFileWriter::has_failed(&self) -> bool {
+    (self.failed)
+}
+
+pub machine ProjectFileWriter::get_written(&self) -> u64 {
+    (self.written)
+}
+
+// The encoded prefix — valid bytes are `bytes[0..written]`; callers pass
+// the length along so the writer only reports the live window.
+pub machine ProjectFileWriter::get_bytes(&self) -> &[u8] {
+    transition self.written <= 4194304 {
+        true -> (&self.bytes[0..self.written])
+        _ -> (&self.bytes[0..0])
+    }
+}
+
+// Upstream serializer append — refuses (and latches failed) on overflow
+// instead of truncating, so a serialized file is always complete or an
+// error, matching anyhow::Result.
+pub machine ProjectFileWriter::put_byte(&mut self, value: u8) -> bool {
+    transition self.written < 4194304 {
+        true -> store(value)
+        _ -> refuse(value)
+    }
+    state store(&mut self, value: u8) -> bool
+        requires self.written < 4194304;
+    {
+        self.bytes[self.written] = value;
+        let next_written: u64 = self.written + 1;
+        self.written = next_written;
+        (true)
+    }
+    state refuse(&mut self, value: u8) -> bool {
+        self.failed = true;
+        (false)
+    }
+}
+
+// Little-endian scalar appends — byte walks share one shifted-copy shape.
+pub machine ProjectFileWriter::put_u16(&mut self, value: u16) -> bool {
+    transition {
+        _ -> put(value, 0)
+    }
+    state put(&mut self, value: u16, index: u64) -> bool {
+        transition index < 2 {
+            true -> byte(value, index)
+            _ -> (true)
+        }
+    }
+    state byte(&mut self, value: u16, index: u64) -> bool
+        requires index < 2;
+    {
+        let shift: u64 = index * 8;
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) % 256) as u64;
+        let stored: bool = self.put_byte((byte as u8));
+        transition stored {
+            true -> put(value, index + 1)
+            _ -> (false)
+        }
+    }
+}
+
+pub machine ProjectFileWriter::put_u32(&mut self, value: u32) -> bool {
+    transition {
+        _ -> put(value, 0)
+    }
+    state put(&mut self, value: u32, index: u64) -> bool {
+        transition index < 4 {
+            true -> byte(value, index)
+            _ -> (true)
+        }
+    }
+    state byte(&mut self, value: u32, index: u64) -> bool
+        requires index < 4;
+    {
+        let shift: u64 = index * 8;
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) % 256) as u64;
+        let stored: bool = self.put_byte((byte as u8));
+        transition stored {
+            true -> put(value, index + 1)
+            _ -> (false)
+        }
+    }
+}
+
+pub machine ProjectFileWriter::put_u64(&mut self, value: u64) -> bool {
+    transition {
+        _ -> put(value, 0)
+    }
+    state put(&mut self, value: u64, index: u64) -> bool {
+        transition index < 8 {
+            true -> byte(value, index)
+            _ -> (true)
+        }
+    }
+    state byte(&mut self, value: u64, index: u64) -> bool
+        requires index < 8;
+    {
+        let shift: u64 = index * 8;
+        let byte: u64 = (((value as u64 in Wrapping) >> (shift as u64 in Wrapping)) % 256) as u64;
+        let stored: bool = self.put_byte((byte as u8));
+        transition stored {
+            true -> put(value, index + 1)
+            _ -> (false)
+        }
+    }
+}
+
+// i64 stores the u64 bit pattern verbatim (two's-complement is already
+// little-endian-friendly); decode reproduces the same bit pattern.
+pub machine ProjectFileWriter::put_i64(&mut self, value: i64) -> bool {
+    let stored: bool = self.put_u64(((value as u64 in Wrapping) as u64));
+    (stored)
+}
+
+pub machine ProjectFileWriter::put_bool(&mut self, value: bool) -> bool {
+    transition value {
+        true -> one(value)
+        _ -> zero(value)
+    }
+    state one(&mut self, value: bool) -> bool {
+        let stored: bool = self.put_byte(1);
+        (stored)
+    }
+    state zero(&mut self, value: bool) -> bool {
+        let stored: bool = self.put_byte(0);
+        (stored)
+    }
+}
+
+// Length-prefixed byte run — u64 length then the raw bytes.
+pub machine ProjectFileWriter::put_bytes(&mut self, value: &[u8]) -> bool {
+    let stored: bool = self.put_u64(value.len);
+    transition stored {
+        true -> copy(value, 0)
+        _ -> (false)
+    }
+    state copy(&mut self, value: &[u8], position: u64) -> bool {
+        transition position < value.len {
+            true -> byte(value, position)
+            _ -> (true)
+        }
+    }
+    state byte(&mut self, value: &[u8], position: u64) -> bool
+        requires position < value.len;
+    {
+        let stored: bool = self.put_byte(value[position]);
+        transition stored {
+            true -> copy(value, position + 1)
+            _ -> (false)
+        }
+    }
+}
+
+// The file header: magic + version so corrupt or foreign files refuse
+// predictably on decode.
+pub machine ProjectFileWriter::put_header(&mut self) -> bool {
+    let a: bool = self.put_byte(83);
+    let b: bool = self.put_byte(81);
+    let c: bool = self.put_byte(80);
+    let d: bool = self.put_byte(82);
+    let e: bool = self.put_u16(1);
+    (a && b && c && d && e)
+}
+
+pub data ProjectFileReader {
+    bytes: [u8; 4194304];
+    len: u64;
+    position: u64;
+    failed: bool;
+}
+
+// Wrap a bounded byte window as a reader — callers hand the file bytes
+// plus their real length (the decode surface never reads past `len`).
+pub machine ProjectFileReader::default() -> ProjectFileReader {
+    (ProjectFileReader { len: 0, position: 0, failed: false })
+}
+
+pub machine ProjectFileReader::wrap(contents: &[u8], content_len: u64) -> ProjectFileReader {
+    let mut created: ProjectFileReader = ProjectFileReader { len: 0, position: 0, failed: false };
+    let copied: bool = created.copy_contents(contents, content_len);
+    (created)
+}
+
+machine ProjectFileReader::copy_contents(&mut self, contents: &[u8], content_len: u64) -> bool {
+    transition content_len <= 4194304 {
+        true -> copy(contents, content_len, 0)
+        _ -> refuse(contents, content_len)
+    }
+    state copy(&mut self, contents: &[u8], content_len: u64, position: u64) -> bool
+        requires content_len <= 4194304;
+    {
+        transition position < content_len && position < contents.len {
+            true -> byte(contents, content_len, position)
+            _ -> accept(contents, content_len)
+        }
+    }
+    state byte(&mut self, contents: &[u8], content_len: u64, position: u64) -> bool
+        requires position < contents.len && content_len <= 4194304;
+    {
+        self.bytes[position] = contents[position];
+        transition {
+            _ -> copy(contents, content_len, position + 1)
+        }
+    }
+    state accept(&mut self, contents: &[u8], content_len: u64) -> bool {
+        self.len = content_len;
+        (true)
+    }
+    state refuse(&mut self, contents: &[u8], content_len: u64) -> bool {
+        self.failed = true;
+        (false)
+    }
+}
+
+pub machine ProjectFileReader::has_failed(&self) -> bool {
+    (self.failed)
+}
+
+pub machine ProjectFileReader::get_position(&self) -> u64 {
+    (self.position)
+}
+
+pub machine ProjectFileReader::get_len(&self) -> u64 {
+    (self.len)
+}
+
+pub machine ProjectFileReader::get_u8(&mut self) -> u8 {
+    transition self.position < self.len && self.position < 4194304 {
+        true -> read()
+        _ -> refuse()
+    }
+    state read(&mut self) -> u8
+        requires self.position < 4194304;
+    {
+        let byte: u8 = self.bytes[self.position];
+        let next_position: u64 = self.position + 1;
+        self.position = next_position;
+        (byte)
+    }
+    state refuse(&mut self) -> u8 {
+        self.failed = true;
+        (0)
+    }
+}
+
+pub machine ProjectFileReader::get_u16(&mut self) -> u16 {
+    transition {
+        _ -> read(0, 0)
+    }
+    state read(&mut self, index: u64, accumulated: u64) -> u16 {
+        transition index < 2 {
+            true -> byte(index, accumulated)
+            _ -> (((accumulated as u16 in Wrapping) as u16))
+        }
+    }
+    state byte(&mut self, index: u64, accumulated: u64) -> u16
+        requires index < 2;
+    {
+        let byte: u8 = self.get_u8();
+        let shift: u64 = index * 8;
+        let merged: u64 = ((accumulated as u64 in Wrapping) | (((byte as u64 in Wrapping) << (shift as u64 in Wrapping)))) as u64;
+        transition {
+            _ -> read(index + 1, merged)
+        }
+    }
+}
+
+pub machine ProjectFileReader::get_u32(&mut self) -> u32 {
+    transition {
+        _ -> read(0, 0)
+    }
+    state read(&mut self, index: u64, accumulated: u64) -> u32 {
+        transition index < 4 {
+            true -> byte(index, accumulated)
+            _ -> (((accumulated as u32 in Wrapping) as u32))
+        }
+    }
+    state byte(&mut self, index: u64, accumulated: u64) -> u32
+        requires index < 4;
+    {
+        let byte: u8 = self.get_u8();
+        let shift: u64 = index * 8;
+        let merged: u64 = ((accumulated as u64 in Wrapping) | (((byte as u64 in Wrapping) << (shift as u64 in Wrapping)))) as u64;
+        transition {
+            _ -> read(index + 1, merged)
+        }
+    }
+}
+
+pub machine ProjectFileReader::get_u64(&mut self) -> u64 {
+    transition {
+        _ -> read(0, 0)
+    }
+    state read(&mut self, index: u64, accumulated: u64) -> u64 {
+        transition index < 8 {
+            true -> byte(index, accumulated)
+            _ -> (accumulated)
+        }
+    }
+    state byte(&mut self, index: u64, accumulated: u64) -> u64
+        requires index < 8;
+    {
+        let byte: u8 = self.get_u8();
+        let shift: u64 = index * 8;
+        let merged: u64 = ((accumulated as u64 in Wrapping) | (((byte as u64 in Wrapping) << (shift as u64 in Wrapping)))) as u64;
+        transition {
+            _ -> read(index + 1, merged)
+        }
+    }
+}
+
+pub machine ProjectFileReader::get_i64(&mut self) -> i64 {
+    let raw: u64 = self.get_u64();
+    (((raw as i64 in Wrapping) as i64))
+}
+
+pub machine ProjectFileReader::get_bool(&mut self) -> bool {
+    let byte: u8 = self.get_u8();
+    (byte == 1)
+}
+
+// Length-prefixed byte run — copies into `out`; a declared length past
+// the caller's capacity or past the file tail refuses (sets failed).
+pub machine ProjectFileReader::get_bytes(&mut self, out: &mut [u8; 512]) -> u64 {
+    let count: u64 = self.get_u64();
+    transition count <= 512 && count <= self.len && self.position <= self.len {
+        true -> bounded(out, count)
+        _ -> refuse(out)
+    }
+    state bounded(&mut self, out: &mut [u8; 512], count: u64) -> u64
+        requires count <= 512;
+    {
+        let remaining: u64 = self.len - self.position;
+        transition count <= remaining {
+            true -> copy(out, count, 0)
+            _ -> refuse(out)
+        }
+    }
+    state copy(&mut self, out: &mut [u8; 512], count: u64, position: u64) -> u64
+        requires count <= 512;
+    {
+        transition position < count && position < 512 {
+            true -> byte(out, count, position)
+            _ -> (count)
+        }
+    }
+    state byte(&mut self, out: &mut [u8; 512], count: u64, position: u64) -> u64
+        requires position < 512 && count <= 512;
+    {
+        let byte: u8 = self.get_u8();
+        out[position] = byte;
+        transition {
+            _ -> copy(out, count, position + 1)
+        }
+    }
+    state refuse(&mut self, out: &mut [u8; 512]) -> u64 {
+        self.failed = true;
+        (0)
+    }
+}
+
+// Header check — magic "SQPR" + supported version (1). Fails the reader
+// on mismatch like upstream's serde_json parse error path.
+pub machine ProjectFileReader::check_header(&mut self) -> bool {
+    let a: u8 = self.get_u8();
+    let b: u8 = self.get_u8();
+    let c: u8 = self.get_u8();
+    let d: u8 = self.get_u8();
+    let version: u16 = self.get_u16();
+    transition (a == 83 && b == 81 && c == 80 && d == 82 && version == 1 && !self.failed) {
+        true -> (true)
+        _ -> refuse()
+    }
+    state refuse(&mut self) -> bool {
+        self.failed = true;
+        (false)
+    }
+}
+
+// ============ file-descriptor transport ============
+
+// The writer half of upstream `File::create` + `to_writer`: drain
+// `bytes[0..written]` honoring short writes. Returns the flushed count;
+// a host error mid-drain flags `failed` (upstream's `?` on write errors).
+pub linux_x86_64 machine ProjectFileWriter::flush_to_fd(&mut self, fd: i32) -> i64
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition self.written <= 4194304 {
+        true -> drain(fd, 0)
+        _ -> fail()
+    }
+    state fail(&mut self) -> i64 {
+        self.failed = true;
+        (-1)
+    }
+    state drain(&mut self, fd: i32, position: u64) -> i64 {
+        transition position < self.written {
+            true -> bounded(fd, position)
+            _ -> done(position)
+        }
+    }
+    state bounded(&mut self, fd: i32, position: u64) -> i64 {
+        transition position <= self.written && self.written <= 4194304 {
+            true -> issue(fd, position)
+            _ -> fail()
+        }
+    }
+    state issue(&mut self, fd: i32, position: u64) -> i64
+        requires position <= self.written && self.written <= 4194304;
+    {
+        let put: i64 = FilesystemHost::write(fd, &self.bytes[position..self.written]);
+        transition put > 0 {
+            true -> accumulate(fd, position, put)
+            _ -> fail()
+        }
+    }
+    state accumulate(&mut self, fd: i32, position: u64, put: i64) -> i64
+        requires position <= self.written && self.written <= 4194304;
+    {
+        let added: u64 = ((put as u64 in Wrapping) as u64);
+        let next: u64 = ((position as u64 in Wrapping) + (added as u64 in Wrapping)) as u64;
+        transition { _ -> drain(fd, next) }
+    }
+    state done(&mut self, position: u64) -> i64 {
+        (((position as i64 in Wrapping)) as i64)
+    }
+}
+
+// The reader half of upstream `File::open` + `from_reader`: fill the
+// bounded buffer to EOF (upstream serde reads through the file's end; a
+// full 4 MiB buffer ends the drain with `len` at the bound — the same
+// refusal surface as an oversized file). Returns the stored count.
+pub linux_x86_64 machine ProjectFileReader::fill_from_fd(&mut self, fd: i32) -> i64
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    self.len = 0;
+    self.position = 0;
+    self.failed = false;
+    transition { _ -> drain(fd) }
+    state drain(&mut self, fd: i32) -> i64 {
+        transition self.len <= 4194304 {
+            true -> bounded(fd)
+            _ -> done()
+        }
+    }
+    state bounded(&mut self, fd: i32) -> i64
+        requires self.len <= 4194304;
+    {
+        let remaining: u64 = 4194304 - self.len;
+        transition remaining > 0 {
+            true -> issue(fd, remaining)
+            _ -> done()
+        }
+    }
+    state issue(&mut self, fd: i32, remaining: u64) -> i64
+        requires self.len <= 4194304;
+    {
+        let got: i64 = FilesystemHost::read(fd, &mut self.bytes[self.len..4194304], remaining);
+        transition got > 0 {
+            true -> accumulate(fd, got)
+            _ -> done()
+        }
+    }
+    state accumulate(&mut self, fd: i32, got: i64) -> i64
+        requires self.len <= 4194304;
+    {
+        let added: u64 = ((got as u64 in Wrapping) as u64);
+        self.len = ((self.len as u64 in Wrapping) + (added as u64 in Wrapping)) as u64;
+        transition { _ -> drain(fd) }
+    }
+    state done(&mut self) -> i64 {
+        (((self.len as i64 in Wrapping)) as i64)
+    }
+}

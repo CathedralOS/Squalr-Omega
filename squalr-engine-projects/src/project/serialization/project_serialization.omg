@@ -1,6 +1,16 @@
 module src::project::serialization::project_serialization;
 
 use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_directory::ProjectItemTypeDirectory;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use src::project::serialization::project_info_serialization::ProjectInfoLoad;
+use src::project::serialization::project_item_serialization::ProjectItemLoad;
+use src::project::serialization::serializable_project_file::ProjectFileSave;
+use src::project::serialization::serializable_project_file::SerializableProjectFile;
+use omega_language_std::filesystem_host;
 
 // Port of project/serialization/project_serialization.rs — the free helper
 // surface is fully portable; the `SerializableProjectFile for Project`
@@ -260,6 +270,712 @@ pub machine is_project_item_file_path(project_item_path: &[u8]) -> bool {
         transition j == 106 && s == 115 && o == 111 && n == 110 {
             true -> (true)
             false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// ============ SerializableProjectFile for Project ============
+//
+// Upstream `save_to_path` writes the project-info file, then every item
+// whose ref path resolves to a regular file (per-item failures log and
+// continue upstream — the port's log-free spelling continues without
+// logging, same control flow). `load_from_path` reads the info file,
+// creates `project_items/` when absent, then walks it depth-first —
+// directories become ProjectItemTypeDirectory entries and recurse,
+// `*.json` files load as items. Upstream's HashMap stores as the
+// pair-table; recursion stores as the 64-deep pending stack (bounded
+// deviation — a deeper or wider tree past the table's 256 entries
+// refuses at the bound, matching the package's table convention).
+//
+// Path-domain routing (documented deviation): the `Path` domain only
+// admits params/literals/concats/subslices, so runtime-carried item
+// paths and dirent names ride the boundary's trusted seams instead —
+// `open_at(dirfd, name)` for opening below an open directory (a
+// relative path may span components), `read_file_metadata(fd)` for the
+// `is_dir`/`is_file` probes upstream runs on `Path`, and
+// `create_dir_name(path)` for the plain-path mkdir. The project-items
+// root itself is opened by concat (`directory + "/project_items"`);
+// stored item paths feed fs calls as the path bytes relative to that
+// root fd (the prefix check keeps the join honest).
+pub data ProjectLoad {
+    case Refused;
+    case Loaded(project: Project);
+}
+
+// The load walk's scratch — the pending-directory stack (bounded 64)
+// carrying each open dirfd beside the path bytes that build child refs,
+// the current directory's getdents buffer + cursor, the record being
+// parsed, and the fstat scratch for child classification. linux x86_64
+// dirent layout: d_reclen u16 at offset 16, d_type u8 at 18, name bytes
+// from 19; struct stat st_mode u32 at byte 24 (S_IFMT 61440, S_IFDIR
+// 16384, S_IFREG 32768).
+pub data ProjectLoadContext {
+    project: Project;
+    pending_paths: [[u8; 512]; 64];
+    pending_lens: [u64; 64];
+    pending_fds: [i32; 64];
+    pending_count: u64;
+    dir_position: i64;
+    dir_buf: [u8; 512];
+    dir_total: i64;
+    dir_off: u64;
+    reclen: u64;
+    entry_name: [u8; 256];
+    entry_name_len: u64;
+    pending_child: [u8; 512];
+    stat_buf: [u8; 144];
+    stat_rc: i32;
+}
+
+pub machine ProjectLoadContext::empty() -> ProjectLoadContext {
+    (ProjectLoadContext {
+        project: Project::default(),
+        pending_count: 0,
+        dir_position: 0,
+        dir_total: 0,
+        dir_off: 0,
+        reclen: 0,
+        entry_name_len: 0,
+        stat_rc: -1,
+    })
+}
+
+pub linux_x86_64 machine Project::save_to_path(
+    &mut self,
+    directory: &[u8] in Path,
+    save_even_if_unchanged: bool
+) -> ProjectFileSave
+satisfies SerializableProjectFile::save_to_path
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let info_saved: ProjectFileSave = self.project_info.save_to_path(directory, save_even_if_unchanged);
+    transition info_saved {
+        ProjectFileSave::Stored -> root_fd(directory, save_even_if_unchanged)
+        _ -> (ProjectFileSave::Refused)
+    }
+    // Open the project-items root once; item file ops run dirfd-relative
+    // off it (the trusted-name seam for stored path bytes — `open_at`
+    // accepts a relative path, the openat semantics the boundary
+    // documents). A missing root leaves every item's `is_file` probe
+    // false upstream — the failed fd skips the same way. `items_root`
+    // carries the join-spelled prefix bytes for the per-item rel split.
+    state root_fd(&mut self, directory: &[u8] in Path, save_even_if_unchanged: bool) -> ProjectFileSave {
+        let mut items_root: [u8; 512];
+        let root_len: u64 = resolve_project_root_directory_path(directory, &mut items_root);
+        let dir_fd: i32 = FilesystemHost::open(directory, 0);
+        transition dir_fd >= 0 {
+            true -> items_open(dir_fd, items_root, root_len, save_even_if_unchanged)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state items_open(&mut self, dir_fd: i32, items_root: [u8; 512], root_len: u64, save_even_if_unchanged: bool) -> ProjectFileSave {
+        let items_fd: i32 = FilesystemHost::open_at(dir_fd, "project_items", 0);
+        let closed_dir: i32 = FilesystemHost::close(dir_fd);
+        transition root_len <= 512 {
+            true -> items(items_root, root_len, items_fd, save_even_if_unchanged, 0)
+            _ -> drain(items_fd)
+        }
+    }
+    state items(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64) -> ProjectFileSave
+        requires root_len <= 512;
+    {
+        transition position < self.project_items_len && position < 256 {
+            true -> copy_path(items_root, root_len, items_fd, save_even_if_unchanged, position, 0)
+            _ -> drain(items_fd)
+        }
+    }
+    state drain(&mut self, items_fd: i32) -> ProjectFileSave {
+        let closed: i32 = FilesystemHost::close(items_fd);
+        (ProjectFileSave::Stored)
+    }
+    // Copy the pair's ref path into scratch so the item's `&mut` borrow
+    // does not alias the shared path borrow (save_even_if_unchanged
+    // threads through, matching upstream's per-item flag).
+    state copy_path(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, index: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256;
+    {
+        let mut path_buf: [u8; 512];
+        transition { _ -> copy_at(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, 0) }
+    }
+    state copy_at(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], index: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256;
+    {
+        let source_len: u64 = self.project_items[position].project_item_ref.project_item_path_len;
+        transition index < source_len && index < 512 {
+            true -> copy_byte(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, index)
+            _ -> path_bound(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, index)
+        }
+    }
+    // The stored path's length must fit the 512 carrier — the dirfd
+    // rel-arg is a subslice of it. Items with longer stored paths skip
+    // (the carrier bound, not an upstream cap).
+    state path_bound(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256;
+    {
+        transition path_len <= 512 {
+            true -> prefix(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, 0)
+            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+        }
+    }
+    state copy_byte(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], index: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && index < 512;
+    {
+        let mut carried: [u8; 512] = path_buf;
+        carried[index] = self.project_items[position].project_item_ref.project_item_path[index];
+        let next: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> copy_at(items_root, root_len, items_fd, save_even_if_unchanged, position, carried, next) }
+    }
+    // The stored item path must sit under `<directory>/project_items/` —
+    // the dirfd seam only reaches there. An item outside the root skips
+    // (named deviation vs upstream, whose absolute paths always resolve —
+    // the boundary exposes no plain-bytes open/stat for them).
+    state prefix(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, index: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && path_len <= 512;
+    {
+        transition index < root_len && index < 512 {
+            true -> prefix_byte(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, index)
+            _ -> root_edge(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len)
+        }
+    }
+    state prefix_byte(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, index: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && path_len <= 512 && index < 512;
+    {
+        transition index < path_len && path_buf[index] == items_root[index] {
+            true -> prefix(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+        }
+    }
+    // `index == root_len` consumed the prefix; the stored path's next
+    // byte must be the separator — the rel arg is the tail past it.
+    state root_edge(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && path_len <= 512;
+    {
+        let rel_start: u64 = ((root_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition rel_start <= path_len && root_len < path_len && path_buf[root_len] == 47 {
+            true -> probe(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start)
+            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+        }
+    }
+    // Upstream's `if project_item_path.is_file()` gate: probe the fd
+    // then fstat it — only regular files reach the item's save arm.
+    state probe(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
+    {
+        let fd: i32 = FilesystemHost::open_at(items_fd, &path_buf[rel_start..path_len], 0);
+        transition fd >= 0 {
+            true -> file_kind(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, fd)
+            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+        }
+    }
+    state file_kind(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, fd: i32) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
+    {
+        let mut stat_buf: [u8; 144];
+        let rc: i32 = FilesystemHost::read_file_metadata(fd, &mut stat_buf);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition rc >= 0 {
+            true -> mode(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, stat_buf)
+            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+        }
+    }
+    state mode(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, stat_buf: [u8; 144]) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
+    {
+        let mode: u32 = ((stat_buf[24] as u32 in Wrapping)
+            | (((stat_buf[25] as u32 in Wrapping)) << 8)
+            | (((stat_buf[26] as u32 in Wrapping)) << 16)
+            | (((stat_buf[27] as u32 in Wrapping)) << 24)) as u32;
+        transition (mode & 61440) == 32768 {
+            true -> store(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start)
+            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+        }
+    }
+    // Upstream `project_item.save_to_path(project_item_path, ...)`,
+    // spelled `save_at` against the items-root fd; per-item failures
+    // continue without logging (upstream's log::error arm).
+    state store(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
+    {
+        let item_saved: ProjectFileSave = self.project_items[position].project_item.save_at(
+            items_fd,
+            &path_buf[rel_start..path_len],
+            &path_buf[0..path_len],
+            save_even_if_unchanged);
+        transition { _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position) }
+    }
+    state next(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64) -> ProjectFileSave
+        requires root_len <= 512 && position < 256;
+    {
+        let advanced: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> items(items_root, root_len, items_fd, save_even_if_unchanged, advanced) }
+    }
+}
+
+pub linux_x86_64 machine Project::load_from_path(
+    project_directory_path: &[u8] in Path
+) -> ProjectLoad
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    // Upstream loads `directory/project.json` first — the impl opens the
+    // leaf through the dirfd seam itself.
+    let loaded: ProjectInfoLoad = ProjectInfo::load_from_path(project_directory_path);
+    transition loaded {
+        ProjectInfoLoad::Loaded { project_info } -> root(project_directory_path, project_info)
+        _ -> (ProjectLoad::Refused)
+    }
+    // Root: `create_dir_all(<dir>/project_items)` when absent (upstream
+    // checks then creates — the create is unconditional-modulo-EEXIST
+    // either way), open it for the dirfd walk, seed the project with the
+    // root directory item, and push the root onto the pending stack.
+    // The dirfd seam carries the fs side: the project directory opens
+    // once, and "project_items" joins as a literal leaf name.
+    state root(project_directory_path: &[u8] in Path, project_info: ProjectInfo) -> ProjectLoad {
+        let mut context: ProjectLoadContext = ProjectLoadContext::empty();
+        let mut root_path: [u8; 512];
+        let root_len: u64 = resolve_project_root_directory_path(project_directory_path, &mut root_path);
+        let dir_fd: i32 = FilesystemHost::open(project_directory_path, 0);
+        transition root_len <= 512 && dir_fd >= 0 {
+            true -> root_make(dir_fd, root_path, root_len, project_info, context)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state root_make(dir_fd: i32, root_path: [u8; 512], root_len: u64, project_info: ProjectInfo, context: ProjectLoadContext) -> ProjectLoad
+        requires root_len <= 512;
+    {
+        let root_fd: i32 = FilesystemHost::open_at(dir_fd, "project_items", 0);
+        transition root_fd >= 0 {
+            true -> root_insert(dir_fd, root_path, root_len, project_info, context, root_fd)
+            _ -> root_create(dir_fd, root_path, root_len, project_info, context)
+        }
+    }
+    // Upstream's absent-root arm: `create_dir_all` walks the root_path
+    // buffer's prefixes (plain bytes — `create_dir_name` is the
+    // boundary's plain-path mkdir, so the stored path is enough).
+    state root_create(dir_fd: i32, root_path: [u8; 512], root_len: u64, project_info: ProjectInfo, context: ProjectLoadContext) -> ProjectLoad
+        requires root_len <= 512;
+    {
+        let made: bool = create_dir_all(&root_path[0..root_len]);
+        transition made {
+            true -> root_reopen(dir_fd, root_path, root_len, project_info, context)
+            _ -> close_dir(dir_fd)
+        }
+    }
+    state root_reopen(dir_fd: i32, root_path: [u8; 512], root_len: u64, project_info: ProjectInfo, context: ProjectLoadContext) -> ProjectLoad
+        requires root_len <= 512;
+    {
+        let root_fd: i32 = FilesystemHost::open_at(dir_fd, "project_items", 0);
+        transition root_fd >= 0 {
+            true -> root_insert(dir_fd, root_path, root_len, project_info, context, root_fd)
+            _ -> close_dir(dir_fd)
+        }
+    }
+    state close_dir(dir_fd: i32) -> ProjectLoad {
+        let closed: i32 = FilesystemHost::close(dir_fd);
+        (ProjectLoad::Refused)
+    }
+    state root_insert(dir_fd: i32, root_path: [u8; 512], root_len: u64, project_info: ProjectInfo, context: ProjectLoadContext, root_fd: i32) -> ProjectLoad
+        requires root_len <= 512;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let pair_ref: ProjectItemRef = ProjectItemRef::new(&root_path[0..root_len]);
+        let item: ProjectItem = ProjectItemTypeDirectory::new_project_item(&pair_ref);
+        let pair: ProjectItemPair = ProjectItemPair::new(pair_ref, item);
+        let root_ref: ProjectItemRef = ProjectItemRef::new(&root_path[0..root_len]);
+        carried.project = Project::new(project_info, root_ref);
+        let inserted: bool = carried.project.insert_project_item(pair);
+        carried.pending_paths[0] = root_path;
+        carried.pending_lens[0] = root_len;
+        carried.pending_fds[0] = root_fd;
+        carried.pending_count = 1;
+        let closed_dir: i32 = FilesystemHost::close(dir_fd);
+        transition { _ -> walk(carried) }
+    }
+    // The stack's top is the directory in progress — its fd is already
+    // open (pushed that way); an empty stack finishes the load.
+    state walk(context: ProjectLoadContext) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.pending_count > 0 && carried.pending_count <= 64 {
+            true -> enter(carried)
+            _ -> finish(carried)
+        }
+    }
+    state enter(context: ProjectLoadContext) -> ProjectLoad
+        requires context.pending_count > 0 && context.pending_count <= 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let top: u64 = ((carried.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition top < 64 {
+            true -> fill(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state fill(context: ProjectLoadContext, top: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let total: i64 = FilesystemHost::read_dir(carried.pending_fds[top], &mut carried.dir_buf, 512, &mut carried.dir_position);
+        carried.dir_total = total;
+        carried.dir_off = 0;
+        transition total > 0 {
+            true -> record(carried, top)
+            _ -> dir_done(carried, total)
+        }
+    }
+    // End of entries (0) or an I/O error: close the dir's own fd and
+    // pop. Upstream's `entry?`/`read_dir` errors refuse — a mid-walk
+    // failure maps to Refused the same way.
+    state dir_done(context: ProjectLoadContext, total: i64) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.pending_count > 0 && carried.pending_count <= 64 && total >= 0 {
+            true -> close_top(carried)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state close_top(context: ProjectLoadContext) -> ProjectLoad
+        requires context.pending_count > 0 && context.pending_count <= 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let top: u64 = ((carried.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition top < 64 {
+            true -> close_do(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state close_do(context: ProjectLoadContext, top: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let closed: i32 = FilesystemHost::close(carried.pending_fds[top]);
+        transition carried.pending_count > 0 {
+            true -> pop(carried)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state pop(context: ProjectLoadContext) -> ProjectLoad
+        requires context.pending_count > 0;
+    {
+        let mut carried: ProjectLoadContext = context;
+        carried.pending_count = ((carried.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition { _ -> walk(carried) }
+    }
+    // One dirent at dir_off: reclen (u16 at +16) frames the record;
+    // malformed frames refuse like upstream's `entry?` propagation.
+    state record(context: ProjectLoadContext, top: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.dir_off < ((carried.dir_total as u64 in Wrapping) as u64) && carried.pending_count <= 64 {
+            true -> bounded(carried, top)
+            _ -> fill(carried, top)
+        }
+    }
+    state bounded(context: ProjectLoadContext, top: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let total_u: u64 = ((carried.dir_total as u64 in Wrapping) as u64);
+        let head_end: u64 = ((carried.dir_off as u64 in Wrapping) + (19 as u64 in Wrapping)) as u64;
+        transition carried.dir_off < total_u && head_end <= total_u && carried.dir_off < 493 {
+            true -> header(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state header(context: ProjectLoadContext, top: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && context.dir_off < 493;
+    {
+        let off_lo: u64 = context.dir_off + 16;
+        let off_hi: u64 = context.dir_off + 17;
+        transition off_lo < 512 && off_hi < 512 {
+            true -> head_read(context, top, off_lo, off_hi)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state head_read(context: ProjectLoadContext, top: u64, off_lo: u64, off_hi: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && context.dir_off < 493 && off_lo < 512 && off_hi < 512;
+    {
+        let lo: u64 = ((context.dir_buf[off_lo] as u64 in Wrapping) as u64);
+        let hi: u64 = ((context.dir_buf[off_hi] as u64 in Wrapping) as u64);
+        let mut carried: ProjectLoadContext = context;
+        carried.reclen = ((((hi as u64 in Wrapping) << 8) | (lo as u64 in Wrapping)) as u64);
+        let end: u64 = ((carried.dir_off as u64 in Wrapping) + (carried.reclen as u64 in Wrapping)) as u64;
+        let total_u: u64 = ((carried.dir_total as u64 in Wrapping) as u64);
+        transition carried.reclen >= 19 && end <= total_u && carried.pending_count <= 64 && carried.dir_off < 493 {
+            true -> extract(carried, top, 0)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    // Copy the entry name: bytes from off+19 until NUL, the record end
+    // (reclen), or the 255-byte name bound — upstream's `entry.file_name`.
+    state extract(context: ProjectLoadContext, top: u64, j: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && context.dir_off < 493;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let name_base: u64 = ((carried.dir_off as u64 in Wrapping) + (19 as u64 in Wrapping)) as u64;
+        let name_at: u64 = ((name_base as u64 in Wrapping) + (j as u64 in Wrapping)) as u64;
+        let record_end: u64 = ((carried.dir_off as u64 in Wrapping) + (carried.reclen as u64 in Wrapping)) as u64;
+        transition j < 255 && name_at < record_end && name_at < ((carried.dir_total as u64 in Wrapping) as u64) && name_at < 512 {
+            true -> name_byte(carried, top, j, name_at)
+            _ -> name_done(carried, top, j)
+        }
+    }
+    state name_byte(context: ProjectLoadContext, top: u64, j: u64, name_at: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && j < 256 && name_at < 512;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let byte: u8 = carried.dir_buf[name_at];
+        transition byte == 0 {
+            true -> name_done(carried, top, j)
+            _ -> store_name(carried, top, j, byte)
+        }
+    }
+    state store_name(context: ProjectLoadContext, top: u64, j: u64, byte: u8) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && j < 256;
+    {
+        let mut carried: ProjectLoadContext = context;
+        carried.entry_name[j] = byte;
+        let next: u64 = ((j as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition carried.dir_off < 493 && carried.pending_count <= 64 {
+            true -> extract(carried, top, next)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state name_done(context: ProjectLoadContext, top: u64, j: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        carried.entry_name_len = j;
+        // "." and ".." skip by name — every getdents walk's required
+        // filter (Rust's read_dir iterator excludes them before the
+        // caller ever sees them upstream).
+        let is_dot: bool = j == 1 && carried.entry_name[0] == 46;
+        let is_dotdot: bool = j == 2 && carried.entry_name[0] == 46 && carried.entry_name[1] == 46;
+        transition is_dot || is_dotdot {
+            true -> dot_skip(carried, top)
+            _ -> child_gate(carried, top, j)
+        }
+    }
+    state dot_skip(context: ProjectLoadContext, top: u64) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.pending_count <= 64 && top < 64 {
+            true -> advance(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state child_gate(context: ProjectLoadContext, top: u64, j: u64) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.pending_count <= 64 && top < 64 && j <= 256 && carried.entry_name_len <= 256 {
+            true -> child(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    // child = current dir's stored path + '/' + entry name — the ref's
+    // identity bytes; the fs side rides the parent fd instead.
+    state child(context: ProjectLoadContext, top: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && context.entry_name_len <= 256;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let dir_len: u64 = carried.pending_lens[top];
+        transition dir_len <= 512 && carried.pending_count <= 64 && carried.entry_name_len <= 256 {
+            true -> child_join(carried, top, dir_len)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state child_join(context: ProjectLoadContext, top: u64, dir_len: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && dir_len <= 512 && context.entry_name_len <= 256;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let dir_view: &[u8] = &carried.pending_paths[top][0..dir_len];
+        let name_view: &[u8] = &carried.entry_name[0..carried.entry_name_len];
+        let child_len: u64 = append_path_component(dir_view, name_view, &mut carried.pending_child);
+        transition carried.pending_count <= 64 && carried.entry_name_len <= 256 {
+            true -> child_open(carried, top, child_len)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    // `open_at` on the parent dirfd — the designed seam for
+    // read_dir-derived names; fstat on the child fd classifies (upstream
+    // `entry_path.is_dir()` is also stat-backed, just path-spelled).
+    state child_open(context: ProjectLoadContext, top: u64, child_len: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && context.entry_name_len <= 256;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let name_view: &[u8] = &carried.entry_name[0..carried.entry_name_len];
+        let child_fd: i32 = FilesystemHost::open_at(carried.pending_fds[top], name_view, 0);
+        transition child_fd >= 0 {
+            true -> stat_gate(carried, top, child_len, child_fd)
+            _ -> adv_gate(carried, top)
+        }
+    }
+    state stat_gate(context: ProjectLoadContext, top: u64, child_len: u64, child_fd: i32) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.pending_count <= 64 && top < 64 && child_len <= 512 && carried.entry_name_len <= 256 {
+            true -> child_stat(carried, top, child_len, child_fd)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state adv_gate(context: ProjectLoadContext, top: u64) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.pending_count <= 64 && top < 64 {
+            true -> advance(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state child_stat(context: ProjectLoadContext, top: u64, child_len: u64, child_fd: i32) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && child_len <= 512 && context.entry_name_len <= 256;
+    {
+        let mut carried: ProjectLoadContext = context;
+        carried.stat_rc = FilesystemHost::read_file_metadata(child_fd, &mut carried.stat_buf);
+        transition carried.stat_rc >= 0 && carried.pending_count <= 64 && carried.entry_name_len <= 256 {
+            true -> classify(carried, top, child_len, child_fd)
+            _ -> close_skip(carried, top, child_fd)
+        }
+    }
+    state classify(context: ProjectLoadContext, top: u64, child_len: u64, child_fd: i32) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && child_len <= 512 && context.entry_name_len <= 256;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let mode: u32 = ((carried.stat_buf[24] as u32 in Wrapping)
+            | (((carried.stat_buf[25] as u32 in Wrapping)) << 8)
+            | (((carried.stat_buf[26] as u32 in Wrapping)) << 16)
+            | (((carried.stat_buf[27] as u32 in Wrapping)) << 24)) as u32;
+        transition (mode & 61440) == 16384 && carried.pending_count <= 64 && carried.entry_name_len <= 256 {
+            true -> push_dir(carried, top, child_len, child_fd)
+            _ -> file_kind(carried, top, child_len, mode, child_fd)
+        }
+    }
+    state file_kind(context: ProjectLoadContext, top: u64, child_len: u64, mode: u32, child_fd: i32) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && child_len <= 512 && context.entry_name_len <= 256;
+    {
+        let mut carried: ProjectLoadContext = context;
+        transition (mode & 61440) == 32768 && is_project_item_file_path(&carried.entry_name[0..carried.entry_name_len]) && carried.pending_count <= 64 {
+            true -> load_item(carried, top, child_len, child_fd)
+            _ -> close_skip(carried, top, child_fd)
+        }
+    }
+    state close_skip(context: ProjectLoadContext, top: u64, child_fd: i32) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let closed: i32 = FilesystemHost::close(child_fd);
+        transition carried.pending_count <= 64 {
+            true -> advance(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    // Directory child: register the directory item (upstream inserts
+    // before recursing) and push the OPEN fd for the next iteration.
+    state push_dir(context: ProjectLoadContext, top: u64, child_len: u64, child_fd: i32) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && child_len <= 512;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let child_view: &[u8] = &carried.pending_child[0..child_len];
+        let child_ref: ProjectItemRef = ProjectItemRef::new(child_view);
+        let child_item: ProjectItem = ProjectItemTypeDirectory::new_project_item(&child_ref);
+        let pair: ProjectItemPair = ProjectItemPair::new(child_ref, child_item);
+        let inserted: bool = carried.project.insert_project_item(pair);
+        transition carried.pending_count < 64 {
+            true -> push(carried, top, child_len, child_fd)
+            _ -> skip_gate(carried, top, child_fd)
+        }
+    }
+    state skip_gate(context: ProjectLoadContext, top: u64, child_fd: i32) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        transition carried.pending_count <= 64 && top < 64 {
+            true -> close_skip(carried, top, child_fd)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state push(context: ProjectLoadContext, top: u64, child_len: u64, child_fd: i32) -> ProjectLoad
+        requires context.pending_count < 64 && top < 64 && child_len <= 512;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let slot: u64 = carried.pending_count;
+        carried.pending_paths[slot] = carried.pending_child;
+        carried.pending_lens[slot] = child_len;
+        carried.pending_fds[slot] = child_fd;
+        carried.pending_count = ((slot as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition carried.pending_count <= 64 {
+            true -> advance(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state load_item(context: ProjectLoadContext, top: u64, child_len: u64, child_fd: i32) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && child_len <= 512;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let mut project_item: ProjectItem = ProjectItem::default();
+        let ok: bool = project_item.fill_and_decode(child_fd);
+        let closed: i32 = FilesystemHost::close(child_fd);
+        transition ok {
+            true -> insert_item(carried, top, child_len, project_item)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state insert_item(context: ProjectLoadContext, top: u64, child_len: u64, project_item: ProjectItem) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64 && child_len <= 512;
+    {
+        let mut carried: ProjectLoadContext = context;
+        let child_view: &[u8] = &carried.pending_child[0..child_len];
+        let item_ref: ProjectItemRef = ProjectItemRef::new(child_view);
+        let pair: ProjectItemPair = ProjectItemPair::new(item_ref, project_item);
+        let inserted: bool = carried.project.insert_project_item(pair);
+        transition carried.pending_count <= 64 {
+            true -> advance(carried, top)
+            _ -> (ProjectLoad::Refused)
+        }
+    }
+    state advance(context: ProjectLoadContext, top: u64) -> ProjectLoad
+        requires context.pending_count <= 64 && top < 64;
+    {
+        let mut carried: ProjectLoadContext = context;
+        carried.dir_off = ((carried.dir_off as u64 in Wrapping) + (carried.reclen as u64 in Wrapping)) as u64;
+        transition { _ -> record(carried, top) }
+    }
+    state finish(context: ProjectLoadContext) -> ProjectLoad {
+        let mut carried: ProjectLoadContext = context;
+        carried.project.set_has_unsaved_changes(false);
+        (ProjectLoad::Loaded { project: carried.project })
+    }
+}
+
+// Upstream `fs::create_dir_all` — each path component's prefix gets a
+// best-effort `create_dir` (an already-present ancestor is fine, like
+// upstream's Ok/absent split), then the leaf itself. EEXIST (-17 on the
+// raw linux seam) counts as success. `path` is ordinary bytes —
+// `create_dir_name` is the boundary's plain-path mkdir (its callers hand
+// it stored/derived path buffers the Path domain cannot re-prove).
+pub linux_x86_64 machine create_dir_all(path: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition { _ -> walk(path, 0) }
+    state walk(path: &[u8], index: u64) -> bool {
+        transition index < path.len {
+            true -> at(path, index)
+            _ -> leaf(path)
+        }
+    }
+    state at(path: &[u8], index: u64) -> bool
+        requires index < path.len;
+    {
+        transition index < path.len && path[index] == 47 && index > 0 {
+            true -> prefix_do(path, index)
+            _ -> walk(path, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state prefix_do(path: &[u8], index: u64) -> bool
+        requires index <= path.len;
+    {
+        let created: i32 = FilesystemHost::create_dir_name(&path[0..index], 493);
+        transition { _ -> walk(path, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state leaf(path: &[u8]) -> bool {
+        let created: i32 = FilesystemHost::create_dir_name(path, 493);
+        transition created >= 0 || created == -17 {
+            true -> (true)
             _ -> (false)
         }
     }
