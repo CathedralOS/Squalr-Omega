@@ -342,7 +342,7 @@ pub machine ProjectLoadContext::empty() -> ProjectLoadContext {
 }
 
 pub linux_x86_64 machine Project::save_to_path(
-    &mut self,
+    project: &mut Project,
     directory: &[u8] in Path,
     save_even_if_unchanged: bool
 ) -> ProjectFileSave
@@ -350,9 +350,9 @@ satisfies SerializableProjectFile::save_to_path
 reaches FilesystemHost
 invokes FilesystemHost;
 {
-    let info_saved: ProjectFileSave = self.project_info.save_to_path(directory, save_even_if_unchanged);
+    let info_saved: ProjectFileSave = ProjectInfo::save_to_path(&mut project.project_info, directory, save_even_if_unchanged);
     transition info_saved {
-        ProjectFileSave::Stored -> root_fd(directory, save_even_if_unchanged)
+        ProjectFileSave::Stored -> root_fd(project, directory, save_even_if_unchanged)
         _ -> (ProjectFileSave::Refused)
     }
     // Open the project-items root once; item file ops run dirfd-relative
@@ -361,126 +361,126 @@ invokes FilesystemHost;
     // documents). A missing root leaves every item's `is_file` probe
     // false upstream — the failed fd skips the same way. `items_root`
     // carries the join-spelled prefix bytes for the per-item rel split.
-    state root_fd(&mut self, directory: &[u8] in Path, save_even_if_unchanged: bool) -> ProjectFileSave {
+    state root_fd(project: &mut Project, directory: &[u8] in Path, save_even_if_unchanged: bool) -> ProjectFileSave {
         let mut items_root: [u8; 512];
         let root_len: u64 = resolve_project_root_directory_path(directory, &mut items_root);
         let dir_fd: i32 = FilesystemHost::open(directory, 0);
         transition dir_fd >= 0 {
-            true -> items_open(dir_fd, items_root, root_len, save_even_if_unchanged)
+            true -> items_open(project, dir_fd, items_root, root_len, save_even_if_unchanged, directory)
             _ -> (ProjectFileSave::Refused)
         }
     }
-    state items_open(&mut self, dir_fd: i32, items_root: [u8; 512], root_len: u64, save_even_if_unchanged: bool) -> ProjectFileSave {
+    state items_open(project: &mut Project, dir_fd: i32, items_root: [u8; 512], root_len: u64, save_even_if_unchanged: bool, directory: &[u8] in Path) -> ProjectFileSave {
         let items_fd: i32 = FilesystemHost::open_at(dir_fd, "project_items", 0);
         let closed_dir: i32 = FilesystemHost::close(dir_fd);
         transition root_len <= 512 {
-            true -> items(items_root, root_len, items_fd, save_even_if_unchanged, 0)
-            _ -> drain(items_fd)
+            true -> items(project, items_root, root_len, items_fd, save_even_if_unchanged, 0, directory)
+            _ -> drain(project, items_fd)
         }
     }
-    state items(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64) -> ProjectFileSave
+    state items(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512;
     {
-        transition position < self.project_items_len && position < 256 {
-            true -> copy_path(items_root, root_len, items_fd, save_even_if_unchanged, position, 0)
-            _ -> drain(items_fd)
+        transition position < project.project_items_len && position < 256 {
+            true -> copy_path(project, items_root, root_len, items_fd, save_even_if_unchanged, position, 0, directory)
+            _ -> drain(project, items_fd)
         }
     }
-    state drain(&mut self, items_fd: i32) -> ProjectFileSave {
+    state drain(project: &mut Project, items_fd: i32) -> ProjectFileSave {
         let closed: i32 = FilesystemHost::close(items_fd);
         (ProjectFileSave::Stored)
     }
     // Copy the pair's ref path into scratch so the item's `&mut` borrow
     // does not alias the shared path borrow (save_even_if_unchanged
     // threads through, matching upstream's per-item flag).
-    state copy_path(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, index: u64) -> ProjectFileSave
+    state copy_path(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, index: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256;
     {
         let mut path_buf: [u8; 512];
-        transition { _ -> copy_at(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, 0) }
+        transition { _ -> copy_at(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, 0, directory) }
     }
-    state copy_at(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], index: u64) -> ProjectFileSave
+    state copy_at(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], index: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256;
     {
-        let source_len: u64 = self.project_items[position].project_item_ref.project_item_path_len;
+        let source_len: u64 = project.project_items[position].project_item_ref.project_item_path_len;
         transition index < source_len && index < 512 {
-            true -> copy_byte(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, index)
-            _ -> path_bound(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, index)
+            true -> copy_byte(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, index, directory)
+            _ -> path_bound(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, index, directory)
         }
     }
     // The stored path's length must fit the 512 carrier — the dirfd
     // rel-arg is a subslice of it. Items with longer stored paths skip
     // (the carrier bound, not an upstream cap).
-    state path_bound(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64) -> ProjectFileSave
+    state path_bound(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256;
     {
         transition path_len <= 512 {
-            true -> prefix(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, 0)
-            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+            true -> prefix(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, 0, directory)
+            _ -> next(project, items_root, root_len, items_fd, save_even_if_unchanged, position, directory)
         }
     }
-    state copy_byte(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], index: u64) -> ProjectFileSave
+    state copy_byte(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], index: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && index < 512;
     {
         let mut carried: [u8; 512] = path_buf;
-        carried[index] = self.project_items[position].project_item_ref.project_item_path[index];
+        carried[index] = project.project_items[position].project_item_ref.project_item_path[index];
         let next: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> copy_at(items_root, root_len, items_fd, save_even_if_unchanged, position, carried, next) }
+        transition { _ -> copy_at(project, items_root, root_len, items_fd, save_even_if_unchanged, position, carried, next, directory) }
     }
     // The stored item path must sit under `<directory>/project_items/` —
     // the dirfd seam only reaches there. An item outside the root skips
     // (named deviation vs upstream, whose absolute paths always resolve —
     // the boundary exposes no plain-bytes open/stat for them).
-    state prefix(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, index: u64) -> ProjectFileSave
+    state prefix(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, index: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && path_len <= 512;
     {
         transition index < root_len && index < 512 {
-            true -> prefix_byte(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, index)
-            _ -> root_edge(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len)
+            true -> prefix_byte(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, index, directory)
+            _ -> root_edge(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, directory)
         }
     }
-    state prefix_byte(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, index: u64) -> ProjectFileSave
+    state prefix_byte(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, index: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && path_len <= 512 && index < 512;
     {
         transition index < path_len && path_buf[index] == items_root[index] {
-            true -> prefix(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
-            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+            true -> prefix(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, directory)
+            _ -> next(project, items_root, root_len, items_fd, save_even_if_unchanged, position, directory)
         }
     }
     // `index == root_len` consumed the prefix; the stored path's next
     // byte must be the separator — the rel arg is the tail past it.
-    state root_edge(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64) -> ProjectFileSave
+    state root_edge(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && path_len <= 512;
     {
         let rel_start: u64 = ((root_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         transition rel_start <= path_len && root_len < path_len && path_buf[root_len] == 47 {
-            true -> probe(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start)
-            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+            true -> probe(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, directory)
+            _ -> next(project, items_root, root_len, items_fd, save_even_if_unchanged, position, directory)
         }
     }
     // Upstream's `if project_item_path.is_file()` gate: probe the fd
     // then fstat it — only regular files reach the item's save arm.
-    state probe(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64) -> ProjectFileSave
+    state probe(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
     {
         let fd: i32 = FilesystemHost::open_at(items_fd, &path_buf[rel_start..path_len], 0);
         transition fd >= 0 {
-            true -> file_kind(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, fd)
-            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+            true -> file_kind(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, fd, directory)
+            _ -> next(project, items_root, root_len, items_fd, save_even_if_unchanged, position, directory)
         }
     }
-    state file_kind(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, fd: i32) -> ProjectFileSave
+    state file_kind(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, fd: i32, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
     {
         let mut stat_buf: [u8; 144];
         let rc: i32 = FilesystemHost::read_file_metadata(fd, &mut stat_buf);
         let closed: i32 = FilesystemHost::close(fd);
         transition rc >= 0 {
-            true -> mode(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, stat_buf)
-            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+            true -> mode(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, stat_buf, directory)
+            _ -> next(project, items_root, root_len, items_fd, save_even_if_unchanged, position, directory)
         }
     }
-    state mode(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, stat_buf: [u8; 144]) -> ProjectFileSave
+    state mode(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, stat_buf: [u8; 144], directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
     {
         let mode: u32 = ((stat_buf[24] as u32 in Wrapping)
@@ -488,28 +488,28 @@ invokes FilesystemHost;
             | (((stat_buf[26] as u32 in Wrapping)) << 16)
             | (((stat_buf[27] as u32 in Wrapping)) << 24)) as u32;
         transition (mode & 61440) == 32768 {
-            true -> store(items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start)
-            _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position)
+            true -> store(project, items_root, root_len, items_fd, save_even_if_unchanged, position, path_buf, path_len, rel_start, directory)
+            _ -> next(project, items_root, root_len, items_fd, save_even_if_unchanged, position, directory)
         }
     }
     // Upstream `project_item.save_to_path(project_item_path, ...)`,
     // spelled `save_at` against the items-root fd; per-item failures
     // continue without logging (upstream's log::error arm).
-    state store(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64) -> ProjectFileSave
+    state store(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, path_buf: [u8; 512], path_len: u64, rel_start: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256 && path_len <= 512 && rel_start <= path_len;
     {
-        let item_saved: ProjectFileSave = self.project_items[position].project_item.save_at(
+        let item_saved: ProjectFileSave = ProjectItem::save_at(&mut project.project_items[position].project_item, 
             items_fd,
             &path_buf[rel_start..path_len],
             &path_buf[0..path_len],
             save_even_if_unchanged);
-        transition { _ -> next(items_root, root_len, items_fd, save_even_if_unchanged, position) }
+        transition { _ -> next(project, items_root, root_len, items_fd, save_even_if_unchanged, position, directory) }
     }
-    state next(&mut self, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64) -> ProjectFileSave
+    state next(project: &mut Project, items_root: [u8; 512], root_len: u64, items_fd: i32, save_even_if_unchanged: bool, position: u64, directory: &[u8] in Path) -> ProjectFileSave
         requires root_len <= 512 && position < 256;
     {
         let advanced: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> items(items_root, root_len, items_fd, save_even_if_unchanged, advanced) }
+        transition { _ -> items(project, items_root, root_len, items_fd, save_even_if_unchanged, advanced, directory) }
     }
 }
 
@@ -585,7 +585,7 @@ invokes FilesystemHost;
         let pair: ProjectItemPair = ProjectItemPair::new(pair_ref, item);
         let root_ref: ProjectItemRef = ProjectItemRef::new(&root_path[0..root_len]);
         carried.project = Project::new(project_info, root_ref);
-        let inserted: bool = carried.project.insert_project_item(pair);
+        let inserted: bool = Project::insert_project_item(&mut carried.project, pair);
         carried.pending_paths[0] = root_path;
         carried.pending_lens[0] = root_len;
         carried.pending_fds[0] = root_fd;
@@ -875,7 +875,7 @@ invokes FilesystemHost;
         let child_ref: ProjectItemRef = ProjectItemRef::new(child_view);
         let child_item: ProjectItem = ProjectItemTypeDirectory::new_project_item(&child_ref);
         let pair: ProjectItemPair = ProjectItemPair::new(child_ref, child_item);
-        let inserted: bool = carried.project.insert_project_item(pair);
+        let inserted: bool = Project::insert_project_item(&mut carried.project, pair);
         transition carried.pending_count < 64 {
             true -> push(carried, top, child_len, child_fd)
             _ -> skip_gate(carried, top, child_fd)
@@ -907,7 +907,7 @@ invokes FilesystemHost;
     {
         let mut carried: ProjectLoadContext = context;
         let mut project_item: ProjectItem = ProjectItem::default();
-        let ok: bool = project_item.fill_and_decode(child_fd);
+        let ok: bool = ProjectItem::fill_and_decode(&mut project_item, child_fd);
         let closed: i32 = FilesystemHost::close(child_fd);
         transition ok {
             true -> insert_item(carried, top, child_len, project_item)
@@ -921,7 +921,7 @@ invokes FilesystemHost;
         let child_view: &[u8] = &carried.pending_child[0..child_len];
         let item_ref: ProjectItemRef = ProjectItemRef::new(child_view);
         let pair: ProjectItemPair = ProjectItemPair::new(item_ref, project_item);
-        let inserted: bool = carried.project.insert_project_item(pair);
+        let inserted: bool = Project::insert_project_item(&mut carried.project, pair);
         transition carried.pending_count <= 64 {
             true -> advance(carried, top)
             _ -> (ProjectLoad::Refused)
@@ -936,7 +936,7 @@ invokes FilesystemHost;
     }
     state finish(context: ProjectLoadContext) -> ProjectLoad {
         let mut carried: ProjectLoadContext = context;
-        carried.project.set_has_unsaved_changes(false);
+        Project::set_has_unsaved_changes(&mut carried.project, false);
         (ProjectLoad::Loaded { project: carried.project })
     }
 }
