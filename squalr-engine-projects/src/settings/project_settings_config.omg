@@ -1,6 +1,12 @@
 module src::settings::project_settings_config;
 
 use squalr_engine_api::src::structures::settings::project_settings::ProjectSettings;
+use src::project::serialization::project_file_codec::ProjectFileReader;
+use src::project::serialization::project_file_codec::ProjectFileWriter;
+use src::project::serialization::project_file_codec_types::decode_project_settings;
+use src::project::serialization::project_file_codec_types::encode_project_settings;
+use src::project::serialization::project_serialization::create_dir_all;
+use omega_language_std::filesystem_host;
 
 // Port of settings/project_settings_config.rs — the settings record plus
 // its on-disk path, instance-carried. Upstream keeps one process-global
@@ -8,11 +14,11 @@ use squalr_engine_api::src::structures::settings::project_settings::ProjectSetti
 // the config in the caller's state instead — named deviation (no static
 // mutable storage, and callers thread the instance explicitly).
 //
-// Deferrals, all downstream of the serde_json-equivalent project-file
-// codec (TASKS.md PROJECT-SERIALIZATION): the config-file read + parse
-// inside upstream `new`, and `save_config`'s pretty-JSON write — the
-// warn-and-default arms that make a corrupt or unreadable file fall back
-// are part of that leg and land with it.
+// The config file persists through the project-file codec (the recorded
+// serde_json deviation): `new` reads + parses when the file exists and
+// falls back to defaults on any failure — upstream's warn-and-default
+// arm, minus the warn (no logger in this package). `save_config` writes
+// the encoded record on every setter, upstream's post-mutation flush.
 //
 // Host-facility deviations: upstream `default_projects_root` prefers
 // `directories::UserDirs` documents/Squalr and `default_config_path`
@@ -26,15 +32,68 @@ pub data ProjectSettingsConfig {
     config_file_len: u64;
 }
 
-// Upstream `new` minus the file-load branch: defaults plus the resolved
-// config path. The read+parse arm is the named codec blocker above.
-pub machine ProjectSettingsConfig::new() -> ProjectSettingsConfig {
+// Upstream `new` — resolve the config path, then read + parse it when it
+// exists; unreadable or undecodable content falls back to defaults.
+// Deviation: `new` takes the config path (`&[u8] in Path` — upstream's
+// fixed `Self::config_file_path()`) rather than storing it first, so the
+// callsite grants the Path domain — a stored field can't re-prove it
+// (a literal like "./project_settings.json" satisfies it directly).
+pub linux_x86_64 machine ProjectSettingsConfig::new(config_file: &[u8] in Path) -> ProjectSettingsConfig
+reaches FilesystemHost
+invokes FilesystemHost;
+{
     let mut created: ProjectSettingsConfig = ProjectSettingsConfig {
-        config: ProjectSettings::default(),
+        config: ProjectSettingsConfig::default_project_settings(),
         config_file_len: 0,
     };
-    created.set_config_file(ProjectSettingsConfig::default_config_path());
-    (created)
+    created.set_config_file(config_file);
+    transition { _ -> read_config(created, config_file) }
+    state read_config(created: ProjectSettingsConfig, config_file: &[u8] in Path) -> ProjectSettingsConfig {
+        let mut carried: ProjectSettingsConfig = created;
+        transition { _ -> open(carried, config_file) }
+    }
+    state open(created: ProjectSettingsConfig, config_file: &[u8] in Path) -> ProjectSettingsConfig {
+        let mut carried: ProjectSettingsConfig = created;
+        let fd: i32 = FilesystemHost::open(config_file, 0);
+        transition fd >= 0 {
+            true -> fill(carried, fd)
+            _ -> (carried)
+        }
+    }
+    state fill(created: ProjectSettingsConfig, fd: i32) -> ProjectSettingsConfig {
+        let mut carried: ProjectSettingsConfig = created;
+        let mut reader: ProjectFileReader = ProjectFileReader::default();
+        let got: i64 = reader.fill_from_fd(fd);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition got > 0 {
+            true -> decode(carried, reader)
+            _ -> (carried)
+        }
+    }
+    state decode(created: ProjectSettingsConfig, reader: ProjectFileReader) -> ProjectSettingsConfig {
+        let mut carried: ProjectSettingsConfig = created;
+        let mut carried_reader: ProjectFileReader = reader;
+        let header_ok: bool = carried_reader.check_header();
+        transition header_ok {
+            true -> body(carried, carried_reader)
+            _ -> (carried)
+        }
+    }
+    state body(created: ProjectSettingsConfig, reader: ProjectFileReader) -> ProjectSettingsConfig {
+        let mut carried: ProjectSettingsConfig = created;
+        let mut carried_reader: ProjectFileReader = reader;
+        let mut decoded: ProjectSettings = ProjectSettings::default();
+        let body_ok: bool = decode_project_settings(&mut carried_reader, &mut decoded);
+        transition body_ok {
+            true -> accept(carried, decoded)
+            _ -> (carried)
+        }
+    }
+    state accept(created: ProjectSettingsConfig, decoded: ProjectSettings) -> ProjectSettingsConfig {
+        let mut carried: ProjectSettingsConfig = created;
+        carried.config = decoded;
+        (carried)
+    }
 }
 
 // Upstream `default_config_path` — "./project_settings.json" (see the
@@ -63,20 +122,22 @@ pub machine ProjectSettingsConfig::get_config_file(&self) -> &[u8] {
     }
 }
 
-pub machine ProjectSettingsConfig::set_config_file(&mut self, config_file: &[u8]) {
+// The path grant is callsite-owned: param carries the domain so callers
+// supply only provable paths; the stored bytes are the plain copy.
+pub machine ProjectSettingsConfig::set_config_file(&mut self, config_file: &[u8] in Path) {
     self.config_file_len = 0;
     transition {
         _ -> copy(config_file, 0)
     }
-    state copy(&mut self, config_file: &[u8], position: u64) {
+    state copy(&mut self, config_file: &[u8] in Path, position: u64) {
         transition position < config_file.len && position < 512 {
             true -> store(config_file, position)
             false -> done()
             _ -> done()
         }
     }
-    state store(&mut self, config_file: &[u8], position: u64)
-        requires position < 512;
+    state store(&mut self, config_file: &[u8] in Path, position: u64)
+        requires position < 512 && position < config_file.len;
     {
         self.config_file[position] = config_file[position];
         self.config_file_len = ((self.config_file_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
@@ -93,11 +154,17 @@ pub machine ProjectSettingsConfig::get_projects_root(&self) -> &[u8] {
     (self.config.get_projects_root())
 }
 
-// Upstream `set_projects_root` — writes the root, then `save_config`;
-// the save is the codec deferral in the header (the mutation itself
-// preserves upstream semantics).
-pub machine ProjectSettingsConfig::set_projects_root(&mut self, projects_root: &[u8]) {
+// Upstream `set_projects_root` — writes the root, then `save_config`
+// (upstream flushes the whole config on every setter).
+// Deviation: `config_file` re-supplied at the callsite (upstream reads
+// the instance's stored path) so the flush's `create` sees a domained
+// arg — stored bytes cannot re-prove `Path`.
+pub linux_x86_64 machine ProjectSettingsConfig::set_projects_root(&mut self, projects_root: &[u8], config_file: &[u8] in Path)
+reaches FilesystemHost
+invokes FilesystemHost;
+{
     self.config.set_projects_root(projects_root);
+    self.save_config(config_file);
 }
 
 // Upstream `get_project_update_interval`.
@@ -105,8 +172,75 @@ pub machine ProjectSettingsConfig::get_project_update_interval(&self) -> u64 {
     (self.config.get_project_update_interval_ms())
 }
 
-// Upstream `set_project_update_interval` — same save deferral as
-// `set_projects_root`.
-pub machine ProjectSettingsConfig::set_project_update_interval(&mut self, project_update_interval_ms: u64) {
+// Upstream `set_project_update_interval` — same post-set `save_config`.
+pub linux_x86_64 machine ProjectSettingsConfig::set_project_update_interval(&mut self, project_update_interval_ms: u64, config_file: &[u8] in Path)
+reaches FilesystemHost
+invokes FilesystemHost;
+{
     self.config.set_project_update_interval_ms(project_update_interval_ms);
+    self.save_config(config_file);
+}
+
+// Upstream `save_config` — `fs::create_dir_all` on the parent (the path
+// up to the final separator, when one exists — "./project_settings.json"
+// resolves "."), then the encoded record written over the file.
+// Failures are silent like upstream's warn-then-return arms.
+// The param carries the domain like `new` — `config_file[0..last_sep]`
+// inherits it into `create_dir_all`, the leaf into `create`.
+pub linux_x86_64 machine ProjectSettingsConfig::save_config(&mut self, config_file: &[u8] in Path)
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition { _ -> parent_dir(config_file, 0, 0) }
+    // Find the last '/' in config_file.
+    state parent_dir(&mut self, config_file: &[u8] in Path, index: u64, last_sep: u64) {
+        transition index < config_file.len {
+            true -> parent_at(config_file, index, last_sep)
+            _ -> parent_make(config_file, last_sep)
+        }
+    }
+    state parent_at(&mut self, config_file: &[u8] in Path, index: u64, last_sep: u64)
+        requires index < config_file.len;
+    {
+        let next: u64 = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition config_file[index] == 47 {
+            true -> parent_dir(config_file, next, index)
+            _ -> parent_dir(config_file, next, last_sep)
+        }
+    }
+    state parent_make(&mut self, config_file: &[u8] in Path, last_sep: u64) {
+        transition last_sep > 0 && last_sep <= config_file.len {
+            true -> parent_do(config_file, last_sep)
+            _ -> write_file(config_file)
+        }
+    }
+    state parent_do(&mut self, config_file: &[u8] in Path, last_sep: u64)
+        requires last_sep <= config_file.len;
+    {
+        let made: bool = create_dir_all(&config_file[0..last_sep]);
+        transition { _ -> write_file(config_file) }
+    }
+    state write_file(&mut self, config_file: &[u8] in Path) {
+        let mut writer: ProjectFileWriter = ProjectFileWriter::new();
+        let head_ok: bool = writer.put_header();
+        let body_ok: bool = encode_project_settings(&mut writer, &self.config);
+        transition head_ok && body_ok {
+            true -> open_file(config_file, writer)
+            _ -> stop()
+        }
+    }
+    state open_file(&mut self, config_file: &[u8] in Path, writer: ProjectFileWriter) {
+        let fd: i32 = FilesystemHost::create(config_file, 438);
+        transition fd >= 0 {
+            true -> write(fd, writer)
+            _ -> stop()
+        }
+    }
+    state stop(&mut self) {
+    }
+    state write(&mut self, fd: i32, writer: ProjectFileWriter) {
+        let mut carried: ProjectFileWriter = writer;
+        let put: i64 = carried.flush_to_fd(fd);
+        let closed: i32 = FilesystemHost::close(fd);
+    }
 }
