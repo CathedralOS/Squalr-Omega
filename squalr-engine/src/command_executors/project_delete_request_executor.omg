@@ -1,0 +1,168 @@
+module src::command_executors::project_delete_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project::delete::project_delete_request::ProjectDeleteRequest;
+use squalr_engine_api::src::commands::project::delete::project_delete_response::ProjectDeleteResponse;
+use squalr_engine_api::src::structures::processes::process_icon::ProcessIcon;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_manifest::ProjectManifest;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_info_serialization;
+use squalr_engine_projects::src::project::serialization::project_info_serialization::ProjectInfoLoad;
+use squalr_engine_projects::src::settings::project_settings_config::ProjectSettingsConfig;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+// Port of command_executors/project/delete/project_delete_request_executor.rs —
+// resolve the directory (explicit path, else projects_root + name), verify
+// it exists, best-effort load its info for the deleted notification, then
+// remove the tree. Upstream's `exists()`/`remove_dir_all` respell onto the
+// runtime-path seams (path_exists / remove_tree).
+pub data ProjectDeleteRequestExecutor {}
+
+pub machine ProjectDeleteRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_delete_request: &ProjectDeleteRequest
+) -> ProjectDeleteResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition ProjectDeleteRequest::has_project_directory_path(project_delete_request) {
+        true -> explicit(engine_unprivileged_state, project_delete_request)
+        _ -> named(engine_unprivileged_state, project_delete_request)
+    }
+
+    state explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, project_delete_request: &ProjectDeleteRequest) -> ProjectDeleteResponse {
+        let path: &[u8] = ProjectDeleteRequest::get_project_directory_path(project_delete_request);
+        let mut chosen: [u8; 512];
+        let chosen_len: u64 = path.len;
+        transition chosen_len > 0 && chosen_len <= 512 {
+            true -> copy_explicit(engine_unprivileged_state, path, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    state copy_explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, path: &[u8], mut chosen: [u8; 512], chosen_len: u64) -> ProjectDeleteResponse
+        requires chosen_len <= 512;
+    {
+        transition { _ -> copy_explicit_byte(engine_unprivileged_state, path, chosen, chosen_len, 0) }
+    }
+    state copy_explicit_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, path: &[u8], mut chosen: [u8; 512], chosen_len: u64, position: u64) -> ProjectDeleteResponse
+        requires chosen_len <= 512;
+    {
+        transition position < path.len && position < 512 {
+            true -> write_explicit(engine_unprivileged_state, path, chosen, chosen_len, position)
+            _ -> exists(engine_unprivileged_state, chosen, chosen_len)
+        }
+    }
+    state write_explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, path: &[u8], mut chosen: [u8; 512], chosen_len: u64, position: u64) -> ProjectDeleteResponse
+        requires chosen_len <= 512 && position < path.len && position < 512;
+    {
+        chosen[position] = path[position];
+        transition { _ -> copy_explicit_byte(engine_unprivileged_state, path, chosen, chosen_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state named(engine_unprivileged_state: &mut EngineUnprivilegedState, project_delete_request: &ProjectDeleteRequest) -> ProjectDeleteResponse {
+        transition ProjectDeleteRequest::has_project_name(project_delete_request) {
+            true -> join(engine_unprivileged_state, project_delete_request)
+            _ -> refused()
+        }
+    }
+
+    state join(engine_unprivileged_state: &mut EngineUnprivilegedState, project_delete_request: &ProjectDeleteRequest) -> ProjectDeleteResponse {
+        let mut chosen: [u8; 512];
+        _ = EngineUnprivilegedState::get_or_init_project_settings_config(engine_unprivileged_state);
+        let settings_config: &ProjectSettingsConfig = EngineUnprivilegedState::get_project_settings_config(engine_unprivileged_state);
+        let projects_root: &[u8] = ProjectSettingsConfig::get_projects_root(settings_config);
+        let project_name: &[u8] = ProjectDeleteRequest::get_project_name(project_delete_request);
+        let chosen_len: u64 = FileSystemUtils::join_path(projects_root, project_name, &mut chosen);
+        transition chosen_len > 0 && chosen_len <= 512 {
+            true -> exists(engine_unprivileged_state, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `project_directory_path.exists()` — runtime-path probe.
+    state exists(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectDeleteResponse
+        requires chosen_len <= 512;
+    {
+        transition FileSystemUtils::path_exists(&chosen[0..chosen_len]) {
+            true -> load_info(engine_unprivileged_state, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `ProjectInfo::load_from_path(dir.join(PROJECT_FILE))
+    // .unwrap_or_else(ProjectInfo::new(dir/PROJECT_FILE, None, default
+    // manifest))` — the deleted notification carries the stored info when
+    // decodable, else a fresh info named for the directory.
+    state load_info(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectDeleteResponse
+        requires chosen_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&chosen[0..chosen_len], 0);
+        transition dir_fd >= 0 {
+            true -> probe_info(engine_unprivileged_state, chosen, chosen_len, dir_fd)
+            _ -> fallback_info(engine_unprivileged_state, chosen, chosen_len)
+        }
+    }
+
+    state probe_info(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, dir_fd: i32) -> ProjectDeleteResponse
+        requires chosen_len <= 512;
+    {
+        let loaded: ProjectInfoLoad = ProjectInfo::load_at(dir_fd, &chosen[0..chosen_len]);
+        _ = FilesystemHost::close(dir_fd);
+        transition loaded {
+            ProjectInfoLoad::Loaded { project_info } -> remove(engine_unprivileged_state, chosen, chosen_len, project_info)
+            _ -> fallback_info(engine_unprivileged_state, chosen, chosen_len)
+        }
+    }
+
+    state fallback_info(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectDeleteResponse
+        requires chosen_len <= 512;
+    {
+        let mut file_path: [u8; 512];
+        let file_len: u64 = FileSystemUtils::join_path(&chosen[0..chosen_len], "project.json", &mut file_path);
+        transition file_len > 0 && file_len <= 512 {
+            true -> built_info(engine_unprivileged_state, chosen, chosen_len, file_path, file_len)
+            _ -> refused()
+        }
+    }
+
+    state built_info(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, file_path: [u8; 512], file_len: u64) -> ProjectDeleteResponse
+        requires chosen_len <= 512 && file_len <= 512;
+    {
+        let default_icon: ProcessIcon = ProcessIcon::default();
+        let manifest: ProjectManifest = ProjectManifest::default();
+        let mut project_info: ProjectInfo = ProjectInfo::new(&file_path[0..file_len], &default_icon, manifest);
+        ProjectInfo::clear_project_icon_rgba(&mut project_info);
+        transition { _ -> remove(engine_unprivileged_state, chosen, chosen_len, project_info) }
+    }
+
+    // Upstream `fs::remove_dir_all` — the port's remove_tree walks the
+    // dirfd seam (same postcondition: the tree is gone on success).
+    state remove(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, deleted_project_info: ProjectInfo) -> ProjectDeleteResponse
+        requires chosen_len <= 512;
+    {
+        transition FileSystemUtils::remove_tree(&chosen[0..chosen_len]) {
+            true -> notify(engine_unprivileged_state, deleted_project_info)
+            _ -> refused()
+        }
+    }
+
+    state notify(engine_unprivileged_state: &mut EngineUnprivilegedState, deleted_project_info: ProjectInfo) -> ProjectDeleteResponse {
+        EngineUnprivilegedState::notify_project_deleted(engine_unprivileged_state, &deleted_project_info);
+        let mut response: ProjectDeleteResponse = ProjectDeleteResponse::new();
+        ProjectDeleteResponse::set_success(&mut response, true);
+        (response)
+    }
+
+    state refused() -> ProjectDeleteResponse {
+        (ProjectDeleteResponse::new())
+    }
+}

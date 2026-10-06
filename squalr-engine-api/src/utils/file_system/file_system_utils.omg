@@ -1,0 +1,1879 @@
+module src::utils::file_system::file_system_utils;
+
+use omega_language_std::filesystem_host;
+
+// Port of utils/file_system/file_system_utils.rs plus the plain-name
+// directory primitives the executors need. Upstream's free `std::fs` calls
+// do not exist port-side; executor-supplied paths arrive as PLAIN runtime
+// bytes which cannot mint the `Path` domain — every op here therefore runs
+// on the boundary's trusted-name seam (`open_at` dirfd + relative name,
+// `create_dir_name`, `unlink_at`, `remove_name`, `remove_dir_name`,
+// `read_dir` + `read_file_metadata` on descriptors), mirroring upstream
+// `openat`/`unlinkat`/`mkdir`/`rmdir` semantics exactly. `open_path` joins
+// the root: absolute paths resolve against an `open("/")` descriptor,
+// relative ones against `open(".")` — the OS/vfs does the path join, no
+// Omega-side string concat is needed.
+//
+// Deviation: upstream `fs::rename`/`fs::remove_dir_all`/`fs::copy`/`fs::create_dir_all`
+// have no plain-name twins in the host surface; they port as
+// `rename_tree`/`remove_tree`/`copy_file`/`create_dir_all_path` —
+// `rename_tree` is a copy-then-delete walk and loses upstream's atomic
+// rename (documented; the host exposes no `renameat`).
+pub data FileSystemUtils {}
+
+// Walk context shared by the recursive directory ops — the same bounded
+// pending-stack shape as the project load walk (64 dir depth, 512-byte
+// dirent buffer, 256-byte entry names).
+pub data FileTreeWalk {
+    pending_fds: [i32; 64];
+    pending_names: [[u8; 256]; 64];
+    pending_name_lens: [u64; 64];
+    // rename_tree's paired destination — one fd + full path per src dir.
+    pending_dst_fds: [i32; 64];
+    pending_dst_paths: [[u8; 512]; 64];
+    pending_dst_lens: [u64; 64];
+    pending_count: u64;
+    dir_buf: [u8; 512];
+    dir_off: u64;
+    dir_total: i64;
+    dir_position: i64;
+    entry_name: [u8; 256];
+    entry_name_len: u64;
+    stat_buf: [u8; 144];
+    stat_rc: i32;
+    io_buf: [u8; 512];
+    child_path: [u8; 512];
+    child_path_len: u64;
+}
+
+// Array fields zero-fill on construction (partial literal).
+pub machine FileTreeWalk::default() -> FileTreeWalk {
+    (FileTreeWalk {
+        pending_count: 0,
+        dir_off: 0,
+        dir_total: 0,
+        dir_position: 0,
+        entry_name_len: 0,
+        stat_rc: 0,
+        child_path_len: 0,
+    })
+}
+
+// Upstream `Path::is_absolute` OR windows drive form — kept verbatim.
+pub machine FileSystemUtils::is_cross_platform_absolute_path(path: &[u8]) -> bool {
+    (FileSystemUtils::is_absolute_bytes(path))
+}
+
+// Port of `path.is_absolute()` plus the windows drive check on the plain
+// bytes (upstream operates on `Path`; both halves reduce to byte scans).
+pub machine FileSystemUtils::is_absolute_bytes(path: &[u8]) -> bool {
+    transition path.len >= 1 {
+        true -> first(path)
+        false -> (false)
+        _ -> (false)
+    }
+    state first(path: &[u8]) -> bool {
+        transition path[0] == 47 || path[0] == 92 {
+            true -> (true)
+            false -> drive(path)
+            _ -> drive(path)
+        }
+    }
+    state drive(path: &[u8]) -> bool {
+        transition path.len > 2 {
+            true -> drive_check(path[0], path[1], path[2])
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    // requires-position `.len` member ops never resolve a CheckedOperator
+    // occurrence — the length guard lives in the caller's scrutinee and
+    // the checked bytes arrive as params.
+    state drive_check(first_byte: u8, second_byte: u8, third_byte: u8) -> bool {
+        let is_letter: bool = (first_byte >= 65 && first_byte <= 90) || (first_byte >= 97 && first_byte <= 122);
+        let is_drive: bool = is_letter && second_byte == 58 && (third_byte == 47 || third_byte == 92);
+        (is_drive)
+    }
+}
+
+// `std::fs::OpenOptions::open` on plain path bytes — open the path's root
+// anchor ("/" for absolute, "." for relative) then `open_at` the remaining
+// components in one call (`openat` accepts multi-component relative names).
+// Returns the descriptor, or -1.
+pub linux_x86_64 machine FileSystemUtils::open_path(path: &[u8], flags: i32) -> i32
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let absolute: bool = FileSystemUtils::is_absolute_bytes(path);
+    transition path.len >= 1 && absolute {
+        true -> anchored(path, flags)
+        false -> relative(path, flags)
+        _ -> (-1)
+    }
+    state anchored(path: &[u8], flags: i32) -> i32 {
+        let root_fd: i32 = FilesystemHost::open("/", 0);
+        transition root_fd >= 0 {
+            true -> at_root(root_fd, path, flags)
+            false -> (-1)
+            _ -> (-1)
+        }
+    }
+    state at_root(root_fd: i32, path: &[u8], flags: i32) -> i32 {
+        let fd: i32 = FilesystemHost::open_at(root_fd, path[1..path.len], flags);
+        _ = FilesystemHost::close(root_fd);
+        (fd)
+    }
+    state relative(path: &[u8], flags: i32) -> i32 {
+        let cwd_fd: i32 = FilesystemHost::open(".", 0);
+        transition cwd_fd >= 0 {
+            true -> at_cwd(cwd_fd, path, flags)
+            false -> (-1)
+            _ -> (-1)
+        }
+    }
+    state at_cwd(cwd_fd: i32, path: &[u8], flags: i32) -> i32 {
+        let fd: i32 = FilesystemHost::open_at(cwd_fd, path[0..path.len], flags);
+        _ = FilesystemHost::close(cwd_fd);
+        (fd)
+    }
+}
+
+// `fs::create_dir_all` on a plain path — create each '/'-delimited prefix;
+// an existing component (-17 EEXIST or a non-negative result that turned
+// out a dir) is treated as success exactly like the project codec's own
+// `create_dir_all`.
+pub linux_x86_64 machine FileSystemUtils::create_dir_all_path(path: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition {
+        _ -> walk(path, 0)
+    }
+    state walk(path: &[u8], position: u64) -> bool {
+        transition position < path.len {
+            true -> scan(path, position)
+            false -> make(path, path.len)
+            _ -> (false)
+        }
+    }
+    state scan(path: &[u8], position: u64) -> bool
+        requires position < path.len;
+    {
+        transition path[position] == 47 {
+            true -> leaf(path, position)
+            false -> walk(path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    // Hit a separator — mkdir the prefix, then continue (skip the first
+    // byte so a leading '/' does not mkdir the empty prefix).
+    state leaf(path: &[u8], position: u64) -> bool
+        requires position < path.len;
+    {
+        transition position > 1 {
+            true -> make_then_walk(path, position)
+            false -> walk(path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state make_then_walk(path: &[u8], position: u64) -> bool
+        requires position < path.len && position > 1;
+    {
+        _ = FilesystemHost::create_dir_name(path[0..position], 493);
+        transition {
+            _ -> walk(path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state make(path: &[u8], end: u64) -> bool {
+        transition end <= path.len && end > 0 {
+            true -> make_it(path, end)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state make_it(path: &[u8], end: u64) -> bool
+        requires end <= path.len;
+    {
+        _ = FilesystemHost::create_dir_name(path[0..end], 493);
+        (true)
+    }
+}
+
+// `Path::exists` on plain bytes — an O_RDONLY open probe.
+pub linux_x86_64 machine FileSystemUtils::path_exists(path: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let fd: i32 = FileSystemUtils::open_path(path, 0);
+    transition fd >= 0 {
+        true -> yes(fd)
+        false -> (false)
+        _ -> (false)
+    }
+    state yes(fd: i32) -> bool {
+        _ = FilesystemHost::close(fd);
+        (true)
+    }
+}
+
+// `Path::is_dir` on runtime path bytes — open + fstat + S_IFDIR kind
+// (st_mode little-endian u32 at stat bytes 24..28, kind bits 61440).
+pub linux_x86_64 machine FileSystemUtils::is_dir_path(path: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let fd: i32 = FileSystemUtils::open_path(path, 0);
+    transition fd >= 0 {
+        true -> stat(fd)
+        false -> (false)
+        _ -> (false)
+    }
+    state stat(fd: i32) -> bool {
+        let mut stat_buf: [u8; 144];
+        let read_rc: i64 = (FilesystemHost::read_file_metadata(fd, &mut stat_buf)) as i64;
+        transition read_rc == 0 {
+            true -> kind(fd, &stat_buf)
+            false -> fail(fd)
+            _ -> fail(fd)
+        }
+    }
+    state kind(fd: i32, stat_buf: &[u8; 144]) -> bool {
+        let mode_lo: u32 = stat_buf[24] as u32;
+        let mode_b1: u32 = stat_buf[25] as u32;
+        let mode_b2: u32 = stat_buf[26] as u32;
+        let mode_b3: u32 = stat_buf[27] as u32;
+        let mode_b1s: u32 = ((mode_b1 as u32 in Wrapping) * (256 as u32 in Wrapping)) as u32;
+        let mode_b2s: u32 = ((mode_b2 as u32 in Wrapping) * (65536 as u32 in Wrapping)) as u32;
+        let mode_b3s: u32 = ((mode_b3 as u32 in Wrapping) * (16777216 as u32 in Wrapping)) as u32;
+        let mode: u32 = ((mode_lo as u32 in Wrapping) + (mode_b1s as u32 in Wrapping) + (mode_b2s as u32 in Wrapping) + (mode_b3s as u32 in Wrapping)) as u32;
+        let mode_rem: u32 = ((mode as u32 in Wrapping) % (61440 as u32 in Wrapping)) as u32;
+        let kind: u32 = ((mode as u32 in Wrapping) - (mode_rem as u32 in Wrapping)) as u32;
+        _ = FilesystemHost::close(fd);
+        transition kind == 16384 {
+            true -> (true)
+            _ -> (false)
+        }
+    }
+    state fail(fd: i32) -> bool {
+        _ = FilesystemHost::close(fd);
+        (false)
+    }
+}
+
+// `read_dir().next().is_some()`-style emptiness probe used by
+// project create — opens the path (must exist and be a dir), drains the
+// first batch and reports whether any entry beyond "." / ".." appears.
+pub linux_x86_64 machine FileSystemUtils::dir_is_empty(path: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let fd: i32 = FileSystemUtils::open_path(path, 0);
+    transition fd >= 0 {
+        true -> read(fd)
+        false -> (false)
+        _ -> (false)
+    }
+    state read(fd: i32) -> bool {
+        let mut walk: FileTreeWalk = FileTreeWalk::default();
+        let got: i64 = FilesystemHost::read_dir(fd, &mut walk.dir_buf, 512, &mut walk.dir_position);
+        _ = FilesystemHost::close(fd);
+        transition got > 0 {
+            true -> scan_entries(&mut walk, got)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state scan_entries(walk: &mut FileTreeWalk, total: i64) -> bool {
+        transition {
+            _ -> entry(walk, total, 0)
+        }
+    }
+    state entry(walk: &mut FileTreeWalk, total: i64, off: u64) -> bool {
+        transition off < 508 && off <= 494 && (off as i64) < total {
+            true -> read_entry(walk, total, off)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state read_entry(walk: &mut FileTreeWalk, total: i64, off: u64) -> bool
+        requires off < 512 && off <= 494;
+    {
+        let index_operand_1: u64 = ((off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64;
+        let index_operand_2: u64 = ((off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64;
+        transition index_operand_1 < 512 && index_operand_2 < 512 {
+            true -> read_reclen(walk, total, off, index_operand_1, index_operand_2)
+            _ -> (false)
+        }
+    }
+    state read_reclen(walk: &mut FileTreeWalk, total: i64, off: u64, lo_index: u64, hi_index: u64) -> bool
+        requires off < 512 && off <= 494 && lo_index < 512 && hi_index < 512;
+    {
+        let reclen_lo: u64 = walk.dir_buf[lo_index] as u64;
+        let reclen_hi: u64 = walk.dir_buf[hi_index] as u64;
+        let reclen_hi_scaled: u64 = ((reclen_hi as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64;
+        let reclen: u64 = ((reclen_lo as u64 in Wrapping) + (reclen_hi_scaled as u64 in Wrapping)) as u64;
+        transition reclen >= 19 && reclen <= 512 {
+            true -> check_name(walk, total, off, reclen)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    // d_name @+19 — a "." / ".." entry skips to the next record; anything
+    // else means the directory is non-empty.
+    state check_name(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512;
+    {
+        let name_len: u64 = ((reclen as u64 in Wrapping) - (19 as u64 in Wrapping)) as u64;
+        transition ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256 {
+            true -> classify(walk, total, off, reclen, name_len)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state classify(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256;
+    {
+        transition name_len >= 1 {
+            true -> first_dot(walk, total, off, reclen, name_len)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state first_dot(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256 && name_len >= 1;
+    {
+        let index_operand_3: u64 = ((off as u64 in Wrapping) + (19 as u64 in Wrapping)) as u64;
+        transition index_operand_3 < 512 {
+            true -> first_dot_read(walk, total, off, reclen, name_len, index_operand_3)
+            _ -> (false)
+        }
+    }
+    state first_dot_read(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64, c1_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256 && name_len >= 1 && c1_index < 512;
+    {
+        let c1: u8 = walk.dir_buf[c1_index];
+        transition c1 == 46 {
+            true -> dot_len(walk, total, off, reclen, name_len)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state dot_len(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256;
+    {
+        transition name_len == 1 {
+            true -> entry(walk, total, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+            false -> second_dot(walk, total, off, reclen, name_len)
+            _ -> (false)
+        }
+    }
+    state second_dot(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256;
+    {
+        transition name_len == 2 {
+            true -> second_dot_read(walk, total, off, reclen, name_len)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state second_dot_read(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256 && name_len == 2;
+    {
+        let index_operand_5: u64 = ((off as u64 in Wrapping) + (20 as u64 in Wrapping)) as u64;
+        transition index_operand_5 < 512 {
+            true -> second_dot_read_byte(walk, total, off, reclen, name_len, index_operand_5)
+            _ -> (false)
+        }
+    }
+    state second_dot_read_byte(walk: &mut FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64, c2_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && name_len <= 256 && name_len == 2 && c2_index < 512;
+    {
+        let c2: u8 = walk.dir_buf[c2_index];
+        transition c2 == 46 {
+            true -> entry(walk, total, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// `fs::remove_dir_all` on plain bytes — iterative dirfd drain: directories
+// push their fd + leaf name; files unlink immediately; an emptied dir is
+// removed via `unlink_at(parent, name, 128)`; the root resolves its parent
+// by the last '/' split and unlinks there. Returns success.
+pub linux_x86_64 machine FileSystemUtils::remove_tree(path: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition path.len >= 1 && path.len <= 512 {
+        true -> open_root(path)
+        false -> (false)
+        _ -> (false)
+    }
+    state open_root(path: &[u8]) -> bool {
+        let fd: i32 = FileSystemUtils::open_path(path, 0);
+        transition fd >= 0 {
+            true -> push_root(path, fd)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state push_root(path: &[u8], fd: i32) -> bool {
+        let mut walk: FileTreeWalk = FileTreeWalk::default();
+        walk.pending_fds[0] = fd;
+        walk.pending_count = 1;
+        transition {
+            _ -> drain(&mut walk, path)
+        }
+    }
+    state drain(walk: &mut FileTreeWalk, path: &[u8]) -> bool {
+        transition walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> read_top(walk, path)
+            false -> root_out(walk, path)
+            _ -> (false)
+        }
+    }
+    state read_top(walk: &mut FileTreeWalk, path: &[u8]) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let index_operand_6: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_6 < 64 {
+            true -> read_top_go(walk, path, index_operand_6)
+            _ -> (false)
+        }
+    }
+    state read_top_go(walk: &mut FileTreeWalk, path: &[u8], top_index: u64) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64 && top_index < 64;
+    {
+        let top: i32 = walk.pending_fds[top_index];
+        walk.dir_off = 0;
+        walk.dir_total = FilesystemHost::read_dir(top, &mut walk.dir_buf, 512, &mut walk.dir_position);
+        transition walk.dir_total > 0 {
+            true -> entry(walk, path, 0)
+            false -> done_dir(walk, path)
+            _ -> (false)
+        }
+    }
+    state entry(walk: &mut FileTreeWalk, path: &[u8], off: u64) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        transition off < 508 && off <= 494 && (off as i64) < walk.dir_total {
+            true -> read_entry(walk, path, off)
+            false -> read_top(walk, path)
+            _ -> (false)
+        }
+    }
+    state read_entry(walk: &mut FileTreeWalk, path: &[u8], off: u64) -> bool
+        requires off < 512 && off <= 494 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let index_operand_7: u64 = ((off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64;
+        let index_operand_8: u64 = ((off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64;
+        transition index_operand_7 < 512 && index_operand_8 < 512 {
+            true -> read_reclen(walk, path, off, index_operand_7, index_operand_8)
+            _ -> (false)
+        }
+    }
+    state read_reclen(walk: &mut FileTreeWalk, path: &[u8], off: u64, lo_index: u64, hi_index: u64) -> bool
+        requires off < 512 && off <= 494 && walk.pending_count > 0 && walk.pending_count <= 64 && lo_index < 512 && hi_index < 512;
+    {
+        let reclen_lo: u64 = walk.dir_buf[lo_index] as u64;
+        let reclen_hi: u64 = walk.dir_buf[hi_index] as u64;
+        let reclen_hi_scaled: u64 = ((reclen_hi as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64;
+        let reclen: u64 = ((reclen_lo as u64 in Wrapping) + (reclen_hi_scaled as u64 in Wrapping)) as u64;
+        transition reclen >= 19 && reclen <= 512 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> entry_name(walk, path, off, reclen)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state entry_name(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let name_len: u64 = ((reclen as u64 in Wrapping) - (19 as u64 in Wrapping)) as u64;
+        transition name_len <= 256 && walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> copy_name(walk, path, off, reclen, name_len, 0)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state copy_name(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        transition position < name_len && position < 256 {
+            true -> copy_byte(walk, path, off, reclen, name_len, position)
+            false -> name_done(walk, path, off, reclen, name_len)
+            _ -> (false)
+        }
+    }
+    state copy_byte(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256 && position < 256 && position < name_len && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let at: u64 = ((off as u64 in Wrapping) + (19 as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition at < 512 {
+            true -> write_byte(walk, path, off, reclen, name_len, position, at)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state write_byte(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, position: u64, at: u64) -> bool
+        requires at < 512 && position < 256 && name_len <= 256 && off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        walk.entry_name[position] = walk.dir_buf[at];
+        transition {
+            _ -> copy_name(walk, path, off, reclen, name_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state name_done(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        walk.entry_name_len = name_len;
+        let is_dot: bool = name_len >= 1 && walk.entry_name[0] == 46 && (name_len == 1 || walk.entry_name[1] == 46);
+        transition is_dot && name_len <= 2 {
+            true -> entry(walk, path, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+            false -> stat_child(walk, path, off, reclen, name_len)
+            _ -> (false)
+        }
+    }
+    state stat_child(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        let index_operand_10: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_10 < 64 {
+            true -> stat_fd(walk, path, off, reclen, name_len, index_operand_10)
+            _ -> (false)
+        }
+    }
+    state stat_fd(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, top_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256 && top_index < 64;
+    {
+        let top: i32 = walk.pending_fds[top_index];
+        let child_fd: i32 = FilesystemHost::open_at(top, walk.entry_name[0..name_len], 0);
+        transition child_fd >= 0 {
+            true -> classify_child(walk, path, off, reclen, name_len, top, child_fd)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state classify_child(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, top: i32, child_fd: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        walk.stat_rc = (FilesystemHost::read_file_metadata(child_fd, &mut walk.stat_buf)) as i32;
+        _ = FilesystemHost::close(child_fd);
+        transition walk.stat_rc == 0 {
+            true -> kind_child(walk, path, off, reclen, name_len, top)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state kind_child(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        let mode_lo: u32 = walk.stat_buf[24] as u32;
+        let mode_b1: u32 = walk.stat_buf[25] as u32;
+        let mode_b2: u32 = walk.stat_buf[26] as u32;
+        let mode_b3: u32 = walk.stat_buf[27] as u32;
+        let mode_b1s: u32 = ((mode_b1 as u32 in Wrapping) * (256 as u32 in Wrapping)) as u32;
+        let mode_b2s: u32 = ((mode_b2 as u32 in Wrapping) * (65536 as u32 in Wrapping)) as u32;
+        let mode_b3s: u32 = ((mode_b3 as u32 in Wrapping) * (16777216 as u32 in Wrapping)) as u32;
+        let mode: u32 = ((mode_lo as u32 in Wrapping) + (mode_b1s as u32 in Wrapping) + (mode_b2s as u32 in Wrapping) + (mode_b3s as u32 in Wrapping)) as u32;
+        let mode_rem: u32 = ((mode as u32 in Wrapping) % (61440 as u32 in Wrapping)) as u32;
+        let kind: u32 = ((mode as u32 in Wrapping) - (mode_rem as u32 in Wrapping)) as u32;
+        transition kind == 16384 {
+            true -> push_dir(walk, path, off, reclen, name_len)
+            false -> unlink_file(walk, path, off, reclen, name_len, top)
+            _ -> (false)
+        }
+    }
+    // A subdirectory — push its fd and leaf name (used at pop for the
+    // `unlink_at(parentfd, name, 128)` rmdir).
+    state push_dir(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        transition walk.pending_count < 64 {
+            true -> push_dir_ok(walk, path, off, reclen, name_len)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state push_dir_ok(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count < 64 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        let index_operand_11: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_11 < 64 {
+            true -> push_dir_fd(walk, path, off, reclen, name_len, index_operand_11)
+            _ -> (false)
+        }
+    }
+    state push_dir_fd(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, top_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && walk.pending_count <= 64 && name_len <= 256 && top_index < 64;
+    {
+        let top: i32 = walk.pending_fds[top_index];
+        let child_fd: i32 = FilesystemHost::open_at(top, walk.entry_name[0..name_len], 0);
+        transition child_fd >= 0 {
+            true -> push_dir_store(walk, path, off, reclen, name_len, child_fd)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state push_dir_store(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, child_fd: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count < 64 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        transition {
+            _ -> push_dir_name(walk, path, off, reclen, name_len, child_fd, 0)
+        }
+    }
+    state push_dir_name(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, child_fd: i32, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count < 64 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        transition position < name_len && position < 256 {
+            true -> push_dir_byte(walk, path, off, reclen, name_len, child_fd, position)
+            false -> push_dir_finish(walk, path, off, reclen, name_len, child_fd)
+            _ -> (false)
+        }
+    }
+    state push_dir_byte(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, child_fd: i32, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count < 64 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256 && position < 256 && position < name_len;
+    {
+        walk.pending_names[walk.pending_count][position] = walk.entry_name[position];
+        transition {
+            _ -> push_dir_name(walk, path, off, reclen, name_len, child_fd, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state push_dir_finish(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, child_fd: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count < 64 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        walk.pending_name_lens[walk.pending_count] = name_len;
+        walk.pending_fds[walk.pending_count] = child_fd;
+        walk.pending_count = ((walk.pending_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> entry(walk, path, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state unlink_file(walk: &mut FileTreeWalk, path: &[u8], off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        _ = FilesystemHost::unlink_at(top, walk.entry_name[0..name_len], 0);
+        transition {
+            _ -> entry(walk, path, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+        }
+    }
+    // A directory's buffer is drained — close its fd, pop the slot, rmdir
+    // it inside its parent (the new top).
+    state done_dir(walk: &mut FileTreeWalk, path: &[u8]) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let index_operand_12: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_12 < 64 {
+            true -> done_dir_pop(walk, index_operand_12, path)
+            _ -> (false)
+        }
+    }
+    state done_dir_pop(walk: &mut FileTreeWalk, top_index: u64, path: &[u8]) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64 && top_index < 64;
+    {
+        let top: i32 = walk.pending_fds[top_index];
+        _ = FilesystemHost::close(top);
+        walk.pending_count = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition walk.pending_count > 0 && walk.pending_count < 64 {
+            true -> rmdir_leaf(walk, path)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state rmdir_leaf(walk: &mut FileTreeWalk, path: &[u8]) -> bool
+        requires walk.pending_count > 0 && walk.pending_count < 64;
+    {
+        let index_operand_13: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_13 < 64 {
+            true -> rmdir_leaf_pop(walk, index_operand_13, path)
+            _ -> (false)
+        }
+    }
+    state rmdir_leaf_pop(walk: &mut FileTreeWalk, parent_index: u64, path: &[u8]) -> bool
+        requires walk.pending_count > 0 && walk.pending_count < 64 && parent_index < 64;
+    {
+        let parent: i32 = walk.pending_fds[parent_index];
+        let name_len: u64 = walk.pending_name_lens[walk.pending_count];
+        transition name_len <= 256 {
+            true -> rmdir_leaf_do(walk, parent, name_len, path)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state rmdir_leaf_do(walk: &mut FileTreeWalk, parent: i32, name_len: u64, path: &[u8]) -> bool
+        requires walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256;
+    {
+        _ = FilesystemHost::unlink_at(parent, walk.pending_names[walk.pending_count][0..name_len], 128);
+        (true)
+    }
+    // The drain ended with the stack empty — remove the root dir itself by
+    // splitting `path` at its last '/' and unlink_at the leaf under the
+    // parent's fd.
+    state root_out(walk: &mut FileTreeWalk, path: &[u8]) -> bool {
+        transition walk.pending_count == 0 {
+            true -> root_remove(path, walk)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state root_remove(path: &[u8], walk: &mut FileTreeWalk) -> bool {
+        transition {
+            _ -> root_scan(path, walk, 0, 0)
+        }
+    }
+    state root_scan(path: &[u8], walk: &mut FileTreeWalk, position: u64, last_sep: u64) -> bool {
+        transition position < path.len {
+            true -> root_byte(path, walk, position, last_sep)
+            false -> root_split(path, walk, last_sep)
+            _ -> (false)
+        }
+    }
+    state root_byte(path: &[u8], walk: &mut FileTreeWalk, position: u64, last_sep: u64) -> bool
+        requires position < path.len;
+    {
+        transition path[position] == 47 {
+            true -> root_scan(path, walk, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, position)
+            false -> root_scan(path, walk, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, last_sep)
+            _ -> (false)
+        }
+    }
+    state root_split(path: &[u8], walk: &mut FileTreeWalk, last_sep: u64) -> bool {
+        transition last_sep > 0 && ((last_sep as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 <= path.len {
+            true -> root_parent(path, walk, last_sep)
+            false -> root_toplevel(path, walk)
+            _ -> (false)
+        }
+    }
+    // The path has no interior separator — relative single-component name;
+    // remove it under cwd.
+    state root_toplevel(path: &[u8], walk: &mut FileTreeWalk) -> bool {
+        let cwd_fd: i32 = FilesystemHost::open(".", 0);
+        transition cwd_fd >= 0 {
+            true -> root_unlink_cwd(path, walk, cwd_fd)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state root_unlink_cwd(path: &[u8], walk: &mut FileTreeWalk, cwd_fd: i32) -> bool {
+        let rc: i32 = FilesystemHost::unlink_at(cwd_fd, path[0..path.len], 128);
+        _ = FilesystemHost::close(cwd_fd);
+        (rc == 0)
+    }
+    state root_parent(path: &[u8], walk: &mut FileTreeWalk, last_sep: u64) -> bool
+        requires ((last_sep as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 <= path.len;
+    {
+        let parent_fd: i32 = FileSystemUtils::open_path(path[0..last_sep], 0);
+        transition parent_fd >= 0 {
+            true -> root_unlink_gate(path, walk, parent_fd, last_sep)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state root_unlink_gate(path: &[u8], walk: &mut FileTreeWalk, parent_fd: i32, last_sep: u64) -> bool
+        requires ((last_sep as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 <= path.len;
+    {
+        let name_lo: u64 = ((last_sep as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition name_lo <= path.len {
+            true -> root_unlink(path, walk, parent_fd, name_lo)
+            _ -> (false)
+        }
+    }
+    state root_unlink(path: &[u8], walk: &mut FileTreeWalk, parent_fd: i32, name_lo: u64) -> bool
+        requires name_lo <= path.len;
+    {
+        let rc: i32 = FilesystemHost::unlink_at(parent_fd, path[name_lo..path.len], 128);
+        _ = FilesystemHost::close(parent_fd);
+        (rc == 0)
+    }
+}
+
+// `fs::copy` for one regular file between open directory descriptors —
+// `copy_file_at(src_dirfd, src_name, dst_dirfd, dst_name)` reads+writes
+// 512-byte chunks. `rename_tree` uses it for files; `copy_file_path`
+// covers `fs::copy(from, to)` on plain paths.
+pub linux_x86_64 machine FileSystemUtils::copy_file_at(src_dirfd: i32, dst_dirfd: i32, src_name: &[u8], dst_name: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let src_fd: i32 = FilesystemHost::open_at(src_dirfd, src_name, 0);
+    transition src_fd >= 0 {
+        true -> open_dst(src_fd, dst_dirfd, dst_name)
+        false -> (false)
+        _ -> (false)
+    }
+    state open_dst(src_fd: i32, dst_dirfd: i32, dst_name: &[u8]) -> bool {
+        let dst_fd: i32 = FilesystemHost::open_at(dst_dirfd, dst_name, 577);
+        transition dst_fd >= 0 {
+            true -> pump(src_fd, dst_fd)
+            false -> close_src(src_fd)
+            _ -> (false)
+        }
+    }
+    state close_src(src_fd: i32) -> bool {
+        _ = FilesystemHost::close(src_fd);
+        (false)
+    }
+    state pump(src_fd: i32, dst_fd: i32) -> bool {
+        let mut walk: FileTreeWalk = FileTreeWalk::default();
+        transition {
+            _ -> pump_read(walk, src_fd, dst_fd)
+        }
+    }
+    state pump_read(walk: FileTreeWalk, src_fd: i32, dst_fd: i32) -> bool {
+        let mut carried: FileTreeWalk = walk;
+        let got: i64 = FilesystemHost::read(src_fd, &mut carried.io_buf, 512);
+        transition got > 0 {
+            true -> pump_write(carried, src_fd, dst_fd, got)
+            false -> pump_done(carried, src_fd, dst_fd, got)
+            _ -> pump_done(carried, src_fd, dst_fd, got)
+        }
+    }
+    state pump_write(walk: FileTreeWalk, src_fd: i32, dst_fd: i32, got: i64) -> bool {
+        transition got <= 512 && got >= 0 {
+            true -> write_it(walk, src_fd, dst_fd, got)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state write_it(walk: FileTreeWalk, src_fd: i32, dst_fd: i32, got: i64) -> bool
+        requires got <= 512 && got >= 0;
+    {
+        let mut carried: FileTreeWalk = walk;
+        let got_u64: u64 = got as u64;
+        transition got_u64 <= 512 {
+            true -> write_go(carried, src_fd, dst_fd, got, got_u64)
+            _ -> (false)
+        }
+    }
+    state write_go(walk: FileTreeWalk, src_fd: i32, dst_fd: i32, got: i64, got_u64: u64) -> bool
+        requires got <= 512 && got >= 0 && got_u64 <= 512;
+    {
+        let mut carried: FileTreeWalk = walk;
+        let put: i64 = FilesystemHost::write(dst_fd, carried.io_buf[0..got_u64]);
+        transition put == got {
+            true -> pump_read(carried, src_fd, dst_fd)
+            false -> pump_fail(carried, src_fd, dst_fd)
+            _ -> pump_fail(carried, src_fd, dst_fd)
+        }
+    }
+    state pump_done(walk: FileTreeWalk, src_fd: i32, dst_fd: i32, got: i64) -> bool {
+        _ = FilesystemHost::close(src_fd);
+        _ = FilesystemHost::close(dst_fd);
+        (got == 0)
+    }
+    state pump_fail(walk: FileTreeWalk, src_fd: i32, dst_fd: i32) -> bool {
+        _ = FilesystemHost::close(src_fd);
+        _ = FilesystemHost::close(dst_fd);
+        (false)
+    }
+}
+
+// `fs::copy(from, to)` on plain paths — anchor both on open dirfd parents
+// (split at the last separator), then `copy_file_at` on the leaf name.
+pub linux_x86_64 machine FileSystemUtils::copy_file_path(from: &[u8], to: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition {
+        _ -> scan_from(from, to, 0, 0)
+    }
+    state scan_from(from: &[u8], to: &[u8], position: u64, last_sep: u64) -> bool {
+        transition position < from.len {
+            true -> scan_from_byte(from, to, position, last_sep)
+            false -> open_from_parent(from, to, last_sep)
+            _ -> (false)
+        }
+    }
+    state scan_from_byte(from: &[u8], to: &[u8], position: u64, last_sep: u64) -> bool
+        requires position < from.len;
+    {
+        transition from[position] == 47 {
+            true -> scan_from(from, to, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, position)
+            false -> scan_from(from, to, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, last_sep)
+            _ -> (false)
+        }
+    }
+    state open_from_parent(from: &[u8], to: &[u8], last_sep: u64) -> bool {
+        transition last_sep > 0 && last_sep < from.len {
+            true -> from_rooted(from, to, last_sep)
+            false -> from_cwd(from, to)
+            _ -> (false)
+        }
+    }
+    state from_rooted(from: &[u8], to: &[u8], last_sep: u64) -> bool
+        requires last_sep > 0 && last_sep < from.len;
+    {
+        let src_dirfd: i32 = FileSystemUtils::open_path(from[0..last_sep], 0);
+        transition src_dirfd >= 0 {
+            true -> scan_to(from, to, src_dirfd, last_sep, 0, 0)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state from_cwd(from: &[u8], to: &[u8]) -> bool {
+        let src_dirfd: i32 = FilesystemHost::open(".", 0);
+        transition src_dirfd >= 0 {
+            true -> scan_to(from, to, src_dirfd, 0, 0, 0)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state scan_to(from: &[u8], to: &[u8], src_dirfd: i32, from_sep: u64, position: u64, last_sep: u64) -> bool {
+        transition position < to.len {
+            true -> scan_to_byte(from, to, src_dirfd, from_sep, position, last_sep)
+            false -> open_to_parent(from, to, src_dirfd, from_sep, last_sep)
+            _ -> (false)
+        }
+    }
+    state scan_to_byte(from: &[u8], to: &[u8], src_dirfd: i32, from_sep: u64, position: u64, last_sep: u64) -> bool
+        requires position < to.len;
+    {
+        transition to[position] == 47 {
+            true -> scan_to(from, to, src_dirfd, from_sep, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, position)
+            false -> scan_to(from, to, src_dirfd, from_sep, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, last_sep)
+            _ -> (false)
+        }
+    }
+    state open_to_parent(from: &[u8], to: &[u8], src_dirfd: i32, from_sep: u64, to_sep: u64) -> bool {
+        transition to_sep > 0 && to_sep < to.len {
+            true -> to_rooted(from, to, src_dirfd, from_sep, to_sep)
+            false -> to_cwd(from, to, src_dirfd, from_sep)
+            _ -> (false)
+        }
+    }
+    state to_rooted(from: &[u8], to: &[u8], src_dirfd: i32, from_sep: u64, to_sep: u64) -> bool
+        requires to_sep > 0 && to_sep < to.len;
+    {
+        let dst_dirfd: i32 = FileSystemUtils::open_path(to[0..to_sep], 0);
+        transition dst_dirfd >= 0 {
+            true -> copy_pair(from, to, src_dirfd, dst_dirfd, from_sep, to_sep)
+            false -> close_src_dir(src_dirfd)
+            _ -> (false)
+        }
+    }
+    state to_cwd(from: &[u8], to: &[u8], src_dirfd: i32, from_sep: u64) -> bool {
+        let dst_dirfd: i32 = FilesystemHost::open(".", 0);
+        transition dst_dirfd >= 0 {
+            true -> copy_pair(from, to, src_dirfd, dst_dirfd, from_sep, 0)
+            false -> close_src_dir(src_dirfd)
+            _ -> (false)
+        }
+    }
+    state close_src_dir(src_dirfd: i32) -> bool {
+        _ = FilesystemHost::close(src_dirfd);
+        (false)
+    }
+    state copy_pair(from: &[u8], to: &[u8], src_dirfd: i32, dst_dirfd: i32, from_sep: u64, to_sep: u64) -> bool {
+        let from_lo: u64 = ((from_sep as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let to_lo: u64 = ((to_sep as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition from_lo <= from.len && to_lo <= to.len {
+            true -> copy_pair_go(from, to, src_dirfd, dst_dirfd, from_lo, to_lo)
+            false -> close_src_dir(src_dirfd)
+            _ -> (false)
+        }
+    }
+    state copy_pair_go(from: &[u8], to: &[u8], src_dirfd: i32, dst_dirfd: i32, from_lo: u64, to_lo: u64) -> bool
+        requires from_lo <= from.len && to_lo <= to.len;
+    {
+        let copied: bool = FileSystemUtils::copy_file_at(
+            src_dirfd,
+            dst_dirfd,
+            from[from_lo..from.len],
+            to[to_lo..to.len]);
+        _ = FilesystemHost::close(src_dirfd);
+        _ = FilesystemHost::close(dst_dirfd);
+        (copied)
+    }
+    // `to_cwd` also needs the dst dirfd closed on the guard-false path.
+    state close_pair_dirs(src_dirfd: i32, dst_dirfd: i32) -> bool {
+        _ = FilesystemHost::close(src_dirfd);
+        _ = FilesystemHost::close(dst_dirfd);
+        (false)
+    }
+}
+
+// Upstream `create_unique_folder` — loop "base_name", "base_name (1)"...
+// until the candidate does not exist, then `fs::create_dir_all` it. The
+// candidate assembles in `walk.child_path` (plain bytes) and the probe
+// rides `path_exists`; `create_dir_all` lands via `create_dir_all_path`.
+// index is bounded at 999 — upstream's unbounded loop is unrepresentable;
+// at 999 the machine refuses (documented bound). Every state re-threads
+// base/base_name/index (states see only their own params).
+pub linux_x86_64 machine FileSystemUtils::create_unique_folder(
+    base: &[u8],
+    base_name: &[u8],
+    out_path: &mut [u8; 512]) -> u64
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    // " (N)" suffix join is bounded: index caps at 999 (upstream's loop is
+    // unbounded; at 999 this machine refuses). child_path budget: base +
+    // '/' + name + " (NNN)" <= 512. States re-thread base/base_name/index
+    // (states see only their own params); `walk` rides as &mut so field
+    // facts written in one state survive into the next through scrutinee
+    // re-guards.
+    transition {
+        _ -> seed(base, base_name, out_path)
+    }
+    state seed(base: &[u8], base_name: &[u8], out_path: &mut [u8; 512]) -> u64 {
+        let mut walk: FileTreeWalk = FileTreeWalk::default();
+        transition {
+            _ -> build_base(&mut walk, base, base_name, 0, out_path, 0)
+        }
+    }
+    state build_base(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64 {
+        transition position < base.len && walk.child_path_len < 512 {
+            true -> put_base(walk, base, base_name, index, out_path, position)
+            false -> join_name(walk, base, base_name, index, out_path, 0)
+            _ -> (0)
+        }
+    }
+    state put_base(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < base.len && walk.child_path_len < 512;
+    {
+        walk.child_path[walk.child_path_len] = base[position];
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> build_base(walk, base, base_name, index, out_path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state join_name(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64 {
+        transition position < base_name.len && walk.child_path_len < 511 {
+            true -> put_name(walk, base, base_name, index, out_path, position)
+            false -> add_suffix(walk, base, base_name, index, out_path)
+            _ -> (0)
+        }
+    }
+    state put_name(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < base_name.len && walk.child_path_len < 511;
+    {
+        transition position == 0 && walk.child_path_len >= 1 && walk.child_path_len < 510 {
+            true -> check_sep(walk, base, base_name, index, out_path, position)
+            false -> write_name_gate(walk, base, base_name, index, out_path, position)
+            _ -> (0)
+        }
+    }
+    state check_sep(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < base_name.len && walk.child_path_len >= 1 && walk.child_path_len < 510;
+    {
+        let prev_index: u64 = ((walk.child_path_len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition prev_index < 512 {
+            true -> check_sep_byte(walk, base, base_name, index, out_path, position, prev_index)
+            _ -> (0)
+        }
+    }
+    state check_sep_byte(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64, prev_index: u64) -> u64
+        requires position < base_name.len && walk.child_path_len >= 1 && walk.child_path_len < 510 && prev_index < 512;
+    {
+        transition walk.child_path[prev_index] != 47 && walk.child_path_len >= 1 && walk.child_path_len < 510 {
+            true -> put_sep(walk, base, base_name, index, out_path, position)
+            false -> write_name_gate(walk, base, base_name, index, out_path, position)
+            _ -> (0)
+        }
+    }
+    state put_sep(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < base_name.len && walk.child_path_len >= 1 && walk.child_path_len < 510;
+    {
+        walk.child_path[walk.child_path_len] = 47;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len < 511 {
+            true -> write_name(walk, base, base_name, index, out_path, position)
+            _ -> (0)
+        }
+    }
+    state write_name_gate(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < base_name.len;
+    {
+        transition walk.child_path_len < 511 {
+            true -> write_name(walk, base, base_name, index, out_path, position)
+            _ -> (0)
+        }
+    }
+    state write_name(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < base_name.len && walk.child_path_len < 511;
+    {
+        walk.child_path[walk.child_path_len] = base_name[position];
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> join_name(walk, base, base_name, index, out_path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // " (N)" suffix for index >= 1 — bounded decimal render (index <= 999).
+    state add_suffix(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64 {
+        transition index >= 1 && index <= 999 {
+            true -> digits(walk, base, base_name, index, out_path)
+            false -> check(walk, base, base_name, index, out_path)
+            _ -> check(walk, base, base_name, index, out_path)
+        }
+    }
+    state digits(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64
+        requires index >= 1 && index <= 999;
+    {
+        transition walk.child_path_len <= 506 {
+            true -> digits_emit(walk, base, base_name, index, out_path)
+            _ -> (0)
+        }
+    }
+    state digits_emit(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64
+        requires index >= 1 && index <= 999 && walk.child_path_len <= 506;
+    {
+        let hundreds: u64 = ((index as u64 in Wrapping) / (100 as u64 in Wrapping)) as u64;
+        let rem_hundreds: u64 = ((index as u64 in Wrapping) - (hundreds as u64 in Wrapping) * (100 as u64 in Wrapping)) as u64;
+        let tens: u64 = ((rem_hundreds as u64 in Wrapping) / (10 as u64 in Wrapping)) as u64;
+        let h_scaled: u64 = ((hundreds as u64 in Wrapping) * (100 as u64 in Wrapping)) as u64;
+        let t_scaled: u64 = ((tens as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64;
+        let ones: u64 = ((index as u64 in Wrapping) - (h_scaled as u64 in Wrapping) - (t_scaled as u64 in Wrapping)) as u64;
+        walk.child_path[walk.child_path_len] = 32;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 507 {
+            true -> digits_open(walk, base, base_name, index, out_path, hundreds, tens, ones)
+            _ -> (0)
+        }
+    }
+    state digits_open(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], hundreds: u64, tens: u64, ones: u64) -> u64
+        requires index >= 1 && index <= 999 && walk.child_path_len <= 507;
+    {
+        walk.child_path[walk.child_path_len] = 40;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 508 && tens <= 9 && ones <= 9 {
+            true -> digits_pick(walk, base, base_name, index, out_path, hundreds, tens, ones)
+            _ -> (0)
+        }
+    }
+    state digits_pick(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], hundreds: u64, tens: u64, ones: u64) -> u64
+        requires index >= 1 && index <= 999 && walk.child_path_len <= 508 && tens <= 9 && ones <= 9;
+    {
+        transition hundreds > 0 && hundreds <= 9 && walk.child_path_len <= 508 {
+            true -> three(walk, base, base_name, index, out_path, hundreds, tens, ones)
+            false -> two_maybe_gate(walk, base, base_name, index, out_path, hundreds, tens, ones)
+            _ -> (0)
+        }
+    }
+    state three(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], hundreds: u64, tens: u64, ones: u64) -> u64
+        requires index >= 1 && index <= 999 && hundreds > 0 && hundreds <= 9 && tens <= 9 && ones <= 9 && walk.child_path_len <= 508;
+    {
+        walk.child_path[walk.child_path_len] = (((hundreds as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64) as u8;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 509 {
+            true -> three_tens(walk, base, base_name, index, out_path, tens, ones)
+            _ -> (0)
+        }
+    }
+    state three_tens(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], tens: u64, ones: u64) -> u64
+        requires index >= 1 && index <= 999 && tens <= 9 && ones <= 9 && walk.child_path_len <= 509;
+    {
+        walk.child_path[walk.child_path_len] = (((tens as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64) as u8;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 510 {
+            true -> three_ones(walk, base, base_name, index, out_path, ones)
+            _ -> (0)
+        }
+    }
+    state three_ones(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], ones: u64) -> u64
+        requires index >= 1 && index <= 999 && ones <= 9 && walk.child_path_len <= 510;
+    {
+        walk.child_path[walk.child_path_len] = (((ones as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64) as u8;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 511 {
+            true -> close_paren(walk, base, base_name, index, out_path)
+            _ -> (0)
+        }
+    }
+    state two_maybe_gate(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], hundreds: u64, tens: u64, ones: u64) -> u64
+        requires index >= 1 && index <= 999 && tens <= 9 && ones <= 9;
+    {
+        transition walk.child_path_len <= 508 {
+            true -> two_maybe(walk, base, base_name, index, out_path, hundreds, tens, ones)
+            _ -> (0)
+        }
+    }
+    state two_maybe(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], hundreds: u64, tens: u64, ones: u64) -> u64
+        requires index >= 1 && index <= 999 && tens <= 9 && ones <= 9 && walk.child_path_len <= 508;
+    {
+        transition tens > 0 && walk.child_path_len <= 508 {
+            true -> two(walk, base, base_name, index, out_path, tens, ones)
+            false -> one_gate(walk, base, base_name, index, out_path, ones)
+            _ -> (0)
+        }
+    }
+    state two(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], tens: u64, ones: u64) -> u64
+        requires index >= 1 && index <= 999 && tens <= 9 && ones <= 9 && walk.child_path_len <= 508;
+    {
+        walk.child_path[walk.child_path_len] = (((tens as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64) as u8;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 509 {
+            true -> two_ones(walk, base, base_name, index, out_path, ones)
+            _ -> (0)
+        }
+    }
+    state two_ones(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], ones: u64) -> u64
+        requires index >= 1 && index <= 999 && ones <= 9 && walk.child_path_len <= 509;
+    {
+        walk.child_path[walk.child_path_len] = (((ones as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64) as u8;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 511 {
+            true -> close_paren(walk, base, base_name, index, out_path)
+            _ -> (0)
+        }
+    }
+    state one_gate(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], ones: u64) -> u64
+        requires index >= 1 && index <= 999 && ones <= 9;
+    {
+        transition walk.child_path_len <= 508 {
+            true -> one(walk, base, base_name, index, out_path, ones)
+            _ -> (0)
+        }
+    }
+    state one(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], ones: u64) -> u64
+        requires index >= 1 && index <= 999 && ones <= 9 && walk.child_path_len <= 508;
+    {
+        walk.child_path[walk.child_path_len] = (((ones as u64 in Wrapping) + (48 as u64 in Wrapping)) as u64) as u8;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.child_path_len <= 511 {
+            true -> close_paren(walk, base, base_name, index, out_path)
+            _ -> (0)
+        }
+    }
+    state close_paren(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64
+        requires walk.child_path_len <= 511;
+    {
+        walk.child_path[walk.child_path_len] = 41;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> check(walk, base, base_name, index, out_path)
+        }
+    }
+    state check(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64 {
+        transition walk.child_path_len <= 512 {
+            true -> probe_path(walk, base, base_name, index, out_path)
+            _ -> (0)
+        }
+    }
+    state probe_path(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64
+        requires walk.child_path_len <= 512;
+    {
+        let exists: bool = FileSystemUtils::path_exists(walk.child_path[0..walk.child_path_len]);
+        transition exists {
+            true -> retry(walk, base, base_name, index, out_path)
+            false -> claim(walk, base, base_name, index, out_path)
+            _ -> (0)
+        }
+    }
+    state retry(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64 {
+        transition index < 999 {
+            true -> reseed(walk, base, base_name, index, out_path)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state reseed(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64
+        requires index < 999;
+    {
+        let mut fresh: FileTreeWalk = FileTreeWalk::default();
+        transition {
+            _ -> build_base(&mut fresh, base, base_name, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, out_path, 0)
+        }
+    }
+    state claim(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512]) -> u64
+        requires walk.child_path_len <= 512;
+    {
+        let made: bool = FileSystemUtils::create_dir_all_path(walk.child_path[0..walk.child_path_len]);
+        transition made {
+            true -> copy_out(walk, base, base_name, index, out_path, 0)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state copy_out(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64 {
+        transition position < walk.child_path_len && position < 512 {
+            true -> copy_out_byte(walk, base, base_name, index, out_path, position)
+            false -> (walk.child_path_len)
+            _ -> (0)
+        }
+    }
+    state copy_out_byte(walk: &mut FileTreeWalk, base: &[u8], base_name: &[u8], index: u64, out_path: &mut [u8; 512], position: u64) -> u64
+        requires position < walk.child_path_len && position < 512;
+    {
+        out_path[position] = walk.child_path[position];
+        transition {
+            _ -> copy_out(walk, base, base_name, index, out_path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `copy_dir_all` + `fs::rename` collapsed — `rename_tree` ports the
+// rename used by project/item rename & move executors: classify the source,
+// copy file-or-tree to the destination, then `remove_tree` the source.
+// Deviation: non-atomic (no `renameat` in the host surface).
+pub linux_x86_64 machine FileSystemUtils::rename_tree(from: &[u8], to: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition from.len >= 1 && from.len <= 512 && to.len >= 1 && to.len <= 512 {
+        true -> classify(from, to)
+        false -> (false)
+        _ -> (false)
+    }
+    state classify(from: &[u8], to: &[u8]) -> bool {
+        let mut walk: FileTreeWalk = FileTreeWalk::default();
+        let src_fd: i32 = FileSystemUtils::open_path(from, 0);
+        transition src_fd >= 0 {
+            true -> stat_src(&mut walk, from, to, src_fd)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state stat_src(walk: &mut FileTreeWalk, from: &[u8], to: &[u8], src_fd: i32) -> bool {
+        walk.stat_rc = (FilesystemHost::read_file_metadata(src_fd, &mut walk.stat_buf)) as i32;
+        transition walk.stat_rc == 0 {
+            true -> mode(walk, from, to, src_fd)
+            false -> close_fail(src_fd)
+            _ -> (false)
+        }
+    }
+    state close_fail(src_fd: i32) -> bool {
+        _ = FilesystemHost::close(src_fd);
+        (false)
+    }
+    state mode(walk: &mut FileTreeWalk, from: &[u8], to: &[u8], src_fd: i32) -> bool {
+        let mode_lo: u32 = walk.stat_buf[24] as u32;
+        let mode_b1: u32 = walk.stat_buf[25] as u32;
+        let mode_b2: u32 = walk.stat_buf[26] as u32;
+        let mode_b3: u32 = walk.stat_buf[27] as u32;
+        let mode_b1s: u32 = ((mode_b1 as u32 in Wrapping) * (256 as u32 in Wrapping)) as u32;
+        let mode_b2s: u32 = ((mode_b2 as u32 in Wrapping) * (65536 as u32 in Wrapping)) as u32;
+        let mode_b3s: u32 = ((mode_b3 as u32 in Wrapping) * (16777216 as u32 in Wrapping)) as u32;
+        let mode: u32 = ((mode_lo as u32 in Wrapping) + (mode_b1s as u32 in Wrapping) + (mode_b2s as u32 in Wrapping) + (mode_b3s as u32 in Wrapping)) as u32;
+        let mode_rem: u32 = ((mode as u32 in Wrapping) % (61440 as u32 in Wrapping)) as u32;
+        let kind: u32 = ((mode as u32 in Wrapping) - (mode_rem as u32 in Wrapping)) as u32;
+        transition kind == 16384 {
+            true -> dir_route(walk, from, to, src_fd)
+            false -> file_route(from, to, src_fd)
+            _ -> (false)
+        }
+    }
+    state file_route(from: &[u8], to: &[u8], src_fd: i32) -> bool {
+        _ = FilesystemHost::close(src_fd);
+        let copied: bool = FileSystemUtils::copy_file_path(from, to);
+        transition copied {
+            true -> unlink_src(from)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state unlink_src(from: &[u8]) -> bool {
+        let rc: i32 = FilesystemHost::remove_name(from);
+        (rc == 0)
+    }
+    // Directory: create the dst tree root, seed the paired stack, then walk
+    // src depth-first copying entries; files via copy_file_at, subdirs via
+    // create_dir_name(dst_child)+paired push.
+    state dir_route(walk: &mut FileTreeWalk, from: &[u8], to: &[u8], src_fd: i32) -> bool {
+        let made: bool = FileSystemUtils::create_dir_all_path(to);
+        transition made {
+            true -> open_dst(walk, from, to, src_fd)
+            false -> close_fail(src_fd)
+            _ -> (false)
+        }
+    }
+    state open_dst(walk: &mut FileTreeWalk, from: &[u8], to: &[u8], src_fd: i32) -> bool {
+        let dst_fd: i32 = FileSystemUtils::open_path(to, 0);
+        transition dst_fd >= 0 {
+            true -> push_roots(walk, from, to, src_fd, dst_fd)
+            false -> close_fail(src_fd)
+            _ -> (false)
+        }
+    }
+    state push_roots(walk: &mut FileTreeWalk, from: &[u8], to: &[u8], src_fd: i32, dst_fd: i32) -> bool {
+        walk.pending_fds[0] = src_fd;
+        walk.pending_dst_fds[0] = dst_fd;
+        walk.pending_count = 1;
+        transition {
+            _ -> seed_dst_path(walk, from, to, 0)
+        }
+    }
+    state seed_dst_path(walk: &mut FileTreeWalk, from: &[u8], to: &[u8], position: u64) -> bool {
+        transition position < to.len && position < 512 {
+            true -> seed_dst_byte(walk, from, to, position)
+            false -> drain(walk)
+            _ -> (false)
+        }
+    }
+    state seed_dst_byte(walk: &mut FileTreeWalk, from: &[u8], to: &[u8], position: u64) -> bool
+        requires position < to.len && position < 512;
+    {
+        walk.pending_dst_paths[0][position] = to[position];
+        walk.pending_dst_lens[0] = ((walk.pending_dst_lens[0] as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> seed_dst_path(walk, from, to, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state drain(walk: &mut FileTreeWalk) -> bool {
+        transition walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> read_top(walk)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state read_top(walk: &mut FileTreeWalk) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let index_operand_28: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_28 < 64 {
+            true -> read_top_go(walk, index_operand_28)
+            _ -> (false)
+        }
+    }
+    state read_top_go(walk: &mut FileTreeWalk, top_index: u64) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64 && top_index < 64;
+    {
+        let top: i32 = walk.pending_fds[top_index];
+        walk.dir_off = 0;
+        walk.dir_total = FilesystemHost::read_dir(top, &mut walk.dir_buf, 512, &mut walk.dir_position);
+        transition walk.dir_total > 0 {
+            true -> entry(walk, 0)
+            false -> done_dir(walk)
+            _ -> (false)
+        }
+    }
+    state entry(walk: &mut FileTreeWalk, off: u64) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        transition off < 508 && off <= 494 && (off as i64 in Saturating) < walk.dir_total {
+            true -> read_entry(walk, off)
+            false -> read_top(walk)
+            _ -> (false)
+        }
+    }
+    state read_entry(walk: &mut FileTreeWalk, off: u64) -> bool
+        requires off < 512 && off <= 494 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let index_operand_29: u64 = ((off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64;
+        let index_operand_30: u64 = ((off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64;
+        transition index_operand_29 < 512 && index_operand_30 < 512 {
+            true -> read_reclen(walk, off, index_operand_29, index_operand_30)
+            _ -> (false)
+        }
+    }
+    state read_reclen(walk: &mut FileTreeWalk, off: u64, lo_index: u64, hi_index: u64) -> bool
+        requires off < 512 && off <= 494 && walk.pending_count > 0 && walk.pending_count <= 64 && lo_index < 512 && hi_index < 512;
+    {
+        let reclen_lo: u64 = walk.dir_buf[lo_index] as u64;
+        let reclen_hi: u64 = walk.dir_buf[hi_index] as u64;
+        let reclen_hi_scaled: u64 = ((reclen_hi as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64;
+        let reclen: u64 = ((reclen_lo as u64 in Wrapping) + (reclen_hi_scaled as u64 in Wrapping)) as u64;
+        transition reclen >= 19 && reclen <= 512 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> entry_name(walk, off, reclen)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state entry_name(walk: &mut FileTreeWalk, off: u64, reclen: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let name_len: u64 = ((reclen as u64 in Wrapping) - (19 as u64 in Wrapping)) as u64;
+        transition name_len <= 256 && walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> copy_name(walk, off, reclen, name_len, 0)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state copy_name(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        transition position < name_len && position < 256 {
+            true -> copy_byte(walk, off, reclen, name_len, position)
+            false -> name_done(walk, off, reclen, name_len)
+            _ -> (false)
+        }
+    }
+    state copy_byte(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256 && position < 256 && position < name_len && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let at: u64 = ((off as u64 in Wrapping) + (19 as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition at < 512 {
+            true -> write_byte(walk, off, reclen, name_len, position, at)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state write_byte(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, position: u64, at: u64) -> bool
+        requires at < 512 && position < 256 && name_len <= 256 && off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        walk.entry_name[position] = walk.dir_buf[at];
+        transition {
+            _ -> copy_name(walk, off, reclen, name_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state name_done(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256 && walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        walk.entry_name_len = name_len;
+        let is_dot: bool = name_len >= 1 && walk.entry_name[0] == 46 && (name_len == 1 || walk.entry_name[1] == 46);
+        transition is_dot && name_len <= 2 {
+            true -> entry(walk, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+            false -> stat_child(walk, off, reclen, name_len)
+            _ -> (false)
+        }
+    }
+    state stat_child(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        let index_operand_31: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_31 < 64 {
+            true -> stat_fd(walk, off, reclen, name_len, index_operand_31)
+            _ -> (false)
+        }
+    }
+    state stat_fd(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256 && top_index < 64;
+    {
+        let top: i32 = walk.pending_fds[top_index];
+        let child_fd: i32 = FilesystemHost::open_at(top, walk.entry_name[0..name_len], 0);
+        transition child_fd >= 0 {
+            true -> kind_child(walk, off, reclen, name_len, top, child_fd)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state kind_child(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, child_fd: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        walk.stat_rc = (FilesystemHost::read_file_metadata(child_fd, &mut walk.stat_buf)) as i32;
+        _ = FilesystemHost::close(child_fd);
+        transition walk.stat_rc == 0 {
+            true -> dispatch_child(walk, off, reclen, name_len, top)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state dispatch_child(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        let mode_lo: u32 = walk.stat_buf[24] as u32;
+        let mode_b1: u32 = walk.stat_buf[25] as u32;
+        let mode_b2: u32 = walk.stat_buf[26] as u32;
+        let mode_b3: u32 = walk.stat_buf[27] as u32;
+        let mode_b1s: u32 = ((mode_b1 as u32 in Wrapping) * (256 as u32 in Wrapping)) as u32;
+        let mode_b2s: u32 = ((mode_b2 as u32 in Wrapping) * (65536 as u32 in Wrapping)) as u32;
+        let mode_b3s: u32 = ((mode_b3 as u32 in Wrapping) * (16777216 as u32 in Wrapping)) as u32;
+        let mode: u32 = ((mode_lo as u32 in Wrapping) + (mode_b1s as u32 in Wrapping) + (mode_b2s as u32 in Wrapping) + (mode_b3s as u32 in Wrapping)) as u32;
+        let mode_rem: u32 = ((mode as u32 in Wrapping) % (61440 as u32 in Wrapping)) as u32;
+        let kind: u32 = ((mode as u32 in Wrapping) - (mode_rem as u32 in Wrapping)) as u32;
+        transition kind == 16384 {
+            true -> push_dir(walk, off, reclen, name_len, top)
+            false -> copy_file(walk, off, reclen, name_len, top)
+            _ -> (false)
+        }
+    }
+    // Regular file — copy it inside the paired dst dirfd under the same name.
+    state copy_file(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        let index_operand_33: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_33 < 64 {
+            true -> copy_file_at_top(walk, off, reclen, name_len, top, index_operand_33)
+            _ -> (false)
+        }
+    }
+    state copy_file_at_top(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, top_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256 && top_index < 64;
+    {
+        let dst_top: i32 = walk.pending_dst_fds[top_index];
+        let copied: bool = FileSystemUtils::copy_file_at(
+            top,
+            dst_top,
+            walk.entry_name[0..name_len],
+            walk.entry_name[0..name_len]);
+        transition copied {
+            true -> entry(walk, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    // Subdirectory — build dst_child_path = dst_path + '/' + name, mkdir it,
+    // open both children, push the pair.
+    state push_dir(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count <= 64 && name_len <= 256;
+    {
+        transition walk.pending_count > 0 && walk.pending_count < 64 {
+            true -> build_child(walk, off, reclen, name_len, top, 0)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state build_child(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256;
+    {
+        let index_operand_34: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_34 < 64 {
+            true -> build_child_read(walk, off, reclen, name_len, top, position, index_operand_34)
+            _ -> (false)
+        }
+    }
+    state build_child_read(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, position: u64, top_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256 && top_index < 64;
+    {
+        let src_len: u64 = walk.pending_dst_lens[top_index];
+        transition position < src_len && position < 512 && walk.child_path_len < 511 {
+            true -> copy_dst(walk, off, reclen, name_len, top, position, src_len)
+            false -> append_sep(walk, off, reclen, name_len, top)
+            _ -> (false)
+        }
+    }
+    state copy_dst(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, position: u64, src_len: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256 && position < 512 && position < src_len && walk.child_path_len < 511;
+    {
+        let index_operand_35: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_35 < 64 {
+            true -> copy_dst_byte(walk, off, reclen, name_len, top, position, index_operand_35)
+            _ -> (false)
+        }
+    }
+    state copy_dst_byte(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, position: u64, top_index: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256 && walk.child_path_len < 511 && top_index < 64 && position < 512;
+    {
+        walk.child_path[walk.child_path_len] = walk.pending_dst_paths[top_index][position];
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.pending_count > 0 && walk.pending_count < 64 {
+            true -> build_child(walk, off, reclen, name_len, top, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state append_sep(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256;
+    {
+        transition walk.child_path_len < 511 {
+            true -> write_sep(walk, off, reclen, name_len, top)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state write_sep(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256 && walk.child_path_len < 511;
+    {
+        walk.child_path[walk.child_path_len] = 47;
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.pending_count > 0 && walk.pending_count < 64 {
+            true -> append_name(walk, off, reclen, name_len, top, 0)
+            _ -> (false)
+        }
+    }
+    state append_name(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256;
+    {
+        transition position < name_len && position < 256 && walk.child_path_len < 511 {
+            true -> write_name(walk, off, reclen, name_len, top, position)
+            false -> make_child_gate(walk, off, reclen, name_len, top)
+            _ -> (false)
+        }
+    }
+    state write_name(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256 && position < 256 && position < name_len && walk.child_path_len < 511;
+    {
+        walk.child_path[walk.child_path_len] = walk.entry_name[position];
+        walk.child_path_len = ((walk.child_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition walk.pending_count > 0 && walk.pending_count < 64 {
+            true -> append_name(walk, off, reclen, name_len, top, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state make_child_gate(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && name_len <= 256;
+    {
+        transition walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512 && name_len <= 256 {
+            true -> make_child(walk, off, reclen, name_len, top)
+            _ -> (false)
+        }
+    }
+    state make_child(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512 && name_len <= 256;
+    {
+        _ = FilesystemHost::create_dir_name(walk.child_path[0..walk.child_path_len], 493);
+        let dst_child: i32 = FileSystemUtils::open_path(walk.child_path[0..walk.child_path_len], 0);
+        transition dst_child >= 0 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256 {
+            true -> open_src_child(walk, off, reclen, name_len, top, dst_child)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state open_src_child(walk: &mut FileTreeWalk, off: u64, reclen: u64, name_len: u64, top: i32, dst_child: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && name_len <= 256;
+    {
+        let src_child: i32 = FilesystemHost::open_at(top, walk.entry_name[0..name_len], 0);
+        transition src_child >= 0 && walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512 {
+            true -> store_pair(walk, off, reclen, src_child, dst_child)
+            false -> close_dst_child(dst_child)
+            _ -> (false)
+        }
+    }
+    state close_dst_child(dst_child: i32) -> bool {
+        _ = FilesystemHost::close(dst_child);
+        (false)
+    }
+    state store_pair(walk: &mut FileTreeWalk, off: u64, reclen: u64, src_child: i32, dst_child: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512;
+    {
+        transition walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512 {
+            true -> store_path(walk, off, reclen, src_child, dst_child, 0)
+            _ -> (false)
+        }
+    }
+    state store_path(walk: &mut FileTreeWalk, off: u64, reclen: u64, src_child: i32, dst_child: i32, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512;
+    {
+        transition position < walk.child_path_len && position < 512 {
+            true -> store_path_byte(walk, off, reclen, src_child, dst_child, position)
+            false -> store_done(walk, off, reclen, src_child, dst_child)
+            _ -> (false)
+        }
+    }
+    state store_path_byte(walk: &mut FileTreeWalk, off: u64, reclen: u64, src_child: i32, dst_child: i32, position: u64) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && position < 512 && position < walk.child_path_len;
+    {
+        walk.pending_dst_paths[walk.pending_count][position] = walk.child_path[position];
+        transition walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512 {
+            true -> store_path(walk, off, reclen, src_child, dst_child, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state store_done(walk: &mut FileTreeWalk, off: u64, reclen: u64, src_child: i32, dst_child: i32) -> bool
+        requires off < 512 && reclen >= 19 && reclen <= 512 && walk.pending_count > 0 && walk.pending_count < 64 && walk.child_path_len <= 512;
+    {
+        walk.pending_dst_lens[walk.pending_count] = walk.child_path_len;
+        walk.pending_fds[walk.pending_count] = src_child;
+        walk.pending_dst_fds[walk.pending_count] = dst_child;
+        walk.pending_count = ((walk.pending_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        walk.child_path_len = 0;
+        transition walk.pending_count > 0 && walk.pending_count <= 64 {
+            true -> entry(walk, ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    // A directory's buffer is drained — close both fds, pop the slot.
+    state done_dir(walk: &mut FileTreeWalk) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64;
+    {
+        let index_operand_36: u64 = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index_operand_36 < 64 {
+            true -> done_dir_pop(walk, index_operand_36)
+            _ -> (false)
+        }
+    }
+    state done_dir_pop(walk: &mut FileTreeWalk, top_index: u64) -> bool
+        requires walk.pending_count > 0 && walk.pending_count <= 64 && top_index < 64;
+    {
+        let top: i32 = walk.pending_fds[top_index];
+        let dst_top: i32 = walk.pending_dst_fds[top_index];
+        _ = FilesystemHost::close(top);
+        _ = FilesystemHost::close(dst_top);
+        walk.pending_count = ((walk.pending_count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> drain(walk)
+        }
+    }
+}
+
+// Upstream `fs::rename` port — copy the tree then remove the source. Both
+// halves are independent boundary calls; when the tree copy succeeds the
+// source removal runs unconditionally (matching `rename`'s post state).
+pub linux_x86_64 machine FileSystemUtils::rename_tree_commit(from: &[u8], to: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let copied: bool = FileSystemUtils::rename_tree(from, to);
+    transition copied {
+        true -> remove_src(from)
+        false -> (false)
+        _ -> (false)
+    }
+    state remove_src(from: &[u8]) -> bool {
+        (FileSystemUtils::remove_tree(from))
+    }
+}
+
+// `Path::join` on plain path bytes — write `directory`, a '/' separator
+// (skipped when the directory already ends in one or is empty), then
+// `name`. Returns the joined length; 0 when nothing was written or the
+// join would overflow the out buffer.
+pub machine FileSystemUtils::join_path(directory: &[u8], name: &[u8], out: &mut [u8; 512]) -> u64 {
+    transition { _ -> copy_head(directory, name, out, 0, 0) }
+    state copy_head(directory: &[u8], name: &[u8], out: &mut [u8; 512], position: u64, written: u64) -> u64 {
+        transition position < directory.len && written < 512 {
+            true -> write_head(directory, name, out, position, written)
+            _ -> sep(directory, name, out, written)
+        }
+    }
+    state write_head(directory: &[u8], name: &[u8], out: &mut [u8; 512], position: u64, written: u64) -> u64
+        requires position < directory.len && written < 512;
+    {
+        out[written] = directory[position];
+        transition { _ -> copy_head(directory, name, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state sep(directory: &[u8], name: &[u8], out: &mut [u8; 512], written: u64) -> u64 {
+        transition written > 0 && written < 512 && name.len > 0 {
+            true -> sep_check(directory, name, out, written)
+            _ -> copy_tail(directory, name, out, written, 0)
+        }
+    }
+    state sep_check(directory: &[u8], name: &[u8], out: &mut [u8; 512], written: u64) -> u64
+        requires written > 0 && written < 512;
+    {
+        let last_index: u64 = ((written as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition last_index < 512 {
+            true -> peek(directory, name, out, written, last_index)
+            _ -> write_sep(directory, name, out, written)
+        }
+    }
+    state peek(directory: &[u8], name: &[u8], out: &mut [u8; 512], written: u64, last_index: u64) -> u64
+        requires written > 0 && written < 512 && last_index < 512;
+    {
+        let last: u8 = out[last_index];
+        transition last == 47 || last == 92 {
+            true -> copy_tail(directory, name, out, written, 0)
+            _ -> write_sep(directory, name, out, written)
+        }
+    }
+    state write_sep(directory: &[u8], name: &[u8], out: &mut [u8; 512], written: u64) -> u64
+        requires written < 512;
+    {
+        out[written] = 47;
+        transition { _ -> copy_tail(directory, name, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, 0) }
+    }
+    state copy_tail(directory: &[u8], name: &[u8], out: &mut [u8; 512], written: u64, position: u64) -> u64 {
+        transition position < name.len && written < 512 {
+            true -> write_tail(directory, name, out, written, position)
+            _ -> (written)
+        }
+    }
+    state write_tail(directory: &[u8], name: &[u8], out: &mut [u8; 512], written: u64, position: u64) -> u64
+        requires position < name.len && written < 512;
+    {
+        out[written] = name[position];
+        transition { _ -> copy_tail(directory, name, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Byte-slice equality — `left == right` on `&[u8]` does not lower; the
+// bounded loop compares length, then bytes.
+pub machine FileSystemUtils::bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    transition left.len == right.len {
+        true -> scan(left, right, 0)
+        _ -> (false)
+    }
+    state scan(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len {
+            true -> byte(left, right, position)
+            _ -> (true)
+        }
+    }
+    state byte(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len;
+    {
+        transition left[position] == right[position] {
+            true -> scan(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}

@@ -1,0 +1,1192 @@
+module src::structures::projects::project_items::built_in_types::project_item_type_address_target;
+
+// Port of squalr-engine-api's
+// structures/projects/project_items/built_in_types/project_item_type_address_target.rs.
+//
+// The address target is a `SymbolicPointerChain` wrapper: a module
+// name plus a root link (offset or symbol) and pointer-offset tail.
+// Upstream's chain owns a Vec; the port wraps the owned chain shape —
+// `OwnedSymbolicPointerChain` — since the borrowed `SymbolicPointerChain`
+// view cannot be stored in a record (documented on the owned type).
+//
+// Upstream `to_runtime_pointer` returns `Option<Pointer>`; `Pointer`
+// here is also a borrowed view, so the runtime result rides the owned
+// `OwnedRuntimePointer` carrier (same fields: address, module,
+// offset segments, size) — callers (strip_symbolic_offsets, the
+// activation freeze-target builder) consume the owned projection.
+//
+// Serialization deviation: upstream serde_json round-trips this record
+// through a utf8 string stored in the item's property field; the port
+// stores the target's bounded binary codec bytes in the same field
+// (utf8 not guaranteed — property fields carry raw bytes).
+
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::structures::memory::symbolic_pointer_chain::PointerChainSymbol;
+use src::structures::memory::symbolic_pointer_chain::SymbolicLinkOffset;
+use src::structures::memory::symbolic_pointer_chain::SymbolicLinkBuild;
+use src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use src::structures::memory::symbolic_pointer_chain::SymbolicTailOffsets;
+use src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use src::structures::projects::project_symbol_catalog::SymbolOffsetMatch;
+use src::structures::structs::owned_symbolic_pointer_chain::OwnedSymbolicPointerChain;
+use src::utils::file_system::file_system_utils::FileSystemUtils;
+
+pub data ProjectItemAddressTarget {
+    pointer_chain: OwnedSymbolicPointerChain;
+}
+
+// Owned projection of upstream `Pointer` for runtime results — the
+// borrowed `Pointer<'offsets>` cannot be carried out of a conversion.
+pub data OwnedRuntimePointer {
+    address: u64;
+    module_name: [u8; 256];
+    module_name_len: u64;
+    offset_segments: [SymbolicPointerChainLink; 64];
+    offset_count: u64;
+    pointer_size: PointerScanPointerSize;
+}
+
+// Upstream `Option<Pointer>` return carrier.
+pub data RuntimePointerMatch {
+    found: bool;
+    pointer: OwnedRuntimePointer;
+}
+
+// Upstream `Option<SymbolicPointerChain>` return carrier.
+pub data ResolvedChainMatch {
+    found: bool;
+    pointer_chain: OwnedSymbolicPointerChain;
+}
+
+// Upstream `Option<Self>` return carrier.
+pub data AddressTargetMatch {
+    found: bool;
+    address_target: ProjectItemAddressTarget;
+}
+
+pub machine OwnedRuntimePointer::get_address(owned_runtime_pointer: &OwnedRuntimePointer) -> u64 {
+    owned_runtime_pointer.address
+}
+
+pub machine OwnedRuntimePointer::get_module_name(owned_runtime_pointer: &OwnedRuntimePointer) -> &[u8] {
+    transition owned_runtime_pointer.module_name_len <= 256 {
+        true -> (&owned_runtime_pointer.module_name[0..owned_runtime_pointer.module_name_len])
+        false -> (&owned_runtime_pointer.module_name[0..256])
+        _ -> (&owned_runtime_pointer.module_name[0..256])
+    }
+}
+
+pub machine OwnedRuntimePointer::get_offset_segments(owned_runtime_pointer: &OwnedRuntimePointer) -> &[SymbolicPointerChainLink] {
+    transition owned_runtime_pointer.offset_count <= 64 {
+        true -> (&owned_runtime_pointer.offset_segments[0..owned_runtime_pointer.offset_count])
+        false -> (&owned_runtime_pointer.offset_segments[0..64])
+        _ -> (&owned_runtime_pointer.offset_segments[0..64])
+    }
+}
+
+pub machine OwnedRuntimePointer::get_offset_count(owned_runtime_pointer: &OwnedRuntimePointer) -> u64 {
+    owned_runtime_pointer.offset_count
+}
+
+// Single-segment read — `Offset(0)` out of range.
+pub machine OwnedRuntimePointer::get_offset_segment(owned_runtime_pointer: &OwnedRuntimePointer, position: u64) -> SymbolicPointerChainLink {
+    transition position < owned_runtime_pointer.offset_count && position < 64 {
+        true -> (owned_runtime_pointer.offset_segments[position])
+        _ -> (SymbolicPointerChainLink::new_offset(0))
+    }
+}
+
+pub machine OwnedRuntimePointer::get_pointer_size(owned_runtime_pointer: &OwnedRuntimePointer) -> PointerScanPointerSize {
+    owned_runtime_pointer.pointer_size
+}
+
+// Upstream `set_module_name` — bounded name copy with live length.
+pub machine OwnedRuntimePointer::set_module_name(owned_runtime_pointer: &mut OwnedRuntimePointer, module_name: &[u8]) {
+    owned_runtime_pointer.module_name_len = 0;
+    transition {
+        _ -> copy(owned_runtime_pointer, module_name, 0)
+    }
+    state copy(owned_runtime_pointer: &mut OwnedRuntimePointer, module_name: &[u8], position: u64) {
+        transition position < module_name.len && position < 256 {
+            true -> store(owned_runtime_pointer, module_name, position)
+            false -> finish(owned_runtime_pointer, position)
+        }
+    }
+    state store(owned_runtime_pointer: &mut OwnedRuntimePointer, module_name: &[u8], position: u64)
+        requires position < module_name.len && position < 256
+    {
+        owned_runtime_pointer.module_name[position] = module_name[position];
+        transition {
+            _ -> copy(owned_runtime_pointer, module_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(owned_runtime_pointer: &mut OwnedRuntimePointer, count: u64) {
+        owned_runtime_pointer.module_name_len = count;
+    }
+}
+
+// Upstream `set_pointer_size` — field write.
+// Upstream segment-list write — bounded copy (64) with live count.
+pub machine OwnedRuntimePointer::set_offset_segments(owned_runtime_pointer: &mut OwnedRuntimePointer, segments: &[SymbolicPointerChainLink]) {
+    owned_runtime_pointer.offset_count = 0;
+    transition {
+        _ -> scan(owned_runtime_pointer, segments, 0)
+    }
+    state scan(owned_runtime_pointer: &mut OwnedRuntimePointer, segments: &[SymbolicPointerChainLink], position: u64) {
+        transition position < segments.len && position < 64 {
+            true -> store(owned_runtime_pointer, segments, position)
+            _ -> done()
+        }
+    }
+    state store(owned_runtime_pointer: &mut OwnedRuntimePointer, segments: &[SymbolicPointerChainLink], position: u64)
+        requires position < segments.len && position < 64
+    {
+        owned_runtime_pointer.offset_segments[position] = segments[position];
+        owned_runtime_pointer.offset_count = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> scan(owned_runtime_pointer, segments, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state done() {
+    }
+}
+
+pub machine OwnedRuntimePointer::set_pointer_size(owned_runtime_pointer: &mut OwnedRuntimePointer, pointer_size: PointerScanPointerSize) {
+    owned_runtime_pointer.pointer_size = pointer_size;
+}
+
+pub machine OwnedRuntimePointer::default() -> OwnedRuntimePointer {
+    (OwnedRuntimePointer {
+        address: 0,
+        module_name_len: 0,
+        offset_count: 0,
+        pointer_size: PointerScanPointerSize::default(),
+    })
+}
+
+pub machine ProjectItemAddressTarget::new(
+    module_name: &[u8],
+    pointer_offsets: &[SymbolicPointerChainLink],
+    pointer_size: PointerScanPointerSize
+) -> ProjectItemAddressTarget {
+    (ProjectItemAddressTarget {
+        pointer_chain: OwnedSymbolicPointerChain::new_with_links(module_name, pointer_offsets, pointer_size),
+    })
+}
+
+pub machine ProjectItemAddressTarget::new_address(
+    address: u64,
+    module_name: &[u8]
+) -> ProjectItemAddressTarget {
+    let mut links: [SymbolicPointerChainLink; 64];
+    links[0] = SymbolicPointerChainLink::new_offset(((address as i64 in Wrapping)) as i64);
+    (ProjectItemAddressTarget::new(module_name, &links[0..1], PointerScanPointerSize::Pointer64))
+}
+
+pub machine ProjectItemAddressTarget::new_address_with_pointer_offsets(
+    address: u64,
+    module_name: &[u8],
+    pointer_offsets: &[SymbolicPointerChainLink]
+) -> ProjectItemAddressTarget {
+    // Root link is the address; the tail follows (upstream pushes the
+    // offset first then extends with the caller's tail).
+    let mut links: [SymbolicPointerChainLink; 64];
+    links[0] = SymbolicPointerChainLink::new_offset(((address as i64 in Wrapping)) as i64);
+    transition {
+        _ -> build(module_name, pointer_offsets, links, 0)
+    }
+    state build(
+        module_name: &[u8],
+        pointer_offsets: &[SymbolicPointerChainLink],
+        links: [SymbolicPointerChainLink; 64],
+        position: u64
+    ) -> ProjectItemAddressTarget {
+        let total: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition position < pointer_offsets.len && total < 64 {
+            true -> copy(module_name, pointer_offsets, links, position, total)
+            false -> assemble(module_name, links, total)
+        }
+    }
+    state copy(
+        module_name: &[u8],
+        pointer_offsets: &[SymbolicPointerChainLink],
+        links: [SymbolicPointerChainLink; 64],
+        position: u64,
+        total: u64
+    ) -> ProjectItemAddressTarget
+        requires position < pointer_offsets.len && total < 64
+    {
+        let mut carried: [SymbolicPointerChainLink; 64] = links;
+        carried[total] = pointer_offsets[position];
+        transition {
+            _ -> build(module_name, pointer_offsets, carried, total)
+        }
+    }
+    state assemble(module_name: &[u8], links: [SymbolicPointerChainLink; 64], count: u64) -> ProjectItemAddressTarget {
+        transition count <= 64 {
+            true -> (ProjectItemAddressTarget::new(module_name, &links[0..count], PointerScanPointerSize::Pointer64))
+            false -> (ProjectItemAddressTarget::new(module_name, &links[0..64], PointerScanPointerSize::Pointer64))
+        }
+    }
+}
+
+pub machine ProjectItemAddressTarget::new_pointer_path(
+    pointer: &OwnedRuntimePointer
+) -> ProjectItemAddressTarget {
+    let mut links: [SymbolicPointerChainLink; 64];
+    links[0] = SymbolicPointerChainLink::new_offset(((pointer.address as i64 in Wrapping)) as i64);
+    transition {
+        _ -> build(pointer, links, 0)
+    }
+    state build(
+        pointer: &OwnedRuntimePointer,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64
+    ) -> ProjectItemAddressTarget {
+        let total: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition position < pointer.offset_count && total < 64 {
+            true -> copy(pointer, links, position, total)
+            false -> assemble(pointer, links, total)
+        }
+    }
+    state copy(
+        pointer: &OwnedRuntimePointer,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64,
+        total: u64
+    ) -> ProjectItemAddressTarget
+        requires position < pointer.offset_count && total < 64
+    {
+        let mut carried: [SymbolicPointerChainLink; 64] = links;
+        carried[total] = pointer.offset_segments[position];
+        transition {
+            _ -> build(pointer, carried, total)
+        }
+    }
+    state assemble(pointer: &OwnedRuntimePointer, links: [SymbolicPointerChainLink; 64], count: u64) -> ProjectItemAddressTarget {
+        let module_name: &[u8] = OwnedRuntimePointer::get_module_name(pointer);
+        let pointer_size: PointerScanPointerSize = pointer.pointer_size;
+        transition count <= 64 {
+            true -> (ProjectItemAddressTarget::new(module_name, &links[0..count], pointer_size))
+            false -> (ProjectItemAddressTarget::new(module_name, &links[0..64], pointer_size))
+        }
+    }
+}
+
+pub machine ProjectItemAddressTarget::get_module_name(project_item_address_target: &ProjectItemAddressTarget) -> &[u8] {
+    (OwnedSymbolicPointerChain::get_module_name(&project_item_address_target.pointer_chain))
+}
+
+pub machine ProjectItemAddressTarget::set_module_name(project_item_address_target: &mut ProjectItemAddressTarget, module_name: &[u8]) {
+    OwnedSymbolicPointerChain::set_module_name(&mut project_item_address_target.pointer_chain, module_name);
+}
+
+pub machine ProjectItemAddressTarget::get_pointer_offsets(project_item_address_target: &ProjectItemAddressTarget) -> &[SymbolicPointerChainLink] {
+    (OwnedSymbolicPointerChain::get_links(&project_item_address_target.pointer_chain))
+}
+
+pub machine ProjectItemAddressTarget::get_link_count(project_item_address_target: &ProjectItemAddressTarget) -> u64 {
+    (OwnedSymbolicPointerChain::get_link_count(&project_item_address_target.pointer_chain))
+}
+
+pub machine ProjectItemAddressTarget::set_pointer_offsets(project_item_address_target: &mut ProjectItemAddressTarget, pointer_offsets: &[SymbolicPointerChainLink]) {
+    OwnedSymbolicPointerChain::set_links(&mut project_item_address_target.pointer_chain, pointer_offsets);
+}
+
+pub machine ProjectItemAddressTarget::get_pointer_offset_at(project_item_address_target: &ProjectItemAddressTarget, position: u64) -> SymbolicPointerChainLink {
+    transition position < OwnedSymbolicPointerChain::get_link_count(&project_item_address_target.pointer_chain) && position < 64 {
+        true -> (OwnedSymbolicPointerChain::get_link(&project_item_address_target.pointer_chain, position))
+        _ -> (SymbolicPointerChainLink::new_offset(0))
+    }
+}
+
+// Position-0 link read — `Offset(0)` when the chain is empty.
+pub machine ProjectItemAddressTarget::get_first_pointer_offset(project_item_address_target: &ProjectItemAddressTarget) -> SymbolicPointerChainLink {
+    let link_count: u64 = OwnedSymbolicPointerChain::get_link_count(&project_item_address_target.pointer_chain);
+    transition link_count > 0 {
+        true -> (OwnedSymbolicPointerChain::get_link(&project_item_address_target.pointer_chain, 0))
+        _ -> (SymbolicPointerChainLink::new_offset(0))
+    }
+}
+
+pub machine ProjectItemAddressTarget::get_pointer_size(project_item_address_target: &ProjectItemAddressTarget) -> PointerScanPointerSize {
+    (OwnedSymbolicPointerChain::get_pointer_size(&project_item_address_target.pointer_chain))
+}
+
+pub machine ProjectItemAddressTarget::set_pointer_size(project_item_address_target: &mut ProjectItemAddressTarget, pointer_size: PointerScanPointerSize) {
+    OwnedSymbolicPointerChain::set_pointer_size(&mut project_item_address_target.pointer_chain, pointer_size);
+}
+
+pub machine ProjectItemAddressTarget::get_root_offset(project_item_address_target: &ProjectItemAddressTarget) -> SymbolicLinkOffset {
+    (OwnedSymbolicPointerChain::get_numeric_root_offset(&project_item_address_target.pointer_chain))
+}
+
+pub machine ProjectItemAddressTarget::get_numeric_pointer_tail(project_item_address_target: &ProjectItemAddressTarget, out: &mut [i64]) -> SymbolicTailOffsets {
+    (OwnedSymbolicPointerChain::get_numeric_tail_offsets(&project_item_address_target.pointer_chain, out))
+}
+
+pub machine ProjectItemAddressTarget::has_symbolic_offsets(project_item_address_target: &ProjectItemAddressTarget) -> bool {
+    (OwnedSymbolicPointerChain::has_symbolic_links(&project_item_address_target.pointer_chain))
+}
+
+// Upstream `to_runtime_pointer` — a numeric root offset builds the
+// runtime pointer out of the tail links; a symbolic root yields the
+// not-found carrier.
+pub machine ProjectItemAddressTarget::to_runtime_pointer(project_item_address_target: &ProjectItemAddressTarget) -> RuntimePointerMatch {
+    let root_offset: SymbolicLinkOffset = OwnedSymbolicPointerChain::get_numeric_root_offset(&project_item_address_target.pointer_chain);
+    transition root_offset.found {
+        true -> bounded(project_item_address_target, root_offset)
+        false -> (RuntimePointerMatch { found: false, pointer: OwnedRuntimePointer::default() })
+    }
+    state bounded(project_item_address_target: &ProjectItemAddressTarget, root_offset: SymbolicLinkOffset) -> RuntimePointerMatch {
+        transition root_offset.offset >= 0 {
+            true -> fill(project_item_address_target, ((root_offset.offset as u64 in Wrapping)) as u64)
+            false -> (RuntimePointerMatch { found: false, pointer: OwnedRuntimePointer::default() })
+        }
+    }
+    state fill(project_item_address_target: &ProjectItemAddressTarget, address: u64) -> RuntimePointerMatch {
+        let mut pointer: OwnedRuntimePointer = OwnedRuntimePointer::default();
+        let module_name: &[u8] = OwnedSymbolicPointerChain::get_module_name(&project_item_address_target.pointer_chain);
+        pointer.address = address;
+        pointer.pointer_size = OwnedSymbolicPointerChain::get_pointer_size(&project_item_address_target.pointer_chain);
+        transition {
+            _ -> copy_module(project_item_address_target, module_name, pointer, 0, module_name.len)
+        }
+    }
+    state copy_module(project_item_address_target: &ProjectItemAddressTarget, module_name: &[u8], pointer: OwnedRuntimePointer, position: u64, module_name_len: u64) -> RuntimePointerMatch {
+        transition position < module_name_len && position < 256 {
+            true -> store_module_gate(project_item_address_target, module_name, pointer, position, module_name_len)
+            false -> copy_links(project_item_address_target, module_name, pointer, 0, module_name_len)
+        }
+    }
+    state store_module_gate(project_item_address_target: &ProjectItemAddressTarget, module_name: &[u8], pointer: OwnedRuntimePointer, position: u64, module_name_len: u64) -> RuntimePointerMatch {
+        transition position < module_name.len && position < 256 {
+            true -> store_module(project_item_address_target, module_name, pointer, position, module_name_len)
+            _ -> (RuntimePointerMatch { found: false, pointer: OwnedRuntimePointer::default() })
+        }
+    }
+    state store_module(project_item_address_target: &ProjectItemAddressTarget, module_name: &[u8], pointer: OwnedRuntimePointer, position: u64, module_name_len: u64) -> RuntimePointerMatch
+        requires position < module_name.len && position < 256;
+    {
+        let mut carried: OwnedRuntimePointer = pointer;
+        carried.module_name[position] = module_name[position];
+        transition {
+            _ -> copy_module(project_item_address_target, module_name, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, module_name_len)
+        }
+    }
+    state copy_links(project_item_address_target: &ProjectItemAddressTarget, module_name: &[u8], pointer: OwnedRuntimePointer, position: u64, module_name_len: u64) -> RuntimePointerMatch {
+        // Tail links = every link past the root.
+        let tail_position: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let link_count: u64 = OwnedSymbolicPointerChain::get_link_count(&project_item_address_target.pointer_chain);
+        transition tail_position < link_count && tail_position < 64 && position < 64 {
+            true -> store_link(project_item_address_target, module_name, pointer, position, tail_position, module_name_len, link_count)
+            false -> done(module_name, pointer, position, module_name_len)
+        }
+    }
+    state store_link(project_item_address_target: &ProjectItemAddressTarget, module_name: &[u8], pointer: OwnedRuntimePointer, position: u64, tail_position: u64, module_name_len: u64, link_count: u64) -> RuntimePointerMatch
+        requires position < 64 && tail_position < 64 && tail_position < link_count;
+    {
+        let mut carried: OwnedRuntimePointer = pointer;
+        carried.offset_segments[position] = OwnedSymbolicPointerChain::get_link(&project_item_address_target.pointer_chain, tail_position);
+        transition {
+            _ -> copy_links(project_item_address_target, module_name, carried, tail_position, module_name_len)
+        }
+    }
+    state done(module_name: &[u8], pointer: OwnedRuntimePointer, count: u64, module_name_len: u64) -> RuntimePointerMatch {
+        let mut carried: OwnedRuntimePointer = pointer;
+        carried.module_name_len = module_name_len;
+        carried.offset_count = count;
+        (RuntimePointerMatch { found: true, pointer: carried })
+    }
+    state finish(project_item_address_target: &ProjectItemAddressTarget, pointer: OwnedRuntimePointer, count: u64) -> RuntimePointerMatch {
+        let mut carried: OwnedRuntimePointer = pointer;
+        carried.offset_count = count;
+        (RuntimePointerMatch { found: true, pointer: carried })
+    }
+}
+
+// Upstream `to_runtime_pointer_resolving_symbols` — symbol links
+// resolve through `find_module_symbol_offset_by_display_name`; any
+// link the catalog cannot resolve fails the whole conversion.
+pub machine ProjectItemAddressTarget::to_runtime_pointer_resolving_symbols(
+    project_item_address_target: &ProjectItemAddressTarget,
+    project_symbol_catalog: &ProjectSymbolCatalog
+) -> RuntimePointerMatch {
+    let resolved: ResolvedChainMatch = ProjectItemAddressTarget::resolve_symbolic_pointer_chain_links(project_item_address_target, project_symbol_catalog);
+    transition resolved.found {
+        true -> runtime(project_item_address_target, &resolved.pointer_chain)
+        false -> (RuntimePointerMatch { found: false, pointer: OwnedRuntimePointer::default() })
+    }
+    state runtime(project_item_address_target: &ProjectItemAddressTarget, pointer_chain: &OwnedSymbolicPointerChain) -> RuntimePointerMatch {
+        let mut cloned_chain: OwnedSymbolicPointerChain = OwnedSymbolicPointerChain::default();
+        OwnedSymbolicPointerChain::clone_from(&mut cloned_chain, pointer_chain);
+        let resolved_target: ProjectItemAddressTarget = ProjectItemAddressTarget {
+            pointer_chain: cloned_chain,
+        };
+        (ProjectItemAddressTarget::to_runtime_pointer(&resolved_target))
+    }
+}
+
+// Upstream `strip_symbolic_offsets` — already-numeric chains copy
+// through unchanged; symbolic chains rebuild from the resolved
+// runtime pointer.
+pub machine ProjectItemAddressTarget::strip_symbolic_offsets(
+    project_item_address_target: &ProjectItemAddressTarget,
+    project_symbol_catalog: &ProjectSymbolCatalog
+) -> AddressTargetMatch {
+    transition ProjectItemAddressTarget::has_symbolic_offsets(project_item_address_target) {
+        true -> resolve(project_item_address_target, project_symbol_catalog)
+        false -> (AddressTargetMatch { found: true, address_target: ProjectItemAddressTarget::clone(project_item_address_target) })
+    }
+    state resolve(project_item_address_target: &ProjectItemAddressTarget, project_symbol_catalog: &ProjectSymbolCatalog) -> AddressTargetMatch {
+        let runtime: RuntimePointerMatch = ProjectItemAddressTarget::to_runtime_pointer_resolving_symbols(project_item_address_target, project_symbol_catalog);
+        transition runtime.found {
+            true -> (AddressTargetMatch {
+                found: true,
+                address_target: ProjectItemAddressTarget::new_pointer_path(&runtime.pointer),
+            })
+            false -> (AddressTargetMatch { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+}
+
+// Upstream `resolve_symbolic_pointer_chain_links` — each symbol link
+// resolves through the catalog's display-name lookup; an unresolvable
+// link fails the conversion.
+pub machine ProjectItemAddressTarget::resolve_symbolic_pointer_chain_links(
+    project_item_address_target: &ProjectItemAddressTarget,
+    project_symbol_catalog: &ProjectSymbolCatalog
+) -> ResolvedChainMatch {
+    let mut links: [SymbolicPointerChainLink; 64];
+    transition {
+        _ -> scan(project_item_address_target, project_symbol_catalog, links, 0)
+    }
+    state scan(project_item_address_target: &ProjectItemAddressTarget,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64
+    ) -> ResolvedChainMatch {
+        transition position < OwnedSymbolicPointerChain::get_link_count(&project_item_address_target.pointer_chain) && position < 64 {
+            true -> link(project_item_address_target, project_symbol_catalog, links, position)
+            false -> assemble(project_item_address_target, links, position)
+        }
+    }
+    state link(project_item_address_target: &ProjectItemAddressTarget,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64
+    ) -> ResolvedChainMatch
+        requires position < 64
+    {
+        let source: SymbolicPointerChainLink = OwnedSymbolicPointerChain::get_link(&project_item_address_target.pointer_chain, position);
+        transition source {
+            SymbolicPointerChainLink::Offset { offset } -> copy_offset(project_item_address_target, project_symbol_catalog, links, position, offset)
+            SymbolicPointerChainLink::Symbol { symbol } -> resolve_symbol(project_item_address_target, project_symbol_catalog, links, position, symbol)
+            _ -> (ResolvedChainMatch { found: false, pointer_chain: OwnedSymbolicPointerChain::default() })
+        }
+    }
+    state copy_offset(project_item_address_target: &ProjectItemAddressTarget,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64,
+        offset: i64
+    ) -> ResolvedChainMatch
+        requires position < 64
+    {
+        let mut carried: [SymbolicPointerChainLink; 64] = links;
+        carried[position] = SymbolicPointerChainLink::new_offset(offset);
+        transition {
+            _ -> scan(project_item_address_target, project_symbol_catalog, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state resolve_symbol(project_item_address_target: &ProjectItemAddressTarget,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64,
+        symbol: PointerChainSymbol
+    ) -> ResolvedChainMatch
+        requires position < 64
+    {
+        transition symbol.symbol_name_len <= 256 {
+            true -> lookup(project_item_address_target, project_symbol_catalog, links, position, symbol)
+            false -> (ResolvedChainMatch { found: false, pointer_chain: OwnedSymbolicPointerChain::default() })
+            _ -> (ResolvedChainMatch { found: false, pointer_chain: OwnedSymbolicPointerChain::default() })
+        }
+    }
+    state lookup(project_item_address_target: &ProjectItemAddressTarget,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64,
+        symbol: PointerChainSymbol
+    ) -> ResolvedChainMatch
+        requires position < 64
+    {
+        let module_name: &[u8] = OwnedSymbolicPointerChain::get_module_name(&project_item_address_target.pointer_chain);
+        let matched: SymbolOffsetMatch = ProjectSymbolCatalog::find_module_symbol_offset_by_display_name(project_symbol_catalog, 
+            module_name,
+            &symbol.symbol_name[0..symbol.symbol_name_len]);
+        transition matched.found {
+            true -> place(project_item_address_target, project_symbol_catalog, links, position, matched.offset)
+            false -> (ResolvedChainMatch { found: false, pointer_chain: OwnedSymbolicPointerChain::default() })
+        }
+    }
+    state place(project_item_address_target: &ProjectItemAddressTarget,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        links: [SymbolicPointerChainLink; 64],
+        position: u64,
+        offset: u64
+    ) -> ResolvedChainMatch
+        requires position < 64
+    {
+        let mut carried: [SymbolicPointerChainLink; 64] = links;
+        carried[position] = SymbolicPointerChainLink::new_offset(((offset as i64 in Wrapping)) as i64);
+        transition {
+            _ -> scan(project_item_address_target, project_symbol_catalog, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state assemble(project_item_address_target: &ProjectItemAddressTarget, links: [SymbolicPointerChainLink; 64], count: u64) -> ResolvedChainMatch {
+        let module_name: &[u8] = OwnedSymbolicPointerChain::get_module_name(&project_item_address_target.pointer_chain);
+        let held_size: PointerScanPointerSize = OwnedSymbolicPointerChain::get_pointer_size(&project_item_address_target.pointer_chain);
+        transition count <= 64 {
+            true -> (ResolvedChainMatch {
+                found: true,
+                pointer_chain: OwnedSymbolicPointerChain::new_with_links(module_name, &links[0..count], held_size),
+            })
+            false -> (ResolvedChainMatch { found: false, pointer_chain: OwnedSymbolicPointerChain::default() })
+        }
+    }
+}
+
+pub machine ProjectItemAddressTarget::clone(source: &ProjectItemAddressTarget) -> ProjectItemAddressTarget {
+    let mut carried: ProjectItemAddressTarget = ProjectItemAddressTarget::default();
+    OwnedSymbolicPointerChain::clone_from(&mut carried.pointer_chain, &source.pointer_chain);
+    (carried)
+}
+
+pub machine ProjectItemAddressTarget::clone_from(project_item_address_target: &mut ProjectItemAddressTarget, source: &ProjectItemAddressTarget) {
+    OwnedSymbolicPointerChain::clone_from(&mut project_item_address_target.pointer_chain, &source.pointer_chain);
+}
+
+pub machine ProjectItemAddressTarget::default() -> ProjectItemAddressTarget {
+    (ProjectItemAddressTarget {
+        pointer_chain: OwnedSymbolicPointerChain::default(),
+    })
+}
+
+// ---- field codec --------------------------------------------------------------
+// The property field's bounded binary form (upstream serde_json):
+// module_len u64le | module | spelling_len u64le | spelling |
+// link_count u64le | per link tag u8 (0 offset → i64le, 1 symbol →
+// symbol_len u64le + bytes). `address_target` threads as a shared
+// param through every state.
+
+pub data AddressTargetDecode {
+    found: bool;
+    address_target: ProjectItemAddressTarget;
+}
+
+machine at_put_u64(out: &mut [u8; 512], position: u64, value: u64) -> u64
+    requires position <= 504
+{
+    out[position] = ((value & 255) as u8 in Wrapping) as u8;
+    let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    transition next < 512 {
+        true -> byte1(out, next, value)
+        false -> (next)
+    }
+    state byte1( out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 256) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte2(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte2( out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 65536) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte3(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte3( out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 16777216) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte4(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte4( out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 4294967296) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte5(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte5( out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 1099511627776) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte6(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte6( out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 281474976710656) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte7(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte7( out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 72057594037927936) & 255) as u8 in Wrapping) as u8;
+        (((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+    }
+}
+
+machine at_get_u64(buffer: &[u8], position: u64) -> u64 {
+    transition position < buffer.len {
+        true -> byte0(buffer, position)
+        false -> (0)
+    }
+    state byte0( buffer: &[u8], position: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc: u64 = ((buffer[position] as u64 in Wrapping)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte1(buffer, next, acc)
+            false -> (acc)
+        }
+    }
+    state byte1( buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 256)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte2(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte2( buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 65536)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte3(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte3( buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 16777216)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte4(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte4( buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 4294967296)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte5(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte5( buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 1099511627776)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte6(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte6( buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 281474976710656)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte7(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte7( buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        (((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 72057594037927936)) as u64)
+    }
+}
+
+machine at_copy_into(out: &mut [u8; 512], position: u64, bytes: &[u8], byte_count: u64) -> u64 {
+    transition {
+        _ -> scan(out, position, bytes, byte_count, 0)
+    }
+    state scan( out: &mut [u8; 512], position: u64, bytes: &[u8], byte_count: u64, index: u64) -> u64 {
+        transition index < byte_count && index < bytes.len && position < 512 {
+            true -> store(out, position, bytes, byte_count, index)
+            false -> (position)
+        }
+    }
+    state store( out: &mut [u8; 512], position: u64, bytes: &[u8], byte_count: u64, index: u64) -> u64 {
+        out[position] = bytes[index];
+        transition {
+            _ -> scan(out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, bytes, byte_count, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+pub machine encode_address_target(address_target: &ProjectItemAddressTarget, out: &mut [u8; 512]) -> u64 {
+    transition {
+        _ -> module_len_put(address_target, out, 0)
+    }
+    state module_len_put( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64) -> u64 {
+        let module: &[u8] = ProjectItemAddressTarget::get_module_name(address_target);
+        transition module.len <= 256 && position <= 504 {
+            true -> module_put(address_target, out, module, position)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state module_put( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], module: &[u8], position: u64)
+        requires position <= 504
+    {
+        let after_len: u64 = at_put_u64(out, position, module.len);
+        let after_module: u64 = at_copy_into(out, after_len, module, module.len);
+        transition {
+            _ -> spelling_len_put(address_target, out, after_module)
+        }
+    }
+    state spelling_len_put( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64) -> u64 {
+        let size: PointerScanPointerSize = ProjectItemAddressTarget::get_pointer_size(address_target);
+        let spelling: &[u8] = PointerScanPointerSize::spelling(&size);
+        transition spelling.len <= 256 && position <= 504 {
+            true -> spelling_put(address_target, out, spelling, position)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state spelling_put( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], spelling: &[u8], position: u64)
+        requires position <= 504
+    {
+        let after_len: u64 = at_put_u64(out, position, spelling.len);
+        let after_spelling: u64 = at_copy_into(out, after_len, spelling, spelling.len);
+        transition {
+            _ -> count_put(address_target, out, after_spelling)
+        }
+    }
+    state count_put( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64) -> u64 {
+        let link_count: u64 = ProjectItemAddressTarget::get_link_count(address_target);
+        transition link_count <= 64 && position <= 504 {
+            true -> count_store(address_target, out, position, link_count)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state count_store( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64)
+        requires position <= 504
+    {
+        let after_count: u64 = at_put_u64(out, position, link_count);
+        transition {
+            _ -> links(address_target, out, after_count, link_count, 0)
+        }
+    }
+    state links( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64, link_position: u64) -> u64 {
+        transition link_position < link_count && link_position < address_target.pointer_chain.link_count && link_position < 64 && position < 512 {
+            true -> link(address_target, out, position, link_count, link_position)
+            false -> (position)
+        }
+    }
+    state link( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64, link_position: u64) -> u64
+        requires position < 512 && link_position < address_target.pointer_chain.link_count && link_position < 64
+    {
+        let source: SymbolicPointerChainLink = OwnedSymbolicPointerChain::get_link(address_target.pointer_chain, link_position);
+        transition source {
+            SymbolicPointerChainLink::Offset { offset } -> offset_link(address_target, out, position, link_count, link_position, offset)
+            SymbolicPointerChainLink::Symbol { symbol } -> symbol_link(address_target, out, position, link_count, link_position, symbol)
+            _ -> (position)
+        }
+    }
+    state offset_link( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64, link_position: u64, offset: i64) -> u64
+        requires position < 512
+    {
+        out[position] = 0;
+        let after_tag: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition after_tag <= 504 {
+            true -> offset_value(address_target, out, after_tag, link_count, link_position, offset)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state offset_value( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64, link_position: u64, offset: i64) -> u64
+        requires position <= 504
+    {
+        let offset_bits: u64 = ((offset as u64 in Wrapping)) as u64;
+        let after: u64 = at_put_u64(out, position, offset_bits);
+        transition {
+            _ -> links(address_target, out, after, link_count, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state symbol_link( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64, link_position: u64, symbol: PointerChainSymbol) -> u64
+        requires position < 512
+    {
+        out[position] = 1;
+        let after_tag: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition symbol.symbol_name_len <= 256 && after_tag <= 504 {
+            true -> symbol_len(address_target, out, after_tag, link_count, link_position, symbol)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state symbol_len( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64, link_position: u64, symbol: PointerChainSymbol) -> u64
+        requires position <= 504
+    {
+        let after_len: u64 = at_put_u64(out, position, symbol.symbol_name_len);
+        transition symbol.symbol_name_len <= 256 {
+            true -> symbol_bytes(address_target, out, after_len, link_count, link_position, symbol)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state symbol_bytes( address_target: &ProjectItemAddressTarget, out: &mut [u8; 512], position: u64, link_count: u64, link_position: u64, symbol: PointerChainSymbol) -> u64
+        requires symbol.symbol_name_len <= 256
+    {
+        let after_name: u64 = at_copy_into(out, position, &symbol.symbol_name[0..symbol.symbol_name_len], symbol.symbol_name_len);
+        transition {
+            _ -> links(address_target, out, after_name, link_count, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Decode scratch — bounded carriers the states fill (module bytes,
+// size spelling, resolved links) before the target is assembled.
+data AddressTargetDecodeScratch {
+    module_name: [u8; 256];
+    module_name_len: u64;
+    spelling: [u8; 256];
+    spelling_len: u64;
+    links: [SymbolicPointerChainLink; 64];
+    link_count: u64;
+    symbol_name: [u8; 256];
+    symbol_name_len: u64;
+}
+
+pub machine decode_address_target(serialized: &[u8], serialized_len: u64) -> AddressTargetDecode {
+    let mut scratch: AddressTargetDecodeScratch = AddressTargetDecodeScratch {
+        module_name_len: 0,
+        spelling_len: 0,
+        link_count: 0,
+    };
+    transition serialized_len <= 512 {
+        true -> module_len(serialized, serialized_len, &mut scratch, 0)
+        false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+    }
+    state module_len( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64) -> AddressTargetDecode {
+        transition serialized_len <= 512 && position <= 504 {
+            true -> module_len_get(serialized, serialized_len, scratch, position)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state module_len_get( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position <= 504
+    {
+        let module_len: u64 = at_get_u64(serialized, position);
+        let after_len: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        let module_end: u64 = ((after_len as u64 in Wrapping) + (module_len as u64 in Wrapping)) as u64;
+        transition module_len <= 256 && module_end <= serialized_len {
+            true -> module_copy(serialized, serialized_len, scratch, after_len, module_end, 0)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state module_copy( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, module_end: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        transition position < module_end && position < serialized.len && index < 256 {
+            true -> module_byte(serialized, serialized_len, scratch, position, module_end, index)
+            false -> module_done(serialized, serialized_len, scratch, module_end, index)
+        }
+    }
+    state module_byte( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, module_end: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position < serialized.len && index < 256
+    {
+        scratch.module_name[index] = serialized[position];
+        transition {
+            _ -> module_copy(serialized, serialized_len, scratch, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, module_end, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state module_done( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        scratch.module_name_len = index;
+        transition {
+            _ -> spelling_len(serialized, serialized_len, scratch, position)
+        }
+    }
+    state spelling_len( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        transition position <= 504 {
+            true -> spelling_len_get(serialized, serialized_len, scratch, position)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state spelling_len_get( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position <= 504
+    {
+        let spelling_len: u64 = at_get_u64(serialized, position);
+        let after_len: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        let spelling_end: u64 = ((after_len as u64 in Wrapping) + (spelling_len as u64 in Wrapping)) as u64;
+        transition spelling_len <= 256 && spelling_end <= serialized_len {
+            true -> spelling_copy(serialized, serialized_len, scratch, after_len, spelling_end, 0)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state spelling_copy( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, spelling_end: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        transition position < spelling_end && position < serialized.len && index < 256 {
+            true -> spelling_byte(serialized, serialized_len, scratch, position, spelling_end, index)
+            false -> spelling_done(serialized, serialized_len, scratch, spelling_end, index)
+        }
+    }
+    state spelling_byte( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, spelling_end: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position < serialized.len && index < 256
+    {
+        scratch.spelling[index] = serialized[position];
+        transition {
+            _ -> spelling_copy(serialized, serialized_len, scratch, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, spelling_end, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state spelling_done( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        scratch.spelling_len = index;
+        transition {
+            _ -> count(serialized, serialized_len, scratch, position)
+        }
+    }
+    state count( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        transition position <= 504 {
+            true -> count_get(serialized, serialized_len, scratch, position)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state count_get( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position <= 504
+    {
+        let link_count: u64 = at_get_u64(serialized, position);
+        let after_count: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        transition link_count <= 64 {
+            true -> links(serialized, serialized_len, scratch, after_count, link_count, 0)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state links( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        transition link_position < link_count && position < serialized.len {
+            true -> link_tag(serialized, serialized_len, scratch, position, link_count, link_position)
+            false -> links_done(scratch, link_count, link_position)
+        }
+    }
+    state link_tag( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position < serialized.len
+    {
+        let tag: u8 = serialized[position];
+        let after_tag: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition tag == 0 {
+            true -> offset_len(serialized, serialized_len, scratch, after_tag, link_count, link_position)
+            false -> symbol_len(serialized, serialized_len, scratch, after_tag, link_count, link_position, tag)
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state offset_len( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        transition position <= 504 && link_position < 64 {
+            true -> offset_get(serialized, serialized_len, scratch, position, link_count, link_position)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state offset_get( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position <= 504 && link_position < 64
+    {
+        let offset_bits: u64 = at_get_u64(serialized, position);
+        let offset: i64 = ((offset_bits as i64 in Wrapping)) as i64;
+        scratch.links[link_position] = SymbolicPointerChainLink::new_offset(offset);
+        let after: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> links(serialized, serialized_len, scratch, after, link_count, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state symbol_len( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64, tag: u8) -> AddressTargetDecode
+        requires serialized_len <= 512
+    {
+        transition tag == 1 && position <= 504 && link_position < 64 {
+            true -> symbol_len_get(serialized, serialized_len, scratch, position, link_count, link_position)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state symbol_len_get( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position <= 504 && link_position < 64
+    {
+        let symbol_len: u64 = at_get_u64(serialized, position);
+        let after_len: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        let symbol_end: u64 = ((after_len as u64 in Wrapping) + (symbol_len as u64 in Wrapping)) as u64;
+        transition symbol_len <= 256 && symbol_end <= serialized_len {
+            true -> symbol_copy(serialized, serialized_len, scratch, after_len, symbol_end, link_count, link_position, 0)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state symbol_copy( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, symbol_end: u64, link_count: u64, link_position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && link_position < 64
+    {
+        transition index == 0 {
+            true -> symbol_reset(serialized, serialized_len, scratch, position, symbol_end, link_count, link_position, index)
+            false -> symbol_scan(serialized, serialized_len, scratch, position, symbol_end, link_count, link_position, index)
+        }
+    }
+    state symbol_reset( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, symbol_end: u64, link_count: u64, link_position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && link_position < 64
+    {
+        scratch.symbol_name_len = 0;
+        transition {
+            _ -> symbol_scan(serialized, serialized_len, scratch, position, symbol_end, link_count, link_position, index)
+        }
+    }
+    state symbol_scan( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, symbol_end: u64, link_count: u64, link_position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && link_position < 64
+    {
+        transition position < symbol_end && position < serialized.len && index < 256 {
+            true -> symbol_byte(serialized, serialized_len, scratch, position, symbol_end, link_count, link_position, index)
+            false -> symbol_done(serialized, serialized_len, scratch, position, link_count, link_position, index)
+        }
+    }
+    state symbol_byte( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, symbol_end: u64, link_count: u64, link_position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && position < serialized.len && index < 256 && link_position < 64
+    {
+        scratch.symbol_name[index] = serialized[position];
+        transition {
+            _ -> symbol_scan(serialized, serialized_len, scratch, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, symbol_end, link_count, link_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state symbol_done( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && link_position < 64
+    {
+        scratch.symbol_name_len = index;
+        transition index <= 256 {
+            true -> symbol_place(serialized, serialized_len, scratch, position, link_count, link_position, index)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state symbol_place( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64, index: u64) -> AddressTargetDecode
+        requires serialized_len <= 512 && link_position < 64 && index <= 256
+    {
+        let built: SymbolicLinkBuild = SymbolicPointerChainLink::new_symbol(&scratch.symbol_name[0..index]);
+        transition built.found {
+            true -> symbol_stored(serialized, serialized_len, scratch, position, link_count, link_position, built.link)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state symbol_stored( serialized: &[u8], serialized_len: u64, scratch: &mut AddressTargetDecodeScratch, position: u64, link_count: u64, link_position: u64, link: SymbolicPointerChainLink) -> AddressTargetDecode
+        requires serialized_len <= 512 && link_position < 64
+    {
+        scratch.links[link_position] = link;
+        transition {
+            _ -> links(serialized, serialized_len, scratch, position, link_count, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state links_done( scratch: &mut AddressTargetDecodeScratch, link_count: u64, link_position: u64) -> AddressTargetDecode {
+        transition link_position == link_count {
+            true -> finish(scratch, link_position)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state finish( scratch: &mut AddressTargetDecodeScratch, link_position: u64) -> AddressTargetDecode {
+        scratch.link_count = link_position;
+        transition {
+            _ -> assemble(scratch)
+        }
+    }
+    state assemble( scratch: &mut AddressTargetDecodeScratch) -> AddressTargetDecode {
+        let len: u64 = scratch.spelling_len;
+        transition len <= 256 {
+            true -> assemble_sized_probe(scratch, len)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state assemble_sized_probe( scratch: &mut AddressTargetDecodeScratch, len: u64) -> AddressTargetDecode
+        requires len <= 256
+    {
+        let spelling_match: Optional<PointerScanPointerSize> = PointerScanPointerSize::from_str(
+            &scratch.spelling[0..len]);
+        transition spelling_match {
+            Optional::Some { value } -> assemble_sized(scratch, value)
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state assemble_sized( scratch: &mut AddressTargetDecodeScratch, pointer_size: PointerScanPointerSize) -> AddressTargetDecode {
+        transition scratch.module_name_len <= 256 && scratch.link_count <= 64 {
+            true -> build(scratch, pointer_size)
+            false -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+            _ -> (AddressTargetDecode { found: false, address_target: ProjectItemAddressTarget::default() })
+        }
+    }
+    state build( scratch: &mut AddressTargetDecodeScratch, pointer_size: PointerScanPointerSize) -> AddressTargetDecode
+        requires scratch.module_name_len <= 256 && scratch.link_count <= 64
+    {
+        (AddressTargetDecode {
+            found: true,
+            address_target: ProjectItemAddressTarget::new(
+                &scratch.module_name[0..scratch.module_name_len],
+                &scratch.links[0..scratch.link_count],
+                pointer_size),
+        })
+    }
+}
+
+// Upstream `PartialEq` — delegates to the chain record equality.
+pub machine ProjectItemAddressTarget::address_targets_equal(left: &ProjectItemAddressTarget, right: &ProjectItemAddressTarget) -> bool {
+    (OwnedSymbolicPointerChain::chains_equal(&left.pointer_chain, &right.pointer_chain))
+}

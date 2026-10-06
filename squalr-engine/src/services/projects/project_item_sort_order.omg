@@ -1,0 +1,1148 @@
+module src::services::projects::project_item_sort_order;
+
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_manifest::ProjectManifest;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+
+// Port of command_executors/project_items/project_item_sort_order.rs —
+// manifest sort-order maintenance. HashSet/HashMap membership -> linear
+// scans over the bounded ProjectPathList (64 x 512). PathBuf prefix /
+// join / component ops -> plain byte prefix checks and '/'-joined concats
+// (in-memory manifest data, no fs calls, so no in-Path domain needed).
+// PathBuf's component-wise Ord -> byte-lex compare ('/' sorts before
+// alphanumerics; ordering is identical on well-formed relative entries —
+// documented bound). Manifest mutations dirty the project via
+// ProjectInfo::set_has_unsaved_changes like upstream.
+pub data ProjectItemSortOrder {}
+
+// Scratch carrier for one in-flight joined/resolved path (512 bound).
+pub data ManifestPathScratch {
+    bytes: [u8; 512];
+    len: u64;
+}
+pub machine ManifestPathScratch::new(manifest_path_scratch: &mut ManifestPathScratch) {
+    manifest_path_scratch.len = 0;
+}
+pub machine ManifestPathScratch::clear(manifest_path_scratch: &mut ManifestPathScratch) {
+    manifest_path_scratch.len = 0;
+}
+pub machine ManifestPathScratch::append(manifest_path_scratch: &mut ManifestPathScratch, byte: u8) -> bool {
+    transition manifest_path_scratch.len < 512 {
+        true -> store(manifest_path_scratch, byte)
+        _ -> (false)
+    }
+    state store(manifest_path_scratch: &mut ManifestPathScratch, byte: u8) -> bool
+        requires manifest_path_scratch.len < 512;
+    {
+        manifest_path_scratch.bytes[manifest_path_scratch.len] = byte;
+        manifest_path_scratch.len = ((manifest_path_scratch.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+pub machine ManifestPathScratch::get_bytes(manifest_path_scratch: &ManifestPathScratch) -> &[u8] {
+    transition manifest_path_scratch.len <= 512 {
+        true -> (&manifest_path_scratch.bytes[0..manifest_path_scratch.len])
+        false -> (&manifest_path_scratch.bytes[0..512])
+        _ -> (&manifest_path_scratch.bytes[0..512])
+    }
+}
+
+// Bounded copy of a byte slice into the scratch buffer; fails over 512.
+pub machine ManifestPathScratch::copy_slice(manifest_path_scratch: &mut ManifestPathScratch, source: &[u8]) -> bool {
+    transition source.len <= 512 {
+        true -> copy(manifest_path_scratch, source, 0)
+        _ -> (false)
+    }
+    state copy(manifest_path_scratch: &mut ManifestPathScratch, source: &[u8], position: u64) -> bool {
+        transition position < source.len {
+            true -> put(manifest_path_scratch, source, position)
+            _ -> (true)
+        }
+    }
+    state put(manifest_path_scratch: &mut ManifestPathScratch, source: &[u8], position: u64) -> bool
+        requires position < source.len;
+    {
+        _ = ManifestPathScratch::append(manifest_path_scratch, source[position]);
+        transition { _ -> copy(manifest_path_scratch, source, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Bounded copy of the live scratch bytes into a raw 512 byte buffer.
+pub machine ManifestPathScratch::copy_into(manifest_path_scratch: &ManifestPathScratch, out: &mut [u8; 512]) -> u64 {
+    transition { _ -> copy(manifest_path_scratch, out, 0) }
+    state copy(manifest_path_scratch: &ManifestPathScratch, out: &mut [u8; 512], position: u64) -> u64 {
+        transition position < manifest_path_scratch.len && position < 512 {
+            true -> put(manifest_path_scratch, out, position)
+            _ -> (manifest_path_scratch.len)
+        }
+    }
+    state put(manifest_path_scratch: &ManifestPathScratch, out: &mut [u8; 512], position: u64) -> u64
+        requires position < manifest_path_scratch.len && position < 512;
+    {
+        out[position] = manifest_path_scratch.bytes[position];
+        transition { _ -> copy(manifest_path_scratch, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// `(path == prefix) || path[len(prefix)] == '/'` — upstream
+// Path::starts_with is component-wise: "a/bc" does NOT start_with "a/b".
+pub machine ProjectItemSortOrder::path_starts_with(project_item_sort_order: &ProjectItemSortOrder, path: &[u8], prefix: &[u8]) -> bool {
+    transition path.len < prefix.len {
+        true -> (false)
+        false -> compare(project_item_sort_order, path, prefix, 0)
+        _ -> (false)
+    }
+    state compare(project_item_sort_order: &ProjectItemSortOrder, path: &[u8], prefix: &[u8], position: u64) -> bool {
+        transition position < prefix.len {
+            true -> compare_byte(project_item_sort_order, path, prefix, position)
+            false -> boundary(project_item_sort_order, path, prefix.len)
+            _ -> (false)
+        }
+    }
+    state compare_byte(project_item_sort_order: &ProjectItemSortOrder, path: &[u8], prefix: &[u8], position: u64) -> bool
+        requires position < path.len && position < prefix.len;
+    {
+        transition path[position] == prefix[position] {
+            true -> compare(project_item_sort_order, path, prefix, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state boundary(project_item_sort_order: &ProjectItemSortOrder, path: &[u8], prefix_len: u64) -> bool {
+        transition prefix_len == path.len {
+            true -> (true)
+            false -> boundary_byte(project_item_sort_order, path, prefix_len)
+            _ -> (false)
+        }
+    }
+    state boundary_byte(project_item_sort_order: &ProjectItemSortOrder, path: &[u8], prefix_len: u64) -> bool
+        requires prefix_len < path.len;
+    {
+        transition path[prefix_len] == 47 {
+            true -> (true)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Byte-lex ordering — the bounded-list sort comparator.
+pub machine ProjectItemSortOrder::path_precedes(
+    project_item_sort_order: &ProjectItemSortOrder,
+    left: &[u8],
+    right: &[u8] ) -> bool {
+    let scan_limit: u64 = left.len;
+    transition right.len < scan_limit {
+        true -> first(project_item_sort_order, left, right, right.len, 0)
+        false -> first(project_item_sort_order, left, right, scan_limit, 0)
+        _ -> (false)
+    }
+    state first(project_item_sort_order: &ProjectItemSortOrder, left: &[u8], right: &[u8], scan_limit: u64, position: u64) -> bool {
+        transition position < scan_limit {
+            true -> compare_byte(project_item_sort_order, left, right, scan_limit, position)
+            false -> length_decide(project_item_sort_order, left, right)
+            _ -> (false)
+        }
+    }
+    state compare_byte(project_item_sort_order: &ProjectItemSortOrder, left: &[u8], right: &[u8], scan_limit: u64, position: u64) -> bool
+        requires position < left.len && position < right.len && position < scan_limit;
+    {
+        transition left[position] == right[position] {
+            true -> first(project_item_sort_order, left, right, scan_limit, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (left[position] < right[position])
+            _ -> (false)
+        }
+    }
+    state length_decide(project_item_sort_order: &ProjectItemSortOrder, left: &[u8], right: &[u8]) -> bool {
+        (left.len < right.len)
+    }
+}
+
+pub machine ProjectItemSortOrder::paths_equal(
+    project_item_sort_order: &ProjectItemSortOrder,
+    left: &[u8],
+    right: &[u8] ) -> bool {
+    transition left.len == right.len {
+        true -> compare(project_item_sort_order, left, right, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state compare(project_item_sort_order: &ProjectItemSortOrder, left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len {
+            true -> compare_byte(project_item_sort_order, left, right, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state compare_byte(project_item_sort_order: &ProjectItemSortOrder, left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len;
+    {
+        transition left[position] == right[position] {
+            true -> compare(project_item_sort_order, left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `is_hidden_project_root_relative_path` — the "project_items"
+// component hides the directory entry itself from sort order.
+pub machine ProjectItemSortOrder::is_hidden_project_root_relative_path(
+    project_item_sort_order: &ProjectItemSortOrder,
+    relative_path: &[u8] ) -> bool {
+    (ProjectItemSortOrder::paths_equal(project_item_sort_order, relative_path, Project::PROJECT_DIR))
+}
+
+// `strip_prefix` on byte paths — upstream Path::strip_prefix needs a
+// component-wise ancestor: boundary byte must be '/'. Exact equality is
+// not a legal relative item path -> escape -> false.
+pub machine ProjectItemSortOrder::strip_directory_prefix(
+    project_item_sort_order: &ProjectItemSortOrder,
+    directory_path: &[u8],
+    item_path: &[u8],
+    out_relative: &mut ManifestPathScratch ) -> bool {
+    ManifestPathScratch::clear(out_relative);
+    transition {
+        _ -> compare(project_item_sort_order, directory_path, item_path, out_relative, 0)
+    }
+    state compare(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_relative: &mut ManifestPathScratch, position: u64) -> bool {
+        transition position < directory_path.len && position < item_path.len {
+            true -> compare_byte(project_item_sort_order, directory_path, item_path, out_relative, position)
+            false -> check_boundary(project_item_sort_order, directory_path, item_path, out_relative)
+            _ -> (false)
+        }
+    }
+    state compare_byte(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_relative: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < directory_path.len && position < item_path.len;
+    {
+        transition directory_path[position] == item_path[position] {
+            true -> compare(project_item_sort_order, directory_path, item_path, out_relative, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state check_boundary(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_relative: &mut ManifestPathScratch) -> bool {
+        transition directory_path.len < item_path.len {
+            true -> boundary_byte(project_item_sort_order, directory_path, item_path, out_relative)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state boundary_byte(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_relative: &mut ManifestPathScratch) -> bool
+        requires directory_path.len < item_path.len;
+    {
+        transition item_path[directory_path.len] == 47 {
+            true -> copy_out(project_item_sort_order, directory_path, item_path, out_relative, ((directory_path.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state copy_out(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_relative: &mut ManifestPathScratch, position: u64) -> bool {
+        transition position < item_path.len && out_relative.len < 512 {
+            true -> copy_out_byte(project_item_sort_order, directory_path, item_path, out_relative, position)
+            false -> (out_relative.len > 0)
+            _ -> (false)
+        }
+    }
+    state copy_out_byte(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_relative: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < item_path.len && out_relative.len < 512;
+    {
+        out_relative.bytes[out_relative.len] = item_path[position];
+        out_relative.len = ((out_relative.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_out(project_item_sort_order, directory_path, item_path, out_relative, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `to_manifest_relative_path`: absolute item paths strip the
+// project directory prefix; relative ones join the root first.
+// Plain-byte concat — in-memory path math, not an fs call.
+pub machine ProjectItemSortOrder::to_manifest_relative_path(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project_directory_path: &[u8],
+    project_item_path: &[u8],
+    out_relative: &mut ManifestPathScratch ) -> bool {
+    transition FileSystemUtils::is_cross_platform_absolute_path(project_item_path) {
+        true -> (ProjectItemSortOrder::strip_directory_prefix(project_item_sort_order, project_directory_path, project_item_path, out_relative))
+        false -> join_then_strip(project_item_sort_order, project_directory_path, project_item_path, out_relative)
+        _ -> (false)
+    }
+    state join_then_strip(project_item_sort_order: &ProjectItemSortOrder, project_directory_path: &[u8], project_item_path: &[u8], out_relative: &mut ManifestPathScratch) -> bool {
+        let mut joined: ManifestPathScratch;
+        ManifestPathScratch::new(&mut joined);
+        _ = ProjectItemSortOrder::join_path(project_item_sort_order, project_directory_path, project_item_path, &mut joined);
+        transition joined.len <= 512 {
+            true -> (ProjectItemSortOrder::strip_directory_prefix(project_item_sort_order, project_directory_path, ManifestPathScratch::get_bytes(&joined), out_relative))
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// `dir + '/' + item` into out_joined; refuses past the 512 bound.
+pub machine ProjectItemSortOrder::join_path(
+    project_item_sort_order: &ProjectItemSortOrder,
+    directory_path: &[u8],
+    item_path: &[u8],
+    out_joined: &mut ManifestPathScratch ) -> bool {
+    ManifestPathScratch::clear(out_joined);
+    transition {
+        _ -> copy_head(project_item_sort_order, directory_path, item_path, out_joined, 0)
+    }
+    state copy_head(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_joined: &mut ManifestPathScratch, position: u64) -> bool {
+        transition position < directory_path.len && out_joined.len < 512 {
+            true -> copy_head_byte(project_item_sort_order, directory_path, item_path, out_joined, position)
+            false -> put_sep(project_item_sort_order, directory_path, item_path, out_joined)
+            _ -> (false)
+        }
+    }
+    state copy_head_byte(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_joined: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < directory_path.len && out_joined.len < 512;
+    {
+        out_joined.bytes[out_joined.len] = directory_path[position];
+        out_joined.len = ((out_joined.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_head(project_item_sort_order, directory_path, item_path, out_joined, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state put_sep(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_joined: &mut ManifestPathScratch) -> bool {
+        transition out_joined.len < 512 {
+            true -> put_sep_write(project_item_sort_order, directory_path, item_path, out_joined)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state put_sep_write(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_joined: &mut ManifestPathScratch) -> bool
+        requires out_joined.len < 512;
+    {
+        out_joined.bytes[out_joined.len] = 47;
+        out_joined.len = ((out_joined.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_tail(project_item_sort_order, directory_path, item_path, out_joined, 0)
+        }
+    }
+    state copy_tail(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_joined: &mut ManifestPathScratch, position: u64) -> bool {
+        transition position < item_path.len && out_joined.len < 512 {
+            true -> copy_tail_byte(project_item_sort_order, directory_path, item_path, out_joined, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state copy_tail_byte(project_item_sort_order: &ProjectItemSortOrder, directory_path: &[u8], item_path: &[u8], out_joined: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < item_path.len && out_joined.len < 512;
+    {
+        out_joined.bytes[out_joined.len] = item_path[position];
+        out_joined.len = ((out_joined.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy_tail(project_item_sort_order, directory_path, item_path, out_joined, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Linear-set membership over a ProjectPathList.
+pub machine ProjectItemSortOrder::list_contains(
+    project_item_sort_order: &ProjectItemSortOrder,
+    list: &ProjectPathList,
+    path: &[u8] ) -> bool {
+    transition {
+        _ -> scan(project_item_sort_order, list, path, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, list: &ProjectPathList, path: &[u8], position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(list) {
+            true -> compare_at(project_item_sort_order, list, path, position)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state compare_at(project_item_sort_order: &ProjectItemSortOrder, list: &ProjectPathList, path: &[u8], position: u64) -> bool {
+        let inner3096: &[u8] = ProjectPathList::get_path(list, position);
+        transition ProjectItemSortOrder::paths_equal(project_item_sort_order, inner3096, path) {
+            true -> (true)
+            false -> scan(project_item_sort_order, list, path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Copy `path` bytes into a scratch (returns false past the 512 bound).
+pub machine ProjectItemSortOrder::copy_into(
+    project_item_sort_order: &ProjectItemSortOrder,
+    path: &[u8],
+    out_scratch: &mut ManifestPathScratch ) -> bool {
+    ManifestPathScratch::clear(out_scratch);
+    transition {
+        _ -> copy(project_item_sort_order, path, out_scratch, 0)
+    }
+    state copy(project_item_sort_order: &ProjectItemSortOrder, path: &[u8], out_scratch: &mut ManifestPathScratch, position: u64) -> bool {
+        transition position < path.len && out_scratch.len < 512 {
+            true -> copy_byte(project_item_sort_order, path, out_scratch, position)
+            false -> (out_scratch.len == path.len)
+            _ -> (false)
+        }
+    }
+    state copy_byte(project_item_sort_order: &ProjectItemSortOrder, path: &[u8], out_scratch: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < path.len && out_scratch.len < 512;
+    {
+        out_scratch.bytes[out_scratch.len] = path[position];
+        out_scratch.len = ((out_scratch.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy(project_item_sort_order, path, out_scratch, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Insert `path` into `list` in byte-lex order (upstream Vec::sort on
+// collected rel paths). Linear probe then shift-insert; dedup'd by the
+// contains guard upstream performs — caller guarantees uniqueness.
+pub machine ProjectItemSortOrder::insert_sorted(
+    project_item_sort_order: &ProjectItemSortOrder,
+    list: &mut ProjectPathList,
+    path: &[u8] ) -> bool {
+    transition ProjectItemSortOrder::list_contains(project_item_sort_order, list, path) {
+        true -> (true)
+        false -> probe(project_item_sort_order, list, path, 0)
+        _ -> (false)
+    }
+    state probe(project_item_sort_order: &ProjectItemSortOrder, list: &mut ProjectPathList, path: &[u8], position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(list) {
+            true -> probe_compare(project_item_sort_order, list, path, position)
+            false -> (ProjectPathList::add_path(list, path))
+            _ -> (false)
+        }
+    }
+    state probe_compare(project_item_sort_order: &ProjectItemSortOrder, list: &mut ProjectPathList, path: &[u8], position: u64) -> bool {
+        let inner3097: &[u8] = ProjectPathList::get_path(list, position);
+        transition ProjectItemSortOrder::path_precedes(project_item_sort_order, path, inner3097) {
+            true -> insert_at(project_item_sort_order, list, path, position)
+            false -> probe(project_item_sort_order, list, path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state insert_at(project_item_sort_order: &ProjectItemSortOrder, list: &mut ProjectPathList, path: &[u8], position: u64) -> bool {
+        // Move the tail one slot right from the end down to position,
+        // then write path at position.
+        transition {
+            _ -> (ProjectPathList::insert_path_at(list, position, path))
+        }
+    }
+}
+
+// Collect each live project item's manifest-relative path into a sorted
+// bounded list (upstream HashMap keys -> pair-table scan; Vec::sort ->
+// sorted insertion).
+pub machine ProjectItemSortOrder::collect_existing_project_item_relative_paths(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &Project,
+    project_directory_path: &[u8],
+    out_paths: &mut ProjectPathList ) -> bool {
+    ProjectPathList::clear(out_paths);
+    transition {
+        _ -> scan_items(project_item_sort_order, project, project_directory_path, out_paths, 0)
+    }
+    state scan_items(project_item_sort_order: &ProjectItemSortOrder, project: &Project, project_directory_path: &[u8], out_paths: &mut ProjectPathList, position: u64) -> bool {
+        transition position < Project::get_project_items_len(project) && position < 256 {
+            true -> item_path(project_item_sort_order, project, project_directory_path, out_paths, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state item_path(project_item_sort_order: &ProjectItemSortOrder, project: &Project, project_directory_path: &[u8], out_paths: &mut ProjectPathList, position: u64) -> bool
+        requires position < 256 && position < Project::get_project_items_len(project);
+    {
+        let pair: &ProjectItemPair = Project::get_project_item_pair(project, position);
+        let item_ref: &ProjectItemRef = ProjectItemPair::get_project_item_ref(pair);
+        let item_path: &[u8] = ProjectItemRef::get_project_item_path(item_ref);
+        let mut scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut scratch);
+        transition ProjectItemSortOrder::to_manifest_relative_path(project_item_sort_order, project_directory_path, item_path, &mut scratch) && scratch.len <= 512 && scratch.len > 0 {
+            true -> check_hidden(project_item_sort_order, project, project_directory_path, out_paths, position, &scratch)
+            false -> scan_items(project_item_sort_order, project, project_directory_path, out_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state check_hidden(project_item_sort_order: &ProjectItemSortOrder, project: &Project, project_directory_path: &[u8], out_paths: &mut ProjectPathList, position: u64, scratch: &ManifestPathScratch) -> bool
+        requires scratch.len <= 512;
+    {
+        let inner3098: &[u8] = ManifestPathScratch::get_bytes(&scratch);
+        transition ProjectItemSortOrder::is_hidden_project_root_relative_path(project_item_sort_order, inner3098) {
+            true -> scan_items(project_item_sort_order, project, project_directory_path, out_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> push_path(project_item_sort_order, project, project_directory_path, out_paths, position, scratch)
+            _ -> (false)
+        }
+    }
+    state push_path(project_item_sort_order: &ProjectItemSortOrder, project: &Project, project_directory_path: &[u8], out_paths: &mut ProjectPathList, position: u64, scratch: &ManifestPathScratch) -> bool
+        requires scratch.len <= 512;
+    {
+        let inner3099: &[u8] = ManifestPathScratch::get_bytes(&scratch);
+        _ = ProjectItemSortOrder::insert_sorted(project_item_sort_order, out_paths, inner3099);
+        transition {
+            _ -> scan_items(project_item_sort_order, project, project_directory_path, out_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `set_project_item_sort_order_if_changed` — byte-compare then
+// store + dirty.
+pub machine ProjectItemSortOrder::set_project_item_sort_order_if_changed(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &mut Project,
+    next_sort_order: &ProjectPathList ) -> bool {
+    let inner3100: &ProjectPathList = Project::get_project_item_sort_order(project);
+    transition ProjectItemSortOrder::lists_equal(project_item_sort_order, inner3100, next_sort_order) {
+        true -> (false)
+        false -> store(project_item_sort_order, project, next_sort_order)
+        _ -> (false)
+    }
+    state store(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, next_sort_order: &ProjectPathList) -> bool {
+        let manifest: &mut ProjectManifest = Project::borrow_project_manifest_mut(project);
+        ProjectManifest::set_project_item_sort_order(manifest, ProjectPathList::clone(&next_sort_order));
+        let info: &mut ProjectInfo = Project::borrow_project_info_mut(project);
+        ProjectInfo::set_has_unsaved_changes(info, true);
+        (true)
+    }
+}
+
+pub machine ProjectItemSortOrder::lists_equal(
+    project_item_sort_order: &ProjectItemSortOrder,
+    left: &ProjectPathList,
+    right: &ProjectPathList ) -> bool {
+    transition ProjectPathList::get_path_count(left) == ProjectPathList::get_path_count(right) {
+        true -> compare(project_item_sort_order, left, right, 0)
+        false -> (false)
+        _ -> (false)
+    }
+    state compare(project_item_sort_order: &ProjectItemSortOrder, left: &ProjectPathList, right: &ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(left) {
+            true -> compare_at(project_item_sort_order, left, right, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state compare_at(project_item_sort_order: &ProjectItemSortOrder, left: &ProjectPathList, right: &ProjectPathList, position: u64) -> bool {
+        let inner3101: &[u8] = ProjectPathList::get_path(left, position);
+        let inner3102: &[u8] = ProjectPathList::get_path(right, position);
+        transition ProjectItemSortOrder::paths_equal(project_item_sort_order, inner3101, inner3102) {
+            true -> compare(project_item_sort_order, left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `normalize_project_item_sort_order` — keep configured entries
+// that still exist (dedup in first-seen order), then append live paths
+// not already listed, then commit-if-changed.
+pub machine ProjectItemSortOrder::normalize_project_item_sort_order(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &mut Project,
+    project_directory_path: &[u8] ) -> bool {
+    let mut existing_paths: ProjectPathList = ProjectPathList::empty();
+    _ = ProjectItemSortOrder::collect_existing_project_item_relative_paths(project_item_sort_order, project, project_directory_path, &mut existing_paths);
+    let mut normalized: ProjectPathList = ProjectPathList::empty();
+    let mut seen: ProjectPathList = ProjectPathList::empty();
+    let inner3103: &ProjectPathList = Project::get_project_item_sort_order(project);
+    _ = ProjectItemSortOrder::keep_configured(project_item_sort_order, inner3103, &existing_paths, &mut normalized, &mut seen);
+    _ = ProjectItemSortOrder::append_missing(project_item_sort_order, &existing_paths, &mut normalized, &mut seen);
+    transition {
+        _ -> (ProjectItemSortOrder::set_project_item_sort_order_if_changed(project_item_sort_order, project, &normalized))
+    }
+}
+
+// keep configured ∩ existing in first-seen order.
+pub machine ProjectItemSortOrder::keep_configured(
+    project_item_sort_order: &ProjectItemSortOrder,
+    configured: &ProjectPathList,
+    existing_paths: &ProjectPathList,
+    normalized: &mut ProjectPathList,
+    seen: &mut ProjectPathList) -> bool {
+    transition {
+        _ -> scan(project_item_sort_order, configured, existing_paths, normalized, seen, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, existing_paths: &ProjectPathList, normalized: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(configured) {
+            true -> check(project_item_sort_order, configured, existing_paths, normalized, seen, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state check(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, existing_paths: &ProjectPathList, normalized: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, existing_paths, configured_path) {
+            true -> dedup(project_item_sort_order, configured, existing_paths, normalized, seen, position)
+            false -> scan(project_item_sort_order, configured, existing_paths, normalized, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state dedup(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, existing_paths: &ProjectPathList, normalized: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, seen, configured_path) {
+            true -> scan(project_item_sort_order, configured, existing_paths, normalized, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> push(project_item_sort_order, configured, existing_paths, normalized, seen, position)
+            _ -> (false)
+        }
+    }
+    state push(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, existing_paths: &ProjectPathList, normalized: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        _ = ProjectPathList::add_path(normalized, configured_path);
+        _ = ProjectPathList::add_path(seen, configured_path);
+        transition {
+            _ -> scan(project_item_sort_order, configured, existing_paths, normalized, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// append existing paths not already seen (existing list is pre-sorted).
+pub machine ProjectItemSortOrder::append_missing(
+    project_item_sort_order: &ProjectItemSortOrder,
+    existing_paths: &ProjectPathList,
+    normalized: &mut ProjectPathList,
+    seen: &mut ProjectPathList) -> bool {
+    transition {
+        _ -> scan(project_item_sort_order, existing_paths, normalized, seen, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, existing_paths: &ProjectPathList, normalized: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(existing_paths) {
+            true -> check(project_item_sort_order, existing_paths, normalized, seen, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state check(project_item_sort_order: &ProjectItemSortOrder, existing_paths: &ProjectPathList, normalized: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        let existing_path: &[u8] = ProjectPathList::get_path(existing_paths, position);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, seen, existing_path) {
+            true -> scan(project_item_sort_order, existing_paths, normalized, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> push(project_item_sort_order, existing_paths, normalized, seen, position)
+            _ -> (false)
+        }
+    }
+    state push(project_item_sort_order: &ProjectItemSortOrder, existing_paths: &ProjectPathList, normalized: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        let existing_path: &[u8] = ProjectPathList::get_path(existing_paths, position);
+        _ = ProjectPathList::add_path(normalized, existing_path);
+        _ = ProjectPathList::add_path(seen, existing_path);
+        transition {
+            _ -> scan(project_item_sort_order, existing_paths, normalized, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `append_project_item_paths_to_sort_order` — normalize then add
+// each new manifest-relative path (skipping the hidden project_items dir
+// root) in sorted position.
+pub machine ProjectItemSortOrder::append_project_item_paths_to_sort_order(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &mut Project,
+    project_directory_path: &[u8],
+    appended_project_item_paths: &ProjectPathList ) -> bool {
+    _ = ProjectItemSortOrder::normalize_project_item_sort_order(project_item_sort_order, project, project_directory_path);
+    transition {
+        _ -> scan(project_item_sort_order, project, project_directory_path, appended_project_item_paths, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], appended_project_item_paths: &ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(appended_project_item_paths) {
+            true -> rel(project_item_sort_order, project, project_directory_path, appended_project_item_paths, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state rel(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], appended_project_item_paths: &ProjectPathList, position: u64) -> bool {
+        let appended_path: &[u8] = ProjectPathList::get_path(appended_project_item_paths, position);
+        let mut scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut scratch);
+        transition ProjectItemSortOrder::to_manifest_relative_path(project_item_sort_order, project_directory_path, appended_path, &mut scratch) && scratch.len <= 512 && scratch.len > 0 {
+            true -> hidden(project_item_sort_order, project, project_directory_path, appended_project_item_paths, position, &scratch)
+            false -> scan(project_item_sort_order, project, project_directory_path, appended_project_item_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state hidden(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], appended_project_item_paths: &ProjectPathList, position: u64, scratch: &ManifestPathScratch) -> bool
+        requires scratch.len <= 512;
+    {
+        let inner3104: &[u8] = ManifestPathScratch::get_bytes(&scratch);
+        transition ProjectItemSortOrder::is_hidden_project_root_relative_path(project_item_sort_order, inner3104) {
+            true -> scan(project_item_sort_order, project, project_directory_path, appended_project_item_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> insert(project_item_sort_order, project, project_directory_path, appended_project_item_paths, position, scratch)
+            _ -> (false)
+        }
+    }
+    state insert(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], appended_project_item_paths: &ProjectPathList, position: u64, scratch: &ManifestPathScratch) -> bool
+        requires scratch.len <= 512;
+    {
+        // Sorted-insert into the live sort order when absent.
+        let sort_order: &ProjectPathList = Project::get_project_item_sort_order(project);
+        let inner3105: &[u8] = ManifestPathScratch::get_bytes(&scratch);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, sort_order, inner3105) {
+            true -> scan(project_item_sort_order, project, project_directory_path, appended_project_item_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> do_insert(project_item_sort_order, project, project_directory_path, appended_project_item_paths, position, scratch)
+            _ -> (false)
+        }
+    }
+    state do_insert(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], appended_project_item_paths: &ProjectPathList, position: u64, scratch: &ManifestPathScratch) -> bool
+        requires scratch.len <= 512;
+    {
+        let current_order: &ProjectPathList = Project::get_project_item_sort_order(project);
+        let mut next_sort_order: ProjectPathList = ProjectPathList::clone(&current_order);
+        let inner3106: &[u8] = ManifestPathScratch::get_bytes(&scratch);
+        _ = ProjectItemSortOrder::insert_sorted(project_item_sort_order, &mut next_sort_order, inner3106);
+        _ = ProjectItemSortOrder::set_project_item_sort_order_if_changed(project_item_sort_order, project, &next_sort_order);
+        transition {
+            _ -> scan(project_item_sort_order, project, project_directory_path, appended_project_item_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `remove_project_item_paths_from_sort_order` — drop configured
+// entries equal to, or descendants of, each removed root.
+pub machine ProjectItemSortOrder::remove_project_item_paths_from_sort_order(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &mut Project,
+    project_directory_path: &[u8],
+    removed_project_item_paths: &ProjectPathList ) -> bool {
+    let mut removed_relative: ProjectPathList = ProjectPathList::empty();
+    _ = ProjectItemSortOrder::to_relative_list(project_item_sort_order, project_directory_path, removed_project_item_paths, &mut removed_relative);
+    let mut next_sort_order: ProjectPathList = ProjectPathList::empty();
+    let inner3107: &ProjectPathList = Project::get_project_item_sort_order(project);
+    _ = ProjectItemSortOrder::filter_removed(project_item_sort_order, inner3107, &removed_relative, &mut next_sort_order);
+    transition {
+        _ -> (ProjectItemSortOrder::set_project_item_sort_order_if_changed(project_item_sort_order, project, &next_sort_order))
+    }
+}
+
+// Map each input path through to_manifest_relative_path into out_list.
+pub machine ProjectItemSortOrder::to_relative_list(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project_directory_path: &[u8],
+    source_paths: &ProjectPathList,
+    out_list: &mut ProjectPathList ) -> bool {
+    ProjectPathList::clear(out_list);
+    transition {
+        _ -> scan(project_item_sort_order, project_directory_path, source_paths, out_list, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, project_directory_path: &[u8], source_paths: &ProjectPathList, out_list: &mut ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(source_paths) {
+            true -> rel(project_item_sort_order, project_directory_path, source_paths, out_list, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state rel(project_item_sort_order: &ProjectItemSortOrder, project_directory_path: &[u8], source_paths: &ProjectPathList, out_list: &mut ProjectPathList, position: u64) -> bool {
+        let source_path: &[u8] = ProjectPathList::get_path(source_paths, position);
+        let mut scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut scratch);
+        transition ProjectItemSortOrder::to_manifest_relative_path(project_item_sort_order, project_directory_path, source_path, &mut scratch) && scratch.len <= 512 && scratch.len > 0 {
+            true -> push_rel(project_item_sort_order, project_directory_path, source_paths, out_list, position, &scratch)
+            false -> scan(project_item_sort_order, project_directory_path, source_paths, out_list, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state push_rel(project_item_sort_order: &ProjectItemSortOrder, project_directory_path: &[u8], source_paths: &ProjectPathList, out_list: &mut ProjectPathList, position: u64, scratch: &ManifestPathScratch) -> bool
+        requires scratch.len <= 512;
+    {
+        let inner3108: &[u8] = ManifestPathScratch::get_bytes(&scratch);
+        _ = ProjectPathList::add_path(out_list, inner3108);
+        transition {
+            _ -> scan(project_item_sort_order, project_directory_path, source_paths, out_list, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Keep configured entries that are not (equal to or descendant of) a
+// removed root.
+pub machine ProjectItemSortOrder::filter_removed(
+    project_item_sort_order: &ProjectItemSortOrder,
+    configured: &ProjectPathList,
+    removed_relative: &ProjectPathList,
+    out_kept: &mut ProjectPathList ) -> bool {
+    transition {
+        _ -> scan(project_item_sort_order, configured, removed_relative, out_kept, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, removed_relative: &ProjectPathList, out_kept: &mut ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(configured) {
+            true -> check(project_item_sort_order, configured, removed_relative, out_kept, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state check(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, removed_relative: &ProjectPathList, out_kept: &mut ProjectPathList, position: u64) -> bool {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        transition ProjectItemSortOrder::list_contains_prefix_root(project_item_sort_order, removed_relative, configured_path) {
+            true -> scan(project_item_sort_order, configured, removed_relative, out_kept, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> keep(project_item_sort_order, configured, removed_relative, out_kept, position)
+            _ -> (false)
+        }
+    }
+    state keep(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, removed_relative: &ProjectPathList, out_kept: &mut ProjectPathList, position: u64) -> bool {
+        let inner3109: &[u8] = ProjectPathList::get_path(configured, position);
+        _ = ProjectPathList::add_path(out_kept, inner3109);
+        transition {
+            _ -> scan(project_item_sort_order, configured, removed_relative, out_kept, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Whether `path` equals or descends from any entry in `roots`.
+pub machine ProjectItemSortOrder::list_contains_prefix_root(
+    project_item_sort_order: &ProjectItemSortOrder,
+    roots: &ProjectPathList,
+    path: &[u8] ) -> bool {
+    transition {
+        _ -> scan(project_item_sort_order, roots, path, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, roots: &ProjectPathList, path: &[u8], position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(roots) {
+            true -> check(project_item_sort_order, roots, path, position)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state check(project_item_sort_order: &ProjectItemSortOrder, roots: &ProjectPathList, path: &[u8], position: u64) -> bool {
+        let inner3110: &[u8] = ProjectPathList::get_path(roots, position);
+        transition ProjectItemSortOrder::path_starts_with(project_item_sort_order, path, inner3110) {
+            true -> (true)
+            false -> scan(project_item_sort_order, roots, path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `rename_project_item_path_in_sort_order` — retarget each
+// configured entry equal to or under the source root onto the target
+// root, preserving suffix, then dedup + commit-if-changed.
+pub machine ProjectItemSortOrder::rename_project_item_path_in_sort_order(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &mut Project,
+    project_directory_path: &[u8],
+    source_project_item_path: &[u8],
+    target_project_item_path: &[u8] ) -> bool {
+    let mut source_relative: ManifestPathScratch;
+    ManifestPathScratch::new(&mut source_relative);
+    let mut target_relative: ManifestPathScratch;
+    ManifestPathScratch::new(&mut target_relative);
+    _ = ProjectItemSortOrder::to_manifest_relative_path(project_item_sort_order, project_directory_path, source_project_item_path, &mut source_relative);
+    _ = ProjectItemSortOrder::to_manifest_relative_path(project_item_sort_order, project_directory_path, target_project_item_path, &mut target_relative);
+    let mut next_sort_order: ProjectPathList = ProjectPathList::empty();
+    let inner3111: &ProjectPathList = Project::get_project_item_sort_order(project);
+    _ = ProjectItemSortOrder::retarget_scan(project_item_sort_order, inner3111, &source_relative, &target_relative, &mut next_sort_order);
+    transition {
+        _ -> (ProjectItemSortOrder::set_project_item_sort_order_if_changed(project_item_sort_order, project, &next_sort_order))
+    }
+}
+
+// For each configured entry: if it sits under source root, rewrite as
+// target_root + suffix; keep others verbatim. Dedup via seen-set.
+pub machine ProjectItemSortOrder::retarget_scan(
+    project_item_sort_order: &ProjectItemSortOrder,
+    configured: &ProjectPathList,
+    source_relative: &ManifestPathScratch,
+    target_relative: &ManifestPathScratch,
+    out_next: &mut ProjectPathList ) -> bool {
+    let mut seen: ProjectPathList = ProjectPathList::empty();
+    transition {
+        _ -> scan(project_item_sort_order, configured, source_relative, target_relative, out_next, &mut seen, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(configured) {
+            true -> check(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state check(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool
+        requires source_relative.len <= 512;
+    {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        let inner3112: &[u8] = ManifestPathScratch::get_bytes(source_relative);
+        transition ProjectItemSortOrder::path_starts_with(project_item_sort_order, configured_path, inner3112) {
+            true -> retarget(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position)
+            false -> keep(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position)
+            _ -> (false)
+        }
+    }
+    state keep(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, seen, configured_path) {
+            true -> scan(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> keep_push(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position)
+            _ -> (false)
+        }
+    }
+    state keep_push(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        _ = ProjectPathList::add_path(out_next, configured_path);
+        _ = ProjectPathList::add_path(seen, configured_path);
+        transition {
+            _ -> scan(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // target_root + the configured suffix from len(source), skipping a leading
+    // '/' if present).
+    state retarget(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64) -> bool
+        requires source_relative.len <= 512 && target_relative.len <= 512;
+    {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        let mut rewritten: ManifestPathScratch;
+        ManifestPathScratch::new(&mut rewritten);
+        let inner3113: &[u8] = ManifestPathScratch::get_bytes(target_relative);
+        _ = ProjectItemSortOrder::copy_into(project_item_sort_order, inner3113, &mut rewritten);
+        transition {
+            _ -> suffix(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position, &mut rewritten, source_relative.len)
+        }
+    }
+    state suffix(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64, rewritten: &mut ManifestPathScratch, suffix_position: u64) -> bool
+        requires source_relative.len <= 512;
+    {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        transition suffix_position < configured_path.len {
+            true -> suffix_byte(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position, rewritten, suffix_position)
+            false -> retarget_push(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position, rewritten)
+            _ -> (false)
+        }
+    }
+    state suffix_byte(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64, rewritten: &mut ManifestPathScratch, suffix_position: u64) -> bool
+        requires rewritten.len < 512 && source_relative.len <= 512;
+    {
+        let configured_path: &[u8] = ProjectPathList::get_path(configured, position);
+        transition suffix_position < configured_path.len {
+            true -> suffix_byte_do(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position, rewritten, suffix_position)
+            false -> retarget_push(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position, rewritten)
+            _ -> (false)
+        }
+    }
+    state suffix_byte_do(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64, rewritten: &mut ManifestPathScratch, suffix_position: u64) -> bool
+        requires rewritten.len < 512 && suffix_position < ProjectPathList::get_path(configured, position).len;
+    {
+        let byte: u8 = ProjectPathList::get_path(configured, position)[suffix_position];
+        rewritten.bytes[rewritten.len] = byte;
+        rewritten.len = ((rewritten.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> suffix(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position, rewritten, ((suffix_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state retarget_push(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64, rewritten: &ManifestPathScratch) -> bool
+        requires rewritten.len <= 512;
+    {
+        let inner3114: &[u8] = ManifestPathScratch::get_bytes(&rewritten);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, seen, inner3114) {
+            true -> scan(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> retarget_push_do(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, position, rewritten)
+            _ -> (false)
+        }
+    }
+    state retarget_push_do(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, source_relative: &ManifestPathScratch, target_relative: &ManifestPathScratch, out_next: &mut ProjectPathList, seen: &mut ProjectPathList, position: u64, rewritten: &ManifestPathScratch) -> bool
+        requires rewritten.len <= 512;
+    {
+        let inner3115: &[u8] = ManifestPathScratch::get_bytes(&rewritten);
+        _ = ProjectPathList::add_path(out_next, inner3115);
+        let inner3116: &[u8] = ManifestPathScratch::get_bytes(&rewritten);
+        _ = ProjectPathList::add_path(seen, inner3116);
+        transition {
+            _ -> scan(project_item_sort_order, configured, source_relative, target_relative, out_next, seen, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `apply_project_item_reorder_to_sort_order` — the
+// min-position-insertion merge: anchor = min over configured order of the
+// moved items' positions; entries at/after anchor that aren't moving stay;
+// moved subset inserts at anchor in requested order.
+pub machine ProjectItemSortOrder::apply_project_item_reorder_to_sort_order(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &mut Project,
+    project_directory_path: &[u8],
+    reordered_project_item_paths: &ProjectPathList ) -> bool {
+    let mut moving_relative: ProjectPathList = ProjectPathList::empty();
+    _ = ProjectItemSortOrder::to_relative_list(project_item_sort_order, project_directory_path, reordered_project_item_paths, &mut moving_relative);
+    // anchor = min configured position of any moving rel path (else no-op).
+    let configured: &ProjectPathList = Project::get_project_item_sort_order(project);
+    let anchor: u64 = ProjectItemSortOrder::min_configured_position(project_item_sort_order, configured, &moving_relative);
+    transition anchor < ProjectPathList::get_path_count(configured) {
+        true -> merge(project_item_sort_order, project, &moving_relative, anchor)
+        false -> (false)
+        _ -> (false)
+    }
+    state merge(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, moving_relative: &ProjectPathList, anchor: u64) -> bool {
+        let configured: &ProjectPathList = Project::get_project_item_sort_order(project);
+        let mut next_sort_order: ProjectPathList = ProjectPathList::empty();
+        _ = ProjectItemSortOrder::reorder_merge(project_item_sort_order, configured, moving_relative, anchor, &mut next_sort_order);
+        _ = ProjectItemSortOrder::set_project_item_sort_order_if_changed(project_item_sort_order, project, &next_sort_order);
+        (true)
+    }
+}
+
+// smallest position p in configured whose path is in moving (else
+// configured.count as the "no anchor" sentinel).
+pub machine ProjectItemSortOrder::min_configured_position(
+    project_item_sort_order: &ProjectItemSortOrder,
+    configured: &ProjectPathList,
+    moving: &ProjectPathList ) -> u64 {
+    transition {
+        _ -> scan(project_item_sort_order, configured, moving, 0)
+    }
+    state scan(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving: &ProjectPathList, position: u64) -> u64 {
+        transition position < ProjectPathList::get_path_count(configured) {
+            true -> check(project_item_sort_order, configured, moving, position)
+            false -> (ProjectPathList::get_path_count(configured))
+            _ -> (ProjectPathList::get_path_count(configured))
+        }
+    }
+    state check(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving: &ProjectPathList, position: u64) -> u64 {
+        let inner3117: &[u8] = ProjectPathList::get_path(configured, position);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, moving, inner3117) {
+            true -> (position)
+            false -> scan(project_item_sort_order, configured, moving, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (ProjectPathList::get_path_count(configured))
+        }
+    }
+}
+
+// next = configured[0..anchor non-moving? NO — upstream keeps prefix
+// verbatim (pre-anchor entries untouched), drops moving entries after
+// anchor, inserts moving subset at anchor in requested order.
+pub machine ProjectItemSortOrder::reorder_merge(
+    project_item_sort_order: &ProjectItemSortOrder,
+    configured: &ProjectPathList,
+    moving_relative: &ProjectPathList,
+    anchor: u64,
+    out_next: &mut ProjectPathList ) -> bool {
+    transition {
+        _ -> prefix(project_item_sort_order, configured, moving_relative, anchor, out_next, 0)
+    }
+    // Copy configured[0..anchor] verbatim.
+    state prefix(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving_relative: &ProjectPathList, anchor: u64, out_next: &mut ProjectPathList, position: u64) -> bool {
+        transition position < anchor && position < ProjectPathList::get_path_count(configured) {
+            true -> prefix_push(project_item_sort_order, configured, moving_relative, anchor, out_next, position)
+            false -> insert_moving(project_item_sort_order, configured, moving_relative, anchor, out_next, 0)
+            _ -> (false)
+        }
+    }
+    state prefix_push(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving_relative: &ProjectPathList, anchor: u64, out_next: &mut ProjectPathList, position: u64) -> bool {
+        let inner3118: &[u8] = ProjectPathList::get_path(configured, position);
+        _ = ProjectPathList::add_path(out_next, inner3118);
+        transition {
+            _ -> prefix(project_item_sort_order, configured, moving_relative, anchor, out_next, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Insert the moving subset in requested order.
+    state insert_moving(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving_relative: &ProjectPathList, anchor: u64, out_next: &mut ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(moving_relative) {
+            true -> insert_moving_push(project_item_sort_order, configured, moving_relative, anchor, out_next, position)
+            false -> tail(project_item_sort_order, configured, moving_relative, anchor, out_next, anchor)
+            _ -> (false)
+        }
+    }
+    state insert_moving_push(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving_relative: &ProjectPathList, anchor: u64, out_next: &mut ProjectPathList, position: u64) -> bool {
+        let inner3119: &[u8] = ProjectPathList::get_path(moving_relative, position);
+        _ = ProjectPathList::add_path(out_next, inner3119);
+        transition {
+            _ -> insert_moving(project_item_sort_order, configured, moving_relative, anchor, out_next, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Append configured[anchor..] minus moving entries.
+    state tail(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving_relative: &ProjectPathList, anchor: u64, out_next: &mut ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(configured) {
+            true -> tail_check(project_item_sort_order, configured, moving_relative, anchor, out_next, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state tail_check(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving_relative: &ProjectPathList, anchor: u64, out_next: &mut ProjectPathList, position: u64) -> bool {
+        let inner3120: &[u8] = ProjectPathList::get_path(configured, position);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, moving_relative, inner3120) {
+            true -> tail(project_item_sort_order, configured, moving_relative, anchor, out_next, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> tail_push(project_item_sort_order, configured, moving_relative, anchor, out_next, position)
+            _ -> (false)
+        }
+    }
+    state tail_push(project_item_sort_order: &ProjectItemSortOrder, configured: &ProjectPathList, moving_relative: &ProjectPathList, anchor: u64, out_next: &mut ProjectPathList, position: u64) -> bool {
+        let inner3121: &[u8] = ProjectPathList::get_path(configured, position);
+        _ = ProjectPathList::add_path(out_next, inner3121);
+        transition {
+            _ -> tail(project_item_sort_order, configured, moving_relative, anchor, out_next, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `append_project_items_to_sort_order` — normalize the manifest's
+// sort-order table against the project contents, then append each added
+// path's manifest-relative spelling once (deduped), persisting only when the
+// table changed.
+pub machine ProjectItemSortOrder::append_project_items_to_sort_order(
+    project_item_sort_order: &ProjectItemSortOrder,
+    project: &mut Project,
+    project_directory_path: &[u8],
+    added_project_item_paths: &ProjectPathList
+) -> bool {
+    let mut did_mutate_sort_order: bool = ProjectItemSortOrder::normalize_project_item_sort_order(project_item_sort_order, project, project_directory_path);
+    let mut known: ProjectPathList = ProjectPathList::empty();
+    _ = ProjectItemSortOrder::collect_existing_project_item_relative_paths(project_item_sort_order, project, project_directory_path, &mut known);
+    let inner13: &ProjectPathList = Project::get_project_item_sort_order(project);
+    let current: ProjectPathList = ProjectPathList::clone(inner13);
+    transition { _ -> seed(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, 0) }
+    // Fold the manifest's configured entries into `known` — they are already
+    // manifest-relative.
+    state seed(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], added_project_item_paths: &ProjectPathList, did_mutate_sort_order: bool, known: ProjectPathList, current: ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(&current) {
+            true -> seed_take(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, position)
+            _ -> append_at(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, 0)
+        }
+    }
+    state seed_take(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], added_project_item_paths: &ProjectPathList, did_mutate_sort_order: bool, known: ProjectPathList, current: ProjectPathList, position: u64) -> bool {
+        let entry: &[u8] = ProjectPathList::get_path(&current, position);
+        let mut entry_scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut entry_scratch);
+        _ = ProjectItemSortOrder::copy_into(project_item_sort_order, entry, &mut entry_scratch);
+        let inner3122: &[u8] = ManifestPathScratch::get_bytes(&entry_scratch);
+        _ = ProjectPathList::add_path(&mut known, inner3122);
+        transition { _ -> seed(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state append_at(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], added_project_item_paths: &ProjectPathList, did_mutate_sort_order: bool, known: ProjectPathList, current: ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(added_project_item_paths) {
+            true -> append_take(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, position)
+            _ -> commit(project_item_sort_order, project, did_mutate_sort_order, current)
+        }
+    }
+    state append_take(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], added_project_item_paths: &ProjectPathList, did_mutate_sort_order: bool, known: ProjectPathList, current: ProjectPathList, position: u64) -> bool {
+        let absolute: &[u8] = ProjectPathList::get_path(added_project_item_paths, position);
+        let mut absolute_scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut absolute_scratch);
+        _ = ProjectItemSortOrder::copy_into(project_item_sort_order, absolute, &mut absolute_scratch);
+        let mut relative: ManifestPathScratch;
+        ManifestPathScratch::new(&mut relative);
+        let inner14: &[u8] = ManifestPathScratch::get_bytes(&absolute_scratch);
+        let has_relative: bool = ProjectItemSortOrder::to_manifest_relative_path(project_item_sort_order, project_directory_path, inner14, &mut relative);
+        let inner3123: &[u8] = ManifestPathScratch::get_bytes(&relative);
+        transition has_relative && relative.len <= 512 && relative.len > 0 && !ProjectItemSortOrder::is_hidden_project_root_relative_path(project_item_sort_order, inner3123) {
+            true -> append_dedup(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, position, relative)
+            _ -> append_at(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state append_dedup(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], added_project_item_paths: &ProjectPathList, did_mutate_sort_order: bool, known: ProjectPathList, current: ProjectPathList, position: u64, relative: ManifestPathScratch) -> bool {
+        let mut probe: ProjectPathList = known;
+        let inner3124: &[u8] = ManifestPathScratch::get_bytes(&relative);
+        transition ProjectItemSortOrder::list_contains(project_item_sort_order, &mut probe, inner3124) {
+            true -> append_at(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> append_push(project_item_sort_order, project, project_directory_path, added_project_item_paths, did_mutate_sort_order, known, current, position, relative)
+        }
+    }
+    state append_push(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, project_directory_path: &[u8], added_project_item_paths: &ProjectPathList, did_mutate_sort_order: bool, known: ProjectPathList, current: ProjectPathList, position: u64, relative: ManifestPathScratch) -> bool {
+        let inner3125: &[u8] = ManifestPathScratch::get_bytes(&relative);
+        _ = ProjectPathList::add_path(&mut known, inner3125);
+        let inner3126: &[u8] = ManifestPathScratch::get_bytes(&relative);
+        _ = ProjectPathList::add_path(&mut current, inner3126);
+        transition { _ -> append_at(project_item_sort_order, project, project_directory_path, added_project_item_paths, true, known, current, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state commit(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, did_mutate_sort_order: bool, current: ProjectPathList) -> bool {
+        transition did_mutate_sort_order {
+            true -> apply(project_item_sort_order, project, did_mutate_sort_order, current)
+            _ -> (false)
+        }
+    }
+    state apply(project_item_sort_order: &ProjectItemSortOrder, project: &mut Project, did_mutate_sort_order: bool, current: ProjectPathList) -> bool {
+        let changed: bool = ProjectItemSortOrder::set_project_item_sort_order_if_changed(project_item_sort_order, project, &current);
+        transition { _ -> (did_mutate_sort_order || changed) }
+    }
+}

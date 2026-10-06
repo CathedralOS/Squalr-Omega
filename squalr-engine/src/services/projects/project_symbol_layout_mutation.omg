@@ -1,0 +1,1865 @@
+// Port of squalr-engine/src/services/projects/project_symbol_layout_mutation.rs.
+//
+// Struct-layout + module-field mutation helpers the symbol executors
+// share: upsert/delete struct-layout descriptors (with reference
+// retargeting), module-field upsert with overlap checks, and module
+// range deletion in shift-left or replace-with-unassigned modes.
+// Deviations: upstream `Result<Summary, String>` collapses to the
+// LayoutMutationResult union (refused carries no error text — the
+// upstream strings were diagnostic-only); `Option`s fold to found
+// flags or position-or-count; HashSet<String> key/name sets ride the
+// request's ProjectStringList directly; checked/wrapping arithmetic
+// respells to bounded Wrapping sums with guard transitions. Table
+// bounds (64 modules/fields/claims, 128 descriptors/claims) follow the
+// api catalog's declared capacities.
+
+module src::services::projects::project_symbol_layout_mutation;
+
+use squalr_engine_api::src::commands::project_symbols::delete::project_symbols_delete_request::ProjectSymbolsDeleteModuleRange;
+use squalr_engine_api::src::commands::project_symbols::delete::project_symbols_delete_request::ProjectSymbolsDeleteModuleRangeMode;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_api::src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
+use src::services::projects::symbol_layout_size_resolver::SymbolLayoutSizeResolver;
+use src::services::projects::symbol_layout_size_resolver::SymbolLayoutSizeResult;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::projects::project_string_list::ProjectStringList;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_symbol_claim::ProjectSymbolClaim;
+use squalr_engine_api::src::structures::projects::project_symbol_locator::ProjectSymbolLocator;
+use squalr_engine_api::src::structures::projects::project_symbol_module::ProjectSymbolModule;
+use squalr_engine_api::src::structures::projects::project_symbol_module_field::ProjectSymbolModuleField;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldCountResolution;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldOffsetResolution;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicResolverRefMatch;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+
+pub data ProjectSymbolLayoutMutation {}
+
+// Upstream `ProjectSymbolLayoutMutationSummary` + Default.
+pub data ProjectSymbolLayoutMutationSummary {
+    changed: bool;
+    deleted_module_field_count: u64;
+    deleted_module_range_count: u64;
+}
+
+pub machine ProjectSymbolLayoutMutationSummary::default() -> ProjectSymbolLayoutMutationSummary {
+    (ProjectSymbolLayoutMutationSummary { changed: false, deleted_module_field_count: 0, deleted_module_range_count: 0 })
+}
+
+pub machine ProjectSymbolLayoutMutationSummary::no_changes() -> ProjectSymbolLayoutMutationSummary {
+    (ProjectSymbolLayoutMutationSummary { changed: false, deleted_module_field_count: 0, deleted_module_range_count: 0 })
+}
+
+// Upstream `Result<Summary, String>` — refused arm carries no text.
+pub data LayoutMutationResult {
+    case Succeeded(summary: ProjectSymbolLayoutMutationSummary);
+    case Refused;
+}
+
+pub machine LayoutMutationResult::succeeded() -> LayoutMutationResult {
+    (LayoutMutationResult::Succeeded { summary: ProjectSymbolLayoutMutationSummary { changed: true, deleted_module_field_count: 0, deleted_module_range_count: 0 } })
+}
+
+// Upstream `string_list_contains` — bounded scan over a ProjectStringList.
+machine layout_string_list_contains(strings: &ProjectStringList, needle: &[u8]) -> bool {
+    let string_count: u64 = ProjectStringList::get_string_count(strings);
+    transition {
+        _ -> scan(strings, needle, string_count, 0)
+    }
+    state scan(strings: &ProjectStringList, needle: &[u8], string_count: u64, position: u64) -> bool {
+        transition position < string_count && position < 64 {
+            true -> compare(strings, needle, string_count, position)
+            false -> (false)
+        }
+    }
+    state compare(strings: &ProjectStringList, needle: &[u8], string_count: u64, position: u64) -> bool
+        requires position < string_count && position < 64
+    {
+        let inner3161: &[u8] = ProjectStringList::get_string(strings, position);
+        transition FileSystemUtils::bytes_equal(inner3161, needle) {
+            true -> (true)
+            false -> scan(strings, needle, string_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine layout_min_u64(left: u64, right: u64) -> u64 {
+    transition {
+        _ -> pick(left, right)
+    }
+    state pick(left: u64, right: u64) -> u64 {
+        transition left < right {
+            true -> (left)
+            false -> (right)
+        }
+    }
+}
+
+// (offset,display_name) ordering comparator — upstream sort key
+// `(offset, display_name)` with lexicographic byte-name order.
+machine layout_name_after(candidate: &[u8], reference: &[u8]) -> bool {
+    let shorter: u64 = layout_min_u64(candidate.len, reference.len);
+    transition {
+        _ -> scan(candidate, reference, shorter, 0)
+    }
+    state scan(candidate: &[u8], reference: &[u8], shorter: u64, position: u64) -> bool {
+        transition position < shorter {
+            true -> compare(candidate, reference, shorter, position)
+            false -> (candidate.len > reference.len)
+        }
+    }
+    state compare(candidate: &[u8], reference: &[u8], shorter: u64, position: u64) -> bool
+        requires position < shorter
+    {
+        transition candidate[position] > reference[position] {
+            true -> (true)
+            false -> lower(candidate, reference, shorter, position)
+        }
+    }
+    state lower(candidate: &[u8], reference: &[u8], shorter: u64, position: u64) -> bool
+        requires position < shorter
+    {
+        transition candidate[position] < reference[position] {
+            true -> (false)
+            false -> scan(candidate, reference, shorter, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// ---- upsert_struct_layout_descriptor ----------------------------------------
+
+pub machine ProjectSymbolLayoutMutation::upsert_struct_layout_descriptor(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    has_original_struct_layout_id: bool,
+    original_struct_layout_id: &[u8],
+    struct_layout_descriptor: &StructLayoutDescriptor ) -> LayoutMutationResult {
+    // Conflict: rename lands on a different live descriptor id —
+    // upstream `Err`, port refuses.
+    let renamed: bool = has_original_struct_layout_id
+        && !FileSystemUtils::bytes_equal(original_struct_layout_id, StructLayoutDescriptor::get_struct_layout_id(struct_layout_descriptor));
+    transition renamed {
+        true -> probe(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor)
+        false -> rebuild(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor, 0)
+    }
+    state probe(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_struct_layout_id: bool,
+        original_struct_layout_id: &[u8],
+        struct_layout_descriptor: &StructLayoutDescriptor
+    ) -> LayoutMutationResult {
+        let struct_layout_id: &[u8] = StructLayoutDescriptor::get_struct_layout_id(struct_layout_descriptor);
+        let position: u64 = ProjectSymbolCatalog::find_struct_layout_descriptor_position(project_symbol_catalog, struct_layout_id);
+        let descriptor_count: u64 = ProjectSymbolCatalog::get_struct_layout_descriptor_count(project_symbol_catalog);
+        transition position < descriptor_count && position < 128 {
+            true -> (LayoutMutationResult::Refused)
+            false -> rebuild(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor, 0)
+        }
+    }
+    // Upstream retains descriptors whose id ∉ {original, replacement};
+    // a removal shifts the next element into `remove_cursor`, so the
+    // scan stays put after a drop and advances after a keep.
+    state rebuild(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_struct_layout_id: bool,
+        original_struct_layout_id: &[u8],
+        struct_layout_descriptor: &StructLayoutDescriptor,
+        remove_cursor: u64
+    ) -> LayoutMutationResult {
+        let descriptor_count: u64 = ProjectSymbolCatalog::get_struct_layout_descriptor_count(project_symbol_catalog);
+        transition remove_cursor < descriptor_count && remove_cursor < 128 {
+            true -> decide(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor, remove_cursor, descriptor_count)
+            false -> insert(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor)
+        }
+    }
+    state decide(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_struct_layout_id: bool,
+        original_struct_layout_id: &[u8],
+        struct_layout_descriptor: &StructLayoutDescriptor,
+        remove_cursor: u64,
+        descriptor_count: u64
+    ) -> LayoutMutationResult
+        requires remove_cursor < descriptor_count && remove_cursor < 128
+    {
+        let descriptor: &StructLayoutDescriptor = ProjectSymbolCatalog::get_struct_layout_descriptor(project_symbol_catalog, remove_cursor);
+        let descriptor_id: &[u8] = StructLayoutDescriptor::get_struct_layout_id(descriptor);
+        let drops: bool = FileSystemUtils::bytes_equal(descriptor_id, StructLayoutDescriptor::get_struct_layout_id(struct_layout_descriptor))
+            || (has_original_struct_layout_id && FileSystemUtils::bytes_equal(descriptor_id, original_struct_layout_id));
+        transition drops {
+            true -> drop_match(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor, remove_cursor, descriptor_count)
+            false -> rebuild(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor, ((remove_cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state drop_match(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_struct_layout_id: bool,
+        original_struct_layout_id: &[u8],
+        struct_layout_descriptor: &StructLayoutDescriptor,
+        remove_cursor: u64,
+        descriptor_count: u64
+    ) -> LayoutMutationResult
+        requires remove_cursor < descriptor_count && remove_cursor < 128
+    {
+        _ = ProjectSymbolCatalog::remove_struct_layout_descriptor_at(project_symbol_catalog, remove_cursor);
+        transition {
+            _ -> rebuild(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor, remove_cursor)
+        }
+    }
+    state insert(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_struct_layout_id: bool,
+        original_struct_layout_id: &[u8],
+        struct_layout_descriptor: &StructLayoutDescriptor
+    ) -> LayoutMutationResult {
+        // Upstream pushes then sorts case-insensitively; the catalog
+        // keeps descriptors sorted — sorted-insert is equivalent.
+        let inserted: bool = ProjectSymbolCatalog::insert_struct_layout_descriptor_sorted(project_symbol_catalog, struct_layout_descriptor);
+        transition inserted {
+            true -> maybe_retarget(project_symbol_layout_mutation, project_symbol_catalog, has_original_struct_layout_id, original_struct_layout_id, struct_layout_descriptor)
+            false -> (LayoutMutationResult::Refused)
+        }
+    }
+    state maybe_retarget(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_struct_layout_id: bool,
+        original_struct_layout_id: &[u8],
+        struct_layout_descriptor: &StructLayoutDescriptor
+    ) -> LayoutMutationResult {
+        let renamed: bool = has_original_struct_layout_id
+            && !FileSystemUtils::bytes_equal(original_struct_layout_id, StructLayoutDescriptor::get_struct_layout_id(struct_layout_descriptor));
+        transition renamed {
+            true -> retarget(project_symbol_layout_mutation, project_symbol_catalog, original_struct_layout_id, struct_layout_descriptor)
+            false -> (LayoutMutationResult::succeeded())
+        }
+    }
+    state retarget(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        struct_layout_descriptor: &StructLayoutDescriptor
+    ) -> LayoutMutationResult {
+        let inner21: &[u8] = StructLayoutDescriptor::get_struct_layout_id(struct_layout_descriptor);
+        let replacement: DataTypeRef = DataTypeRef::new(inner21);
+        ProjectSymbolLayoutMutation::retarget_catalog_struct_layout_references(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, &replacement);
+        (LayoutMutationResult::succeeded())
+    }
+}
+
+// ---- delete_struct_layout ---------------------------------------------------
+
+pub machine ProjectSymbolLayoutMutation::delete_struct_layout(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    struct_layout_id: &[u8],
+    replacement_data_type: &DataTypeRef ) -> LayoutMutationResult {
+    let position: u64 = ProjectSymbolCatalog::find_struct_layout_descriptor_position(project_symbol_catalog, struct_layout_id);
+    let descriptor_count: u64 = ProjectSymbolCatalog::get_struct_layout_descriptor_count(project_symbol_catalog);
+    transition position < descriptor_count && position < 128 {
+        true -> remove(project_symbol_layout_mutation, project_symbol_catalog, struct_layout_id, replacement_data_type, position, descriptor_count)
+        false -> (LayoutMutationResult::Refused)
+    }
+    state remove(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        position: u64,
+        descriptor_count: u64
+    ) -> LayoutMutationResult
+        requires position < descriptor_count && position < 128
+    {
+        let removed: bool = ProjectSymbolCatalog::remove_struct_layout_descriptor_at(project_symbol_catalog, position);
+        transition removed {
+            true -> retarget(project_symbol_layout_mutation, project_symbol_catalog, struct_layout_id, replacement_data_type)
+            false -> (LayoutMutationResult::Refused)
+        }
+    }
+    state retarget(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef
+    ) -> LayoutMutationResult {
+        ProjectSymbolLayoutMutation::retarget_catalog_struct_layout_references(project_symbol_layout_mutation, project_symbol_catalog, struct_layout_id, replacement_data_type);
+        (LayoutMutationResult::succeeded())
+    }
+}
+
+// ---- resolve_struct_layout_id_size_in_bytes ---------------------------------
+
+pub machine ProjectSymbolLayoutMutation::resolve_struct_layout_id_size_in_bytes(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    struct_layout_id: &[u8] ) -> SymbolLayoutSizeResult {
+    transition {
+        _ -> (SymbolLayoutSizeResolver::resolve_struct_layout_id_size_in_bytes(
+            engine_unprivileged_state, project_symbol_catalog, true, struct_layout_id))
+    }
+}
+
+// ---- upsert_module_field ----------------------------------------------------
+
+// Upstream `upsert_module_field`: resolves the layout id's declared
+// size (unassigned layouts refuse), clamps the module size through
+// ensure, then upserts with overlap checking. A missing module after
+// ensure is unreachable upstream; the port refuses.
+pub machine ProjectSymbolLayoutMutation::upsert_module_field(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    module_name: &[u8],
+    display_name: &[u8],
+    offset: u64,
+    struct_layout_id: &[u8] ) -> LayoutMutationResult {
+    let size: SymbolLayoutSizeResult = SymbolLayoutSizeResolver::resolve_struct_layout_id_size_in_bytes(engine_unprivileged_state, project_symbol_catalog, true, struct_layout_id);
+    transition size.found && size.size_in_bytes > 0 {
+        true -> bounded(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, module_name, display_name, offset, struct_layout_id, size.size_in_bytes)
+        false -> (LayoutMutationResult::Refused)
+    }
+    state bounded(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        field_size_in_bytes: u64
+    ) -> LayoutMutationResult {
+        // Upstream `offset + size` — checked-add; a wrap past 18446744073709551615
+        // leaves end < offset (size > 0) and refuses.
+        let end_offset: u64 = ((offset as u64 in Wrapping) + (field_size_in_bytes as u64 in Wrapping)) as u64;
+        transition end_offset >= offset {
+            true -> ensure(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, module_name, display_name, offset, struct_layout_id, field_size_in_bytes)
+            false -> (LayoutMutationResult::Refused)
+        }
+    }
+    state ensure(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        field_size_in_bytes: u64
+    ) -> LayoutMutationResult {
+        let end_offset: u64 = ((offset as u64 in Wrapping) + (field_size_in_bytes as u64 in Wrapping)) as u64;
+        // Upstream `ensure_symbol_module` returns unit — the locate
+        // step's find-position is what refuses an empty module name.
+        _ = ProjectSymbolCatalog::ensure_symbol_module(project_symbol_catalog, module_name, end_offset);
+        transition {
+            _ -> locate(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, module_name, display_name, offset, struct_layout_id, field_size_in_bytes)
+        }
+    }
+    state locate(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        field_size_in_bytes: u64
+    ) -> LayoutMutationResult {
+        let module_position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, module_name);
+        let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+        transition module_position < module_count && module_position < 64 {
+            true -> overlap(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, display_name, offset, struct_layout_id, field_size_in_bytes, module_position, module_count, 0)
+            false -> (LayoutMutationResult::Refused)
+        }
+    }
+    // Upstream `has_overlapping_module_field`: same-offset fields are
+    // the dedup/update path; a different-offset field whose resolved
+    // span intersects [offset, offset+size) refuses.
+    state overlap(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        field_size_in_bytes: u64,
+        module_position: u64,
+        module_count: u64,
+        field_cursor: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition field_cursor < field_count && field_cursor < 64 {
+            true -> overlap_field(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, display_name, offset, struct_layout_id, field_size_in_bytes, module_position, module_count, field_cursor, field_count)
+            false -> place(project_symbol_layout_mutation, project_symbol_catalog, display_name, offset, struct_layout_id, module_position, module_count)
+        }
+    }
+    state overlap_field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        field_size_in_bytes: u64,
+        module_position: u64,
+        module_count: u64,
+        field_cursor: u64,
+        field_count: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64 && field_cursor < field_count && field_cursor < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, field_cursor);
+        let field_offset: u64 = ProjectSymbolModuleField::get_offset(field);
+        transition field_offset == offset {
+            true -> overlap(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, display_name, offset, struct_layout_id, field_size_in_bytes, module_position, module_count, ((field_cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> overlap_size(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, display_name, offset, struct_layout_id, field_size_in_bytes, module_position, module_count, field_cursor, field_count)
+        }
+    }
+    state overlap_size(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        field_size_in_bytes: u64,
+        module_position: u64,
+        module_count: u64,
+        field_cursor: u64,
+        field_count: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64 && field_cursor < field_count && field_cursor < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, field_cursor);
+        let inner22: &[u8] = ProjectSymbolModuleField::get_struct_layout_id(field);
+        let other: SymbolLayoutSizeResult = SymbolLayoutSizeResolver::resolve_struct_layout_id_size_in_bytes(engine_unprivileged_state, project_symbol_catalog, true, inner22);
+        let other_offset: u64 = ProjectSymbolModuleField::get_offset(field);
+        let new_end: u64 = ((offset as u64 in Wrapping) + (field_size_in_bytes as u64 in Wrapping)) as u64;
+        let other_end: u64 = ((other_offset as u64 in Wrapping) + (other.size_in_bytes as u64 in Wrapping)) as u64;
+        transition other.found && other.size_in_bytes > 0 && offset < other_end && other_offset < new_end {
+            true -> (LayoutMutationResult::Refused)
+            false -> overlap(project_symbol_layout_mutation, engine_unprivileged_state, project_symbol_catalog, display_name, offset, struct_layout_id, field_size_in_bytes, module_position, module_count, ((field_cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state place(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        module_position: u64,
+        module_count: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64
+    {
+        // Upstream `find_field -> update-or-push + sort`; update
+        // refreshes display-name/id in place, insert places at the
+        // sorted (offset, display_name) slot — the list stays sorted.
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field_position: u64 = ProjectSymbolModule::find_field_position(module, offset);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition field_position < field_count && field_position < 64 {
+            true -> update(project_symbol_layout_mutation, project_symbol_catalog, display_name, struct_layout_id, module_position, module_count, field_position, field_count)
+            false -> slot(project_symbol_layout_mutation, project_symbol_catalog, display_name, offset, struct_layout_id, module_position, module_count, field_count, 0)
+        }
+    }
+    state update(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        struct_layout_id: &[u8],
+        module_position: u64,
+        module_count: u64,
+        field_position: u64,
+        field_count: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64 && field_position < field_count && field_position < 64
+    {
+        let module: &mut ProjectSymbolModule = ProjectSymbolCatalog::borrow_symbol_module_mut(project_symbol_catalog, module_position);
+        let field: &mut ProjectSymbolModuleField = ProjectSymbolModule::get_field_mut(module, field_position);
+        ProjectSymbolModuleField::set_display_name(field, display_name);
+        ProjectSymbolModuleField::set_struct_layout_id(field, struct_layout_id);
+        (LayoutMutationResult::succeeded())
+    }
+    state slot(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        module_position: u64,
+        module_count: u64,
+        field_count: u64,
+        probe: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        transition probe < field_count && probe < 64 {
+            true -> probe_field(project_symbol_layout_mutation, project_symbol_catalog, display_name, offset, struct_layout_id, module_position, module_count, field_count, probe)
+            false -> insert_at(project_symbol_layout_mutation, project_symbol_catalog, display_name, offset, struct_layout_id, module_position, module_count, probe)
+        }
+    }
+    state probe_field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        module_position: u64,
+        module_count: u64,
+        field_count: u64,
+        probe: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64 && probe < field_count && probe < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, probe);
+        let field_offset: u64 = ProjectSymbolModuleField::get_offset(field);
+        let after: bool = field_offset > offset
+            || (field_offset == offset && layout_name_after(ProjectSymbolModuleField::get_display_name(field), display_name));
+        transition after {
+            true -> insert_at(project_symbol_layout_mutation, project_symbol_catalog, display_name, offset, struct_layout_id, module_position, module_count, probe)
+            false -> slot(project_symbol_layout_mutation, project_symbol_catalog, display_name, offset, struct_layout_id, module_position, module_count, field_count, ((probe as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state insert_at(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        display_name: &[u8],
+        offset: u64,
+        struct_layout_id: &[u8],
+        module_position: u64,
+        module_count: u64,
+        field_position: u64
+    ) -> LayoutMutationResult
+        requires module_position < module_count && module_position < 64 && field_position < 64
+    {
+        let field: ProjectSymbolModuleField = ProjectSymbolModuleField::new(display_name, offset, struct_layout_id);
+        let module: &mut ProjectSymbolModule = ProjectSymbolCatalog::borrow_symbol_module_mut(project_symbol_catalog, module_position);
+        let inserted: bool = ProjectSymbolModule::insert_field_at(module, field_position, &field);
+        transition inserted {
+            true -> (LayoutMutationResult::succeeded())
+            false -> (LayoutMutationResult::Refused)
+        }
+    }
+}
+
+// ---- delete_module_fields_by_locator_key ------------------------------------
+
+// Upstream: every module's fields are retained unless their
+// `get_symbol_locator_key(module_name)` is in the key set; the summary
+// counts removed fields and marks changed when any dropped. Key set
+// rides the request's ProjectStringList. Descending removal keeps
+// earlier slot positions intact (`remaining` tracks the scan window;
+// `field_count` re-binds fresh each step since removals shrink it).
+pub machine ProjectSymbolLayoutMutation::delete_module_fields_by_locator_key(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    symbol_locator_keys: &ProjectStringList
+) -> ProjectSymbolLayoutMutationSummary {
+    let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+    transition {
+        _ -> module(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, 0, 0)
+    }
+    state module(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        symbol_locator_keys: &ProjectStringList,
+        module_count: u64,
+        module_position: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        transition module_position < module_count && module_position < 64 {
+            true -> fields(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, deleted_count)
+            false -> (ProjectSymbolLayoutMutationSummary { changed: deleted_count > 0, deleted_module_field_count: deleted_count, deleted_module_range_count: 0 })
+        }
+    }
+    state fields(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        symbol_locator_keys: &ProjectStringList,
+        module_count: u64,
+        module_position: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition {
+            _ -> field(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, field_count, field_count, deleted_count)
+        }
+    }
+    state field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        symbol_locator_keys: &ProjectStringList,
+        module_count: u64,
+        module_position: u64,
+        remaining: u64,
+        field_count: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && remaining <= field_count
+    {
+        transition remaining > 0 {
+            true -> key(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, remaining, deleted_count)
+            false -> module(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, ((module_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_count)
+        }
+    }
+    state key(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        symbol_locator_keys: &ProjectStringList,
+        module_count: u64,
+        module_position: u64,
+        field_position: u64,
+        field_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && field_position < field_count && remaining > 0
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let module_name: &[u8] = ProjectSymbolModule::get_module_name(module);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, field_position);
+        let mut field_key: [u8; 256];
+        let field_key_len: u64 = ProjectSymbolModuleField::get_symbol_locator_key(field, module_name, &mut field_key);
+        transition field_key_len <= 256 {
+            true -> probe(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, field_position, field_count, remaining, deleted_count, &field_key, field_key_len)
+            false -> field(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, deleted_count)
+        }
+    }
+    state probe(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        symbol_locator_keys: &ProjectStringList,
+        module_count: u64,
+        module_position: u64,
+        field_position: u64,
+        field_count: u64,
+        remaining: u64,
+        deleted_count: u64,
+        field_key: &[u8; 256],
+        field_key_len: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && field_position < field_count && remaining > 0 && field_key_len <= 256
+    {
+        let listed: bool = layout_string_list_contains(symbol_locator_keys, &field_key[0..field_key_len]);
+        transition listed {
+            true -> drop_field(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, field_position, remaining, deleted_count)
+            false -> field(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, deleted_count)
+        }
+    }
+    state drop_field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        symbol_locator_keys: &ProjectStringList,
+        module_count: u64,
+        module_position: u64,
+        field_position: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && remaining > 0
+    {
+        let module: &mut ProjectSymbolModule = ProjectSymbolCatalog::borrow_symbol_module_mut(project_symbol_catalog, module_position);
+        _ = ProjectSymbolModule::remove_field_at(module, field_position);
+        transition {
+            _ -> recount(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, remaining, deleted_count)
+        }
+    }
+    state recount(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        symbol_locator_keys: &ProjectStringList,
+        module_count: u64,
+        module_position: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && remaining > 0
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition {
+            _ -> field(project_symbol_layout_mutation, project_symbol_catalog, symbol_locator_keys, module_count, module_position, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, ((deleted_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// ---- delete_or_shift_module_fields ------------------------------------------
+
+// Upstream `delete_or_shift_module_fields`: fields inside
+// [offset, offset+length) drop; fields at/above the end shift left by
+// `length`; lower fields keep their offset. Descending pass.
+machine layout_delete_or_shift_module_fields(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    symbol_module: &mut ProjectSymbolModule,
+    offset: u64,
+    length: u64
+) -> ProjectSymbolLayoutMutationSummary {
+    let field_count: u64 = ProjectSymbolModule::get_field_count(symbol_module);
+    transition {
+        _ -> field(project_symbol_layout_mutation, symbol_module, offset, length, field_count, field_count, 0)
+    }
+    state field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        symbol_module: &mut ProjectSymbolModule,
+        offset: u64,
+        length: u64,
+        remaining: u64,
+        field_count: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires remaining <= field_count
+    {
+        transition remaining > 0 {
+            true -> decide(project_symbol_layout_mutation, symbol_module, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, remaining, deleted_count)
+            false -> (ProjectSymbolLayoutMutationSummary { changed: deleted_count > 0, deleted_module_field_count: deleted_count, deleted_module_range_count: 0 })
+        }
+    }
+    state decide(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        symbol_module: &mut ProjectSymbolModule,
+        offset: u64,
+        length: u64,
+        field_position: u64,
+        field_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires field_position < field_count && remaining > 0
+    {
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(symbol_module, field_position);
+        let field_offset: u64 = ProjectSymbolModuleField::get_offset(field);
+        let range_end: u64 = ((offset as u64 in Wrapping) + (length as u64 in Wrapping)) as u64;
+        let in_range: bool = field_offset >= offset && field_offset < range_end;
+        let after_range: bool = field_offset >= range_end;
+        transition in_range {
+            true -> drop_field(project_symbol_layout_mutation, symbol_module, offset, length, field_position, remaining, deleted_count)
+            false -> maybe_shift(project_symbol_layout_mutation, symbol_module, offset, length, field_position, field_count, remaining, deleted_count, after_range)
+        }
+    }
+    state maybe_shift(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        symbol_module: &mut ProjectSymbolModule,
+        offset: u64,
+        length: u64,
+        field_position: u64,
+        field_count: u64,
+        remaining: u64,
+        deleted_count: u64,
+        after_range: bool
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires field_position < field_count && remaining > 0
+    {
+        transition after_range {
+            true -> shift_field(project_symbol_layout_mutation, symbol_module, offset, length, field_position, field_count, remaining, deleted_count)
+            false -> recount(project_symbol_layout_mutation, symbol_module, offset, length, remaining, deleted_count)
+        }
+    }
+    state shift_field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        symbol_module: &mut ProjectSymbolModule,
+        offset: u64,
+        length: u64,
+        field_position: u64,
+        field_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+
+
+
+
+
+
+
+
+        requires field_position < field_count && remaining > 0
+    {
+        // Upstream `field.set_offset(field.offset - length)` — guarded
+        // by `>= end > offset`, so length <= offset <= field_offset and
+        // the Wrapping subtraction cannot wrap.
+        let field: &mut ProjectSymbolModuleField = ProjectSymbolModule::get_field_mut(symbol_module, field_position);
+        let field_offset: u64 = ProjectSymbolModuleField::get_offset(field);
+        let shifted: u64 = ((field_offset as u64 in Wrapping) - (length as u64 in Wrapping)) as u64;
+        ProjectSymbolModuleField::set_offset(field, shifted);
+        transition {
+            _ -> recount(project_symbol_layout_mutation, symbol_module, offset, length, remaining, deleted_count)
+        }
+    }
+    state drop_field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        symbol_module: &mut ProjectSymbolModule,
+        offset: u64,
+        length: u64,
+        field_position: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        _ = ProjectSymbolModule::remove_field_at(symbol_module, field_position);
+        transition {
+            _ -> recount_drop(project_symbol_layout_mutation, symbol_module, offset, length, remaining, deleted_count)
+        }
+    }
+    state recount(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        symbol_module: &mut ProjectSymbolModule,
+        offset: u64,
+        length: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        let field_count: u64 = ProjectSymbolModule::get_field_count(symbol_module);
+        transition {
+            _ -> field(project_symbol_layout_mutation, symbol_module, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, deleted_count)
+        }
+    }
+    state recount_drop(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        symbol_module: &mut ProjectSymbolModule,
+        offset: u64,
+        length: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        let field_count: u64 = ProjectSymbolModule::get_field_count(symbol_module);
+        transition {
+            _ -> field(project_symbol_layout_mutation, symbol_module, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, ((deleted_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// ---- delete_or_shift_module_symbol_claims -----------------------------------
+
+// Upstream: ModuleOffset claims in the deleted module inside
+// [offset, offset+length) drop; claims at/above the end shift left;
+// other locators untouched. Descending pass over the claim table.
+machine layout_delete_or_shift_module_claims(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    module_name: &[u8],
+    offset: u64,
+    length: u64
+) -> ProjectSymbolLayoutMutationSummary {
+    let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+    transition {
+        _ -> claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_count, claim_count, 0)
+    }
+    state claim(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        remaining: u64,
+        claim_count: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires remaining <= claim_count
+    {
+        transition remaining > 0 {
+            true -> decide(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, claim_count, remaining, deleted_count)
+            false -> (ProjectSymbolLayoutMutationSummary { changed: deleted_count > 0, deleted_module_field_count: 0, deleted_module_range_count: deleted_count })
+        }
+    }
+    state decide(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        claim_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires claim_position < claim_count && remaining > 0
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let matches: bool = ProjectSymbolLocator::is_module_offset(locator)
+            && FileSystemUtils::bytes_equal(ProjectSymbolLocator::get_focus_module_name(locator), module_name);
+        transition matches {
+            true -> ranged(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_position, claim_count, remaining, deleted_count)
+            false -> next(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_count, remaining, deleted_count)
+        }
+    }
+    state ranged(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        claim_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires claim_position < claim_count && remaining > 0
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let claim_offset: u64 = ProjectSymbolLocator::get_focus_address(locator);
+        let range_end: u64 = ((offset as u64 in Wrapping) + (length as u64 in Wrapping)) as u64;
+        transition claim_offset >= offset && claim_offset < range_end {
+            true -> drop_claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_position, remaining, deleted_count)
+            false -> maybe_shift(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_position, claim_count, remaining, deleted_count, claim_offset >= range_end)
+        }
+    }
+    state maybe_shift(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        claim_count: u64,
+        remaining: u64,
+        deleted_count: u64,
+        after_range: bool
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires claim_position < claim_count && remaining > 0
+    {
+        transition after_range {
+            true -> shift_claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_position, claim_count, remaining, deleted_count)
+            false -> next(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_count, remaining, deleted_count)
+        }
+    }
+    state shift_claim(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        claim_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires claim_position < claim_count && remaining > 0
+    {
+        let claim: &mut ProjectSymbolClaim = ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog, claim_position);
+        let locator: &mut ProjectSymbolLocator = ProjectSymbolClaim::get_locator_mut(claim);
+        let claim_offset: u64 = ProjectSymbolLocator::get_focus_address(locator);
+        let shifted: u64 = ((claim_offset as u64 in Saturating) - (length as u64 in Saturating)) as u64;
+        let claim_module_name: &[u8] = ProjectSymbolLocator::get_focus_module_name(locator);
+        let rewritten: ProjectSymbolLocator = ProjectSymbolLocator::new_module_offset(claim_module_name, shifted);
+        ProjectSymbolLocator::clone_from(locator, &rewritten);
+        transition {
+            _ -> next(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_count, remaining, deleted_count)
+        }
+    }
+    state drop_claim(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        _ = ProjectSymbolCatalog::remove_symbol_claim_at(project_symbol_catalog, claim_position);
+        transition {
+            _ -> recount_drop(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, remaining, deleted_count)
+        }
+    }
+    state next(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        transition {
+            _ -> claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, claim_count, deleted_count)
+        }
+    }
+    state recount_drop(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+        transition {
+            _ -> claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, claim_count, ((deleted_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// ---- delete_module_range_to_unassigned --------------------------------------
+
+// Upstream `delete_module_range_to_unassigned`: fields inside
+// [offset, offset+length) drop (the gap surfaces as unassigned);
+// claims in range drop too. Summary counts fields + one range.
+machine layout_delete_module_range_to_unassigned(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    module_name: &[u8],
+    offset: u64,
+    length: u64
+) -> ProjectSymbolLayoutMutationSummary {
+    let module_position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, module_name);
+    let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+    transition module_position < module_count && module_position < 64 {
+        true -> clamp(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, module_position, module_count)
+        false -> (ProjectSymbolLayoutMutationSummary::no_changes())
+    }
+    state clamp(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        module_position: u64,
+        module_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64
+    {
+        // Upstream `len.min(module_size - offset)` clamp.
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let module_size: u64 = ProjectSymbolModule::get_size(module);
+        transition offset < module_size {
+            true -> bounded(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, module_position, module_count, module_size)
+            false -> (ProjectSymbolLayoutMutationSummary::no_changes())
+        }
+    }
+    state bounded(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        module_position: u64,
+        module_count: u64,
+        module_size: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && offset < module_size
+    {
+        let remaining_size: u64 = ((module_size as u64 in Wrapping) - (offset as u64 in Wrapping)) as u64;
+        let bounded_length: u64 = layout_min_u64(length, remaining_size);
+        transition bounded_length > 0 {
+            true -> drop_fields(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, module_position, module_count)
+            false -> (ProjectSymbolLayoutMutationSummary::no_changes())
+        }
+    }
+    state drop_fields(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        bounded_length: u64,
+        module_position: u64,
+        module_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition {
+            _ -> field(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, module_position, module_count, field_count, field_count, 0)
+        }
+    }
+    state field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        bounded_length: u64,
+        module_position: u64,
+        module_count: u64,
+        remaining: u64,
+        field_count: u64,
+        deleted_fields: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && remaining <= field_count
+    {
+        transition remaining > 0 {
+            true -> decide(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, module_position, module_count, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, remaining, deleted_fields)
+            false -> drop_claims(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, deleted_fields)
+        }
+    }
+    state decide(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        bounded_length: u64,
+        module_position: u64,
+        module_count: u64,
+        field_position: u64,
+        field_count: u64,
+        remaining: u64,
+        deleted_fields: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && field_position < field_count && remaining > 0
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, field_position);
+        let field_offset: u64 = ProjectSymbolModuleField::get_offset(field);
+        let range_end: u64 = ((offset as u64 in Wrapping) + (bounded_length as u64 in Wrapping)) as u64;
+        transition field_offset >= offset && field_offset < range_end {
+            true -> drop_field(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, module_position, module_count, field_position, remaining, deleted_fields)
+            false -> field(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, module_position, module_count, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, deleted_fields)
+        }
+    }
+    state drop_field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        bounded_length: u64,
+        module_position: u64,
+        module_count: u64,
+        field_position: u64,
+        remaining: u64,
+        deleted_fields: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && remaining > 0
+    {
+        let module: &mut ProjectSymbolModule = ProjectSymbolCatalog::borrow_symbol_module_mut(project_symbol_catalog, module_position);
+        _ = ProjectSymbolModule::remove_field_at(module, field_position);
+        transition {
+            _ -> recount(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, module_position, module_count, remaining, deleted_fields)
+        }
+    }
+    state recount(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        bounded_length: u64,
+        module_position: u64,
+        module_count: u64,
+        remaining: u64,
+        deleted_fields: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires module_position < module_count && module_position < 64 && remaining > 0
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition {
+            _ -> field(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length, module_position, module_count, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, field_count, ((deleted_fields as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state drop_claims(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        bounded_length: u64,
+        deleted_fields: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        // Upstream `did_delete_range` = fields-removed || deleted_length
+        // > 0 — the caller only reaches this state under
+        // bounded_length > 0, so the range always counts; the fields
+        // removed inside it report as the range deletion, not field
+        // deletions.
+        _ = layout_delete_module_claims_in_range(
+            project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, bounded_length);
+        transition {
+            _ -> (ProjectSymbolLayoutMutationSummary { changed: true, deleted_module_field_count: 0, deleted_module_range_count: 1 })
+        }
+    }
+}
+
+// Upstream `delete_module_symbol_claims_in_range`: ModuleOffset claims
+// in the module inside [offset, offset+length) drop. Descending pass.
+machine layout_delete_module_claims_in_range(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    module_name: &[u8],
+    offset: u64,
+    length: u64
+) -> ProjectSymbolLayoutMutationSummary {
+    let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+    transition {
+        _ -> claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_count, claim_count, 0)
+    }
+    state claim(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        remaining: u64,
+        claim_count: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires remaining <= claim_count
+    {
+        transition remaining > 0 {
+            true -> decide(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, claim_count, remaining, deleted_count)
+            false -> (ProjectSymbolLayoutMutationSummary { changed: deleted_count > 0, deleted_module_field_count: 0, deleted_module_range_count: deleted_count })
+        }
+    }
+    state decide(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        claim_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires claim_position < claim_count && remaining > 0
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let matches: bool = ProjectSymbolLocator::is_module_offset(locator)
+            && FileSystemUtils::bytes_equal(ProjectSymbolLocator::get_focus_module_name(locator), module_name);
+        transition matches {
+            true -> ranged(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_position, claim_count, remaining, deleted_count)
+            false -> claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, claim_count, deleted_count)
+        }
+    }
+    state ranged(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        claim_count: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires claim_position < claim_count && remaining > 0
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let claim_offset: u64 = ProjectSymbolLocator::get_focus_address(locator);
+        let range_end: u64 = ((offset as u64 in Wrapping) + (length as u64 in Wrapping)) as u64;
+        transition claim_offset >= offset && claim_offset < range_end {
+            true -> drop_claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, claim_position, remaining, deleted_count)
+            false -> claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, claim_count, deleted_count)
+        }
+    }
+    state drop_claim(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        claim_position: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        _ = ProjectSymbolCatalog::remove_symbol_claim_at(project_symbol_catalog, claim_position);
+        transition {
+            _ -> recount(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, remaining, deleted_count)
+        }
+    }
+    state recount(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_name: &[u8],
+        offset: u64,
+        length: u64,
+        remaining: u64,
+        deleted_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+        transition {
+            _ -> claim(project_symbol_layout_mutation, project_symbol_catalog, module_name, offset, length, ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, claim_count, ((deleted_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// ---- delete_module_ranges_and_shift ------------------------------------------
+
+// Upstream `delete_module_ranges_and_shift`: per ShiftLeft range on a
+// surviving module — clamp, shrink module size, delete-or-shift fields
+// and claims. Ranges ride the request directly (upstream partitions a
+// Vec; the port iterates the request per mode, preserving per-mode
+// order).
+pub machine ProjectSymbolLayoutMutation::delete_module_ranges_and_shift(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    module_ranges: &MutationRangeList,
+    deleted_module_names: &ProjectStringList ) -> ProjectSymbolLayoutMutationSummary {
+    let range_count: u64 = MutationRangeList::get_count(module_ranges);
+    transition {
+        _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, 0, 0)
+    }
+    state range(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        transition range_position < range_count && range_position < 64 {
+            true -> mode(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges)
+            _ -> (ProjectSymbolLayoutMutationSummary { changed: deleted_ranges > 0, deleted_module_field_count: 0, deleted_module_range_count: deleted_ranges })
+        }
+    }
+    state mode(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64;
+    {
+        // Upstream splits ranges by mode in `delete_module_ranges`; the
+        // port filters inside each walker (bounded lists over Vec).
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let range_mode: ProjectSymbolsDeleteModuleRangeMode = ProjectSymbolsDeleteModuleRange::get_mode(range);
+        transition range_mode {
+            ProjectSymbolsDeleteModuleRangeMode::ShiftLeft -> skip(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges)
+            _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+        }
+    }
+    state skip(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let module_name: &[u8] = ProjectSymbolsDeleteModuleRange::get_module_name(range);
+        let skip: bool = layout_string_list_contains(deleted_module_names, module_name);
+        transition skip {
+            true -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+            _ -> locate(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges)
+        }
+    }
+    state locate(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let module_name: &[u8] = ProjectSymbolsDeleteModuleRange::get_module_name(range);
+        let module_position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, module_name);
+        let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+        transition module_position < module_count && module_position < 64 {
+            true -> clamp(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges, module_position, module_count)
+            _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+        }
+    }
+    state clamp(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64,
+        module_position: u64,
+        module_count: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64 && module_position < module_count && module_position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let range_offset: u64 = ProjectSymbolsDeleteModuleRange::get_offset(range);
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let module_size: u64 = ProjectSymbolModule::get_size(module);
+        transition range_offset < module_size {
+            true -> bounded(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges, module_position, module_count, module_size)
+            _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+        }
+    }
+    state bounded(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64,
+        module_position: u64,
+        module_count: u64,
+        module_size: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64 && module_position < module_count && module_position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let range_offset: u64 = ProjectSymbolsDeleteModuleRange::get_offset(range);
+        let range_length: u64 = ProjectSymbolsDeleteModuleRange::get_length(range);
+        let remaining_size: u64 = ((module_size as u64 in Wrapping) - (range_offset as u64 in Wrapping)) as u64;
+        let bounded_length: u64 = layout_min_u64(range_length, remaining_size);
+        transition bounded_length > 0 {
+            true -> apply(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges, module_position, module_count, module_size, bounded_length)
+            _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+        }
+    }
+    state apply(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64,
+        module_position: u64,
+        module_count: u64,
+        module_size: u64,
+        bounded_length: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64 && module_position < module_count && module_position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let range_offset: u64 = ProjectSymbolsDeleteModuleRange::get_offset(range);
+        let module_name: &[u8] = ProjectSymbolsDeleteModuleRange::get_module_name(range);
+        let shrunk: u64 = ((module_size as u64 in Wrapping) - (bounded_length as u64 in Wrapping)) as u64;
+        let module: &mut ProjectSymbolModule = ProjectSymbolCatalog::borrow_symbol_module_mut(project_symbol_catalog, module_position);
+        ProjectSymbolModule::set_size(module, shrunk);
+        let fields_summary: ProjectSymbolLayoutMutationSummary = layout_delete_or_shift_module_fields(
+            project_symbol_layout_mutation, module, range_offset, bounded_length);
+        let claims_summary: ProjectSymbolLayoutMutationSummary = layout_delete_or_shift_module_claims(
+            project_symbol_layout_mutation, project_symbol_catalog, module_name, range_offset, bounded_length);
+        transition {
+            _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((deleted_ranges as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// ---- delete_module_ranges_to_unassigned --------------------------------------
+
+pub machine ProjectSymbolLayoutMutation::delete_module_ranges_to_unassigned(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    module_ranges: &MutationRangeList,
+    deleted_module_names: &ProjectStringList ) -> ProjectSymbolLayoutMutationSummary {
+    let range_count: u64 = MutationRangeList::get_count(module_ranges);
+    transition {
+        _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, 0, 0)
+    }
+    state range(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary {
+        transition range_position < range_count && range_position < 64 {
+            true -> mode(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges)
+            _ -> (ProjectSymbolLayoutMutationSummary { changed: deleted_ranges > 0, deleted_module_field_count: 0, deleted_module_range_count: deleted_ranges })
+        }
+    }
+    state mode(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let range_mode: ProjectSymbolsDeleteModuleRangeMode = ProjectSymbolsDeleteModuleRange::get_mode(range);
+        transition range_mode {
+            ProjectSymbolsDeleteModuleRangeMode::ReplaceWithUnassigned -> module(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges)
+            _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+        }
+    }
+    state module(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let module_name: &[u8] = ProjectSymbolsDeleteModuleRange::get_module_name(range);
+        let skip: bool = layout_string_list_contains(deleted_module_names, module_name);
+        transition skip {
+            true -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+            _ -> apply(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, range_position, deleted_ranges)
+        }
+    }
+    state apply(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        module_ranges: &MutationRangeList,
+        deleted_module_names: &ProjectStringList,
+        range_count: u64,
+        range_position: u64,
+        deleted_ranges: u64
+    ) -> ProjectSymbolLayoutMutationSummary
+        requires range_position < range_count && range_position < 64;
+    {
+        // Upstream folds `did_delete_range` into the range count only.
+        let range: &ProjectSymbolsDeleteModuleRange = MutationRangeList::get(module_ranges, range_position);
+        let summary: ProjectSymbolLayoutMutationSummary = layout_delete_module_range_to_unassigned(
+            project_symbol_layout_mutation, project_symbol_catalog, ProjectSymbolsDeleteModuleRange::get_module_name(range), ProjectSymbolsDeleteModuleRange::get_offset(range), ProjectSymbolsDeleteModuleRange::get_length(range));
+        transition summary.changed {
+            true -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((deleted_ranges as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> range(project_symbol_layout_mutation, project_symbol_catalog, module_ranges, deleted_module_names, range_count, ((range_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_ranges)
+        }
+    }
+}
+
+// ---- delete_module_ranges ----------------------------------------------------
+
+pub machine ProjectSymbolLayoutMutation::delete_module_ranges(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    module_ranges: &MutationRangeList,
+    deleted_module_names: &ProjectStringList ) -> ProjectSymbolLayoutMutationSummary {
+    let shift_summary: ProjectSymbolLayoutMutationSummary = ProjectSymbolLayoutMutation::delete_module_ranges_and_shift(project_symbol_layout_mutation, 
+        project_symbol_catalog, module_ranges, deleted_module_names);
+    let unassigned_summary: ProjectSymbolLayoutMutationSummary = ProjectSymbolLayoutMutation::delete_module_ranges_to_unassigned(project_symbol_layout_mutation, 
+        project_symbol_catalog, module_ranges, deleted_module_names);
+    let changed: bool = shift_summary.changed || unassigned_summary.changed;
+    (ProjectSymbolLayoutMutationSummary {
+        changed: changed,
+        deleted_module_field_count: ((shift_summary.deleted_module_field_count as u64 in Wrapping) + (unassigned_summary.deleted_module_field_count as u64 in Wrapping)) as u64,
+        deleted_module_range_count: ((shift_summary.deleted_module_range_count as u64 in Wrapping) + (unassigned_summary.deleted_module_range_count as u64 in Wrapping)) as u64
+    })
+}
+
+// ---- retarget_catalog_struct_layout_references ------------------------------
+
+// Upstream `retarget_catalog_struct_layout_references`: rewrites every
+// claim struct_layout_id, every module-field struct_layout_id, and
+// every descriptor field type reference from source to replacement.
+pub machine ProjectSymbolLayoutMutation::retarget_catalog_struct_layout_references(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    source_struct_layout_id: &[u8],
+    replacement_data_type: &DataTypeRef) {
+    let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+    let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+    let descriptor_count: u64 = ProjectSymbolCatalog::get_struct_layout_descriptor_count(project_symbol_catalog);
+    transition {
+        _ -> claims(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, 0)
+    }
+    state claims(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        claim_position: u64
+    ) {
+        transition claim_position < claim_count && claim_position < 128 {
+            true -> claim(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, claim_position)
+            false -> modules(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, 0)
+        }
+    }
+    state claim(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        claim_position: u64
+    )
+        requires claim_position < claim_count && claim_position < 128
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let matches: bool = FileSystemUtils::bytes_equal(ProjectSymbolClaim::get_struct_layout_id(claim), source_struct_layout_id);
+        transition matches {
+            true -> retarget_claim(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, claim_position)
+            false -> claims(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, ((claim_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state retarget_claim(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        claim_position: u64
+    )
+        requires claim_position < claim_count && claim_position < 128
+    {
+        let claim: &mut ProjectSymbolClaim = ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog, claim_position);
+        ProjectSymbolClaim::set_struct_layout_id(claim, DataTypeRef::get_data_type_id(replacement_data_type));
+        transition {
+            _ -> claims(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, ((claim_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state modules(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        module_position: u64
+    ) {
+        transition module_position < module_count && module_position < 64 {
+            true -> fields(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, module_position, 0)
+            false -> descriptors(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, 0)
+        }
+    }
+    state fields(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        module_position: u64,
+        field_position: u64
+    )
+        requires module_position < module_count && module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition field_position < field_count && field_position < 64 {
+            true -> field(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, module_position, field_position, field_count)
+            false -> modules(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, ((module_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        module_position: u64,
+        field_position: u64,
+        field_count: u64
+    )
+        requires module_position < module_count && module_position < 64 && field_position < field_count && field_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, field_position);
+        let matches: bool = FileSystemUtils::bytes_equal(ProjectSymbolModuleField::get_struct_layout_id(field), source_struct_layout_id);
+        transition matches {
+            true -> retarget_field(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, module_position, field_position, field_count)
+            false -> fields(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, module_position, 0)
+        }
+    }
+    state retarget_field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        module_position: u64,
+        field_position: u64,
+        field_count: u64
+    )
+        requires module_position < module_count && module_position < 64 && field_position < field_count && field_position < 64
+    {
+        let module: &mut ProjectSymbolModule = ProjectSymbolCatalog::borrow_symbol_module_mut(project_symbol_catalog, module_position);
+        let field: &mut ProjectSymbolModuleField = ProjectSymbolModule::get_field_mut(module, field_position);
+        ProjectSymbolModuleField::set_struct_layout_id(field, DataTypeRef::get_data_type_id(replacement_data_type));
+        transition {
+            _ -> fields(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, module_position, 0)
+        }
+    }
+    state descriptors(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        descriptor_position: u64
+    ) {
+        transition descriptor_position < descriptor_count && descriptor_position < 128 {
+            true -> descriptor(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, descriptor_position)
+            false -> done()
+        }
+    }
+    state descriptor(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        claim_count: u64,
+        module_count: u64,
+        descriptor_count: u64,
+        descriptor_position: u64
+    )
+        requires descriptor_position < descriptor_count && descriptor_position < 128
+    {
+        // Upstream rebuilds each descriptor's definition with
+        // retargeted field types via new_with_layout_kind +
+        // with_declared_size_in_bytes; the port writes the rebuilt
+        // descriptor back into the same slot.
+        let descriptor: &StructLayoutDescriptor = ProjectSymbolCatalog::get_struct_layout_descriptor(project_symbol_catalog, descriptor_position);
+        let retargeted: StructLayoutDescriptor = layout_retarget_descriptor(project_symbol_layout_mutation, descriptor, source_struct_layout_id, replacement_data_type);
+        _ = ProjectSymbolCatalog::set_struct_layout_descriptor_at(project_symbol_catalog, descriptor_position, &retargeted);
+        transition {
+            _ -> descriptors(project_symbol_layout_mutation, project_symbol_catalog, source_struct_layout_id, replacement_data_type, claim_count, module_count, descriptor_count, ((descriptor_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state done() { }
+}
+
+// ---- retarget helpers ---------------------------------------------------------
+
+// Rebuilds one descriptor's definition with field data-type refs
+// retargeted; upstream `new_with_layout_kind` + declared-size
+// preservation.
+machine layout_retarget_descriptor(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    struct_layout_descriptor: &StructLayoutDescriptor,
+    source_struct_layout_id: &[u8],
+    replacement_data_type: &DataTypeRef
+) -> StructLayoutDescriptor {
+    let struct_layout_id: &[u8] = StructLayoutDescriptor::get_struct_layout_id(struct_layout_descriptor);
+    let definition: &SymbolicStructDefinition = StructLayoutDescriptor::get_struct_layout_definition(struct_layout_descriptor);
+    let field_count: u64 = SymbolicStructDefinition::get_field_count(definition);
+    let mut rebuilt_fields: [SymbolicFieldDefinition; 64];
+    transition {
+        _ -> fields(project_symbol_layout_mutation, struct_layout_id, definition, field_count, source_struct_layout_id, replacement_data_type, &mut rebuilt_fields, 0)
+    }
+    state fields(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        struct_layout_id: &[u8],
+        definition: &SymbolicStructDefinition,
+        field_count: u64,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        rebuilt_fields: &mut [SymbolicFieldDefinition; 64],
+        field_position: u64
+    ) -> StructLayoutDescriptor {
+        transition field_position < field_count && field_position < 64 {
+            true -> field(project_symbol_layout_mutation, struct_layout_id, definition, field_count, source_struct_layout_id, replacement_data_type, rebuilt_fields, field_position)
+            false -> build(project_symbol_layout_mutation, struct_layout_id, definition, field_count, rebuilt_fields)
+        }
+    }
+    state field(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        struct_layout_id: &[u8],
+        definition: &SymbolicStructDefinition,
+        field_count: u64,
+        source_struct_layout_id: &[u8],
+        replacement_data_type: &DataTypeRef,
+        rebuilt_fields: &mut [SymbolicFieldDefinition; 64],
+        field_position: u64
+    ) -> StructLayoutDescriptor
+        requires field_position < field_count && field_position < 64
+    {
+        let field: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(definition, field_position);
+        let retargeted: SymbolicFieldDefinition = layout_retarget_field_type(project_symbol_layout_mutation, field, source_struct_layout_id, replacement_data_type);
+        rebuilt_fields[field_position] = retargeted;
+        transition {
+            _ -> fields(project_symbol_layout_mutation, struct_layout_id, definition, field_count, source_struct_layout_id, replacement_data_type, rebuilt_fields, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state build(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+        struct_layout_id: &[u8],
+        definition: &SymbolicStructDefinition,
+        field_count: u64,
+        rebuilt_fields: &mut [SymbolicFieldDefinition; 64]
+    ) -> StructLayoutDescriptor
+        requires field_count <= 64
+    {
+        let namespace: &[u8] = SymbolicStructDefinition::get_symbol_namespace(definition);
+        let layout_kind: SymbolicLayoutKind = SymbolicStructDefinition::get_layout_kind(definition);
+        let mut rebuilt_definition: SymbolicStructDefinition = SymbolicStructDefinition::new_with_layout_kind(
+            namespace, layout_kind, &rebuilt_fields[0..field_count]);
+        let has_declared: bool = SymbolicStructDefinition::has_declared_size_in_bytes(definition);
+        let declared_size: u64 = SymbolicStructDefinition::get_declared_size_in_bytes(definition);
+        SymbolicStructDefinition::set_declared_size_in_bytes(&mut rebuilt_definition, has_declared, declared_size);
+        (StructLayoutDescriptor::new(struct_layout_id, &rebuilt_definition))
+    }
+}
+
+// Upstream `retarget_symbolic_field_definition_type`: a field whose
+// data-type ref names the source layout is rebuilt around the
+// replacement ref (name, container, count/display-count/offset
+// resolutions and active-when resolver all carry); untouched fields
+// return a clone.
+machine layout_retarget_field_type(
+    project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation,
+    field: &SymbolicFieldDefinition,
+    source_struct_layout_id: &[u8],
+    replacement_data_type: &DataTypeRef
+) -> SymbolicFieldDefinition {
+    let data_type: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(field);
+    let matches: bool = FileSystemUtils::bytes_equal(DataTypeRef::get_data_type_id(&data_type), source_struct_layout_id);
+    transition matches {
+        true -> rebuild(project_symbol_layout_mutation, field, replacement_data_type)
+        false -> cloned(project_symbol_layout_mutation, field)
+    }
+    state cloned(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation, field: &SymbolicFieldDefinition) -> SymbolicFieldDefinition {
+        (SymbolicFieldDefinition::clone(field))
+    }
+    state rebuild(project_symbol_layout_mutation: &mut ProjectSymbolLayoutMutation, field: &SymbolicFieldDefinition, replacement_data_type: &DataTypeRef) -> SymbolicFieldDefinition {
+        let cloned_type: DataTypeRef = DataTypeRef::clone(replacement_data_type);
+        let container: ContainerType = SymbolicFieldDefinition::get_container_type(field);
+        let count: SymbolicFieldCountResolution = SymbolicFieldDefinition::get_count_resolution(field);
+        let display_count: SymbolicFieldCountResolution = SymbolicFieldDefinition::get_display_count_resolution(field);
+        let offset: SymbolicFieldOffsetResolution = SymbolicFieldDefinition::get_offset_resolution(field);
+        let resolver: SymbolicResolverRefMatch = SymbolicFieldDefinition::get_active_when_resolver(field);
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(field);
+        let constructed: SymbolicFieldDefinition = SymbolicFieldDefinition::new_named_with_resolutions_and_display_count(
+            field_name, cloned_type, container, count, display_count, offset);
+        (SymbolicFieldDefinition::with_active_when_resolver(&constructed, resolver))
+    }
+}
+
+// Upstream `module_ranges.sort_by(desc (module_name, offset))` —
+// normalized ranges (trim-empty name or 0 length dropped) insert into
+// a bounded table kept descending-sorted.
+pub data MutationRangeList {
+    ranges: [ProjectSymbolsDeleteModuleRange; 64];
+    range_count: u64;
+}
+
+pub machine MutationRangeList::new() -> MutationRangeList {
+    (MutationRangeList { range_count: 0 })
+}
+
+pub machine MutationRangeList::get_count(mutation_range_list: &MutationRangeList) -> u64 {
+    (mutation_range_list.range_count)
+}
+
+pub machine MutationRangeList::get(mutation_range_list: &MutationRangeList, position: u64) -> &ProjectSymbolsDeleteModuleRange
+    requires position < mutation_range_list.range_count && position < 64
+{
+    (&mutation_range_list.ranges[position])
+}
+
+// Descending order: `left` sorts before `right` when its
+// (module_name, offset) is strictly greater byte-lexicographically.
+machine mutation_range_precedes(left: &ProjectSymbolsDeleteModuleRange, right: &ProjectSymbolsDeleteModuleRange) -> bool {
+    let name_cmp: bool = FileSystemUtils::bytes_equal(ProjectSymbolsDeleteModuleRange::get_module_name(left), ProjectSymbolsDeleteModuleRange::get_module_name(right));
+    transition name_cmp {
+        true -> offset(left, right)
+        false -> name(left, right)
+    }
+    state offset(left: &ProjectSymbolsDeleteModuleRange, right: &ProjectSymbolsDeleteModuleRange) -> bool {
+        (ProjectSymbolsDeleteModuleRange::get_offset(left) > ProjectSymbolsDeleteModuleRange::get_offset(right))
+    }
+    state name(left: &ProjectSymbolsDeleteModuleRange, right: &ProjectSymbolsDeleteModuleRange) -> bool {
+        (layout_name_after(ProjectSymbolsDeleteModuleRange::get_module_name(left), ProjectSymbolsDeleteModuleRange::get_module_name(right)))
+    }
+}
+
+pub machine MutationRangeList::insert_sorted(mutation_range_list: &mut MutationRangeList, range: &ProjectSymbolsDeleteModuleRange) -> bool {
+    transition mutation_range_list.range_count < 64 {
+        true -> slot(mutation_range_list, range, 0)
+        false -> (false)
+    }
+    state slot(mutation_range_list: &mut MutationRangeList, range: &ProjectSymbolsDeleteModuleRange, probe: u64) -> bool {
+        transition probe < mutation_range_list.range_count && probe < 64 {
+            true -> probe_entry(mutation_range_list, range, probe)
+            false -> place(mutation_range_list, range, probe)
+        }
+    }
+    state probe_entry(mutation_range_list: &mut MutationRangeList, range: &ProjectSymbolsDeleteModuleRange, probe: u64) -> bool
+        requires probe < mutation_range_list.range_count && probe < 64
+    {
+        let entry: &ProjectSymbolsDeleteModuleRange = &mutation_range_list.ranges[probe];
+        transition mutation_range_precedes(range, entry) {
+            true -> shift(mutation_range_list, mutation_range_list.range_count, range, probe)
+            false -> slot(mutation_range_list, range, ((probe as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Shift right from the tail down to `position`, then place.
+    state shift(mutation_range_list: &mut MutationRangeList, cursor: u64, range: &ProjectSymbolsDeleteModuleRange, position: u64) -> bool
+        requires position < 64 && position <= mutation_range_list.range_count
+    {
+        transition cursor > position {
+            true -> shift_step(mutation_range_list, cursor, range, position)
+            false -> place(mutation_range_list, range, position)
+        }
+    }
+    state shift_step(mutation_range_list: &mut MutationRangeList, cursor: u64, range: &ProjectSymbolsDeleteModuleRange, position: u64) -> bool
+        requires cursor > 0 && cursor <= mutation_range_list.range_count && cursor < 64 && position < 64
+    {
+        let previous: ProjectSymbolsDeleteModuleRange = ProjectSymbolsDeleteModuleRange::clone(&mutation_range_list.ranges[((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64]);
+        ProjectSymbolsDeleteModuleRange::clone_from(&mut mutation_range_list.ranges[cursor], &previous);
+        transition {
+            _ -> shift(mutation_range_list, ((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, range, position)
+        }
+    }
+    state place(mutation_range_list: &mut MutationRangeList, range: &ProjectSymbolsDeleteModuleRange, position: u64) -> bool
+        requires position < 64 && position <= mutation_range_list.range_count
+    {
+        ProjectSymbolsDeleteModuleRange::clone_from(&mut mutation_range_list.ranges[position], range);
+        mutation_range_list.range_count = ((mutation_range_list.range_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+

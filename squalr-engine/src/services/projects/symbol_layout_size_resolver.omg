@@ -1,0 +1,977 @@
+module src::services::projects::symbol_layout_size_resolver;
+
+use omega::language::core::option;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinitionParse;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldOffsetResolution;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicUnassignedSize;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use squalr_engine_api::src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+
+// Port of structures/projects/symbol_layouts/symbol_layout_size_resolver.rs.
+//
+// Upstream's two resolvers are generic closures (primitive-size +
+// struct-layout lookups); Omega has no closures, so the ports take
+// `&EngineUnprivilegedState` — primitive sizes via
+// `get_unit_size_in_bytes` (upstream's closure resolves
+// `get_default_value(...).get_size_in_bytes`, the same registered unit
+// size — documented deviation) and struct layouts via
+// `resolve_struct_layout_definition`.
+// File placement moves api -> engine::services::projects beside the
+// mutation service that calls it; documented deviation.
+//
+// `Option<u64>` results carry as SymbolLayoutSizeResult{found,size}.
+// `HashSet<String>` visited ids carry as a bounded 64-name set.
+
+pub data SymbolLayoutSizeResolver {}
+
+pub data SymbolLayoutSizeResult {
+    found: bool;
+    size_in_bytes: u64;
+}
+
+// Bounded visited-struct-layout-id set (upstream HashSet<String>).
+pub data SymbolLayoutVisitSet {
+    names: [[u8; 256]; 64];
+    lens: [u64; 64];
+    count: u64;
+}
+
+pub machine SymbolLayoutVisitSet::new() -> SymbolLayoutVisitSet {
+    SymbolLayoutVisitSet { count: 0 }
+}
+
+pub machine SymbolLayoutVisitSet::contains(symbol_layout_visit_set: &SymbolLayoutVisitSet, name: &[u8]) -> bool {
+    transition { _ -> scan(symbol_layout_visit_set, name, 0) }
+    state scan(symbol_layout_visit_set: &SymbolLayoutVisitSet, name: &[u8], position: u64) -> bool {
+        transition position < symbol_layout_visit_set.count && position < 64 {
+            true -> compare(symbol_layout_visit_set, name, position)
+            _ -> (false)
+        }
+    }
+    state compare(symbol_layout_visit_set: &SymbolLayoutVisitSet, name: &[u8], position: u64) -> bool
+        requires position < symbol_layout_visit_set.count && position < 64;
+    {
+        transition symbol_layout_visit_set.lens[position] == name.len && name.len <= 256 {
+            true -> walk(symbol_layout_visit_set, name, position, 0)
+            _ -> scan(symbol_layout_visit_set, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state walk(symbol_layout_visit_set: &SymbolLayoutVisitSet, name: &[u8], position: u64, cursor: u64) -> bool
+        requires position < symbol_layout_visit_set.count && position < 64;
+    {
+        transition cursor < symbol_layout_visit_set.lens[position] && cursor < name.len {
+            true -> bytes(symbol_layout_visit_set, name, position, cursor)
+            _ -> verdict(symbol_layout_visit_set, name, position, cursor)
+        }
+    }
+    state bytes(symbol_layout_visit_set: &SymbolLayoutVisitSet, name: &[u8], position: u64, cursor: u64) -> bool
+        requires position < symbol_layout_visit_set.count && position < 64 && cursor < symbol_layout_visit_set.lens[position] && cursor < name.len;
+    {
+        transition symbol_layout_visit_set.names[position][cursor] == name[cursor] {
+            true -> walk(symbol_layout_visit_set, name, position, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> scan(symbol_layout_visit_set, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state verdict(symbol_layout_visit_set: &SymbolLayoutVisitSet, name: &[u8], position: u64, cursor: u64) -> bool
+        requires position < symbol_layout_visit_set.count && position < 64;
+    {
+        cursor == symbol_layout_visit_set.lens[position]
+    }
+}
+
+// Upstream `HashSet::insert` semantics — returns false when already present.
+pub machine SymbolLayoutVisitSet::insert(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8]) -> bool {
+    transition SymbolLayoutVisitSet::contains(symbol_layout_visit_set, name) {
+        true -> (false)
+        _ -> room(symbol_layout_visit_set, name)
+    }
+    state room(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8]) -> bool {
+        transition symbol_layout_visit_set.count < 64 && name.len <= 256 {
+            true -> store(symbol_layout_visit_set, name)
+            _ -> (false)
+        }
+    }
+    state store(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8]) -> bool
+        requires symbol_layout_visit_set.count < 64 && name.len <= 256;
+    {
+        let written: u64 = resolver_copy_span(&mut symbol_layout_visit_set.names[symbol_layout_visit_set.count], name);
+        symbol_layout_visit_set.lens[symbol_layout_visit_set.count] = written;
+        symbol_layout_visit_set.count = ((symbol_layout_visit_set.count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+pub machine SymbolLayoutVisitSet::remove(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8]) {
+    transition { _ -> scan(symbol_layout_visit_set, name, 0) }
+    state scan(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8], position: u64) {
+        transition position < symbol_layout_visit_set.count && position < 64 {
+            true -> compare(symbol_layout_visit_set, name, position)
+            _ -> done()
+        }
+    }
+    state compare(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8], position: u64)
+        requires position < symbol_layout_visit_set.count && position < 64;
+    {
+        transition symbol_layout_visit_set.lens[position] == name.len && name.len <= 256 {
+            true -> walk(symbol_layout_visit_set, name, position, 0)
+            _ -> scan(symbol_layout_visit_set, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state walk(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8], position: u64, cursor: u64)
+        requires position < symbol_layout_visit_set.count && position < 64;
+    {
+        transition cursor < symbol_layout_visit_set.lens[position] && cursor < name.len {
+            true -> bytes(symbol_layout_visit_set, name, position, cursor)
+            _ -> drop_at(symbol_layout_visit_set, position)
+        }
+    }
+    state bytes(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, name: &[u8], position: u64, cursor: u64)
+        requires position < symbol_layout_visit_set.count && position < 64 && cursor < symbol_layout_visit_set.lens[position] && cursor < name.len;
+    {
+        transition symbol_layout_visit_set.names[position][cursor] == name[cursor] {
+            true -> walk(symbol_layout_visit_set, name, position, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> scan(symbol_layout_visit_set, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state drop_at(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, position: u64)
+        requires position < symbol_layout_visit_set.count && position < 64;
+    {
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < symbol_layout_visit_set.count {
+            true -> shift(symbol_layout_visit_set, position, next)
+            _ -> finish(symbol_layout_visit_set)
+        }
+    }
+    state shift(symbol_layout_visit_set: &mut SymbolLayoutVisitSet, position: u64, source: u64)
+        requires position < symbol_layout_visit_set.count && position < 64 && source < symbol_layout_visit_set.count && source < 64;
+    {
+        symbol_layout_visit_set.names[position] = symbol_layout_visit_set.names[source];
+        symbol_layout_visit_set.lens[position] = symbol_layout_visit_set.lens[source];
+        transition { _ -> shift(symbol_layout_visit_set, source, ((source as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state finish(symbol_layout_visit_set: &mut SymbolLayoutVisitSet)
+        requires symbol_layout_visit_set.count > 0;
+    {
+        symbol_layout_visit_set.count = ((symbol_layout_visit_set.count as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+    }
+    state done() { }
+}
+
+machine resolver_copy_span(out: &mut [u8; 256], name: &[u8]) -> u64 {
+    transition { _ -> each(out, name, 0) }
+    state each(out: &mut [u8; 256], name: &[u8], position: u64) -> u64 {
+        transition position < name.len && position < 256 {
+            true -> write(out, name, position)
+            _ -> (position)
+        }
+    }
+    state write(out: &mut [u8; 256], name: &[u8], position: u64) -> u64
+        requires position < name.len && position < 256;
+    {
+        out[position] = name[position];
+        transition { _ -> each(out, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Upstream `resolve_symbolic_field_size_in_bytes`,
+// `resolve_symbolic_struct_size_in_bytes`, and
+// `resolve_symbolic_struct_field_span_in_bytes` form a recursive triad
+// (field -> struct -> span -> field) whose post-call `?` and per-field
+// loop continuations have no tail spelling under Omega's runtime
+// call-cycle admission, so the descent ports as a bounded explicit
+// frame worklist with the same visit/dedup semantics. Documented
+// deviation: descent is bounded to 64 frames (upstream recursion is
+// unbounded but visited-guarded).
+
+pub data SymbolLayoutSizeFrame {
+    kind: u8;
+    awaiting: bool;
+    field: SymbolicFieldDefinition;
+    structure: SymbolicStructDefinition;
+    container_type: ContainerType;
+    field_offset: u64;
+    cursor: u64;
+    accumulator: u64;
+    apply_declared: bool;
+    unvisit_id: [u8; 256];
+    unvisit_len: u64;
+}
+
+pub data SymbolLayoutFrameStack {
+    frames: [SymbolLayoutSizeFrame; 64];
+    len: u64;
+}
+
+machine resolver_frame_push(
+    stack: &mut SymbolLayoutFrameStack,
+    frame: SymbolLayoutSizeFrame
+) -> bool {
+    transition stack.len < 64 {
+        true -> store(stack, frame)
+        _ -> (false)
+    }
+    state store(
+        stack: &mut SymbolLayoutFrameStack,
+        frame: SymbolLayoutSizeFrame
+    ) -> bool
+        requires stack.len < 64;
+    {
+        stack.frames[stack.len] = frame;
+        stack.len = ((stack.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+machine symbol_layout_size_run(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    use_catalog_layouts: bool,
+    stack: &mut SymbolLayoutFrameStack,
+    visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+    result: SymbolLayoutSizeResult
+) -> SymbolLayoutSizeResult {
+    transition stack.len == 0 {
+        true -> (result)
+        _ -> dispatch(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result)
+    }
+    state dispatch(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult
+    ) -> SymbolLayoutSizeResult
+        requires 0 < stack.len && stack.len <= 64;
+    {
+        let top_index: u64 = stack.len - 1;
+        transition top_index < 64 {
+            true -> peeked(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+            _ -> (result)
+        }
+    }
+    state peeked(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        transition frame.kind == 1 {
+            true -> walk_step(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+            _ -> field_step(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+        }
+    }
+    state field_step(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        // An awaiting field frame is never the dispatch top — its child
+        // walk sits above it until deliver() consumes the child result.
+        transition frame.awaiting {
+            true -> (result)
+            _ -> eval_field(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+        }
+    }
+    state eval_field(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        transition SymbolicFieldDefinition::is_unassigned(&frame.field) {
+            true -> field_unassigned(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+            _ -> field_pointer(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+        }
+    }
+    state field_unassigned(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let matched: SymbolicUnassignedSize = SymbolicFieldDefinition::get_unassigned_size_in_bytes(&frame.field);
+        transition matched.found {
+            true -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, true, matched.size_in_bytes)
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, false, 0)
+        }
+    }
+    state field_pointer(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let pointer_size: Optional<PointerScanPointerSize> = ContainerType::get_pointer_size(&frame.container_type);
+        transition pointer_size {
+            Optional::Some { value } -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, true, PointerScanPointerSize::get_size_in_bytes(&value))
+            _ -> field_unit(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+        }
+    }
+    state field_unit(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(&frame.field);
+        let primitive_size: u64 = EngineUnprivilegedState::get_unit_size_in_bytes(engine_unprivileged_state, &data_type_ref);
+        transition primitive_size > 0 {
+            true -> field_unit_apply(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, primitive_size)
+            _ -> field_layout(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, data_type_ref)
+        }
+    }
+    state field_unit_apply(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        primitive_size: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let total_size: u64 = ContainerType::get_total_size_in_bytes(&frame.container_type, primitive_size);
+        transition { _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, true, total_size) }
+    }
+    state field_layout(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        data_type_ref: DataTypeRef
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let struct_layout_id: &[u8] = DataTypeRef::get_data_type_id(&data_type_ref);
+        let mut struct_layout_id_copy: [u8; 256];
+        let struct_layout_id_len: u64 = resolver_copy_span(&mut struct_layout_id_copy, struct_layout_id);
+        transition struct_layout_id_len <= 256 {
+            true -> field_visit(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, struct_layout_id_copy, struct_layout_id_len)
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, false, 0)
+        }
+    }
+    state field_visit(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        struct_layout_id_copy: [u8; 256],
+        struct_layout_id_len: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && struct_layout_id_len <= 256;
+    {
+        // upstream `visited_struct_layout_ids.insert(...)` — false = cycle.
+        let inserted: bool = SymbolLayoutVisitSet::insert(visited_struct_layout_ids, &struct_layout_id_copy[0..struct_layout_id_len]);
+        transition inserted {
+            true -> field_lookup(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, struct_layout_id_copy, struct_layout_id_len)
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, false, 0)
+        }
+    }
+    state field_lookup(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        struct_layout_id_copy: [u8; 256],
+        struct_layout_id_len: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && struct_layout_id_len <= 256;
+    {
+        let mut definition: SymbolicStructDefinition = SymbolicStructDefinition::new_empty("");
+        let resolved: bool = resolve_layout_definition(
+            engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, &struct_layout_id_copy[0..struct_layout_id_len], &mut definition);
+        transition resolved {
+            true -> field_await_walk(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, definition, struct_layout_id_copy, struct_layout_id_len)
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, false, 0)
+        }
+    }
+    state field_await_walk(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        definition: SymbolicStructDefinition,
+        struct_layout_id_copy: [u8; 256],
+        struct_layout_id_len: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && struct_layout_id_len <= 256;
+    {
+        _ = resolver_copy_span(&mut stack.frames[top_index].unvisit_id, &struct_layout_id_copy[0..struct_layout_id_len]);
+        stack.frames[top_index].unvisit_len = struct_layout_id_len;
+        stack.frames[top_index].awaiting = true;
+        let mut walk: SymbolLayoutSizeFrame;
+        walk.kind = 1;
+        walk.awaiting = false;
+        walk.field = SymbolicFieldDefinition::new_unassigned(0);
+        walk.structure = definition;
+        walk.container_type = ContainerType::default();
+        walk.field_offset = 0;
+        walk.cursor = 0;
+        walk.accumulator = 0;
+        walk.apply_declared = true;
+        walk.unvisit_len = 0;
+        let pushed: bool = resolver_frame_push(stack, walk);
+        transition pushed {
+            true -> dispatch(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, SymbolLayoutSizeResult { found: false, size_in_bytes: 0 })
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, false, 0)
+        }
+    }
+    state maybe_unvisit(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        size_in_bytes: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let unvisit_len: u64 = frame.unvisit_len;
+        transition 0 < unvisit_len && unvisit_len <= 256 {
+            true -> do_unvisit(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, size_in_bytes, unvisit_len)
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, true, size_in_bytes)
+        }
+    }
+    state do_unvisit(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        size_in_bytes: u64,
+        unvisit_len: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && 0 < unvisit_len && unvisit_len <= 256;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        SymbolLayoutVisitSet::remove(visited_struct_layout_ids, &frame.unvisit_id[0..unvisit_len]);
+        transition { _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, true, size_in_bytes) }
+    }
+    state walk_step(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let field_cursor: u64 = frame.cursor;
+        let field_count: u64 = SymbolicStructDefinition::get_field_count(&frame.structure);
+        transition field_cursor < field_count && field_cursor < 64 {
+            true -> walk_indexed(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_cursor)
+            _ -> walk_finish(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+        }
+    }
+    state walk_indexed(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_cursor: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && field_cursor < 64;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let symbolic_field_definition: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(&frame.structure, field_cursor);
+        transition SymbolicFieldDefinition::is_unassigned(symbolic_field_definition) {
+            true -> walk_unassigned(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_cursor)
+            _ -> walk_offset(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_cursor)
+        }
+    }
+    state walk_unassigned(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_cursor: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && field_cursor < 64;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let symbolic_field_definition: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(&frame.structure, field_cursor);
+        let matched: SymbolicUnassignedSize = SymbolicFieldDefinition::get_unassigned_size_in_bytes(symbolic_field_definition);
+        transition matched.found {
+            true -> walk_unassigned_grow(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, matched.size_in_bytes)
+            _ -> (SymbolLayoutSizeResult { found: false, size_in_bytes: 0 })
+        }
+    }
+    state walk_unassigned_grow(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        unassigned_size: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        stack.frames[top_index].accumulator = ((stack.frames[top_index].accumulator as u64 in Saturating) + (unassigned_size as u64 in Saturating)) as u64;
+        stack.frames[top_index].cursor = ((stack.frames[top_index].cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> dispatch(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result) }
+    }
+    state walk_offset(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_cursor: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && field_cursor < 64;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let symbolic_field_definition: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(&frame.structure, field_cursor);
+        let offset_resolution: SymbolicFieldOffsetResolution = SymbolicFieldDefinition::get_offset_resolution(symbolic_field_definition);
+        transition offset_resolution {
+            SymbolicFieldOffsetResolution::Static { offset_in_bytes } -> walk_push_field(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_cursor, offset_in_bytes)
+            _ -> walk_union_probe(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_cursor)
+        }
+    }
+    state walk_union_probe(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_cursor: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let layout_kind: SymbolicLayoutKind = SymbolicStructDefinition::get_layout_kind(&frame.structure);
+        let accumulator: u64 = frame.accumulator;
+        transition SymbolicLayoutKind::is_union(&layout_kind) {
+            true -> walk_push_field(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_cursor, 0)
+            _ -> walk_push_field(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_cursor, accumulator)
+        }
+    }
+    state walk_push_field(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_cursor: u64,
+        field_offset: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len && field_cursor < 64;
+    {
+        stack.frames[top_index].field_offset = field_offset;
+        let inner_field: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(&stack.frames[top_index].structure, field_cursor);
+        let field_copy: SymbolicFieldDefinition = SymbolicFieldDefinition::clone(inner_field);
+        let container_type: ContainerType = SymbolicFieldDefinition::get_container_type(&field_copy);
+        let mut child: SymbolLayoutSizeFrame;
+        child.kind = 0;
+        child.awaiting = false;
+        child.field = field_copy;
+        child.structure = SymbolicStructDefinition::new_empty("");
+        child.container_type = container_type;
+        child.field_offset = 0;
+        child.cursor = 0;
+        child.accumulator = 0;
+        child.apply_declared = false;
+        child.unvisit_len = 0;
+        let pushed: bool = resolver_frame_push(stack, child);
+        transition pushed {
+            true -> dispatch(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result)
+            _ -> (SymbolLayoutSizeResult { found: false, size_in_bytes: 0 })
+        }
+    }
+    state walk_finish(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let accumulator: u64 = frame.accumulator;
+        let declared: u64 = SymbolicStructDefinition::get_declared_size_in_bytes(&frame.structure);
+        transition frame.apply_declared && declared > accumulator {
+            true -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, true, declared)
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, true, accumulator)
+        }
+    }
+    state pop_deliver(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        top_index: u64,
+        found: bool,
+        size_in_bytes: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        stack.len = stack.len - 1;
+        let frame_result: SymbolLayoutSizeResult = SymbolLayoutSizeResult { found: found, size_in_bytes: size_in_bytes };
+        transition { _ -> deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, frame_result) }
+    }
+    state deliver(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult
+    ) -> SymbolLayoutSizeResult {
+        transition stack.len == 0 {
+            true -> (result)
+            _ -> deliver_top(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result)
+        }
+    }
+    state deliver_top(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult
+    ) -> SymbolLayoutSizeResult
+        requires 0 < stack.len && stack.len <= 64;
+    {
+        let top_index: u64 = stack.len - 1;
+        transition top_index < 64 {
+            true -> deliver_peek(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+            _ -> (SymbolLayoutSizeResult { found: false, size_in_bytes: 0 })
+        }
+    }
+    state deliver_peek(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        transition frame.kind == 1 {
+            true -> deliver_walk(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+            _ -> deliver_field(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+        }
+    }
+    state deliver_walk(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let field_offset: u64 = frame.field_offset;
+        let accumulator: u64 = frame.accumulator;
+        transition result.found {
+            true -> deliver_walk_bound(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_offset, accumulator)
+            _ -> (result)
+        }
+    }
+    state deliver_walk_bound(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_offset: u64,
+        accumulator: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        transition result.size_in_bytes <= 18446744073709551615 - field_offset {
+            true -> deliver_walk_fold(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_offset, accumulator)
+            _ -> (SymbolLayoutSizeResult { found: false, size_in_bytes: 0 })
+        }
+    }
+    state deliver_walk_fold(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_offset: u64,
+        accumulator: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let field_end: u64 = field_offset + result.size_in_bytes;
+        transition accumulator < field_end {
+            true -> deliver_walk_grow(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index, field_end)
+            _ -> deliver_walk_advance(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index)
+        }
+    }
+    state deliver_walk_grow(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64,
+        field_end: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        stack.frames[top_index].accumulator = field_end;
+        transition { _ -> deliver_walk_advance(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result, top_index) }
+    }
+    state deliver_walk_advance(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        stack.frames[top_index].cursor = ((stack.frames[top_index].cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> dispatch(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, result) }
+    }
+    state deliver_field(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        stack: &mut SymbolLayoutFrameStack,
+        visited_struct_layout_ids: &mut SymbolLayoutVisitSet,
+        result: SymbolLayoutSizeResult,
+        top_index: u64
+    ) -> SymbolLayoutSizeResult
+        requires top_index < 64 && 0 < stack.len;
+    {
+        let frame: &SymbolLayoutSizeFrame = &stack.frames[top_index];
+        let total_size: u64 = ContainerType::get_total_size_in_bytes(&frame.container_type, result.size_in_bytes);
+        transition result.found {
+            true -> maybe_unvisit(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, total_size)
+            _ -> pop_deliver(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, stack, visited_struct_layout_ids, top_index, false, 0)
+        }
+    }
+}
+
+pub machine SymbolLayoutSizeResolver::resolve_symbolic_field_size_in_bytes(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    use_catalog_layouts: bool,
+    symbolic_field_definition: &SymbolicFieldDefinition,
+    visited_struct_layout_ids: &mut SymbolLayoutVisitSet
+) -> SymbolLayoutSizeResult {
+    let mut stack: SymbolLayoutFrameStack;
+    stack.len = 0;
+    let mut root: SymbolLayoutSizeFrame;
+    root.kind = 0;
+    root.awaiting = false;
+    root.field = SymbolicFieldDefinition::clone(symbolic_field_definition);
+    root.structure = SymbolicStructDefinition::new_empty("");
+    root.container_type = SymbolicFieldDefinition::get_container_type(symbolic_field_definition);
+    root.field_offset = 0;
+    root.cursor = 0;
+    root.accumulator = 0;
+    root.apply_declared = false;
+    root.unvisit_len = 0;
+    _ = resolver_frame_push(&mut stack, root);
+    (symbol_layout_size_run(
+        engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, &mut stack, visited_struct_layout_ids,
+        SymbolLayoutSizeResult { found: false, size_in_bytes: 0 }))
+}
+
+pub machine SymbolLayoutSizeResolver::resolve_symbolic_struct_size_in_bytes(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    use_catalog_layouts: bool,
+    symbolic_struct_definition: &SymbolicStructDefinition,
+    visited_struct_layout_ids: &mut SymbolLayoutVisitSet
+) -> SymbolLayoutSizeResult {
+    let mut stack: SymbolLayoutFrameStack;
+    stack.len = 0;
+    let mut root: SymbolLayoutSizeFrame;
+    root.kind = 1;
+    root.awaiting = false;
+    root.field = SymbolicFieldDefinition::new_unassigned(0);
+    root.structure = SymbolicStructDefinition::clone(symbolic_struct_definition);
+    root.container_type = ContainerType::default();
+    root.field_offset = 0;
+    root.cursor = 0;
+    root.accumulator = 0;
+    root.apply_declared = true;
+    root.unvisit_len = 0;
+    _ = resolver_frame_push(&mut stack, root);
+    (symbol_layout_size_run(
+        engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, &mut stack, visited_struct_layout_ids,
+        SymbolLayoutSizeResult { found: false, size_in_bytes: 0 }))
+}
+
+pub machine SymbolLayoutSizeResolver::resolve_symbolic_struct_field_span_in_bytes(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    use_catalog_layouts: bool,
+    symbolic_struct_definition: &SymbolicStructDefinition,
+    visited_struct_layout_ids: &mut SymbolLayoutVisitSet
+) -> SymbolLayoutSizeResult {
+    let mut stack: SymbolLayoutFrameStack;
+    stack.len = 0;
+    let mut root: SymbolLayoutSizeFrame;
+    root.kind = 1;
+    root.awaiting = false;
+    root.field = SymbolicFieldDefinition::new_unassigned(0);
+    root.structure = SymbolicStructDefinition::clone(symbolic_struct_definition);
+    root.container_type = ContainerType::default();
+    root.field_offset = 0;
+    root.cursor = 0;
+    root.accumulator = 0;
+    root.apply_declared = false;
+    root.unvisit_len = 0;
+    _ = resolver_frame_push(&mut stack, root);
+    (symbol_layout_size_run(
+        engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, &mut stack, visited_struct_layout_ids,
+        SymbolLayoutSizeResult { found: false, size_in_bytes: 0 }))
+}
+
+// Empty slice backing for `SymbolicStructDefinition::new("", &[])`.
+
+// Flag-driven layout lookup — upstream's two closure spellings.
+machine resolve_layout_definition(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    use_catalog_layouts: bool,
+    struct_layout_id: &[u8],
+    out: &mut SymbolicStructDefinition
+) -> bool {
+    transition use_catalog_layouts {
+        true -> catalog(engine_unprivileged_state, project_symbol_catalog, struct_layout_id, out)
+        _ -> ctx(engine_unprivileged_state, project_symbol_catalog, struct_layout_id, out)
+    }
+    state catalog(engine_unprivileged_state: &EngineUnprivilegedState, project_symbol_catalog: &ProjectSymbolCatalog, struct_layout_id: &[u8], out: &mut SymbolicStructDefinition) -> bool {
+        let position: u64 = ProjectSymbolCatalog::find_struct_layout_descriptor_position(project_symbol_catalog, struct_layout_id);
+        transition position < 128 && position < ProjectSymbolCatalog::get_struct_layout_descriptor_count(project_symbol_catalog) {
+            true -> copy(project_symbol_catalog, position, out)
+            _ -> (false)
+        }
+    }
+    state copy(project_symbol_catalog: &ProjectSymbolCatalog, position: u64, out: &mut SymbolicStructDefinition) -> bool
+        requires position < 128 && position < ProjectSymbolCatalog::get_struct_layout_descriptor_count(project_symbol_catalog);
+    {
+        let descriptor: &StructLayoutDescriptor = ProjectSymbolCatalog::get_struct_layout_descriptor(project_symbol_catalog, position);
+        SymbolicStructDefinition::clone_from(out, StructLayoutDescriptor::get_struct_layout_definition(descriptor));
+        (true)
+    }
+    state ctx(engine_unprivileged_state: &EngineUnprivilegedState, project_symbol_catalog: &ProjectSymbolCatalog, struct_layout_id: &[u8], out: &mut SymbolicStructDefinition) -> bool {
+        (EngineUnprivilegedState::resolve_struct_layout_definition(engine_unprivileged_state, struct_layout_id, out))
+    }
+}
+
+// Upstream `ProjectSymbolLayoutMutation::resolve_struct_layout_id_size_in_bytes`
+// — parses the layout-id as a field definition and resolves its size;
+// the visited set is owned internally (upstream threads a HashSet).
+pub machine SymbolLayoutSizeResolver::resolve_struct_layout_id_size_in_bytes(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    use_catalog_layouts: bool,
+    struct_layout_id: &[u8]
+) -> SymbolLayoutSizeResult {
+    let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(struct_layout_id);
+    transition parsed {
+        SymbolicFieldDefinitionParse::Parsed { value } -> resolve(engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, &value)
+        _ -> (SymbolLayoutSizeResult { found: false, size_in_bytes: 0 })
+    }
+    state resolve(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        use_catalog_layouts: bool,
+        symbolic_field_definition: &SymbolicFieldDefinition
+    ) -> SymbolLayoutSizeResult {
+        let mut visited: SymbolLayoutVisitSet = SymbolLayoutVisitSet::new();
+        (SymbolLayoutSizeResolver::resolve_symbolic_field_size_in_bytes(
+            engine_unprivileged_state, project_symbol_catalog, use_catalog_layouts, symbolic_field_definition, &mut visited))
+    }
+}

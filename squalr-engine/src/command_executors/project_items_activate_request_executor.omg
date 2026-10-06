@@ -1,0 +1,81 @@
+module src::command_executors::project_items_activate_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::activate::project_items_activate_request::ProjectItemsActivateRequest;
+use squalr_engine_api::src::commands::project_items::activate::project_items_activate_response::ProjectItemsActivateResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::structures::projects::project_string_list::ProjectStringList;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_activation::ActivationChangeSet;
+use src::services::projects::project_item_activation::ProjectItemActivation;
+
+// Port of command_executors/project_items/activate/
+// project_items_activate_request_executor.rs — apply activation to the
+// opened project's pair table, then dispatch the memory-freeze request and
+// notify when the change set is non-empty. Upstream's `Vec<PathBuf>`
+// request paths arrive as the api's `ProjectStringList`; they pour into a
+// `ProjectPathList` for the service layer.
+pub data ProjectItemsActivateRequestExecutor {}
+
+pub machine ProjectItemsActivateRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_activate_request: &ProjectItemsActivateRequest
+) -> ProjectItemsActivateResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut requested_paths: ProjectPathList = ProjectPathList::empty();
+    let request_paths: &ProjectStringList = ProjectItemsActivateRequest::get_project_item_paths(project_items_activate_request);
+    transition { _ -> pour(project_items_activate_request, engine_unprivileged_state, engine_bindings, requested_paths, 0, request_paths) }
+
+    state pour(project_items_activate_request: &ProjectItemsActivateRequest, engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, mut requested_paths: ProjectPathList, position: u64, request_paths: &ProjectStringList) -> ProjectItemsActivateResponse {
+        transition position < ProjectStringList::get_string_count(request_paths) {
+            true -> pour_one(engine_unprivileged_state, engine_bindings, project_items_activate_request, requested_paths, position, request_paths)
+            _ -> apply(engine_unprivileged_state, engine_bindings, project_items_activate_request, requested_paths)
+        }
+    }
+    state pour_one(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_activate_request: &ProjectItemsActivateRequest, mut requested_paths: ProjectPathList, position: u64, request_paths: &ProjectStringList) -> ProjectItemsActivateResponse {
+        let inner3010: &[u8] = ProjectStringList::get_string(request_paths, position);
+        _ = ProjectPathList::add_path(&mut requested_paths, inner3010);
+        transition { _ -> pour(project_items_activate_request, engine_unprivileged_state, engine_bindings, requested_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, request_paths) }
+    }
+
+    state apply(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_activate_request: &ProjectItemsActivateRequest, requested_paths: ProjectPathList) -> ProjectItemsActivateResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> apply_do(engine_unprivileged_state, engine_bindings, project_items_activate_request, requested_paths)
+            _ -> apply_done()
+        }
+    }
+
+    state apply_do(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_activate_request: &ProjectItemsActivateRequest, requested_paths: ProjectPathList) -> ProjectItemsActivateResponse {
+        let is_activated: bool = ProjectItemsActivateRequest::get_is_activated(project_items_activate_request);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let change_set: ActivationChangeSet = ProjectItemActivation::apply_project_item_activation(opened_project, &requested_paths, is_activated);
+        transition change_set.has_activation_changes {
+            true -> freeze(engine_unprivileged_state, engine_bindings, change_set, is_activated)
+            _ -> apply_done()
+        }
+    }
+
+    // Upstream `dispatch_memory_freeze_request` + `notify_project_items_changed`.
+    state freeze(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, change_set: ActivationChangeSet, is_activated: bool) -> ProjectItemsActivateResponse {
+        ProjectItemActivation::dispatch_memory_freeze_request(engine_bindings, &change_set.freeze_targets, is_activated);
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        (ProjectItemsActivateResponse::new())
+    }
+
+    state apply_done() -> ProjectItemsActivateResponse {
+        (ProjectItemsActivateResponse::new())
+    }
+}

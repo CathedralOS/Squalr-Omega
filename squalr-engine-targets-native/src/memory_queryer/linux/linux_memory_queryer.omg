@@ -936,8 +936,8 @@ invokes FilesystemHost;
     }
 
     state emit_write(linux_memory_queryer: &mut LinuxMemoryQueryer, region: &mut normalized_region::NormalizedRegion) -> MemoryBoundsStep {
-        region.set_base_address(linux_memory_queryer.emit_base);
-        region.set_region_size(linux_memory_queryer.emit_size);
+        region.base_address = linux_memory_queryer.emit_base;
+        region.region_size = linux_memory_queryer.emit_size;
         transition { _ -> consume_line_region(linux_memory_queryer, region) }
     }
 
@@ -1106,27 +1106,30 @@ invokes FilesystemHost;
 
     state begin(linux_memory_queryer: &mut LinuxMemoryQueryer, address: u64) -> AddressWritable {
         linux_memory_queryer.write_hit = false;
-        transition { _ -> pull(linux_memory_queryer, address) }
+        // `walk_region` lives on the queryer for cross-call reuse, but a
+        // `&mut` arg cannot share the queryer's mutable root — the scan
+        // step's scratch region is an owned local threaded by value.
+        let mut step_region: normalized_region::NormalizedRegion = normalized_region::NormalizedRegion { base_address: 0, region_size: 0 };
+        transition { _ -> pull(linux_memory_queryer, address, step_region) }
     }
 
-    state pull(linux_memory_queryer: &mut LinuxMemoryQueryer, address: u64) -> AddressWritable {
-        NormalizedRegion::set_base_address(&mut linux_memory_queryer.walk_region, 0);
-        NormalizedRegion::set_region_size(&mut linux_memory_queryer.walk_region, 0);
-        let step: MemoryBoundsStep = LinuxMemoryQueryer::next_virtual_page(linux_memory_queryer, &mut linux_memory_queryer.walk_region);
+    state pull(linux_memory_queryer: &mut LinuxMemoryQueryer, address: u64, step_region: normalized_region::NormalizedRegion) -> AddressWritable {
+        let mut region_next: normalized_region::NormalizedRegion = step_region;
+        let step: MemoryBoundsStep = LinuxMemoryQueryer::next_virtual_page(linux_memory_queryer, &mut region_next);
         let step_is_region: bool = MemoryBoundsStep::is_region(&step);
         transition step_is_region {
-            true -> check(linux_memory_queryer, address)
+            true -> check(linux_memory_queryer, address, region_next)
             _ -> finish(linux_memory_queryer)
         }
     }
 
-    state check(linux_memory_queryer: &mut LinuxMemoryQueryer, address: u64) -> AddressWritable {
-        let _w_base: u64 = NormalizedRegion::get_base_address(&linux_memory_queryer.walk_region);
-        let _w_size: u64 = NormalizedRegion::get_region_size(&linux_memory_queryer.walk_region);
+    state check(linux_memory_queryer: &mut LinuxMemoryQueryer, address: u64, step_region: normalized_region::NormalizedRegion) -> AddressWritable {
+        let _w_base: u64 = step_region.base_address;
+        let _w_size: u64 = step_region.region_size;
         let _w_end: u64 = ((_w_base as u64 in Saturating) + (_w_size as u64 in Saturating)) as u64;
         transition _w_base <= address && address < _w_end {
             true -> hit(linux_memory_queryer)
-            false -> pull(linux_memory_queryer, address)
+            false -> pull(linux_memory_queryer, address, step_region)
         }
     }
 
@@ -1261,7 +1264,8 @@ invokes FilesystemHost;
     }
 
     state drain(linux_memory_queryer: &mut LinuxMemoryQueryer) -> MemoryBoundsOpen {
-        let step: MemoryBoundsStep = LinuxMemoryQueryer::next_virtual_page(linux_memory_queryer, &mut linux_memory_queryer.walk_region);
+        let mut step_region: normalized_region::NormalizedRegion = normalized_region::NormalizedRegion { base_address: 0, region_size: 0 };
+        let step: MemoryBoundsStep = LinuxMemoryQueryer::next_virtual_page(linux_memory_queryer, &mut step_region);
         // Three-way kind dispatch — union scrutinees are admitted on
         // params, not locals, so the split rides a hop state.
         transition {
@@ -1353,7 +1357,8 @@ invokes FilesystemHost;
     }
 
     state drain(linux_memory_queryer: &mut LinuxMemoryQueryer, process_info: &OpenedProcessInfo) -> MemoryBoundsOpen {
-        let step: MemoryBoundsStep = LinuxMemoryQueryer::next_virtual_page(linux_memory_queryer, &mut linux_memory_queryer.walk_region);
+        let mut step_region: normalized_region::NormalizedRegion = normalized_region::NormalizedRegion { base_address: 0, region_size: 0 };
+        let step: MemoryBoundsStep = LinuxMemoryQueryer::next_virtual_page(linux_memory_queryer, &mut step_region);
         // Three-way kind dispatch — union scrutinees are admitted on
         // params, not locals, so the split rides a hop state.
         transition {
@@ -1591,11 +1596,11 @@ machine LinuxMemoryQueryer::is_ws(linux_memory_queryer: &mut LinuxMemoryQueryer,
 // Module-name copy through a caller-bounded slice — the requires clause
 // couples the slice and caller-proven bounds so paths[lo..hi] is provably in
 // bounds inside the callee.
-machine LinuxMemoryQueryer::fill_name(linux_memory_queryer: &mut LinuxMemoryQueryer, module: &mut NormalizedModule, paths: &[u8], lo: u64, hi: u64)
+machine LinuxMemoryQueryer::fill_name(linux_memory_queryer: &mut LinuxMemoryQueryer, module: &mut NormalizedModule)
 requires
-    lo <= hi && hi <= paths.len;
+    linux_memory_queryer.id_lo <= linux_memory_queryer.id_hi && linux_memory_queryer.id_hi <= linux_memory_queryer.mod_paths.len;
 {
-    NormalizedModule::set_module_name(module, paths[lo..hi])
+    NormalizedModule::set_module_name(module, linux_memory_queryer.mod_paths[linux_memory_queryer.id_lo..linux_memory_queryer.id_hi])
 }
 
 machine LinuxMemoryQueryer::fill_module(linux_memory_queryer: &mut LinuxMemoryQueryer, module: &mut NormalizedModule) {
@@ -1610,7 +1615,7 @@ machine LinuxMemoryQueryer::fill_module(linux_memory_queryer: &mut LinuxMemoryQu
     }
 
     state fill(linux_memory_queryer: &mut LinuxMemoryQueryer, module: &mut NormalizedModule) {
-        LinuxMemoryQueryer::fill_name(linux_memory_queryer, &mut module, &linux_memory_queryer.mod_paths, linux_memory_queryer.id_lo, linux_memory_queryer.id_hi);
+        LinuxMemoryQueryer::fill_name(linux_memory_queryer, &mut module);
         let sel_lo: U64Result = LinuxMemoryQueryer::mod_lo_at(linux_memory_queryer, linux_memory_queryer.sel_index);
         let sel_hi: U64Result = LinuxMemoryQueryer::mod_hi_at(linux_memory_queryer, linux_memory_queryer.sel_index);
         NormalizedModule::set_base_address(module, sel_lo.v);
@@ -1668,8 +1673,8 @@ machine LinuxMemoryQueryer::next_module_region(
         linux_memory_queryer.mod_emit = ((linux_memory_queryer.mod_emit as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         let emit_lo: U64Result = LinuxMemoryQueryer::mod_lo_at(linux_memory_queryer, linux_memory_queryer.sel_index);
         let emit_hi: U64Result = LinuxMemoryQueryer::mod_hi_at(linux_memory_queryer, linux_memory_queryer.sel_index);
-        region.set_base_address(emit_lo.v);
-        region.set_region_size(((emit_hi.v as u64 in Wrapping) - (emit_lo.v as u64 in Wrapping)) as u64);
+        region.base_address = emit_lo.v;
+        region.region_size = ((emit_hi.v as u64 in Wrapping) - (emit_lo.v as u64 in Wrapping)) as u64;
         transition { _ -> yielded(linux_memory_queryer) }
     }
 

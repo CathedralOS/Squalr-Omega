@@ -1,0 +1,805 @@
+module src::services::projects::project_symbol_runtime_value_write;
+
+// Port of squalr-engine/src/services/projects/project_symbol_runtime_value_write.rs.
+//
+// Builds a privileged MemoryWriteRequest for a symbol address + field name +
+// edited anonymous value string.
+//
+// Named deviations:
+// - `SymbolicStructDefinition::from_str` is unported — the type-id resolution
+//   chain keeps upstream's other arms in order (catalog descriptor, registry
+//   layout resolve, field-definition parse, anonymous single-field fallback)
+//   minus that one probe. Documented deviation.
+// - Plugin instruction sets are unported (`find_instruction_set` /
+//   `assemble_at_address`): an instruction-typed field whose value string is
+//   `String` format resolves to a write failure (upstream's Err arm) instead
+//   of calling the assembler plugin. Non-String formats still deanonymize
+//   through the data type — the upstream order.
+// - `DataTypeStringUtf8::FLAG_NULL_TERMINATED` / `DataTypeRef::has_flag` are
+//   unported — the utf8 null-terminate pad/truncate normalization is skipped;
+//   value bytes pass through unchanged (same as upstream's non-null-terminated
+//   and non-ArrayFixed arms). Documented deviation.
+// - `get_default_value` -> `DataTypeRef::get_unit_size_in_bytes` inside
+//   SymbolLayoutSizeResolver (previously documented in that file).
+// - `HashSet<String>` visited-type-ids is the resolver's bounded
+//   SymbolLayoutVisitSet (64 names).
+// - `Result<MemoryWriteRequest, String>` -> SymbolWritePlan{found, request,
+//   failure text}; `format!` messages become bounded byte slices.
+
+use omega::language::core::option;
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::memory::write::memory_write_request::MemoryWriteMode;
+use squalr_engine_api::src::commands::memory::write::memory_write_request::MemoryWriteRequest;
+use squalr_engine_api::src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinitionParse;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldOffsetResolution;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicUnassignedSize;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_session::src::engine_unprivileged_state::DeanonymizeValueOutcome;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::services::projects::symbol_layout_size_resolver::SymbolLayoutSizeResult;
+use src::services::projects::symbol_layout_size_resolver::SymbolLayoutSizeResolver;
+use src::services::projects::symbol_layout_size_resolver::SymbolLayoutVisitSet;
+
+pub data ProjectSymbolRuntimeValueWrite {}
+
+// `Option<SymbolicStructDefinition>` carrier for layout resolution.
+pub data LayoutDefinitionMatch {
+    found: bool;
+    definition: SymbolicStructDefinition;
+}
+
+// Empty slice backing for anonymous empty definitions.
+
+// Upstream `ProjectSymbolRuntimeValueWritePlanRequest`.
+pub data SymbolRuntimeValueWritePlanRequest {
+    address: u64;
+    module_name: [u8; 256];
+    module_name_len: u64;
+    symbol_type_id: [u8; 256];
+    symbol_type_id_len: u64;
+    container_type: ContainerType;
+    field_name: [u8; 256];
+    field_name_len: u64;
+    anonymous_value_string: AnonymousValueString;
+}
+
+// Upstream `Result<MemoryWriteRequest, String>` carrier.
+pub data SymbolWritePlan {
+    found: bool;
+    request: MemoryWriteRequest;
+    failure: [u8; 256];
+    failure_len: u64;
+}
+
+// Upstream `ResolvedSymbolicFieldWriteTarget`.
+data FieldWriteTarget {
+    found: bool;
+    symbolic_field_definition: SymbolicFieldDefinition;
+    offset: u64;
+}
+
+// Upstream `build_project_symbol_runtime_value_write_request`.
+pub machine ProjectSymbolRuntimeValueWrite::build_project_symbol_runtime_value_write_request(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    write_plan_request: &SymbolRuntimeValueWritePlanRequest
+) -> SymbolWritePlan
+{
+    let definition: LayoutDefinitionMatch = ProjectSymbolRuntimeValueWrite::build_named_symbolic_struct_definition_for_value_edit(
+        engine_unprivileged_state, project_symbol_catalog, write_plan_request.symbol_type_id, write_plan_request.symbol_type_id_len, write_plan_request.container_type);
+    transition definition.found {
+        true -> field(engine_unprivileged_state, project_symbol_catalog, write_plan_request, definition.definition)
+        _ -> (fail("unable to resolve symbol type"))
+    }
+    state field(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        write_plan_request: &SymbolRuntimeValueWritePlanRequest,
+        symbolic_struct_definition: SymbolicStructDefinition
+    ) -> SymbolWritePlan
+    {
+        let target: FieldWriteTarget = ProjectSymbolRuntimeValueWrite::resolve_symbol_layout_field_write_target(
+            engine_unprivileged_state, project_symbol_catalog, &symbolic_struct_definition,
+            &write_plan_request.field_name[0..write_plan_request.field_name_len]);
+        transition target.found {
+            true -> write(engine_unprivileged_state, write_plan_request, target)
+            _ -> (fail("unable to resolve writable field"))
+        }
+    }
+    state write(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        write_plan_request: &SymbolRuntimeValueWritePlanRequest,
+        target: FieldWriteTarget
+    ) -> SymbolWritePlan
+    {
+        // checked_add — Wrapping add then reject on wrap.
+        let summed: u64 = ((write_plan_request.address as u64 in Wrapping) + (target.offset as u64 in Wrapping)) as u64;
+        transition summed >= write_plan_request.address || target.offset == 0 {
+            true -> bytes(engine_unprivileged_state, write_plan_request, target, summed)
+            _ -> (fail("edited symbol field address overflowed"))
+        }
+    }
+    state bytes(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        write_plan_request: &SymbolRuntimeValueWritePlanRequest,
+        target: FieldWriteTarget,
+        address: u64
+    ) -> SymbolWritePlan
+    {
+        let field_data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(&target.symbolic_field_definition);
+        let field_base_len: u64 = DataTypeRef::get_base_data_type_id_len(&field_data_type_ref);
+        let field_data_type_id: &[u8] = DataTypeRef::get_data_type_id(&field_data_type_ref);
+        // normalize_instruction_data_type_id on the BASE id — upstream calls
+        // it on get_base_data_type_id().
+        transition field_base_len >= 2 && field_base_len <= field_data_type_id.len {
+            true -> instruction_check(engine_unprivileged_state, write_plan_request, target, address, field_data_type_id, field_base_len)
+            _ -> deanonymize(engine_unprivileged_state, write_plan_request, target, address)
+        }
+    }
+    state instruction_check(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        write_plan_request: &SymbolRuntimeValueWritePlanRequest,
+        target: FieldWriteTarget,
+        address: u64,
+        field_data_type_id: &[u8],
+        field_base_len: u64
+    ) -> SymbolWritePlan
+        requires field_base_len >= 2 && field_base_len <= field_data_type_id.len;
+    {
+        transition field_data_type_id[0] == 105 && field_data_type_id[1] == 95 {
+            true -> instruction(engine_unprivileged_state, write_plan_request, target, address)
+            _ -> deanonymize(engine_unprivileged_state, write_plan_request, target, address)
+        }
+    }
+    state instruction(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        write_plan_request: &SymbolRuntimeValueWritePlanRequest,
+        target: FieldWriteTarget,
+        address: u64
+    ) -> SymbolWritePlan
+    {
+        // Plugin assembler unported: the String-format arm upstream delegates
+        // to instruction_set.assemble_at_address; other formats deanonymize
+        // through the i_ data type (kept).
+        let normalized: AnonymousValueString = ProjectSymbolRuntimeValueWrite::normalize_anonymous_value_container_type(
+            &write_plan_request.anonymous_value_string,
+            SymbolicFieldDefinition::get_container_type(&target.symbolic_field_definition));
+        let format: AnonymousValueStringFormat = AnonymousValueString::get_anonymous_value_string_format(&normalized);
+        transition format {
+            AnonymousValueStringFormat::String -> (fail("no instruction set plugin is enabled"))
+            _ -> deanonymize(engine_unprivileged_state, write_plan_request, target, address)
+        }
+    }
+    state deanonymize(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        write_plan_request: &SymbolRuntimeValueWritePlanRequest,
+        target: FieldWriteTarget,
+        address: u64
+    ) -> SymbolWritePlan
+    {
+        let normalized: AnonymousValueString = ProjectSymbolRuntimeValueWrite::normalize_anonymous_value_container_type(
+            &write_plan_request.anonymous_value_string,
+            SymbolicFieldDefinition::get_container_type(&target.symbolic_field_definition));
+        let field_data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(&target.symbolic_field_definition);
+        let mut operation: [u8; 64];
+        let mut operation_len: u64 = 0;
+        let outcome: DeanonymizeValueOutcome = EngineUnprivilegedState::deanonymize_value_string(
+            engine_unprivileged_state, &field_data_type_ref, &normalized, &mut operation, &mut operation_len);
+        transition outcome {
+            DeanonymizeValueOutcome::Value { data_value } -> build(write_plan_request, address, data_value)
+            _ -> (fail("failed to parse edited symbol value"))
+        }
+    }
+    state build(
+        write_plan_request: &SymbolRuntimeValueWritePlanRequest,
+        address: u64,
+        data_value: DataValue
+    ) -> SymbolWritePlan {
+        // MemoryWriteMode::Raw — the CheckedCode arm only fires on the
+        // plugin-assembler path which fails upstream of here.
+        let value_slice: &[u8] = DataValue::get_value_bytes(&data_value);
+        let module_slice: &[u8] = &write_plan_request.module_name[0..write_plan_request.module_name_len];
+        let request: MemoryWriteRequest = MemoryWriteRequest::new(address, module_slice, value_slice, MemoryWriteMode::Raw);
+        (SymbolWritePlan { found: true, request: request, failure_len: 0 })
+    }
+    state fail(failure: &[u8]) -> SymbolWritePlan {
+        (ProjectSymbolRuntimeValueWrite::failed_write_plan(failure))
+    }
+}
+
+// Failure constructor for callers that cannot reach this machine's
+// internal states (upstream's Err(String) arm).
+pub machine ProjectSymbolRuntimeValueWrite::failed_write_plan(failure: &[u8]) -> SymbolWritePlan {
+    transition { _ -> build(failure) }
+    state build(failure: &[u8]) -> SymbolWritePlan {
+        let mut plan: SymbolWritePlan = SymbolWritePlan {
+            found: false,
+            request: MemoryWriteRequest::new(0, "", "", MemoryWriteMode::Raw),
+            failure_len: 0,
+        };
+        plan.failure_len = ProjectSymbolRuntimeValueWrite::copy_failure(&mut plan.failure, failure);
+        (plan)
+    }
+}
+
+// Upstream `build_named_symbolic_struct_definition_for_value_edit`.
+machine ProjectSymbolRuntimeValueWrite::build_named_symbolic_struct_definition_for_value_edit(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    symbol_type_id: [u8; 256],
+    symbol_type_id_len: u64,
+    container_type: ContainerType
+) -> LayoutDefinitionMatch {
+    let resolved: LayoutDefinitionMatch = ProjectSymbolRuntimeValueWrite::build_symbolic_struct_definition_for_symbol_type(
+        engine_unprivileged_state, project_symbol_catalog, &symbol_type_id[0..symbol_type_id_len]);
+    transition resolved.found {
+        true -> fields(resolved.definition, symbol_type_id, symbol_type_id_len, container_type)
+        _ -> absent()
+    }
+    state fields(
+        definition: SymbolicStructDefinition,
+        symbol_type_id: [u8; 256],
+        symbol_type_id_len: u64,
+        container_type: ContainerType
+    ) -> LayoutDefinitionMatch {
+        transition SymbolicStructDefinition::get_field_count(&definition) > 0 {
+            true -> (LayoutDefinitionMatch { found: true, definition: definition })
+            _ -> fallback(symbol_type_id, symbol_type_id_len, container_type)
+        }
+    }
+    state fallback(
+        symbol_type_id: [u8; 256],
+        symbol_type_id_len: u64,
+        container_type: ContainerType
+    ) -> LayoutDefinitionMatch {
+        let data_type_ref: DataTypeRef = DataTypeRef::new(&symbol_type_id[0..symbol_type_id_len]);
+        let field: SymbolicFieldDefinition = SymbolicFieldDefinition::new(data_type_ref, container_type);
+        let fields: [SymbolicFieldDefinition; 1] = [field];
+        let definition: SymbolicStructDefinition = SymbolicStructDefinition::new("", &fields[0..1]);
+        (LayoutDefinitionMatch { found: true, definition: definition })
+    }
+    state absent() -> LayoutDefinitionMatch {
+        (LayoutDefinitionMatch { found: false, definition: SymbolicStructDefinition::new_empty("") })
+    }
+}
+
+// Upstream `build_symbolic_struct_definition_for_symbol_type` — minus the
+// `SymbolicStructDefinition::from_str` arm (unported parse).
+machine ProjectSymbolRuntimeValueWrite::build_symbolic_struct_definition_for_symbol_type(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    symbol_type_id: &[u8]
+) -> LayoutDefinitionMatch {
+    transition { _ -> catalog(engine_unprivileged_state, project_symbol_catalog, symbol_type_id, 0) }
+    state catalog(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbol_type_id: &[u8],
+        at: u64
+    ) -> LayoutDefinitionMatch {
+        transition at < ProjectSymbolCatalog::get_struct_layout_descriptor_count(project_symbol_catalog) && at < 128 {
+            true -> check(engine_unprivileged_state, project_symbol_catalog, symbol_type_id, at)
+            _ -> registry(engine_unprivileged_state, symbol_type_id)
+        }
+    }
+    state check(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbol_type_id: &[u8],
+        at: u64
+    ) -> LayoutDefinitionMatch
+        requires at < 128;
+    {
+        let descriptor: &StructLayoutDescriptor = ProjectSymbolCatalog::get_struct_layout_descriptor(project_symbol_catalog, at);
+        let layout_id: &[u8] = StructLayoutDescriptor::get_struct_layout_id(descriptor);
+        transition ProjectSymbolRuntimeValueWrite::bytes_equal(layout_id, symbol_type_id) {
+            true -> hit(descriptor)
+            _ -> catalog(engine_unprivileged_state, project_symbol_catalog, symbol_type_id, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state hit(descriptor: &StructLayoutDescriptor) -> LayoutDefinitionMatch {
+        let definition: SymbolicStructDefinition = SymbolicStructDefinition::clone(
+            StructLayoutDescriptor::get_struct_layout_definition(descriptor));
+        (LayoutDefinitionMatch { found: true, definition: definition })
+    }
+    state registry(engine_unprivileged_state: &mut EngineUnprivilegedState, symbol_type_id: &[u8]) -> LayoutDefinitionMatch {
+        let mut definition: SymbolicStructDefinition = SymbolicStructDefinition::new_empty("");
+        let resolved: bool = EngineUnprivilegedState::resolve_struct_layout_definition(engine_unprivileged_state, symbol_type_id, &mut definition);
+        transition resolved {
+            true -> (LayoutDefinitionMatch { found: true, definition: definition })
+            _ -> field_fallback(symbol_type_id)
+        }
+    }
+    state field_fallback(symbol_type_id: &[u8]) -> LayoutDefinitionMatch {
+        let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(symbol_type_id);
+        transition parsed {
+            SymbolicFieldDefinitionParse::Parsed { value } -> anonymous(value)
+            _ -> final_fallback(symbol_type_id)
+        }
+    }
+    state anonymous(symbolic_field_definition: SymbolicFieldDefinition) -> LayoutDefinitionMatch {
+        let fields: [SymbolicFieldDefinition; 1] = [symbolic_field_definition];
+        let definition: SymbolicStructDefinition = SymbolicStructDefinition::new("", &fields[0..1]);
+        (LayoutDefinitionMatch { found: true, definition: definition })
+    }
+    state final_fallback(symbol_type_id: &[u8]) -> LayoutDefinitionMatch {
+        let data_type_ref: DataTypeRef = DataTypeRef::new(symbol_type_id);
+        let field: SymbolicFieldDefinition = SymbolicFieldDefinition::new(data_type_ref, ContainerType::None);
+        let fields: [SymbolicFieldDefinition; 1] = [field];
+        let definition: SymbolicStructDefinition = SymbolicStructDefinition::new("", &fields[0..1]);
+        (LayoutDefinitionMatch { found: true, definition: definition })
+    }
+}
+
+// Upstream `resolve_symbol_layout_field_write_target` — walks the struct's
+// fields carrying the sequential offset accumulator; field names compare
+// after `normalize_symbol_value_field_name` (empty name -> "value"/"value_N").
+machine ProjectSymbolRuntimeValueWrite::resolve_symbol_layout_field_write_target(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    symbolic_struct_definition: &SymbolicStructDefinition,
+    edited_field_name: &[u8]
+) -> FieldWriteTarget {
+    let mut visits: SymbolLayoutVisitSet = SymbolLayoutVisitSet::new();
+    transition { _ -> each(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, &mut visits, 0, 0, 0) }
+    state each(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64
+    ) -> FieldWriteTarget {
+        transition at < SymbolicStructDefinition::get_field_count(symbolic_struct_definition) && at < 64 {
+            true -> field(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index)
+            _ -> absent()
+        }
+    }
+    state field(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        let field: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(symbolic_struct_definition, at);
+        transition SymbolicFieldDefinition::is_unassigned(field) {
+            true -> unassigned(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field)
+            _ -> assigned(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field)
+        }
+    }
+    state unassigned(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        let size: SymbolicUnassignedSize = SymbolicFieldDefinition::get_unassigned_size_in_bytes(field);
+        transition size.found {
+            true -> advance_unassigned(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, size.size_in_bytes)
+            _ -> absent()
+        }
+    }
+    state advance_unassigned(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        unassigned_size: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        // saturating_add
+        let summed: u64 = ((next_sequential_offset as u64 in Wrapping) + (unassigned_size as u64 in Wrapping)) as u64;
+        transition summed >= next_sequential_offset {
+            true -> each(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, summed, value_field_index)
+            _ -> absent()
+        }
+    }
+    state assigned(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        let layout_kind: SymbolicLayoutKind = SymbolicStructDefinition::get_layout_kind(symbolic_struct_definition);
+        let resolution: SymbolicFieldOffsetResolution = SymbolicFieldDefinition::get_offset_resolution(field);
+        transition resolution {
+            SymbolicFieldOffsetResolution::Static { offset_in_bytes } -> offset_static(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field, offset_in_bytes)
+            _ -> offset_kind(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field, layout_kind)
+        }
+    }
+    state offset_kind(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition,
+        layout_kind: SymbolicLayoutKind
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        transition SymbolicLayoutKind::is_union(&layout_kind) {
+            true -> offset_zero(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field)
+            _ -> offset_sequential(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field)
+        }
+    }
+    state offset_zero(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        transition { _ -> name_match(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field, 0) }
+    }
+    state offset_sequential(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        transition { _ -> name_match(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field, next_sequential_offset) }
+    }
+    state offset_static(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition,
+        field_offset: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        transition { _ -> name_match(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field, field_offset) }
+    }
+    state name_match(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition,
+        field_offset: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        transition ProjectSymbolRuntimeValueWrite::normalized_name_equals(field, value_field_index, edited_field_name) {
+            true -> (FieldWriteTarget { found: true, symbolic_field_definition: SymbolicFieldDefinition::clone(field), offset: field_offset })
+            _ -> size(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field, field_offset)
+        }
+    }
+    state size(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field: &SymbolicFieldDefinition,
+        field_offset: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        let size: SymbolLayoutSizeResult = SymbolLayoutSizeResolver::resolve_symbolic_field_size_in_bytes(
+            engine_unprivileged_state, project_symbol_catalog, false, field, visited);
+        transition size.found {
+            true -> accumulate(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, field_offset, size.size_in_bytes)
+            _ -> absent()
+        }
+    }
+    state accumulate(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        field_offset: u64,
+        field_size_in_bytes: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        // next_sequential_offset.max(field_offset.checked_add(size)?)
+        let summed: u64 = ((field_offset as u64 in Wrapping) + (field_size_in_bytes as u64 in Wrapping)) as u64;
+        transition summed >= field_offset {
+            true -> take_max(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index, summed)
+            _ -> absent()
+        }
+    }
+    state take_max(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64,
+        summed: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        let mut carried_next: u64 = next_sequential_offset;
+        transition summed > next_sequential_offset {
+            true -> bump_index(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, summed, value_field_index)
+            _ -> bump_index(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, at, next_sequential_offset, value_field_index)
+        }
+    }
+    state bump_index(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        symbolic_struct_definition: &SymbolicStructDefinition,
+        edited_field_name: &[u8],
+        visited: &mut SymbolLayoutVisitSet,
+        at: u64,
+        next_sequential_offset: u64,
+        value_field_index: u64
+    ) -> FieldWriteTarget
+        requires at < 64;
+    {
+        transition { _ -> each(engine_unprivileged_state, project_symbol_catalog, symbolic_struct_definition, edited_field_name, visited, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next_sequential_offset, ((value_field_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state absent() -> FieldWriteTarget {
+        (FieldWriteTarget { found: false, symbolic_field_definition: SymbolicFieldDefinition::new_unassigned(0), offset: 0 })
+    }
+}
+
+// Upstream `normalize_anonymous_value_container_type`.
+machine ProjectSymbolRuntimeValueWrite::normalize_anonymous_value_container_type(
+    anonymous_value_string: &AnonymousValueString,
+    field_container_type: ContainerType
+) -> AnonymousValueString {
+    let value_container_type: ContainerType = AnonymousValueString::get_container_type(anonymous_value_string);
+    transition !ContainerType::equals(&value_container_type, &ContainerType::None) || ContainerType::equals(&field_container_type, &ContainerType::None) {
+        true -> (AnonymousValueString::clone(anonymous_value_string))
+        _ -> adopt(anonymous_value_string, field_container_type)
+    }
+    state adopt(anonymous_value_string: &AnonymousValueString, field_container_type: ContainerType) -> AnonymousValueString {
+        let mut text: [u8; 4096];
+        let text_len: u64 = AnonymousValueString::copy_anonymous_value_string(anonymous_value_string, &mut text);
+        transition text_len <= 4096 {
+            true -> build(text, text_len, anonymous_value_string, field_container_type)
+            _ -> (AnonymousValueString::clone(anonymous_value_string))
+        }
+    }
+    state build(text: [u8; 4096], text_len: u64, anonymous_value_string: &AnonymousValueString, field_container_type: ContainerType) -> AnonymousValueString
+        requires text_len <= 4096;
+    {
+        let inner3171: AnonymousValueStringFormat = AnonymousValueString::get_anonymous_value_string_format(anonymous_value_string);
+        (AnonymousValueString::new(&text[0..text_len], inner3171, field_container_type))
+    }
+}
+
+// Upstream `normalize_symbol_value_field_name` + equality —
+// field_name empty -> "value" (index 0) or "value_{index}".
+machine ProjectSymbolRuntimeValueWrite::normalized_name_equals(
+    field: &SymbolicFieldDefinition,
+    value_field_index: u64,
+    edited_field_name: &[u8]
+) -> bool {
+    let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(field);
+    let trimmed_len: u64 = ProjectSymbolRuntimeValueWrite::trim_len(field_name);
+    transition trimmed_len == 0 {
+        true -> synthetic(value_field_index, edited_field_name)
+        _ -> direct(field_name, trimmed_len, edited_field_name)
+    }
+    state direct(field_name: &[u8], trimmed_len: u64, edited_field_name: &[u8]) -> bool
+        requires trimmed_len <= field_name.len;
+    {
+        (ProjectSymbolRuntimeValueWrite::bytes_equal(&field_name[0..trimmed_len], edited_field_name))
+    }
+    state synthetic(value_field_index: u64, edited_field_name: &[u8]) -> bool {
+        transition value_field_index == 0 {
+            true -> (ProjectSymbolRuntimeValueWrite::bytes_equal("value", edited_field_name))
+            _ -> indexed(value_field_index, edited_field_name)
+        }
+    }
+    state indexed(value_field_index: u64, edited_field_name: &[u8]) -> bool {
+        let mut synthetic: [u8; 256];
+        let synthetic_len: u64 = ProjectSymbolRuntimeValueWrite::format_value_index(&mut synthetic, value_field_index);
+        transition synthetic_len <= 256 {
+            true -> compare(synthetic, synthetic_len, edited_field_name)
+            _ -> (false)
+        }
+    }
+    state compare(synthetic: [u8; 256], synthetic_len: u64, edited_field_name: &[u8]) -> bool
+        requires synthetic_len <= 256;
+    {
+        (ProjectSymbolRuntimeValueWrite::bytes_equal(&synthetic[0..synthetic_len], edited_field_name))
+    }
+}
+
+// "value_{index}" in decimal — upstream format!("value_{}", field_index).
+machine ProjectSymbolRuntimeValueWrite::format_value_index(out: &mut [u8; 256], index: u64) -> u64 {
+    out[0] = 118;
+    out[1] = 97;
+    out[2] = 108;
+    out[3] = 117;
+    out[4] = 101;
+    out[5] = 95;
+    let digits: u64 = ProjectSymbolRuntimeValueWrite::decimal_width(index);
+    _ = ProjectSymbolRuntimeValueWrite::write_decimal_at(out, index, 6, digits);
+    (((6 as u64 in Wrapping) + (digits as u64 in Wrapping)) as u64)
+}
+
+machine ProjectSymbolRuntimeValueWrite::decimal_width(value: u64) -> u64 {
+    transition { _ -> measure(value, 1) }
+    state measure(remaining: u64, count: u64) -> u64 {
+        transition remaining >= 10 {
+            true -> measure(remaining / 10, ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (count)
+        }
+    }
+}
+
+machine ProjectSymbolRuntimeValueWrite::write_decimal_at(out: &mut [u8; 256], value: u64, start: u64, width: u64) -> u64 {
+    transition { _ -> each(out, value, start, width, 0) }
+    state each(out: &mut [u8; 256], value: u64, start: u64, width: u64, at: u64) -> u64 {
+        transition at < width && (((start as u64 in Wrapping) + (at as u64 in Wrapping)) as u64 )< 256 {
+            true -> write(out, value, start, width, at)
+            _ -> (start)
+        }
+    }
+    state write(out: &mut [u8; 256], value: u64, start: u64, width: u64, at: u64) -> u64
+        requires at < width && (((start as u64 in Wrapping) + (at as u64 in Wrapping)) as u64 )< 256;
+    {
+        // write the least significant digit at the tail position.
+        let position_from_end: u64 = (((width as u64 in Wrapping) - (1 as u64 in Wrapping) - (at as u64 in Wrapping)) as u64);
+        let divisor: u64 = ProjectSymbolRuntimeValueWrite::pow10(position_from_end);
+        // `pow10` only ever returns a nonzero product, but the checker
+        // discharges division nonzero per dominating guard — guard here.
+        transition divisor > 0 {
+            true -> emit(out, value, start, width, at, divisor)
+            _ -> (start)
+        }
+    }
+    state emit(out: &mut [u8; 256], value: u64, start: u64, width: u64, at: u64, divisor: u64) -> u64
+        requires at < width && (((start as u64 in Wrapping) + (at as u64 in Wrapping)) as u64 )< 256 && divisor > 0;
+    {
+        let digit: u64 = ((value as u64 in Wrapping) / (divisor as u64 in Wrapping)) as u64;
+        let ones: u64 = ((digit as u64 in Wrapping) % (10 as u64 in Wrapping)) as u64;
+        transition ones < 10 {
+            true -> store(out, value, start, width, at, ones)
+            _ -> each(out, value, start, width, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store(out: &mut [u8; 256], value: u64, start: u64, width: u64, at: u64, digit: u64) -> u64
+        requires at < width && (((start as u64 in Wrapping) + (at as u64 in Wrapping)) as u64 )< 256 && digit < 10;
+    {
+        out[((start as u64 in Wrapping) + (at as u64 in Wrapping)) as u64] = ((48 + digit) as u8);
+        transition { _ -> each(out, value, start, width, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine ProjectSymbolRuntimeValueWrite::pow10(exponent: u64) -> u64 {
+    transition { _ -> build(exponent, 0, 1) }
+    state build(exponent: u64, at: u64, value: u64) -> u64 {
+        transition at < exponent {
+            true -> build(exponent, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((value as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64)
+            _ -> (value)
+        }
+    }
+}
+
+// whitespace trim length (space/tab like upstream `.trim().is_empty()` on
+// already-stored names — front-and-back trim, but stored names have no
+// leading spaces upstream).
+machine ProjectSymbolRuntimeValueWrite::trim_len(text: &[u8]) -> u64 {
+    transition { _ -> scan(text, text.len) }
+    state scan(text: &[u8], end: u64) -> u64 {
+        transition end > 0 {
+            true -> check(text, end)
+            _ -> (0)
+        }
+    }
+    state check(text: &[u8], end: u64) -> u64
+        requires end > 0 && end <= text.len;
+    {
+        let last: u8 = text[((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64];
+        transition last == 32 || last == 9 {
+            true -> scan(text, ((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64)
+            _ -> (end)
+        }
+    }
+}
+
+machine ProjectSymbolRuntimeValueWrite::bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    transition left.len == right.len {
+        true -> probe(left, right, 0)
+        _ -> (false)
+    }
+    state probe(left: &[u8], right: &[u8], at: u64) -> bool {
+        transition at < left.len && at < right.len {
+            true -> byte(left, right, at)
+            _ -> (true)
+        }
+    }
+    state byte(left: &[u8], right: &[u8], at: u64) -> bool
+        requires at < left.len && at < right.len;
+    {
+        transition left[at] == right[at] {
+            true -> probe(left, right, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+machine ProjectSymbolRuntimeValueWrite::copy_failure(out: &mut [u8; 256], failure: &[u8]) -> u64 {
+    transition { _ -> each(out, failure, 0) }
+    state each(out: &mut [u8; 256], failure: &[u8], at: u64) -> u64 {
+        transition at < failure.len && at < 256 {
+            true -> write(out, failure, at)
+            _ -> (at)
+        }
+    }
+    state write(out: &mut [u8; 256], failure: &[u8], at: u64) -> u64
+        requires at < failure.len && at < 256;
+    {
+        out[at] = failure[at];
+        transition { _ -> each(out, failure, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}

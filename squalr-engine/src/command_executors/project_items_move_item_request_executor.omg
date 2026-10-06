@@ -1,0 +1,308 @@
+module src::command_executors::project_items_move_item_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::move_item::project_items_move_item_request::ProjectItemsMoveItemRequest;
+use squalr_engine_api::src::commands::project_items::move_item::project_items_move_item_response::ProjectItemsMoveItemResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::project_serialization::ProjectLoad;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/move_item/
+// project_items_move_request_executor.rs — resolve each requested item
+// path, refuse destinations that already exist, `fs::rename` each into the
+// target dir (rename_tree_commit — copy+remove twin), reload the opened
+// project, move the sort-order entries, save, notify.
+pub data ProjectItemsMoveItemRequestExecutor {}
+
+pub machine ProjectItemsMoveItemRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_move_item_request: &ProjectItemsMoveItemRequest
+) -> ProjectItemsMoveItemResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let paths: &ProjectPathList = ProjectItemsMoveItemRequest::get_project_item_paths(project_items_move_item_request);
+    transition ProjectPathList::get_path_count(paths) == 0 {
+        true -> empty()
+        _ -> opened(engine_unprivileged_state, project_items_move_item_request)
+    }
+
+    state empty() -> ProjectItemsMoveItemResponse {
+        let mut response: ProjectItemsMoveItemResponse = ProjectItemsMoveItemResponse::new();
+        ProjectItemsMoveItemResponse::set_success(&mut response, true);
+        (response)
+    }
+
+    state opened(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest) -> ProjectItemsMoveItemResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> directory(engine_unprivileged_state, project_items_move_item_request)
+            _ -> refused()
+        }
+    }
+
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest) -> ProjectItemsMoveItemResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> measure(engine_unprivileged_state, project_items_move_item_request, directory)
+            _ -> refused()
+        }
+    }
+    state measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512]) -> ProjectItemsMoveItemResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> target(engine_unprivileged_state, project_items_move_item_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+
+    // `resolve_project_item_path(dir, request.target)` + create_dir_all.
+    state target(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let mut target: ManifestPathScratch;
+        ManifestPathScratch::new(&mut target);
+        let target_path: &[u8] = ProjectItemsMoveItemRequest::get_target_directory_path(project_items_move_item_request);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], target_path, &mut target) {
+            true -> mkdir(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target)
+            _ -> refused()
+        }
+    }
+    state mkdir(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let inner3043: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition FileSystemUtils::create_dir_all_path(inner3043) {
+            true -> loop_items(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, 0)
+            _ -> refused()
+        }
+    }
+
+    // Per item: resolve source, extract its file name, join into target,
+    // refuse existing destinations, rename_tree_commit the move. Two
+    // parallel lists track (source, destination) for the sort-order pass.
+    state loop_items(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, position: u64) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let mut moved_sources: ProjectPathList = ProjectPathList::empty();
+        let mut moved_destinations: ProjectPathList = ProjectPathList::empty();
+        transition { _ -> each(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, 0, 0, true) }
+    }
+
+    state each(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let paths: &ProjectPathList = ProjectItemsMoveItemRequest::get_project_item_paths(project_items_move_item_request);
+        transition position < ProjectPathList::get_path_count(paths) {
+            true -> resolve_source(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success)
+            _ -> reload_gate(engine_unprivileged_state, directory, directory_len, moved_sources, moved_destinations, moved_count, operation_success)
+        }
+    }
+
+    state resolve_source(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let paths: &ProjectPathList = ProjectItemsMoveItemRequest::get_project_item_paths(project_items_move_item_request);
+        let item_path: &[u8] = ProjectPathList::get_path(paths, position);
+        let mut source: ManifestPathScratch;
+        ManifestPathScratch::new(&mut source);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], item_path, &mut source) {
+            true -> file_name(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source)
+            _ -> each(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, moved_count, false)
+        }
+    }
+
+    // Upstream `source.file_name()` — the final path component — copied
+    // out of the resolved source bytes via the last-separator scan.
+    state file_name(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let name_start: u64 = ProjectItemFileMutation::find_last_separator(source_bytes);
+        transition name_start <= source_bytes.len {
+            true -> name_copy(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, name_start)
+            _ -> each(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, moved_count, false)
+        }
+    }
+    state name_copy(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, name_start: u64) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let mut name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut name);
+        transition { _ -> name_loop(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, name_start, name) }
+    }
+    state name_loop(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, name_start: u64, mut name: ManifestPathScratch) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let name_position: u64 = name.len;
+        let source_index: u64 = ((name_start as u64 in Wrapping) + (name_position as u64 in Wrapping)) as u64;
+        transition source_index < source_bytes.len && source_index < 512 {
+            true -> name_byte(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, name_start, name, source_index)
+            _ -> join_dest(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, name)
+        }
+    }
+    state name_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, name_start: u64, mut name: ManifestPathScratch, source_index: u64) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition source_index < source_bytes.len && source_index < 512 {
+            true -> name_put(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, name_start, name, source_bytes[source_index])
+            _ -> join_dest(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, name)
+        }
+    }
+    state name_put(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, name_start: u64, mut name: ManifestPathScratch, byte: u8) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        _ = ManifestPathScratch::append(&mut name, byte);
+        transition { _ -> name_loop(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, name_start, name) }
+    }
+
+    state join_dest(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, name: ManifestPathScratch) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let mut destination: ManifestPathScratch;
+        ManifestPathScratch::new(&mut destination);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3044: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let inner3045: &[u8] = ManifestPathScratch::get_bytes(&name);
+        transition ProjectItemSortOrder::join_path(path_joiner, inner3044, inner3045, &mut destination) {
+            true -> dest_exists(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, destination)
+            _ -> each(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, moved_count, false)
+        }
+    }
+
+    state dest_exists(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, destination: ManifestPathScratch) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let inner3046: &[u8] = ManifestPathScratch::get_bytes(&destination);
+        transition FileSystemUtils::path_exists(inner3046) {
+            true -> each(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, moved_count, false)
+            _ -> do_rename(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, destination)
+        }
+    }
+    state do_rename(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, destination: ManifestPathScratch) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let inner3047: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let inner3048: &[u8] = ManifestPathScratch::get_bytes(&destination);
+        transition FileSystemUtils::rename_tree_commit(inner3047, inner3048) {
+            true -> record_move(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, position, moved_count, operation_success, source, destination)
+            _ -> each(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, moved_count, false)
+        }
+    }
+    state record_move(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_move_item_request: &ProjectItemsMoveItemRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, mut moved_sources: ProjectPathList, mut moved_destinations: ProjectPathList, position: u64, moved_count: u64, operation_success: bool, source: ManifestPathScratch, destination: ManifestPathScratch) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let inner3049: &[u8] = ManifestPathScratch::get_bytes(&source);
+        _ = ProjectPathList::add_path(&mut moved_sources, inner3049);
+        let inner3050: &[u8] = ManifestPathScratch::get_bytes(&destination);
+        _ = ProjectPathList::add_path(&mut moved_destinations, inner3050);
+        transition { _ -> each(engine_unprivileged_state, project_items_move_item_request, directory, directory_len, target, moved_sources, moved_destinations, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((moved_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, operation_success) }
+    }
+
+    // Upstream `reload_opened_project` — full `Project::load_at` then
+    // store; a reload failure fails the command outright.
+    state reload_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, moved_sources: ProjectPathList, moved_destinations: ProjectPathList, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        transition moved_count > 0 {
+            true -> reload_open(engine_unprivileged_state, directory, directory_len, moved_sources, moved_destinations, moved_count, operation_success)
+            _ -> respond(operation_success, moved_count)
+        }
+    }
+    state reload_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, moved_sources: ProjectPathList, moved_destinations: ProjectPathList, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> reload_read(engine_unprivileged_state, dir_fd, directory, directory_len, moved_sources, moved_destinations, moved_count, operation_success)
+            _ -> respond(false, moved_count)
+        }
+    }
+    state reload_read(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, moved_sources: ProjectPathList, moved_destinations: ProjectPathList, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let loaded: ProjectLoad = Project::load_at(dir_fd, &directory[0..directory_len]);
+        _ = FilesystemHost::close(dir_fd);
+        transition loaded {
+            ProjectLoad::Loaded { project } -> sort(engine_unprivileged_state, directory, directory_len, moved_sources, moved_destinations, moved_count, operation_success, project)
+            _ -> respond(false, moved_count)
+        }
+    }
+    state sort(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, moved_sources: ProjectPathList, moved_destinations: ProjectPathList, moved_count: u64, operation_success: bool, mut project: Project) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::remove_project_item_paths_from_sort_order(&sort_order, &mut project, &directory[0..directory_len], &moved_sources);
+        _ = ProjectItemSortOrder::append_project_item_paths_to_sort_order(&sort_order, &mut project, &directory[0..directory_len], &moved_destinations);
+        transition { _ -> store(engine_unprivileged_state, directory, directory_len, moved_count, operation_success, project) }
+    }
+    state store(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, moved_count: u64, operation_success: bool, project: Project) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::set_opened_project(project_manager, &project);
+        transition { _ -> save_open(engine_unprivileged_state, directory, directory_len, moved_count, operation_success) }
+    }
+    state save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> save_do(engine_unprivileged_state, dir_fd, directory, directory_len, moved_count, operation_success)
+            _ -> respond(false, moved_count)
+        }
+    }
+    state save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify_done(engine_unprivileged_state, moved_count, operation_success)
+            _ -> respond(false, moved_count)
+        }
+    }
+
+    state notify_done(engine_unprivileged_state: &mut EngineUnprivilegedState, moved_count: u64, operation_success: bool) -> ProjectItemsMoveItemResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> respond(operation_success, moved_count) }
+    }
+
+    state respond(operation_success: bool, moved_count: u64) -> ProjectItemsMoveItemResponse {
+        let mut response: ProjectItemsMoveItemResponse = ProjectItemsMoveItemResponse::new();
+        ProjectItemsMoveItemResponse::set_success(&mut response, operation_success);
+        ProjectItemsMoveItemResponse::set_moved_project_item_count(&mut response, moved_count);
+        (response)
+    }
+
+    state refused() -> ProjectItemsMoveItemResponse {
+        (ProjectItemsMoveItemResponse::new())
+    }
+}

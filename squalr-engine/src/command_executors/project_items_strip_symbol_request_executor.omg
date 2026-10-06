@@ -1,0 +1,249 @@
+module src::command_executors::project_items_strip_symbol_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::strip_symbol::project_items_strip_symbol_request::ProjectItemsStripSymbolRequest;
+use squalr_engine_api::src::commands::project_items::strip_symbol::project_items_strip_symbol_response::ProjectItemsStripSymbolResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project::ProjectItemLookup;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::ProjectItemTypeAddress;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::ProjectItemAddressTarget;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::AddressTargetMatch;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/strip_symbol/
+// project_items_strip_symbol_request_executor.rs — for each address item
+// path: resolve → lookup → `strip_symbolic_offsets` against the symbol
+// catalog; changed targets get `set_address_target` + dirty. Zero
+// stripped items short-circuits success before the save, matching
+// upstream's early return.
+pub data ProjectItemsStripSymbolRequestExecutor {}
+
+pub machine ProjectItemsStripSymbolRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest
+) -> ProjectItemsStripSymbolResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let paths: &ProjectPathList = ProjectItemsStripSymbolRequest::get_project_item_paths(project_items_strip_symbol_request);
+    transition ProjectPathList::get_path_count(paths) == 0 {
+        true -> respond(true, 0)
+        _ -> opened(engine_unprivileged_state, project_items_strip_symbol_request)
+    }
+
+    state opened(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest) -> ProjectItemsStripSymbolResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> directory(engine_unprivileged_state, project_items_strip_symbol_request)
+            _ -> fail("Cannot strip project item symbol information without an opened project.")
+        }
+    }
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest) -> ProjectItemsStripSymbolResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> measure(engine_unprivileged_state, project_items_strip_symbol_request, directory)
+            _ -> fail("Failed to resolve opened project directory for strip-symbol operation.")
+        }
+    }
+    state measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512]) -> ProjectItemsStripSymbolResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> catalog(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len)
+            _ -> fail("Failed to resolve opened project directory for strip-symbol operation.")
+        }
+    }
+    // Upstream clones the catalog before the item loop (the opened
+    // project's `&mut` can't overlap a borrowed catalog).
+    state catalog(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let inner43: &ProjectSymbolCatalog = ProjectInfo::get_project_symbol_catalog(project_info);
+        let catalog: ProjectSymbolCatalog = ProjectSymbolCatalog::clone(inner43);
+        transition { _ -> each(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, 0, 0) }
+    }
+
+    state each(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let paths: &ProjectPathList = ProjectItemsStripSymbolRequest::get_project_item_paths(project_items_strip_symbol_request);
+        let count: u64 = ProjectPathList::get_path_count(paths);
+        transition position < count {
+            true -> resolve(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count)
+            _ -> count_gate(engine_unprivileged_state, directory, directory_len, stripped_count)
+        }
+    }
+    state resolve(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let mut resolved: ManifestPathScratch;
+        ManifestPathScratch::new(&mut resolved);
+        let paths: &ProjectPathList = ProjectItemsStripSymbolRequest::get_project_item_paths(project_items_strip_symbol_request);
+        let path: &[u8] = ProjectPathList::get_path(paths, position);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], path, &mut resolved) {
+            true -> lookup(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count, resolved)
+            _ -> skip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count)
+        }
+    }
+    state lookup(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64, resolved: ManifestPathScratch) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let inner44: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let item_ref: ProjectItemRef = ProjectItemRef::new(inner44);
+        let found: ProjectItemLookup = Project::lookup_project_item_index(opened_project, &item_ref);
+        transition found {
+            ProjectItemLookup::Found { index } -> kind(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count, index)
+            _ -> skip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count)
+        }
+    }
+    // `get_item_type().get_project_item_type_id() != "address"` → skip.
+    state kind(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64, index: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, index);
+        let item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(item);
+        let mut path_equaler: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let is_address: bool = ProjectItemSortOrder::paths_equal(path_equaler, ProjectItemTypeRef::get_project_item_type_id(item_type), ProjectItemTypeAddress::get_project_item_type_id());
+        transition is_address {
+            true -> has_symbolic(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count, index)
+            _ -> skip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count)
+        }
+    }
+    state has_symbolic(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64, index: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, index);
+        let item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        let target: ProjectItemAddressTarget = ProjectItemTypeAddress::get_address_target(item);
+        transition ProjectItemAddressTarget::has_symbolic_offsets(&target) {
+            true -> strip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count, index, target)
+            _ -> skip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count)
+        }
+    }
+    state strip(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64, index: u64, target: ProjectItemAddressTarget) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let stripped: AddressTargetMatch = ProjectItemAddressTarget::strip_symbolic_offsets(&target, &catalog);
+        transition stripped.found {
+            true -> compare(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count, index, target, stripped.address_target)
+            _ -> skip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count)
+        }
+    }
+    // `stripped == address_target` → skip; otherwise write back + dirty.
+    state compare(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64, index: u64, target: ProjectItemAddressTarget, stripped_target: ProjectItemAddressTarget) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        transition ProjectItemAddressTarget::address_targets_equal(&stripped_target, &target) {
+            true -> skip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count)
+            _ -> apply(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, stripped_count, index, stripped_target)
+        }
+    }
+    state apply(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64, index: u64, stripped_target: ProjectItemAddressTarget) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, index);
+        let item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        ProjectItemTypeAddress::set_address_target(item, stripped_target);
+        ProjectItem::set_has_unsaved_changes(item, true);
+        transition { _ -> skip(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, position, ((stripped_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state skip(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_strip_symbol_request: &ProjectItemsStripSymbolRequest, directory: [u8; 512], directory_len: u64, catalog: ProjectSymbolCatalog, position: u64, stripped_count: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        transition { _ -> each(engine_unprivileged_state, project_items_strip_symbol_request, directory, directory_len, catalog, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, stripped_count) }
+    }
+
+    // Upstream: zero stripped items returns success without a save.
+    state count_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, stripped_count: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        transition stripped_count == 0 {
+            true -> respond(true, 0)
+            _ -> mark_dirty(engine_unprivileged_state, directory, directory_len, stripped_count)
+        }
+    }
+    state mark_dirty(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, stripped_count: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let info: &mut ProjectInfo = Project::borrow_project_info_mut(opened_project);
+        ProjectInfo::set_has_unsaved_changes(info, true);
+        transition { _ -> save_open(engine_unprivileged_state, directory, directory_len, stripped_count) }
+    }
+    state save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, stripped_count: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> save_do(engine_unprivileged_state, dir_fd, directory, directory_len, stripped_count)
+            _ -> fail("Failed to save project after strip-symbol operation.")
+        }
+    }
+    state save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, stripped_count: u64) -> ProjectItemsStripSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify_done(engine_unprivileged_state, stripped_count)
+            _ -> fail("Failed to save project after strip-symbol operation.")
+        }
+    }
+    state notify_done(engine_unprivileged_state: &mut EngineUnprivilegedState, stripped_count: u64) -> ProjectItemsStripSymbolResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> respond(true, stripped_count) }
+    }
+    state respond(success: bool, stripped_count: u64) -> ProjectItemsStripSymbolResponse {
+        let mut response: ProjectItemsStripSymbolResponse = ProjectItemsStripSymbolResponse::new();
+        ProjectItemsStripSymbolResponse::set_success(&mut response, success);
+        ProjectItemsStripSymbolResponse::set_stripped_project_item_count(&mut response, stripped_count);
+        (response)
+    }
+    state fail(error: &[u8]) -> ProjectItemsStripSymbolResponse {
+        let mut response: ProjectItemsStripSymbolResponse = ProjectItemsStripSymbolResponse::new();
+        ProjectItemsStripSymbolResponse::set_stripped_project_item_count(&mut response, 0);
+        ProjectItemsStripSymbolResponse::set_error(&mut response, error);
+        (response)
+    }
+}

@@ -1,0 +1,982 @@
+// Port of squalr-engine/src/services/projects/project_symbol_catalog_mutation.rs.
+//
+// Command-facing catalog mutations shared by the symbol executors:
+// create (dedup display name, module-field upsert or absolute claim),
+// update (claim or module-field retarget), and delete (locator keys,
+// whole modules, and bounded module ranges). Deviations: upstream
+// `Result<T, String>` folds to found/refused unions (error strings
+// were diagnostic-only); HashSet<String> request sets ride bounded
+// ProjectStringLists built once from trimmed request entries;
+// Option<u64>/Option<String> ride has_ flags; the deleted-module-name
+// set upstream rebuilds rides a bounded ManifestScratchList.
+
+module src::services::projects::project_symbol_catalog_mutation;
+
+use squalr_engine_api::src::commands::project_symbols::create::project_symbols_create_request::ProjectSymbolsCreateRequest;
+use squalr_engine_api::src::commands::project_symbols::delete::project_symbols_delete_request::ProjectSymbolsDeleteModuleRange;
+use squalr_engine_api::src::commands::project_symbols::delete::project_symbols_delete_request::ProjectSymbolsDeleteModuleRangeMode;
+use squalr_engine_api::src::commands::project_symbols::delete::project_symbols_delete_request::ProjectSymbolsDeleteRequest;
+use squalr_engine_api::src::commands::project_symbols::update::project_symbols_update_request::ProjectSymbolsUpdateRequest;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::services::projects::project_symbol_layout_mutation::MutationRangeList;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+use src::services::projects::project_symbol_layout_mutation::LayoutMutationResult;
+use src::services::projects::project_symbol_layout_mutation::ProjectSymbolLayoutMutation;
+use src::services::projects::project_symbol_layout_mutation::ProjectSymbolLayoutMutationSummary;
+use src::services::projects::project_symbol_name_scope::ProjectSymbolNameScope;
+use squalr_engine_api::src::structures::projects::project_string_list::ProjectStringList;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectModuleFieldMatch;
+use squalr_engine_api::src::structures::projects::project_symbol_claim::ProjectSymbolClaim;
+use squalr_engine_api::src::structures::projects::project_symbol_claim::ProjectSymbolClaimMetadataEntry;
+use squalr_engine_api::src::structures::projects::project_symbol_locator::ProjectSymbolLocator;
+use squalr_engine_api::src::structures::projects::project_symbol_module::ProjectSymbolModule;
+use squalr_engine_api::src::structures::projects::project_symbol_module_field::ProjectSymbolModuleField;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+
+pub data ProjectSymbolCatalogMutation {}
+
+// Upstream `ProjectSymbolsDeleteMutationSummary` + did_delete_anything.
+pub data ProjectSymbolsDeleteMutationSummary {
+    deleted_symbol_count: u64;
+    deleted_module_count: u64;
+    deleted_module_range_count: u64;
+}
+
+pub machine ProjectSymbolsDeleteMutationSummary::did_delete_anything(project_symbols_delete_mutation_summary: &ProjectSymbolsDeleteMutationSummary) -> bool {
+    (project_symbols_delete_mutation_summary.deleted_symbol_count > 0 || project_symbols_delete_mutation_summary.deleted_module_count > 0 || project_symbols_delete_mutation_summary.deleted_module_range_count > 0)
+}
+
+// Upstream `Result<String /* locator key */, String>` — Created
+// carries the computed locator key bytes; Refused folds all Errs.
+pub data CatalogCreateResult {
+    case Created(locator_key: [u8; 256], locator_key_len: u64);
+    case Refused;
+}
+
+// Upstream `Result<(), String>` — refused folds all Errs.
+pub data CatalogMutationResult {
+    case Succeeded;
+    case Refused;
+}
+
+// ---- create_project_symbol ---------------------------------------------------
+
+// Upstream `build_create_locator`: address wins; else a trimmed
+// non-empty module_name + offset; else refused.
+machine mutation_build_locator(request: &ProjectSymbolsCreateRequest, out_locator: &mut ProjectSymbolLocator) -> bool {
+    transition ProjectSymbolsCreateRequest::has_address(request) {
+        true -> absolute(request, out_locator)
+        false -> module(request, out_locator)
+    }
+    state absolute(request: &ProjectSymbolsCreateRequest, out_locator: &mut ProjectSymbolLocator) -> bool {
+        let address: u64 = ProjectSymbolsCreateRequest::get_address(request);
+        ProjectSymbolLocator::clone_from(out_locator, &ProjectSymbolLocator::new_absolute_address(address));
+        (true)
+    }
+    state module(request: &ProjectSymbolsCreateRequest, out_locator: &mut ProjectSymbolLocator) -> bool {
+        transition ProjectSymbolsCreateRequest::has_module_name(request) && ProjectSymbolsCreateRequest::has_offset(request) {
+            true -> named(request, out_locator)
+            false -> (false)
+        }
+    }
+    state named(request: &ProjectSymbolsCreateRequest, out_locator: &mut ProjectSymbolLocator) -> bool {
+        let mut trimmed_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut trimmed_name);
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let inner3149: &[u8] = ProjectSymbolsCreateRequest::get_module_name(request);
+        _ = ProjectSymbolNameScope::trim_copy(&mut name_scope, inner3149, &mut trimmed_name);
+        transition trimmed_name.len > 0 {
+            true -> offset(request, out_locator, &trimmed_name)
+            false -> (false)
+        }
+    }
+    state offset(request: &ProjectSymbolsCreateRequest, out_locator: &mut ProjectSymbolLocator, trimmed_name: &ManifestPathScratch) -> bool {
+        ProjectSymbolLocator::clone_from(out_locator, &ProjectSymbolLocator::new_module_offset(ManifestPathScratch::get_bytes(&trimmed_name), ProjectSymbolsCreateRequest::get_offset(request)));
+        (true)
+    }
+}
+
+pub machine ProjectSymbolCatalogMutation::create_project_symbol(
+    project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    request: &ProjectSymbolsCreateRequest ) -> CatalogCreateResult {
+    let mut locator: ProjectSymbolLocator = ProjectSymbolLocator::default();
+    let built: bool = mutation_build_locator(request, &mut locator);
+    let mut trimmed_display_name: ManifestPathScratch;
+    ManifestPathScratch::new(&mut trimmed_display_name);
+    let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+    let inner3150: &[u8] = ProjectSymbolsCreateRequest::get_display_name(request);
+    _ = ProjectSymbolNameScope::trim_copy(&mut name_scope, inner3150, &mut trimmed_display_name);
+    let mut trimmed_layout_id: ManifestPathScratch;
+    ManifestPathScratch::new(&mut trimmed_layout_id);
+    let inner3151: &[u8] = ProjectSymbolsCreateRequest::get_struct_layout_id(request);
+    _ = ProjectSymbolNameScope::trim_copy(&mut name_scope, inner3151, &mut trimmed_layout_id);
+    transition built && trimmed_display_name.len > 0 && trimmed_layout_id.len > 0 {
+        true -> deduplicate(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, &locator, &trimmed_display_name, &trimmed_layout_id)
+        false -> (CatalogCreateResult::Refused)
+    }
+    state deduplicate(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsCreateRequest,
+        locator: &ProjectSymbolLocator,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch
+    ) -> CatalogCreateResult {
+        // Upstream `deduplicate_display_name(..., None)` — no ignored key.
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let mut deduped: ManifestPathScratch;
+        ManifestPathScratch::new(&mut deduped);
+        _ = ProjectSymbolNameScope::deduplicate_display_name(&mut name_scope,
+            project_symbol_catalog, locator, ManifestPathScratch::get_bytes(trimmed_display_name), "", false, &mut deduped);
+        let locator_owned: ProjectSymbolLocator = ProjectSymbolLocator::clone(locator);
+        transition locator_owned {
+            ProjectSymbolLocator::ModuleOffset { module_name, module_name_len, offset } -> upsert_module(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, locator, &module_name[0..module_name_len], offset, trimmed_layout_id, &deduped)
+            _ -> claim_address(project_symbol_catalog_mutation, project_symbol_catalog, request, locator, trimmed_layout_id, &deduped)
+        }
+    }
+    state upsert_module(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        locator: &ProjectSymbolLocator,
+        module_name: &[u8],
+        offset: u64,
+        trimmed_layout_id: &ManifestPathScratch,
+        display_name: &ManifestPathScratch
+    ) -> CatalogCreateResult {
+        // Upstream `ProjectSymbolLayoutMutation::upsert_module_field(...)?`
+        // — the module-offset arm; an error refuses the create.
+        let mut layout_mutation: ProjectSymbolLayoutMutation = ProjectSymbolLayoutMutation {};
+        let inner15: &[u8] = ManifestPathScratch::get_bytes(display_name);
+        let inner16: &[u8] = ManifestPathScratch::get_bytes(trimmed_layout_id);
+        let upserted: LayoutMutationResult = ProjectSymbolLayoutMutation::upsert_module_field(&mut layout_mutation, engine_unprivileged_state, project_symbol_catalog, module_name, inner15, offset, inner16);
+        transition upserted {
+            LayoutMutationResult::Succeeded { summary } -> key_of(project_symbol_catalog_mutation, locator)
+            _ -> (CatalogCreateResult::Refused)
+        }
+    }
+    state claim_address(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsCreateRequest,
+        locator: &ProjectSymbolLocator,
+        trimmed_layout_id: &ManifestPathScratch,
+        display_name: &ManifestPathScratch
+    ) -> CatalogCreateResult {
+        // Upstream `ProjectSymbolClaim::new(display_name, locator,
+        // struct_layout_id)` + metadata clone; the create request's
+        // module/address fields are already folded into `locator`.
+        let mut created: ProjectSymbolClaim = ProjectSymbolClaim::new(ManifestPathScratch::get_bytes(display_name), locator, ManifestPathScratch::get_bytes(trimmed_layout_id));
+        transition { _ -> metadata(project_symbol_catalog_mutation, project_symbol_catalog, request, &mut created, 0) }
+    }
+    state metadata(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsCreateRequest,
+        created: &mut ProjectSymbolClaim,
+        entry_position: u64
+    ) -> CatalogCreateResult {
+        let entry_count: u64 = ProjectSymbolsCreateRequest::get_metadata_entry_count(request);
+        transition entry_position < entry_count {
+            true -> add_metadata(project_symbol_catalog_mutation, project_symbol_catalog, request, created, entry_position, entry_count)
+            _ -> push(project_symbol_catalog_mutation, project_symbol_catalog, created)
+        }
+    }
+    state add_metadata(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsCreateRequest,
+        created: &mut ProjectSymbolClaim,
+        entry_position: u64,
+        entry_count: u64
+    ) -> CatalogCreateResult
+        requires entry_position < entry_count && entry_position < 64;
+    {
+        let metadata: &ProjectSymbolClaimMetadataEntry = ProjectSymbolsCreateRequest::get_metadata_entry(request, entry_position);
+        let inner3152: &[u8] = ProjectSymbolClaimMetadataEntry::get_key(metadata);
+        let inner3153: &[u8] = ProjectSymbolClaimMetadataEntry::get_value(metadata);
+        _ = ProjectSymbolClaim::add_metadata(created, inner3152, inner3153);
+        transition {
+            _ -> metadata(project_symbol_catalog_mutation, project_symbol_catalog, request, created, ((entry_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state key_of(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation, locator: &ProjectSymbolLocator) -> CatalogCreateResult {
+        let mut locator_key: [u8; 256];
+        let locator_key_len: u64 = ProjectSymbolLocator::to_locator_key(locator, &mut locator_key);
+        transition locator_key_len <= 256 {
+            true -> (CatalogCreateResult::Created { locator_key: locator_key, locator_key_len: locator_key_len })
+            false -> (CatalogCreateResult::Refused)
+        }
+    }
+    state push(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation, project_symbol_catalog: &mut ProjectSymbolCatalog, created: &mut ProjectSymbolClaim) -> CatalogCreateResult {
+        let added: bool = ProjectSymbolCatalog::add_symbol_claim(project_symbol_catalog, created);
+        transition added {
+            true -> key_out(project_symbol_catalog_mutation, created)
+            false -> (CatalogCreateResult::Refused)
+        }
+    }
+    state key_out(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation, created: &ProjectSymbolClaim) -> CatalogCreateResult {
+        let mut locator_key: [u8; 256];
+        let locator_key_len: u64 = ProjectSymbolClaim::get_symbol_locator_key(created, &mut locator_key);
+        transition locator_key_len <= 256 {
+            true -> (CatalogCreateResult::Created { locator_key: locator_key, locator_key_len: locator_key_len })
+            false -> (CatalogCreateResult::Refused)
+        }
+    }
+}
+
+// ---- update_project_symbol ----------------------------------------------------
+
+// Upstream `update_project_symbol`: trims both optional fields
+// (empty -> absent), finds the claim or the module field by locator
+// key, dedups the display name, and applies; at least one non-empty
+// field is required; an unfindable key refuses.
+pub machine ProjectSymbolCatalogMutation::update_project_symbol(
+    project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    request: &ProjectSymbolsUpdateRequest ) -> CatalogMutationResult {
+    let mut trimmed_display_name: ManifestPathScratch;
+    ManifestPathScratch::new(&mut trimmed_display_name);
+    let has_display: bool = ProjectSymbolsUpdateRequest::has_display_name(request);
+    transition has_display {
+        true -> trim_display(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, &mut trimmed_display_name)
+        false -> trim_type(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, &mut trimmed_display_name)
+    }
+    state trim_display(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &mut ManifestPathScratch
+    ) -> CatalogMutationResult {
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let inner3154: &[u8] = ProjectSymbolsUpdateRequest::get_display_name(request);
+        _ = ProjectSymbolNameScope::trim_copy(&mut name_scope, inner3154, trimmed_display_name);
+        transition {
+            _ -> trim_type(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name)
+        }
+    }
+    state trim_type(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &mut ManifestPathScratch
+    ) -> CatalogMutationResult {
+        let mut trimmed_layout_id: ManifestPathScratch;
+        ManifestPathScratch::new(&mut trimmed_layout_id);
+        let has_layout: bool = ProjectSymbolsUpdateRequest::has_struct_layout_id(request);
+        transition has_layout {
+            true -> trim_layout(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, &mut trimmed_layout_id)
+            false -> gate(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, &trimmed_layout_id, has_layout)
+        }
+    }
+    state trim_layout(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &mut ManifestPathScratch,
+        trimmed_layout_id: &mut ManifestPathScratch
+    ) -> CatalogMutationResult {
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let inner3155: &[u8] = ProjectSymbolsUpdateRequest::get_struct_layout_id(request);
+        _ = ProjectSymbolNameScope::trim_copy(&mut name_scope, inner3155, trimmed_layout_id);
+        transition {
+            _ -> gate(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, true)
+        }
+    }
+    state gate(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool
+    ) -> CatalogMutationResult {
+        // Upstream `Option.map(trim).filter(!empty)` — a present-but-
+        // whitespace field folds to absent on BOTH names.
+        let has_effective_display: bool = trimmed_display_name.len > 0;
+        let has_effective_layout: bool = has_layout_id && trimmed_layout_id.len > 0;
+        transition !has_effective_display && !has_effective_layout {
+            true -> (CatalogMutationResult::Refused)
+            false -> locate(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_effective_display, has_effective_layout)
+        }
+    }
+    state locate(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_display: bool,
+        has_layout_id: bool
+    ) -> CatalogMutationResult {
+        let inner17: &[u8] = ProjectSymbolsUpdateRequest::get_symbol_locator_key(request);
+        let claim_position: u64 = ProjectSymbolCatalog::find_symbol_claim_position(project_symbol_catalog, inner17);
+        let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+        transition claim_position < claim_count && claim_position < 128 {
+            true -> claim(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_display, has_layout_id, claim_position, claim_count)
+            false -> module(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_display, has_layout_id)
+        }
+    }
+    state claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_display: bool,
+        has_layout_id: bool,
+        claim_position: u64,
+        claim_count: u64
+    ) -> CatalogMutationResult
+        requires claim_position < claim_count && claim_position < 128
+    {
+        // Dedup only runs when a display name was actually provided.
+        transition has_display {
+            true -> dedup_claim(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_layout_id, claim_position, claim_count)
+            false -> apply_claim(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_layout_id, has_display, has_layout_id, claim_position, claim_count, trimmed_display_name)
+        }
+    }
+    state dedup_claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        claim_position: u64,
+        claim_count: u64
+    ) -> CatalogMutationResult
+        requires claim_position < claim_count && claim_position < 128
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let claim_locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let locator: ProjectSymbolLocator = ProjectSymbolLocator::clone(claim_locator);
+        let mut deduped: ManifestPathScratch;
+        ManifestPathScratch::new(&mut deduped);
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        _ = ProjectSymbolNameScope::deduplicate_display_name(&mut name_scope,
+            project_symbol_catalog, &locator, ManifestPathScratch::get_bytes(trimmed_display_name), ProjectSymbolsUpdateRequest::get_symbol_locator_key(request), true, &mut deduped);
+        transition {
+            _ -> apply_claim(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_layout_id, true, has_layout_id, claim_position, claim_count, deduped)
+        }
+    }
+    state apply_claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_display: bool,
+        has_layout_id: bool,
+        claim_position: u64,
+        claim_count: u64,
+        display_name: &ManifestPathScratch
+    ) -> CatalogMutationResult
+        requires claim_position < claim_count && claim_position < 128
+    {
+        let claim: &mut ProjectSymbolClaim = ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog, claim_position);
+        transition has_display {
+            true -> name_claim(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, trimmed_layout_id, has_layout_id, claim_position, display_name)
+            false -> type_claim(project_symbol_catalog_mutation, project_symbol_catalog, trimmed_layout_id, has_layout_id, claim_position)
+        }
+    }
+    state name_claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        claim_position: u64,
+        display_name: &ManifestPathScratch
+    ) -> CatalogMutationResult
+        requires claim_position < project_symbol_catalog.symbol_claim_count && claim_position < 128
+    {
+        let claim: &mut ProjectSymbolClaim = ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog, claim_position);
+        ProjectSymbolClaim::set_display_name(claim, ManifestPathScratch::get_bytes(&display_name));
+        transition {
+            _ -> type_claim(project_symbol_catalog_mutation, project_symbol_catalog, trimmed_layout_id, has_layout_id, claim_position)
+        }
+    }
+    state type_claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        claim_position: u64
+    ) -> CatalogMutationResult
+        requires claim_position < project_symbol_catalog.symbol_claim_count && claim_position < 128
+    {
+        transition has_layout_id {
+            true -> set_type_claim(project_symbol_catalog_mutation, project_symbol_catalog, trimmed_layout_id, claim_position)
+            false -> (CatalogMutationResult::Succeeded)
+        }
+    }
+    state set_type_claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        trimmed_layout_id: &ManifestPathScratch,
+        claim_position: u64
+    ) -> CatalogMutationResult
+        requires claim_position < project_symbol_catalog.symbol_claim_count && claim_position < 128
+    {
+        let claim: &mut ProjectSymbolClaim = ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog, claim_position);
+        ProjectSymbolClaim::set_struct_layout_id(claim, ManifestPathScratch::get_bytes(trimmed_layout_id));
+        (CatalogMutationResult::Succeeded)
+    }
+    state module(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_display: bool,
+        has_layout_id: bool
+    ) -> CatalogMutationResult {
+        let locator_key: &[u8] = ProjectSymbolsUpdateRequest::get_symbol_locator_key(request);
+        let matched: ProjectModuleFieldMatch = ProjectSymbolCatalog::find_module_field(project_symbol_catalog, locator_key);
+        transition matched.found {
+            true -> module_dedup(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_display, has_layout_id, matched)
+            false -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_dedup(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_display: bool,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch
+    ) -> CatalogMutationResult {
+        // Upstream: display falls back to the field's current name,
+        // layout to the field's current id; dedup always runs on the
+        // resolved display name against a fresh module-offset locator.
+        let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+        transition matched.module_position < module_count && matched.module_position < 64 {
+            true -> module_fields(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_display, has_layout_id, matched, module_count)
+            false -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_fields(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_display: bool,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch,
+        module_count: u64
+    ) -> CatalogMutationResult
+        requires matched.module_position < module_count && matched.module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, matched.module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition matched.field_position < field_count && matched.field_position < 64 {
+            true -> module_apply(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_display, has_layout_id, matched, module_count, field_count)
+            false -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_apply(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_display: bool,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch,
+        module_count: u64,
+        field_count: u64
+    ) -> CatalogMutationResult
+        requires matched.module_position < module_count && matched.module_position < 64 && matched.field_position < field_count && matched.field_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, matched.module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, matched.field_position);
+        let module_name: &[u8] = ProjectSymbolModule::get_module_name(module);
+        let offset: u64 = ProjectSymbolModuleField::get_offset(field);
+        let locator: ProjectSymbolLocator = ProjectSymbolLocator::new_module_offset(module_name, offset);
+        transition has_display {
+            true -> module_display(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_display_name, trimmed_layout_id, has_layout_id, matched, module_name, offset, &locator)
+            false -> module_fallback(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_layout_id, has_layout_id, matched, module_name, offset, &locator)
+        }
+    }
+    state module_display(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_display_name: &ManifestPathScratch,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        locator: &ProjectSymbolLocator
+    ) -> CatalogMutationResult {
+        let mut deduped: ManifestPathScratch;
+        ManifestPathScratch::new(&mut deduped);
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        _ = ProjectSymbolNameScope::deduplicate_display_name(&mut name_scope,
+            project_symbol_catalog, locator, ManifestPathScratch::get_bytes(trimmed_display_name), ProjectSymbolsUpdateRequest::get_symbol_locator_key(request), true, &mut deduped);
+        transition {
+            _ -> module_type(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_layout_id, has_layout_id, matched, module_name, offset, &deduped)
+        }
+    }
+    state module_fallback(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        locator: &ProjectSymbolLocator
+    ) -> CatalogMutationResult {
+        // Upstream `unwrap_or_else(field.display_name)` then dedup.
+        let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+        transition matched.module_position < module_count && matched.module_position < 64 {
+            true -> module_fallback_fields(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_layout_id, has_layout_id, matched, module_name, offset, locator, module_count)
+            false -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_fallback_fields(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        locator: &ProjectSymbolLocator,
+        module_count: u64
+    ) -> CatalogMutationResult
+        requires matched.module_position < module_count && matched.module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, matched.module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition matched.field_position < field_count && matched.field_position < 64 {
+            true -> module_fallback_dedup(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_layout_id, has_layout_id, matched, module_name, offset, locator, module_count, field_count)
+            false -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_fallback_dedup(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        locator: &ProjectSymbolLocator,
+        module_count: u64,
+        field_count: u64
+    ) -> CatalogMutationResult
+        requires matched.module_position < module_count && matched.module_position < 64 && matched.field_position < field_count && matched.field_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, matched.module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, matched.field_position);
+        let mut deduped: ManifestPathScratch;
+        ManifestPathScratch::new(&mut deduped);
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        _ = ProjectSymbolNameScope::deduplicate_display_name(&mut name_scope,
+            project_symbol_catalog, locator, ProjectSymbolModuleField::get_display_name(field), ProjectSymbolsUpdateRequest::get_symbol_locator_key(request), true, &mut deduped);
+        transition {
+            _ -> module_type(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, trimmed_layout_id, has_layout_id, matched, module_name, offset, &deduped)
+        }
+    }
+    state module_type(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        trimmed_layout_id: &ManifestPathScratch,
+        has_layout_id: bool,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        display_name: &ManifestPathScratch
+    ) -> CatalogMutationResult {
+        // Upstream `unwrap_or_else(field.struct_layout_id)` fallback.
+        transition has_layout_id {
+            true -> module_upsert(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, trimmed_layout_id, matched, module_name, offset, display_name)
+            false -> module_fallback_type(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, request, matched, module_name, offset, display_name)
+        }
+    }
+    state module_fallback_type(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsUpdateRequest,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        display_name: &ManifestPathScratch
+    ) -> CatalogMutationResult {
+        let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+        transition matched.module_position < module_count && matched.module_position < 64 {
+            true -> module_fallback_type_fields(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, matched, module_name, offset, display_name, module_count)
+            false -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_fallback_type_fields(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        display_name: &ManifestPathScratch,
+        module_count: u64
+    ) -> CatalogMutationResult
+        requires matched.module_position < module_count && matched.module_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, matched.module_position);
+        let field_count: u64 = ProjectSymbolModule::get_field_count(module);
+        transition matched.field_position < field_count && matched.field_position < 64 {
+            true -> module_fallback_type_apply(project_symbol_catalog_mutation, engine_unprivileged_state, project_symbol_catalog, matched, module_name, offset, display_name, module_count, field_count)
+            false -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_fallback_type_apply(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        display_name: &ManifestPathScratch,
+        module_count: u64,
+        field_count: u64
+    ) -> CatalogMutationResult
+        requires matched.module_position < module_count && matched.module_position < 64 && matched.field_position < field_count && matched.field_position < 64
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, matched.module_position);
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, matched.field_position);
+        let mut layout_mutation: ProjectSymbolLayoutMutation = ProjectSymbolLayoutMutation {};
+        let result: LayoutMutationResult = ProjectSymbolLayoutMutation::upsert_module_field(
+            &mut layout_mutation, engine_unprivileged_state, project_symbol_catalog, module_name, ManifestPathScratch::get_bytes(display_name), offset, ProjectSymbolModuleField::get_struct_layout_id(field));
+        transition result {
+            LayoutMutationResult::Succeeded { summary } -> (CatalogMutationResult::Succeeded)
+            _ -> (CatalogMutationResult::Refused)
+        }
+    }
+    state module_upsert(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        trimmed_layout_id: &ManifestPathScratch,
+        matched: ProjectModuleFieldMatch,
+        module_name: &[u8],
+        offset: u64,
+        display_name: &ManifestPathScratch
+    ) -> CatalogMutationResult {
+        let mut layout_mutation: ProjectSymbolLayoutMutation = ProjectSymbolLayoutMutation {};
+        let result: LayoutMutationResult = ProjectSymbolLayoutMutation::upsert_module_field(
+            &mut layout_mutation, engine_unprivileged_state, project_symbol_catalog, module_name, ManifestPathScratch::get_bytes(display_name), offset, ManifestPathScratch::get_bytes(trimmed_layout_id));
+        transition result {
+            LayoutMutationResult::Succeeded { summary } -> (CatalogMutationResult::Succeeded)
+            _ -> (CatalogMutationResult::Refused)
+        }
+    }
+}
+
+// ---- delete_project_symbols ----------------------------------------------------
+
+// Bounded normalized request sets (upstream HashSet<String> of
+// trimmed non-empty entries).
+
+machine mutation_collect_nonempty(source: &ProjectStringList, out: &mut ProjectStringList) {
+    let string_count: u64 = ProjectStringList::get_string_count(source);
+    transition {
+        _ -> scan(source, out, string_count, 0)
+    }
+    state scan(source: &ProjectStringList, out: &mut ProjectStringList, string_count: u64, position: u64) {
+        transition position < string_count && position < 64 {
+            true -> element(source, out, string_count, position)
+            _ -> done()
+        }
+    }
+    state element(source: &ProjectStringList, out: &mut ProjectStringList, string_count: u64, position: u64)
+        requires position < string_count && position < 64;
+    {
+        let mut trimmed: ManifestPathScratch;
+        ManifestPathScratch::new(&mut trimmed);
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let inner3156: &[u8] = ProjectStringList::get_string(source, position);
+        _ = ProjectSymbolNameScope::trim_copy(&mut name_scope, inner3156, &mut trimmed);
+        transition trimmed.len > 0 {
+            true -> store(source, out, string_count, position, &trimmed)
+            _ -> scan(source, out, string_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store(source: &ProjectStringList, out: &mut ProjectStringList, string_count: u64, position: u64, trimmed: &ManifestPathScratch)
+        requires position < string_count && position < 64;
+    {
+        let inner3157: &[u8] = ManifestPathScratch::get_bytes(trimmed);
+        _ = ProjectStringList::add_string(out, inner3157);
+        transition {
+            _ -> scan(source, out, string_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state done() { }
+}
+
+// Upstream `normalize_delete_module_range` into the sorted table.
+machine mutation_collect_ranges(request: &ProjectSymbolsDeleteRequest, out: &mut MutationRangeList) {
+    let range_count: u64 = ProjectSymbolsDeleteRequest::get_module_range_count(request);
+    transition {
+        _ -> scan(request, out, range_count, 0)
+    }
+    state scan(request: &ProjectSymbolsDeleteRequest, out: &mut MutationRangeList, range_count: u64, position: u64) {
+        transition position < range_count && position < 64 {
+            true -> element(request, out, range_count, position)
+            _ -> done()
+        }
+    }
+    state element(request: &ProjectSymbolsDeleteRequest, out: &mut MutationRangeList, range_count: u64, position: u64)
+        requires position < range_count && position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = ProjectSymbolsDeleteRequest::get_module_range(request, position);
+        let mut trimmed: ManifestPathScratch;
+        ManifestPathScratch::new(&mut trimmed);
+        let mut name_scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let inner3158: &[u8] = ProjectSymbolsDeleteModuleRange::get_module_name(range);
+        _ = ProjectSymbolNameScope::trim_copy(&mut name_scope, inner3158, &mut trimmed);
+        transition trimmed.len > 0 && ProjectSymbolsDeleteModuleRange::get_length(range) > 0 {
+            true -> store(request, out, range_count, position, &trimmed)
+            _ -> scan(request, out, range_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store(request: &ProjectSymbolsDeleteRequest, out: &mut MutationRangeList, range_count: u64, position: u64, trimmed: &ManifestPathScratch)
+        requires position < range_count && position < 64;
+    {
+        let range: &ProjectSymbolsDeleteModuleRange = ProjectSymbolsDeleteRequest::get_module_range(request, position);
+        let normalized: ProjectSymbolsDeleteModuleRange = ProjectSymbolsDeleteModuleRange::new(
+            ManifestPathScratch::get_bytes(trimmed), ProjectSymbolsDeleteModuleRange::get_offset(range), ProjectSymbolsDeleteModuleRange::get_length(range), ProjectSymbolsDeleteModuleRange::get_mode(range));
+        _ = MutationRangeList::insert_sorted(out, &normalized);
+        transition {
+            _ -> scan(request, out, range_count, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state done() { }
+}
+
+pub machine ProjectSymbolCatalogMutation::delete_project_symbols(
+    project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+    project_symbol_catalog: &mut ProjectSymbolCatalog,
+    request: &ProjectSymbolsDeleteRequest ) -> ProjectSymbolsDeleteMutationSummary {
+    let mut locator_keys: ProjectStringList = ProjectStringList::empty();
+    let mut module_names: ProjectStringList = ProjectStringList::empty();
+    let mut ranges: MutationRangeList = MutationRangeList::new();
+    mutation_collect_nonempty(ProjectSymbolsDeleteRequest::get_symbol_locator_keys(request), &mut locator_keys);
+    mutation_collect_nonempty(ProjectSymbolsDeleteRequest::get_module_names(request), &mut module_names);
+    mutation_collect_ranges(request, &mut ranges);
+    let mut deleted_module_names: ProjectStringList = ProjectStringList::empty();
+    transition {
+        _ -> modules(project_symbol_catalog_mutation, project_symbol_catalog, request, &locator_keys, &module_names, &ranges, &mut deleted_module_names, 0, 0)
+    }
+    // Delete every existing module whose name is in the requested set;
+    // the names of modules actually deleted feed the root-layout purge
+    // (upstream `deleted_module_names`).
+    state modules(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsDeleteRequest,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        ranges: &MutationRangeList,
+        deleted_module_names: &mut ProjectStringList,
+        module_position: u64,
+        deleted_module_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary {
+        let module_count: u64 = ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+        transition module_position < module_count && module_position < 64 {
+            true -> module(project_symbol_catalog_mutation, project_symbol_catalog, request, locator_keys, module_names, ranges, deleted_module_names, module_position, module_count, deleted_module_count)
+            _ -> layouts(project_symbol_catalog_mutation, project_symbol_catalog, request, locator_keys, module_names, ranges, deleted_module_names, deleted_module_count)
+        }
+    }
+    state module(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsDeleteRequest,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        ranges: &MutationRangeList,
+        deleted_module_names: &mut ProjectStringList,
+        module_position: u64,
+        module_count: u64,
+        deleted_module_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary
+        requires module_position < module_count && module_position < 64;
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let module_name: &[u8] = ProjectSymbolModule::get_module_name(module);
+        transition layout_string_list_contains(module_names, module_name) {
+            true -> drop_module(project_symbol_catalog_mutation, project_symbol_catalog, request, locator_keys, module_names, ranges, deleted_module_names, module_position, module_count, deleted_module_count)
+            _ -> modules(project_symbol_catalog_mutation, project_symbol_catalog, request, locator_keys, module_names, ranges, deleted_module_names, ((module_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_module_count)
+        }
+    }
+    state drop_module(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsDeleteRequest,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        ranges: &MutationRangeList,
+        deleted_module_names: &mut ProjectStringList,
+        module_position: u64,
+        module_count: u64,
+        deleted_module_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary
+        requires module_position < module_count && module_position < 64;
+    {
+        // Upstream `retain` — a removal shifts the next module into the
+        // same slot, so the scan position stays put. The name is
+        // collected before removal for the root-layout purge.
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        let inner3159: &[u8] = ProjectSymbolModule::get_module_name(module);
+        _ = ProjectStringList::add_string(deleted_module_names, inner3159);
+        _ = ProjectSymbolCatalog::remove_symbol_module_at(project_symbol_catalog, module_position);
+        transition {
+            _ -> modules(project_symbol_catalog_mutation, project_symbol_catalog, request, locator_keys, module_names, ranges, deleted_module_names, module_position, ((deleted_module_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state layouts(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsDeleteRequest,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        ranges: &MutationRangeList,
+        deleted_module_names: &mut ProjectStringList,
+        deleted_module_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary {
+        _ = ProjectSymbolCatalog::delete_module_root_struct_layouts(project_symbol_catalog, deleted_module_names);
+        let mut layout_mutation: ProjectSymbolLayoutMutation = ProjectSymbolLayoutMutation {};
+        let field_summary: ProjectSymbolLayoutMutationSummary = ProjectSymbolLayoutMutation::delete_module_fields_by_locator_key(
+            &mut layout_mutation, project_symbol_catalog, locator_keys);
+        transition {
+            _ -> ranges_apply(project_symbol_catalog_mutation, project_symbol_catalog, request, locator_keys, module_names, ranges, deleted_module_count, field_summary.deleted_module_field_count)
+        }
+    }
+    state ranges_apply(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        request: &ProjectSymbolsDeleteRequest,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        ranges: &MutationRangeList,
+        deleted_module_count: u64,
+        deleted_field_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary {
+        let mut layout_mutation: ProjectSymbolLayoutMutation = ProjectSymbolLayoutMutation {};
+        let range_summary: ProjectSymbolLayoutMutationSummary = ProjectSymbolLayoutMutation::delete_module_ranges(
+            &mut layout_mutation, project_symbol_catalog, ranges, module_names);
+        transition {
+            _ -> claims(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, range_summary.deleted_module_range_count, 0, 0)
+        }
+    }
+    state claims(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        deleted_module_count: u64,
+        deleted_field_count: u64,
+        deleted_range_count: u64,
+        claim_position: u64,
+        deleted_symbol_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary {
+        let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+        transition claim_position < claim_count && claim_position < 128 {
+            true -> claim(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, claim_position, claim_count, deleted_symbol_count)
+            false -> (ProjectSymbolsDeleteMutationSummary { deleted_symbol_count: ((deleted_symbol_count as u64 in Wrapping) + (deleted_field_count as u64 in Wrapping)) as u64, deleted_module_count: deleted_module_count, deleted_module_range_count: deleted_range_count })
+        }
+    }
+    state claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        deleted_module_count: u64,
+        deleted_field_count: u64,
+        deleted_range_count: u64,
+        claim_position: u64,
+        claim_count: u64,
+        deleted_symbol_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary
+        requires claim_position < claim_count && claim_position < 128
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let mut claim_key: [u8; 256];
+        let claim_key_len: u64 = ProjectSymbolClaim::get_symbol_locator_key(claim, &mut claim_key);
+        transition claim_key_len <= 256 {
+            true -> key_check(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, claim_position, deleted_symbol_count, &claim_key, claim_key_len)
+            false -> claims(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, ((claim_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_symbol_count)
+        }
+    }
+    state key_check(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        deleted_module_count: u64,
+        deleted_field_count: u64,
+        deleted_range_count: u64,
+        claim_position: u64,
+        deleted_symbol_count: u64,
+        claim_key: &[u8; 256],
+        claim_key_len: u64
+    ) -> ProjectSymbolsDeleteMutationSummary
+        requires claim_key_len <= 256
+    {
+        let listed: bool = layout_string_list_contains(locator_keys, &claim_key[0..claim_key_len]);
+        transition listed {
+            true -> drop_claim(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, claim_position, deleted_symbol_count)
+            false -> module_check(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, claim_position, deleted_symbol_count)
+        }
+    }
+    state module_check(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        deleted_module_count: u64,
+        deleted_field_count: u64,
+        deleted_range_count: u64,
+        claim_position: u64,
+        deleted_symbol_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary {
+        let claim_count: u64 = ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog);
+        transition claim_position < claim_count && claim_position < 128 {
+            true -> module_locator(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, claim_position, claim_count, deleted_symbol_count)
+            false -> claims(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, ((claim_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_symbol_count)
+        }
+    }
+    state module_locator(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        deleted_module_count: u64,
+        deleted_field_count: u64,
+        deleted_range_count: u64,
+        claim_position: u64,
+        claim_count: u64,
+        deleted_symbol_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary
+        requires claim_position < claim_count && claim_position < 128
+    {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let in_module: bool = ProjectSymbolLocator::is_module_offset(locator)
+            && layout_string_list_contains(module_names, ProjectSymbolLocator::get_focus_module_name(locator));
+        transition in_module {
+            true -> drop_claim(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, claim_position, deleted_symbol_count)
+            false -> claims(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, ((claim_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_symbol_count)
+        }
+    }
+    state drop_claim(project_symbol_catalog_mutation: &mut ProjectSymbolCatalogMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        locator_keys: &ProjectStringList,
+        module_names: &ProjectStringList,
+        deleted_module_count: u64,
+        deleted_field_count: u64,
+        deleted_range_count: u64,
+        claim_position: u64,
+        deleted_symbol_count: u64
+    ) -> ProjectSymbolsDeleteMutationSummary {
+        // Removal shifts the next claim into the same slot — the scan
+        // position stays put after a drop.
+        _ = ProjectSymbolCatalog::remove_symbol_claim_at(project_symbol_catalog, claim_position);
+        transition {
+            _ -> claims(project_symbol_catalog_mutation, project_symbol_catalog, locator_keys, module_names, deleted_module_count, deleted_field_count, deleted_range_count, claim_position, ((deleted_symbol_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}

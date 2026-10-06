@@ -1,0 +1,98 @@
+module src::command_executors::project_items_list_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::list::project_items_list_request::ProjectItemsListRequest;
+use squalr_engine_api::src::commands::project_items::list::project_items_list_response::ProjectItemsListResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project::ProjectItemLookup;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_preview::ProjectItemPreview;
+
+// Port of command_executors/project_items/list/
+// project_items_list_request_executor.rs — refresh display values, then
+// fill the response (info + root item + all pairs). Upstream clones the
+// items into a Vec and refreshes the COPY; the port service refreshes the
+// opened project's display-value fields in place (they are display-only)
+// and the response clones the table after — same wire bytes, documented
+// deviation.
+pub data ProjectItemsListRequestExecutor {}
+
+pub machine ProjectItemsListRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_list_request: &ProjectItemsListRequest
+) -> ProjectItemsListResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+    transition ProjectManager::get_has_opened_project(project_manager) {
+        true -> refresh(engine_unprivileged_state, engine_bindings, project_items_list_request)
+        _ -> (ProjectItemsListResponse::default())
+    }
+
+    state refresh(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_list_request: &ProjectItemsListRequest) -> ProjectItemsListResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let catalog: &squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog = Project::get_project_symbol_catalog(opened_project);
+        let has_paths: bool = ProjectItemsListRequest::has_preview_project_item_paths(project_items_list_request);
+        let paths: &squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList = ProjectItemsListRequest::get_preview_project_item_paths(project_items_list_request);
+        ProjectItemPreview::refresh_project_item_display_values(engine_unprivileged_state, engine_bindings, catalog, opened_project, has_paths, paths);
+        transition { _ -> fill_info(engine_unprivileged_state) }
+    }
+
+    state fill_info(engine_unprivileged_state: &mut EngineUnprivilegedState) -> ProjectItemsListResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let mut response: ProjectItemsListResponse = ProjectItemsListResponse::new();
+        ProjectItemsListResponse::set_opened_project_info(&mut response, ProjectInfo::clone(Project::get_project_info(opened_project)));
+        transition { _ -> fill_root(engine_unprivileged_state, response) }
+    }
+
+    // Upstream `opened_project.get_project_root().cloned()` — the pair
+    // lookup resolves the root ref to its item.
+    state fill_root(engine_unprivileged_state: &mut EngineUnprivilegedState, mut response: ProjectItemsListResponse) -> ProjectItemsListResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let lookup: ProjectItemLookup = Project::get_project_root(opened_project);
+        transition lookup {
+            ProjectItemLookup::Found { index } -> set_root(engine_unprivileged_state, response, index)
+            _ -> fill_items(engine_unprivileged_state, response, 0)
+        }
+    }
+    state set_root(engine_unprivileged_state: &mut EngineUnprivilegedState, mut response: ProjectItemsListResponse, index: u64) -> ProjectItemsListResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, index);
+        let item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        ProjectItemsListResponse::set_opened_project_root(&mut response, ProjectItem::clone(item));
+        transition { _ -> fill_items(engine_unprivileged_state, response, 0) }
+    }
+
+    state fill_items(engine_unprivileged_state: &mut EngineUnprivilegedState, mut response: ProjectItemsListResponse, position: u64) -> ProjectItemsListResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        transition position < Project::get_project_items_len(opened_project) {
+            true -> fill_one(engine_unprivileged_state, response, position)
+            _ -> (response)
+        }
+    }
+    state fill_one(engine_unprivileged_state: &mut EngineUnprivilegedState, mut response: ProjectItemsListResponse, position: u64) -> ProjectItemsListResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, position);
+        let inner3042: ProjectItemPair = ProjectItemPair::clone(pair);
+        _ = ProjectItemsListResponse::add_opened_project_item(&mut response, inner3042);
+        transition { _ -> fill_items(engine_unprivileged_state, response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}

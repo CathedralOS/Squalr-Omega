@@ -1,0 +1,251 @@
+module src::command_executors::project_list_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project::list::project_list_request::ProjectListRequest;
+use squalr_engine_api::src::commands::project::list::project_list_response::ProjectListResponse;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileTreeWalk;
+use squalr_engine_projects::src::project::serialization::project_info_serialization;
+use squalr_engine_projects::src::project::serialization::project_info_serialization::ProjectInfoLoad;
+use squalr_engine_projects::src::settings::project_settings_config::ProjectSettingsConfig;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+// Port of command_executors/project/list/project_list_request_executor.rs —
+// read projects_root, walk its entries, probe each entry for
+// `entry/project.json`, and load ProjectInfo for each project found.
+// Upstream's `Path::exists`/`read_dir`/`is_dir`/`exists` chain respells
+// onto dirfd ops: the `<entry>/project.json` probe subsumes is_dir (a
+// non-directory entry cannot contain it) — same acceptance set.
+pub data ProjectListRequestExecutor {}
+
+pub machine ProjectListRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_list_request: &ProjectListRequest
+) -> ProjectListResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut response: ProjectListResponse = ProjectListResponse::new();
+    _ = EngineUnprivilegedState::get_or_init_project_settings_config(engine_unprivileged_state);
+        let settings_config: &ProjectSettingsConfig = EngineUnprivilegedState::get_project_settings_config(engine_unprivileged_state);
+        let projects_root: &[u8] = ProjectSettingsConfig::get_projects_root(settings_config);
+    let mut chosen: [u8; 512];
+    let chosen_len: u64 = FileSystemUtils::join_path(projects_root, "", &mut chosen);
+    transition chosen_len > 0 && chosen_len <= 512 {
+        true -> open_root(engine_unprivileged_state, chosen, chosen_len, response)
+        _ -> (response)
+    }
+
+    state open_root(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse) -> ProjectListResponse
+        requires chosen_len <= 512;
+    {
+        transition FileSystemUtils::path_exists(&chosen[0..chosen_len]) {
+            true -> open(engine_unprivileged_state, chosen, chosen_len, response)
+            _ -> (response)
+        }
+    }
+
+    state open(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse) -> ProjectListResponse
+        requires chosen_len <= 512;
+    {
+        let root_fd: i32 = FileSystemUtils::open_path(&chosen[0..chosen_len], 0);
+        transition root_fd >= 0 {
+            true -> read(engine_unprivileged_state, root_fd, chosen, chosen_len, response)
+            _ -> (response)
+        }
+    }
+
+    // The getdents64 cursor paginates through dir_position; each fill
+    // scans its records then refills until the drain returns <= 0.
+    state read(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse) -> ProjectListResponse
+        requires chosen_len <= 512;
+    {
+        let mut walk: FileTreeWalk = FileTreeWalk::default();
+        transition { _ -> refill(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk) }
+    }
+
+    state refill(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk) -> ProjectListResponse
+        requires chosen_len <= 512;
+    {
+        let got: i64 = FilesystemHost::read_dir(root_fd, &mut walk.dir_buf, 512, &mut walk.dir_position);
+        transition got > 0 {
+            true -> entry(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, got, 0)
+            _ -> done(root_fd, response)
+        }
+    }
+
+    state entry(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64) -> ProjectListResponse
+        requires chosen_len <= 512;
+    {
+        transition off < 508 && off <= 494 && (off as i64) < total {
+            true -> read_entry(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off)
+            _ -> refill(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk)
+        }
+    }
+
+    state read_entry(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && off <= 494;
+    {
+        let lo_index: u64 = ((off as u64 in Wrapping) + (16 as u64 in Wrapping)) as u64;
+        let hi_index: u64 = ((off as u64 in Wrapping) + (17 as u64 in Wrapping)) as u64;
+        transition lo_index < 512 && hi_index < 512 {
+            true -> reclen(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, lo_index, hi_index)
+            _ -> refill(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk)
+        }
+    }
+
+    state reclen(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, lo_index: u64, hi_index: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && off <= 494 && lo_index < 512 && hi_index < 512;
+    {
+        let reclen_lo: u64 = walk.dir_buf[lo_index] as u64;
+        let reclen_hi: u64 = walk.dir_buf[hi_index] as u64;
+        let reclen_hi_scaled: u64 = ((reclen_hi as u64 in Wrapping) * (256 as u64 in Wrapping)) as u64;
+        let reclen: u64 = ((reclen_lo as u64 in Wrapping) + (reclen_hi_scaled as u64 in Wrapping)) as u64;
+        transition reclen >= 19 && reclen <= 512 && ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64 <= 512 {
+            true -> name_len_of(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen)
+            _ -> refill(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk)
+        }
+    }
+
+    state name_len_of(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen >= 19 && reclen <= 512;
+    {
+        let name_len: u64 = ((reclen as u64 in Wrapping) - (19 as u64 in Wrapping)) as u64;
+        transition name_len <= 256 && name_len >= 1 {
+            true -> name_start(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len)
+            _ -> refill(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk)
+        }
+    }
+
+    state name_start(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256 && name_len >= 1;
+    {
+        let name_index: u64 = ((off as u64 in Wrapping) + (19 as u64 in Wrapping)) as u64;
+        transition name_index < 512 {
+            true -> copy_name(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len, name_index, 0)
+            _ -> refill(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk)
+        }
+    }
+
+    state copy_name(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64, name_index: u64, name_position: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256 && name_index < 512;
+    {
+        transition name_position < name_len && (((name_index as u64 in Wrapping) + (name_position as u64 in Wrapping)) as u64 )< 512 {
+            true -> name_dot(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len, name_index, name_position)
+            _ -> probe_entry(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len)
+        }
+    }
+
+    // "." and ".." skip; any other entry name gets a project.json probe.
+    state name_dot(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64, name_index: u64, name_position: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256 && name_index < 512 && name_position < name_len;
+    {
+        let probe_index: u64 = ((name_index as u64 in Wrapping) + (name_position as u64 in Wrapping)) as u64;
+        transition probe_index < 512 {
+            true -> name_byte(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len, name_index, name_position, probe_index)
+            _ -> refill(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk)
+        }
+    }
+
+    state name_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64, name_index: u64, name_position: u64, probe_index: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256 && name_index < 512 && name_position < name_len && name_position < 256 && probe_index < 512;
+    {
+        walk.entry_name[name_position] = walk.dir_buf[probe_index];
+        transition { _ -> copy_name(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len, name_index, ((name_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state probe_entry(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256;
+    {
+        // Skip "." / ".." — one-byte "." or two-byte "..".
+        transition name_len == 1 || name_len == 2 {
+            true -> dot_check(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len)
+            _ -> project_probe(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len)
+        }
+    }
+
+    state dot_check(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256 && name_len >= 1;
+    {
+        let first: u8 = walk.entry_name[0];
+        transition first == 46 {
+            true -> next(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen)
+            _ -> project_probe(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len)
+        }
+    }
+
+    // Upstream `entry_path.join(PROJECT_FILE).exists()` — probe
+    // `<entry>/project.json` dirfd-relative under the root.
+    state project_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256;
+    {
+        let mut joined: [u8; 512];
+        let joined_len: u64 = FileSystemUtils::join_path(&chosen[0..chosen_len], &walk.entry_name[0..name_len], &mut joined);
+        let mut item_file: [u8; 512];
+        let item_len: u64 = FileSystemUtils::join_path(&walk.entry_name[0..name_len], "project.json", &mut item_file);
+        transition joined_len > 0 && item_len > 0 {
+            true -> open_entry(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len, joined, joined_len, item_file, item_len)
+            _ -> next(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen)
+        }
+    }
+
+    state open_entry(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64, joined: [u8; 512], joined_len: u64, item_file: [u8; 512], item_len: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256 && joined_len <= 512 && item_len <= 512;
+    {
+        // openat against the ROOT dirfd with the multi-component name
+        // "<entry>/project.json" — proves the project file's presence.
+        let probe_fd: i32 = FilesystemHost::open_at(root_fd, &item_file[0..item_len], 0);
+        transition probe_fd >= 0 {
+            true -> load_info(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, name_len, joined, joined_len)
+            _ -> next(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen)
+        }
+    }
+
+    state load_info(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, name_len: u64, joined: [u8; 512], joined_len: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && name_len <= 256 && joined_len <= 512;
+    {
+        let entry_fd: i32 = FilesystemHost::open_at(root_fd, &walk.entry_name[0..name_len], 0);
+        transition entry_fd >= 0 {
+            true -> decode_info(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, entry_fd, joined, joined_len)
+            _ -> next(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen)
+        }
+    }
+
+    state decode_info(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, entry_fd: i32, joined: [u8; 512], joined_len: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512 && joined_len <= 512;
+    {
+        let loaded: ProjectInfoLoad = ProjectInfo::load_at(entry_fd, &joined[0..joined_len]);
+        _ = FilesystemHost::close(entry_fd);
+        transition loaded {
+            ProjectInfoLoad::Loaded { project_info } -> push(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen, project_info)
+            _ -> next(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen)
+        }
+    }
+
+    state push(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64, project_info: ProjectInfo) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512;
+    {
+        _ = ProjectListResponse::add_project_info(&mut response, project_info);
+        transition { _ -> next(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, off, reclen) }
+    }
+
+    state next(engine_unprivileged_state: &mut EngineUnprivilegedState, root_fd: i32, chosen: [u8; 512], chosen_len: u64, mut response: ProjectListResponse, mut walk: FileTreeWalk, total: i64, off: u64, reclen: u64) -> ProjectListResponse
+        requires chosen_len <= 512 && off < 512 && reclen <= 512;
+    {
+        let next_off: u64 = ((off as u64 in Wrapping) + (reclen as u64 in Wrapping)) as u64;
+        transition { _ -> entry(engine_unprivileged_state, root_fd, chosen, chosen_len, response, walk, total, next_off) }
+    }
+
+    state done(root_fd: i32, mut response: ProjectListResponse) -> ProjectListResponse {
+        _ = FilesystemHost::close(root_fd);
+        (response)
+    }
+}

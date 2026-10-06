@@ -8,9 +8,14 @@ use squalr_engine_api::src::commands::command_invocation::EngineCommand;
 use squalr_engine_api::src::commands::command_invocation::EngineCommandResponse;
 use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
 use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::commands::unprivileged_command::UnprivilegedCommand;
+use squalr_engine_api::src::commands::unprivileged_command_response::UnprivilegedCommandResponse;
+use squalr_engine_api::src::engine::unprivileged_response_mailbox::UnprivilegedResponseMailbox;
 use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
 use squalr_engine_session::src::engine_unprivileged_state::CommandDispatchPlan;
 use squalr_engine_session::src::engine_unprivileged_state::CommandPublicationResult;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
 use src::squalr_engine::SqualrEngine;
 
 // Invocation wire — upstream `EngineUnprivilegedState::
@@ -87,8 +92,7 @@ crashes Trap
 
     // Upstream's `let EngineCommand::Privileged(command) =
     // dispatch_invocation.get_command()` — a middleware that rewrote the
-    // command into a non-privileged one fails here (impossible today:
-    // EngineCommand has only the Privileged case).
+    // command into a non-privileged one fails here.
     state extract(
         engine: &mut SqualrEngine,
         invocation: CommandInvocation,
@@ -97,6 +101,7 @@ crashes Trap
         let command: &EngineCommand = CommandInvocation::get_command(&invocation);
         transition command {
             EngineCommand::Privileged { command } -> dispatch(engine, &invocation, command, out_response)
+            _ -> mismatched(engine, &invocation)
         }
     }
 
@@ -149,6 +154,126 @@ crashes Trap
         out_response: &mut PrivilegedResponseMailbox
     ) -> bool {
         PrivilegedResponseMailbox::deliver(out_response, response);
+        (true)
+    }
+}
+
+// Unprivileged arm of `send_invocation` — upstream
+// `EngineUnprivilegedState::dispatch_unprivileged_command_invocation`:
+// create -> prepare -> `engine_bindings.dispatch_unprivileged_command`
+// whose callback is the response publisher. The synchronous bindings
+// arm delivers into the mailbox inside the dispatch call, same as the
+// privileged wire.
+pub machine CommandInvocationWireModule::send_unprivileged_invocation(
+    engine: &mut SqualrEngine,
+    source: CommandInvocationSource,
+    unprivileged_command: UnprivilegedCommand,
+    out_response: &mut UnprivilegedResponseMailbox
+) -> bool
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let command_invocation: CommandInvocation = EngineUnprivilegedState::create_command_invocation(&mut engine.engine_unprivileged_state,
+        source,
+        EngineCommand::Unprivileged { command: unprivileged_command });
+    let plan: CommandDispatchPlan = EngineUnprivilegedState::prepare_command_invocation(&mut engine.engine_unprivileged_state, command_invocation);
+    transition plan {
+        CommandDispatchPlan::Dispatch { invocation } -> extract(engine, invocation, out_response)
+        CommandDispatchPlan::Respond { invocation, response } -> respond(engine, invocation, response, out_response)
+        CommandDispatchPlan::Reject { invocation, reason, reason_len } -> reject(engine, &invocation, reason, reason_len)
+        _ -> (false)
+    }
+
+    state respond(
+        engine: &mut SqualrEngine,
+        invocation: CommandInvocation,
+        response: EngineCommandResponse,
+        out_response: &mut UnprivilegedResponseMailbox
+    ) -> bool {
+        transition response {
+            EngineCommandResponse::Unprivileged { response } -> publish(engine, &invocation, EngineCommandResponse::Unprivileged { response: response }, out_response)
+            _ -> mismatched(engine, &invocation)
+        }
+    }
+
+    state reject(
+        engine: &mut SqualrEngine,
+        invocation: &CommandInvocation,
+        reason: [u8; 256],
+        reason_len: u64
+    ) -> bool {
+        EngineUnprivilegedState::log_rejected_invocation(&mut engine.engine_unprivileged_state, invocation, reason, reason_len);
+        (false)
+    }
+
+    state mismatched(engine: &mut SqualrEngine, invocation: &CommandInvocation) -> bool {
+        EngineUnprivilegedState::log_mismatched_invocation_response(&mut engine.engine_unprivileged_state, invocation);
+        (false)
+    }
+
+    state extract(
+        engine: &mut SqualrEngine,
+        invocation: CommandInvocation,
+        out_response: &mut UnprivilegedResponseMailbox
+    ) -> bool {
+        let command: &EngineCommand = CommandInvocation::get_command(&invocation);
+        transition command {
+            EngineCommand::Unprivileged { command } -> dispatch(engine, &invocation, command, out_response)
+            _ -> mismatched(engine, &invocation)
+        }
+    }
+
+    // Upstream `engine_bindings.dispatch_unprivileged_command(command,
+    // execution_context, publisher-callback)` — the standalone bindings
+    // arm executes the unprivileged executor chain synchronously into
+    // the mailbox, then the response publisher walks middleware +
+    // listeners exactly as upstream's wrapped callback does.
+    state dispatch(
+        engine: &mut SqualrEngine,
+        invocation: &CommandInvocation,
+        command: &UnprivilegedCommand,
+        out_response: &mut UnprivilegedResponseMailbox
+    ) -> bool {
+        let mut mailbox: UnprivilegedResponseMailbox = UnprivilegedResponseMailbox::default();
+        _ = StandaloneEngineApiUnprivilegedBindings::dispatch_unprivileged_command(&mut engine.engine_bindings, &mut engine.engine_unprivileged_state, command, &mut mailbox);
+        transition mailbox {
+            UnprivilegedResponseMailbox::Delivered { response } -> publish(engine, invocation, EngineCommandResponse::Unprivileged { response: response }, out_response)
+            UnprivilegedResponseMailbox::Empty -> (false)
+            _ -> (false)
+        }
+    }
+
+    state publish(
+        engine: &mut SqualrEngine,
+        invocation: &CommandInvocation,
+        response: EngineCommandResponse,
+        out_response: &mut UnprivilegedResponseMailbox
+    ) -> bool {
+        let publication: CommandPublicationResult = EngineUnprivilegedState::publish_command_response(&mut engine.engine_unprivileged_state, invocation, response);
+        transition publication {
+            CommandPublicationResult::Delivered { response } -> deliver(response, out_response)
+            CommandPublicationResult::Suppressed { reason, reason_len } -> (false)
+            _ -> (false)
+        }
+    }
+    state deliver(
+        response: EngineCommandResponse,
+        out_response: &mut UnprivilegedResponseMailbox
+    ) -> bool {
+        transition response {
+            EngineCommandResponse::Unprivileged { response } -> store(response, out_response)
+            _ -> (false)
+        }
+    }
+    state store(
+        response: UnprivilegedCommandResponse,
+        out_response: &mut UnprivilegedResponseMailbox
+    ) -> bool {
+        UnprivilegedResponseMailbox::deliver(out_response, response);
         (true)
     }
 }

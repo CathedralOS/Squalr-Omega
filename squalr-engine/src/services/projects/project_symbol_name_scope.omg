@@ -1,0 +1,530 @@
+module src::services::projects::project_symbol_name_scope;
+
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_symbol_claim::ProjectSymbolClaim;
+use squalr_engine_api::src::structures::projects::project_symbol_locator::ProjectSymbolLocator;
+use squalr_engine_api::src::structures::projects::project_symbol_module::ProjectSymbolModule;
+use squalr_engine_api::src::structures::projects::project_symbol_module_field::ProjectSymbolModuleField;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+
+// Port of command_executors/project_items/project_symbol_name_scope.rs —
+// display-name deduplication scoped by locator kind. HashSet<String> ->
+// linear scans over a bounded name table (192 x 256 — 128 claims + 64
+// module fields, documented bound). ASCII trim for `str::trim`
+// (space/tab/LF/CR/VT/FF).
+pub data ProjectSymbolNameScope {}
+
+// Bounded reserved-name set.
+pub data ReservedNameSet {
+    names: [[u8; 256]; 192];
+    name_lens: [u64; 192];
+    name_count: u64;
+}
+pub machine ReservedNameSet::new(reserved_name_set: &mut ReservedNameSet) {
+    reserved_name_set.name_count = 0;
+}
+pub machine ReservedNameSet::contains(reserved_name_set: &ReservedNameSet, name: &[u8]) -> bool {
+    transition {
+        _ -> scan(reserved_name_set, name, 0)
+    }
+    state scan(reserved_name_set: &ReservedNameSet, name: &[u8], position: u64) -> bool {
+        transition position < reserved_name_set.name_count && position < 192 {
+            true -> compare(reserved_name_set, name, position)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state compare(reserved_name_set: &ReservedNameSet, name: &[u8], position: u64) -> bool
+        requires position < 192;
+    {
+        let len: u64 = reserved_name_set.name_lens[position];
+        transition len <= 256 && len == name.len {
+            true -> bytes_equal(reserved_name_set, name, position, 0)
+            false -> scan(reserved_name_set, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state bytes_equal(reserved_name_set: &ReservedNameSet, name: &[u8], position: u64, offset: u64) -> bool
+        requires position < 192;
+    {
+        transition offset < name.len && offset < 256 && offset < reserved_name_set.name_lens[position] {
+            true -> byte(reserved_name_set, name, position, offset)
+            false -> after(reserved_name_set, name, position, offset)
+            _ -> (false)
+        }
+    }
+    state byte(reserved_name_set: &ReservedNameSet, name: &[u8], position: u64, offset: u64) -> bool
+        requires position < 192 && offset < 256 && offset < name.len;
+    {
+        transition reserved_name_set.names[position][offset] == name[offset] {
+            true -> bytes_equal(reserved_name_set, name, position, ((offset as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> scan(reserved_name_set, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state after(reserved_name_set: &ReservedNameSet, name: &[u8], position: u64, offset: u64) -> bool
+        requires position < 192;
+    {
+        transition offset == name.len && offset == reserved_name_set.name_lens[position] {
+            true -> (true)
+            false -> scan(reserved_name_set, name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state done(reserved_name_set: &ReservedNameSet, name: &[u8]) -> bool {
+        (false)
+    }
+}
+pub machine ReservedNameSet::insert(reserved_name_set: &mut ReservedNameSet, name: &[u8]) -> bool {
+    transition reserved_name_set.name_count < 192 && name.len <= 256 {
+        true -> store(reserved_name_set, name)
+        false -> (false)
+        _ -> (false)
+    }
+    state store(reserved_name_set: &mut ReservedNameSet, name: &[u8]) -> bool {
+        let index: u64 = reserved_name_set.name_count;
+        transition index < 192 {
+            true -> copy(reserved_name_set, name, index, 0)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state copy(reserved_name_set: &mut ReservedNameSet, name: &[u8], index: u64, position: u64) -> bool
+        requires index < 192;
+    {
+        transition position < name.len && position < 256 {
+            true -> write(reserved_name_set, name, index, position)
+            false -> finish(reserved_name_set, name, index, position)
+            _ -> (false)
+        }
+    }
+    state write(reserved_name_set: &mut ReservedNameSet, name: &[u8], index: u64, position: u64) -> bool
+        requires index < 192 && position < 256;
+    {
+        reserved_name_set.names[index][position] = name[position];
+        transition {
+            _ -> copy(reserved_name_set, name, index, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state finish(reserved_name_set: &mut ReservedNameSet, name: &[u8], index: u64, count: u64) -> bool
+        requires index < 192;
+    {
+        reserved_name_set.name_lens[index] = count;
+        reserved_name_set.name_count = ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+// ASCII-whitespace trim (str::trim superset kept minimal: ' ' \t \n \r
+// \x0B \x0C).
+pub machine ProjectSymbolNameScope::trim_copy(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch) -> bool {
+    ManifestPathScratch::clear(&mut out_trimmed);
+    transition {
+        _ -> head(project_symbol_name_scope, source, out_trimmed, 0)
+    }
+    state head(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, position: u64) -> bool {
+        transition position < source.len {
+            true -> head_byte(project_symbol_name_scope, source, out_trimmed, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state head_byte(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < source.len;
+    {
+        let byte: u8 = source[position];
+        let is_space: bool = byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12;
+        transition is_space {
+            true -> head(project_symbol_name_scope, source, out_trimmed, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> tail_start(project_symbol_name_scope, source, out_trimmed, position)
+            _ -> (false)
+        }
+    }
+    state tail_start(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, head_position: u64) -> bool {
+        transition {
+            _ -> tail_walk(project_symbol_name_scope, source, out_trimmed, head_position, source.len)
+        }
+    }
+    state tail_walk(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, head_position: u64, end: u64) -> bool {
+        transition end > head_position {
+            true -> tail_byte(project_symbol_name_scope, source, out_trimmed, head_position, end)
+            false -> copy(project_symbol_name_scope, source, out_trimmed, head_position, end, 0)
+            _ -> (false)
+        }
+    }
+    state tail_byte(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, head_position: u64, end: u64) -> bool
+        requires end > 0 && end <= source.len && end > head_position;
+    {
+        let mut back: u64 = ((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition back < source.len {
+            true -> tail_byte_at(project_symbol_name_scope, source, out_trimmed, head_position, end, back)
+            false -> copy(project_symbol_name_scope, source, out_trimmed, head_position, end, 0)
+            _ -> (false)
+        }
+    }
+    state tail_byte_at(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, head_position: u64, end: u64, back: u64) -> bool
+        requires back < source.len;
+    {
+        let byte: u8 = source[back];
+        let is_space: bool = byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12;
+        transition is_space {
+            true -> tail_walk(project_symbol_name_scope, source, out_trimmed, head_position, back)
+            false -> copy(project_symbol_name_scope, source, out_trimmed, head_position, end, 0)
+            _ -> (false)
+        }
+    }
+    state copy(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, head_position: u64, end: u64, position: u64) -> bool
+        requires head_position <= source.len && end <= source.len && head_position <= end;
+    {
+        let mut source_index: u64 = ((head_position as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition source_index < end && out_trimmed.len < 512 {
+            true -> copy_byte(project_symbol_name_scope, source, out_trimmed, head_position, end, position, source_index)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state copy_byte(project_symbol_name_scope: &mut ProjectSymbolNameScope, source: &[u8], out_trimmed: &mut ManifestPathScratch, head_position: u64, end: u64, position: u64, source_index: u64) -> bool
+        requires source_index < source.len && out_trimmed.len < 512;
+    {
+        out_trimmed.bytes[out_trimmed.len] = source[source_index];
+        out_trimmed.len = ((out_trimmed.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> copy(project_symbol_name_scope, source, out_trimmed, head_position, end, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `deduplicate_display_name` — "Name", "Name_0", "Name_1", ...
+// scoped by locator kind; `ignored_locator_key` skips the current symbol
+// (rename case).
+pub machine ProjectSymbolNameScope::deduplicate_display_name(project_symbol_name_scope: &mut ProjectSymbolNameScope, 
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    locator: &ProjectSymbolLocator,
+    requested_display_name: &[u8],
+    ignored_locator_key: &[u8],
+    has_ignored_locator_key: bool,
+    out_display_name: &mut ManifestPathScratch
+ )
+ -> bool {
+    let mut trimmed: ManifestPathScratch;
+        ManifestPathScratch::new(&mut trimmed);
+    _ = ProjectSymbolNameScope::trim_copy(project_symbol_name_scope, requested_display_name, &mut trimmed);
+    transition trimmed.len <= 512 {
+        true -> base(project_symbol_name_scope, project_symbol_catalog, locator, &trimmed, ignored_locator_key, has_ignored_locator_key, out_display_name)
+        false -> (false)
+        _ -> (false)
+    }
+    state base(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, trimmed: &ManifestPathScratch, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_display_name: &mut ManifestPathScratch) -> bool
+        requires trimmed.len <= 512;
+    {
+        let mut base_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut base_name);
+        _ = ProjectSymbolNameScope::pick_base(project_symbol_name_scope, trimmed, &mut base_name);
+        let mut reserved: ReservedNameSet;
+        ReservedNameSet::new(&mut reserved);
+        _ = ProjectSymbolNameScope::collect_reserved_display_names(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, &mut reserved);
+        transition base_name.len <= 512 {
+            true -> probe(project_symbol_name_scope, project_symbol_catalog, locator, &base_name, &reserved, out_display_name)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state probe(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, base_name: &ManifestPathScratch, reserved: &ReservedNameSet, out_display_name: &mut ManifestPathScratch) -> bool
+        requires base_name.len <= 512;
+    {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3162: &[u8] = ManifestPathScratch::get_bytes(base_name);
+        transition ReservedNameSet::contains(reserved, inner3162) {
+            true -> suffix_probe(project_symbol_name_scope, project_symbol_catalog, locator, base_name, reserved, out_display_name, 0)
+            false -> (ProjectItemSortOrder::copy_into(&path_joiner, ManifestPathScratch::get_bytes(base_name), out_display_name))
+            _ -> (false)
+        }
+    }
+    state suffix_probe(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, base_name: &ManifestPathScratch, reserved: &ReservedNameSet, out_display_name: &mut ManifestPathScratch, sequence: u64) -> bool
+        requires base_name.len <= 512;
+    {
+        transition sequence <= 999 {
+            true -> candidate(project_symbol_name_scope, project_symbol_catalog, locator, base_name, reserved, out_display_name, sequence)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state candidate(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, base_name: &ManifestPathScratch, reserved: &ReservedNameSet, out_display_name: &mut ManifestPathScratch, sequence: u64) -> bool
+        requires base_name.len <= 512;
+    {
+        let mut candidate_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut candidate_name);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3163: &[u8] = ManifestPathScratch::get_bytes(base_name);
+        _ = ProjectItemSortOrder::copy_into(&path_joiner, inner3163, &mut candidate_name);
+        _ = ProjectSymbolNameScope::append_decimal_suffix(project_symbol_name_scope, &mut candidate_name, sequence);
+        transition candidate_name.len <= 512 {
+            true -> check(project_symbol_name_scope, project_symbol_catalog, locator, base_name, reserved, out_display_name, sequence, &candidate_name)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state check(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, base_name: &ManifestPathScratch, reserved: &ReservedNameSet, out_display_name: &mut ManifestPathScratch, sequence: u64, candidate_name: &ManifestPathScratch) -> bool
+        requires base_name.len <= 512 && candidate_name.len <= 512;
+    {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3164: &[u8] = ManifestPathScratch::get_bytes(&candidate_name);
+        transition ReservedNameSet::contains(reserved, inner3164) {
+            true -> next(project_symbol_name_scope, project_symbol_catalog, locator, base_name, reserved, out_display_name, sequence)
+            false -> (ProjectItemSortOrder::copy_into(&path_joiner, ManifestPathScratch::get_bytes(&candidate_name), out_display_name))
+            _ -> (false)
+        }
+    }
+    state next(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, base_name: &ManifestPathScratch, reserved: &ReservedNameSet, out_display_name: &mut ManifestPathScratch, sequence: u64) -> bool {
+        let mut next_sequence: u64 = ((sequence as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_sequence <= 999 {
+            true -> suffix_probe(project_symbol_name_scope, project_symbol_catalog, locator, base_name, reserved, out_display_name, next_sequence)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream: trimmed empty -> "Symbol", else the trimmed bytes.
+pub machine ProjectSymbolNameScope::pick_base(project_symbol_name_scope: &mut ProjectSymbolNameScope, trimmed: &ManifestPathScratch, out_base: &mut ManifestPathScratch) -> bool {
+    transition trimmed.len == 0 {
+        true -> fallback(project_symbol_name_scope, out_base)
+        false -> copy_base(project_symbol_name_scope, trimmed, out_base)
+        _ -> (false)
+    }
+    state fallback(project_symbol_name_scope: &mut ProjectSymbolNameScope, out_base: &mut ManifestPathScratch) -> bool {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        (ProjectItemSortOrder::copy_into(&path_joiner, "Symbol", out_base))
+    }
+    state copy_base(project_symbol_name_scope: &mut ProjectSymbolNameScope, trimmed: &ManifestPathScratch, out_base: &mut ManifestPathScratch) -> bool
+        requires trimmed.len <= 512;
+    {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3165: &[u8] = ManifestPathScratch::get_bytes(trimmed);
+        (ProjectItemSortOrder::copy_into(&path_joiner, inner3165, out_base))
+    }
+}
+
+// `_<decimal>` bounded emit(sequence <= 999 — bound documented; at the
+// bound the candidate loop refuses like generate_unique).
+pub machine ProjectSymbolNameScope::append_decimal_suffix(project_symbol_name_scope: &mut ProjectSymbolNameScope, scratch: &mut ManifestPathScratch, sequence: u64) -> bool {
+    transition scratch.len < 512 {
+        true -> sep(project_symbol_name_scope, scratch, sequence)
+        false -> (false)
+        _ -> (false)
+    }
+    state sep(project_symbol_name_scope: &mut ProjectSymbolNameScope, scratch: &mut ManifestPathScratch, sequence: u64) -> bool
+        requires scratch.len < 512;
+    {
+        scratch.bytes[scratch.len] = 95;
+        scratch.len = ((scratch.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> magnitude(project_symbol_name_scope, scratch, sequence, sequence, 1)
+        }
+    }
+    state magnitude(project_symbol_name_scope: &mut ProjectSymbolNameScope, scratch: &mut ManifestPathScratch, sequence: u64, value: u64, mag: u64) -> bool {
+        let mut next_mag: u64 = ((mag as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64;
+        transition next_mag <= value && next_mag <= 999 && mag < 100 {
+            true -> magnitude(project_symbol_name_scope, scratch, sequence, value, next_mag)
+            false -> emit(project_symbol_name_scope, scratch, sequence, value, mag)
+            _ -> (false)
+        }
+    }
+    state emit(project_symbol_name_scope: &mut ProjectSymbolNameScope, scratch: &mut ManifestPathScratch, sequence: u64, value: u64, mag: u64) -> bool {
+        transition mag > 0 {
+            true -> emit_byte(project_symbol_name_scope, scratch, sequence, value, mag)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state emit_byte(project_symbol_name_scope: &mut ProjectSymbolNameScope, scratch: &mut ManifestPathScratch, sequence: u64, value: u64, mag: u64) -> bool {
+        let mut digit: u64 = value / mag;
+        transition digit <= 9 && scratch.len < 512 {
+            true -> emit_write(project_symbol_name_scope, scratch, sequence, value, mag, digit)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state emit_write(project_symbol_name_scope: &mut ProjectSymbolNameScope, scratch: &mut ManifestPathScratch, sequence: u64, value: u64, mag: u64, digit: u64) -> bool
+        requires scratch.len < 512 && digit <= 9;
+    {
+        scratch.bytes[scratch.len] = (48 + digit) as u8;
+        scratch.len = ((scratch.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let mut remainder: u64 = value % mag;
+        let mut next_mag: u64 = mag / 10;
+        transition {
+            _ -> emit(project_symbol_name_scope, scratch, sequence, remainder, next_mag)
+        }
+    }
+}
+
+// Upstream `collect_reserved_display_names` — AbsoluteAddress reserves
+// every absolute claim's name; ModuleOffset reserves the module's field
+// names + that module's claims.
+pub machine ProjectSymbolNameScope::collect_reserved_display_names(project_symbol_name_scope: &mut ProjectSymbolNameScope, 
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    locator: &ProjectSymbolLocator,
+    ignored_locator_key: &[u8],
+    has_ignored_locator_key: bool,
+    out_reserved: &mut ReservedNameSet
+ )
+ -> bool {
+    transition {
+        _ -> kind(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved)
+    }
+    state kind(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet) -> bool {
+        transition ProjectSymbolLocator::is_module_offset(locator) {
+            true -> module(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved)
+            false -> absolute(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, 0)
+            _ -> (false)
+        }
+    }
+    state absolute(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64) -> bool {
+        transition position < ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog) {
+            true -> absolute_claim(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state absolute_claim(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64) -> bool {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, position);
+        let mut key: [u8; 256];
+        let key_len: u64 = ProjectSymbolClaim::get_symbol_locator_key(claim, &mut key);
+        transition has_ignored_locator_key && key_len == ignored_locator_key.len && key_len <= 256 {
+            true -> absolute_check_key(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim, &key, key_len)
+            false -> absolute_kind(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim)
+            _ -> (false)
+        }
+    }
+    state absolute_check_key(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64, claim: &ProjectSymbolClaim, key: &[u8; 256], key_len: u64) -> bool
+        requires key_len <= 256;
+    {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        transition ProjectItemSortOrder::paths_equal(&path_joiner, &key[0..key_len], ignored_locator_key) {
+            true -> absolute(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> absolute_kind(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim)
+            _ -> (false)
+        }
+    }
+    state absolute_kind(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64, claim: &ProjectSymbolClaim) -> bool {
+        let claim_locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        transition ProjectSymbolLocator::is_module_offset(claim_locator) {
+            true -> absolute(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> absolute_reserve(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim)
+            _ -> (false)
+        }
+    }
+    state absolute_reserve(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64, claim: &ProjectSymbolClaim) -> bool {
+        let inner3166: &[u8] = ProjectSymbolClaim::get_display_name(&claim);
+        _ = ReservedNameSet::insert(out_reserved, inner3166);
+        transition {
+            _ -> absolute(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // ModuleOffset: reserve the named module's fields then its claims.
+    state module(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet) -> bool {
+        let module_name: &[u8] = ProjectSymbolLocator::get_focus_module_name(locator);
+        let module_position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, module_name);
+        transition module_position < ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog) && module_position < 64 {
+            true -> module_fields(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, module_position, 0)
+            false -> module_claims(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, 0)
+            _ -> (false)
+        }
+    }
+    state module_fields(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, module_position: u64, field_position: u64) -> bool
+        requires module_position < ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+    {
+        let module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, module_position);
+        transition field_position < ProjectSymbolModule::get_field_count(module) {
+            true -> module_field(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, module_position, field_position, module)
+            false -> module_claims(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, 0)
+            _ -> (false)
+        }
+    }
+    state module_field(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, module_position: u64, field_position: u64, module: &ProjectSymbolModule) -> bool
+        requires module_position < ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+    {
+        let field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(module, field_position);
+        let module_name: &[u8] = ProjectSymbolModule::get_module_name(module);
+        let mut key: [u8; 256];
+        let key_len: u64 = ProjectSymbolModuleField::get_symbol_locator_key(field, module_name, &mut key);
+        transition has_ignored_locator_key && key_len == ignored_locator_key.len && key_len <= 256 {
+            true -> module_field_key(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, module_position, field_position, field, &key, key_len)
+            false -> module_field_reserve(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, module_position, field_position, field)
+            _ -> (false)
+        }
+    }
+    state module_field_key(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, module_position: u64, field_position: u64, field: &ProjectSymbolModuleField, key: &[u8; 256], key_len: u64) -> bool
+        requires key_len <= 256 && module_position < ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+    {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        transition ProjectItemSortOrder::paths_equal(&path_joiner, &key[0..key_len], ignored_locator_key) {
+            true -> module_fields(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, module_position, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> module_field_reserve(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, module_position, field_position, field)
+            _ -> (false)
+        }
+    }
+    state module_field_reserve(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, module_position: u64, field_position: u64, field: &ProjectSymbolModuleField) -> bool
+        requires module_position < ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog);
+    {
+        let inner3167: &[u8] = ProjectSymbolModuleField::get_display_name(&field);
+        _ = ReservedNameSet::insert(out_reserved, inner3167);
+        transition {
+            _ -> module_fields(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, module_position, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state module_claims(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64) -> bool {
+        transition position < ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog) {
+            true -> module_claim(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state module_claim(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64) -> bool {
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, position);
+        let mut key: [u8; 256];
+        let key_len: u64 = ProjectSymbolClaim::get_symbol_locator_key(&claim, &mut key);
+        transition has_ignored_locator_key && key_len == ignored_locator_key.len && key_len <= 256 {
+            true -> module_claim_key(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim, &key, key_len)
+            false -> module_claim_kind(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim)
+            _ -> (false)
+        }
+    }
+    state module_claim_key(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64, claim: &ProjectSymbolClaim, key: &[u8; 256], key_len: u64) -> bool
+        requires key_len <= 256;
+    {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        transition ProjectItemSortOrder::paths_equal(&path_joiner, &key[0..key_len], ignored_locator_key) {
+            true -> module_claims(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> module_claim_kind(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim)
+            _ -> (false)
+        }
+    }
+    state module_claim_kind(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64, claim: &ProjectSymbolClaim) -> bool {
+        let claim_locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        transition ProjectSymbolLocator::is_module_offset(claim_locator) {
+            true -> module_claim_module(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim)
+            false -> module_claims(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state module_claim_module(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64, claim: &ProjectSymbolClaim) -> bool {
+        let claim_locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3168: &[u8] = ProjectSymbolLocator::get_focus_module_name(claim_locator);
+        let inner3169: &[u8] = ProjectSymbolLocator::get_focus_module_name(locator);
+        transition ProjectItemSortOrder::paths_equal(&path_joiner, inner3168, inner3169) {
+            true -> module_claim_reserve(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, position, claim)
+            false -> module_claims(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state module_claim_reserve(project_symbol_name_scope: &mut ProjectSymbolNameScope, project_symbol_catalog: &ProjectSymbolCatalog, locator: &ProjectSymbolLocator, ignored_locator_key: &[u8], has_ignored_locator_key: bool, out_reserved: &mut ReservedNameSet, position: u64, claim: &ProjectSymbolClaim) -> bool {
+        let inner3170: &[u8] = ProjectSymbolClaim::get_display_name(&claim);
+        _ = ReservedNameSet::insert(out_reserved, inner3170);
+        transition {
+            _ -> module_claims(project_symbol_name_scope, project_symbol_catalog, locator, ignored_locator_key, has_ignored_locator_key, out_reserved, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}

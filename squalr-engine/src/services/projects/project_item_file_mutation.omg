@@ -1,0 +1,1050 @@
+module src::services::projects::project_item_file_mutation;
+
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project::ProjectItemLookup;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_directory::ProjectItemTypeDirectory;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Upstream `ProjectItemFileMutation` is a unit namespace of free helpers;
+// the port declares it like the sibling mutation services.
+pub data ProjectItemFileMutation {}
+
+pub machine ProjectItemFileMutation::normalize_project_item_path(path: &[u8], out_normalized: &mut ManifestPathScratch) -> bool {
+    ManifestPathScratch::clear(out_normalized);
+    transition {
+        _ -> scan(path, out_normalized, 0)
+    }
+    // position walks path bytes; components are [component_start, position)
+    // inside out_normalized via a parallel component stack encoded as
+    // offsets — bounded 64 components of positions.
+    state scan(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool {
+        transition {
+            _ -> component(path, out_normalized, position, 0)
+        }
+    }
+    // component: find next '/' boundary from position.
+    state component(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        let end_index: u64 = ((position as u64 in Wrapping) + (scan as u64 in Wrapping)) as u64;
+        transition end_index < path.len && scan < 512 {
+            true -> component_at(path, out_normalized, position, scan, end_index)
+            false -> emit(path, out_normalized, position, scan)
+            _ -> (false)
+        }
+    }
+    state component_at(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64, end_index: u64) -> bool
+        requires end_index < path.len;
+    {
+        transition path[end_index] == 47 {
+            true -> emit(path, out_normalized, position, scan)
+            false -> component(path, out_normalized, position, ((scan as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    // Component bytes are path[position .. position+scan] (scan may run
+    // past the end — emit treats it as the tail component).
+    state emit(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        let mut end: u64 = ((position as u64 in Wrapping) + (scan as u64 in Wrapping)) as u64;
+        transition end > path.len {
+            true -> emit_clamped(path, out_normalized, position)
+            false -> classify(path, out_normalized, position, scan)
+            _ -> (false)
+        }
+    }
+    state emit_clamped(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool {
+        let mut scan: u64 = 0;
+        transition position < path.len {
+            true -> emit_clamped_len(path, out_normalized, position)
+            false -> classify(path, out_normalized, position, 0)
+            _ -> (false)
+        }
+    }
+    state emit_clamped_len(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < path.len;
+    {
+        let mut scan: u64 = ((path.len as u64 in Wrapping) - (position as u64 in Wrapping)) as u64;
+        transition {
+            _ -> classify(path, out_normalized, position, scan)
+        }
+    }
+    state classify(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        // '.' component -> drop; '..' -> pop or keep; other -> append.
+        transition scan == 1 {
+            true -> dot(path, out_normalized, position)
+            false -> classify_len(path, out_normalized, position, scan)
+            _ -> (false)
+        }
+    }
+    state dot(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < path.len;
+    {
+        transition path[position] == 46 {
+            true -> advance(path, out_normalized, position)
+            false -> classify_wide(path, out_normalized, position, 1)
+            _ -> (false)
+        }
+    }
+    state classify_len(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        transition scan == 2 {
+            true -> dotdot(path, out_normalized, position)
+            false -> append_component(path, out_normalized, position, scan)
+            _ -> (false)
+        }
+    }
+    state classify_wide(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        transition scan == 2 {
+            true -> dotdot(path, out_normalized, position)
+            false -> append_component(path, out_normalized, position, scan)
+            _ -> (false)
+        }
+    }
+    state dotdot(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool {
+        let dot_index: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition dot_index < path.len {
+            true -> dotdot_bytes(path, out_normalized, position, dot_index)
+            false -> append_component(path, out_normalized, position, 2)
+            _ -> (false)
+        }
+    }
+    state dotdot_bytes(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, dot_index: u64) -> bool
+        requires position < path.len && dot_index < path.len;
+    {
+        transition path[position] == 46 && path[dot_index] == 46 {
+            true -> pop_or_keep(path, out_normalized, position)
+            false -> append_component(path, out_normalized, position, 2)
+            _ -> (false)
+        }
+    }
+    // Pop the last kept component when it's a normal one; otherwise keep
+    // the '..' verbatim (upstream pushes un-poppable parents).
+    state pop_or_keep(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool {
+        transition {
+            _ -> find_last_sep(path, out_normalized, position, out_normalized.len)
+        }
+    }
+    state find_last_sep(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        transition scan > 0 {
+            true -> last_sep_at(path, out_normalized, position, scan)
+            false -> keep_parent(path, out_normalized, position)
+            _ -> (false)
+        }
+    }
+    state last_sep_at(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool
+        requires scan > 0 && scan <= 512;
+    {
+        let mut back: u64 = ((scan as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition back < 512 && back < out_normalized.len {
+            true -> last_sep_byte(path, out_normalized, position, back)
+            false -> keep_parent(path, out_normalized, position)
+            _ -> (false)
+        }
+    }
+    state last_sep_byte(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, back: u64) -> bool
+        requires back < out_normalized.len && back < 512;
+    {
+        transition out_normalized.bytes[back] == 47 {
+            true -> check_parent_component(path, out_normalized, position, back)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    // Last component is out[.., back+1..len) — pop only when it isn't
+    // itself a '..' run (keep rule) — and the head isn't "/" or "..".
+    state check_parent_component(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, back: u64) -> bool
+        requires back < 512 && back < out_normalized.len;
+    {
+        let mut component_len: u64 = ((out_normalized.len as u64 in Wrapping) - (back as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition component_len == 2 {
+            true -> check_parent_is_dotdot(path, out_normalized, position, back)
+            false -> pop(path, out_normalized, position, back)
+            _ -> (false)
+        }
+    }
+    state check_parent_is_dotdot(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, back: u64) -> bool
+        requires back < 511 && back < out_normalized.len;
+    {
+        let mut dot_index: u64 = ((back as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition out_normalized.bytes[dot_index] == 46 {
+            true -> check_second_dot(path, out_normalized, position, back)
+            false -> pop(path, out_normalized, position, back)
+            _ -> (false)
+        }
+    }
+    state check_second_dot(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, back: u64) -> bool
+        requires back < 510 && back < out_normalized.len;
+    {
+        let mut dot_index: u64 = ((back as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64;
+        transition out_normalized.bytes[dot_index] == 46 {
+            true -> keep_parent(path, out_normalized, position)
+            false -> pop(path, out_normalized, position, back)
+            _ -> (false)
+        }
+    }
+    state pop(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, back: u64) -> bool
+        requires back < 512 && back <= out_normalized.len;
+    {
+        out_normalized.len = back;
+        transition {
+            _ -> advance(path, out_normalized, position)
+        }
+    }
+    state keep_parent(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool {
+        transition {
+            _ -> append_component(path, out_normalized, position, 2)
+        }
+    }
+    // Append `path[position..position+scan]` (clamped) with a '/'
+    // separator when the normalized buffer is non-empty.
+    state append_component(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        transition out_normalized.len > 0 && out_normalized.len < 512 {
+            true -> sep(path, out_normalized, position, scan)
+            false -> append_bytes(path, out_normalized, position, scan, 0)
+            _ -> (false)
+        }
+    }
+    state sep(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool
+        requires out_normalized.len < 512;
+    {
+        out_normalized.bytes[out_normalized.len] = 47;
+        out_normalized.len = ((out_normalized.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> append_bytes(path, out_normalized, position, scan, 0)
+        }
+    }
+    state append_bytes(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64, offset: u64) -> bool {
+        transition offset < scan && out_normalized.len < 512 {
+            true -> append_byte(path, out_normalized, position, scan, offset)
+            false -> advance(path, out_normalized, position)
+            _ -> (false)
+        }
+    }
+    state append_byte(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64, offset: u64) -> bool
+        requires out_normalized.len < 512;
+    {
+        let mut source_index: u64 = ((position as u64 in Wrapping) + (offset as u64 in Wrapping)) as u64;
+        transition source_index < path.len {
+            true -> append_byte_do(path, out_normalized, position, scan, offset, source_index)
+            false -> advance(path, out_normalized, position)
+            _ -> (false)
+        }
+    }
+    state append_byte_do(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64, offset: u64, source_index: u64) -> bool
+        requires out_normalized.len < 512 && source_index < path.len;
+    {
+        out_normalized.bytes[out_normalized.len] = path[source_index];
+        out_normalized.len = ((out_normalized.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> append_bytes(path, out_normalized, position, scan, ((offset as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state advance(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool {
+        transition {
+            _ -> next_position(path, out_normalized, position)
+        }
+    }
+    state next_position(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64) -> bool {
+        // Skip past the consumed component AND its trailing '/' run.
+        transition position < path.len {
+            true -> skip_to_sep(path, out_normalized, position, 0)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state skip_to_sep(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        let end_index: u64 = ((position as u64 in Wrapping) + (scan as u64 in Wrapping)) as u64;
+        transition end_index < path.len && scan < 512 {
+            true -> sep_at(path, out_normalized, position, scan, end_index)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state sep_at(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64, end_index: u64) -> bool
+        requires end_index < path.len;
+    {
+        transition path[end_index] == 47 {
+            true -> after_sep(path, out_normalized, position, scan)
+            false -> skip_to_sep(path, out_normalized, position, ((scan as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state after_sep(path: &[u8], out_normalized: &mut ManifestPathScratch, position: u64, scan: u64) -> bool {
+        // Skip the '/' run itself then recurse into the next component.
+        transition {
+            _ -> skip_seps(path, out_normalized, ((position as u64 in Wrapping) + (scan as u64 in Wrapping)) as u64)
+        }
+    }
+    state skip_seps(path: &[u8], out_normalized: &mut ManifestPathScratch, next: u64) -> bool {
+        transition next < path.len {
+            true -> seps_byte(path, out_normalized, next)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state seps_byte(path: &[u8], out_normalized: &mut ManifestPathScratch, next: u64) -> bool
+        requires next < path.len;
+    {
+        transition path[next] == 47 {
+            true -> skip_seps(path, out_normalized, ((next as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> component(path, out_normalized, next, 0)
+            _ -> (false)
+        }
+    }
+}
+
+// `is_directory_path`: ref lookup hits -> item type id == "directory";
+// miss -> the path has no extension (no '.' after the last '/').
+pub machine ProjectItemFileMutation::is_directory_path(project_item_path: &[u8], project: &Project) -> bool {
+    let mut item_ref: ProjectItemRef = ProjectItemRef::new(project_item_path);
+    transition {
+        _ -> lookup(project_item_path, project, &item_ref)
+    }
+    state lookup(project_item_path: &[u8], project: &Project, item_ref: &ProjectItemRef) -> bool {
+        let outcome: ProjectItemLookup = Project::lookup_project_item_index(project, item_ref);
+        transition outcome {
+            ProjectItemLookup::Found { index } -> typed(project_item_path, project, index)
+            _ -> extension_probe(project_item_path, project, item_ref)
+        }
+    }
+    state typed(project_item_path: &[u8], project: &Project, index: u64) -> bool
+        requires index < 256;
+    {
+        let pair: &ProjectItemPair = Project::get_project_item_pair(project, index);
+        let item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(item);
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3083: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        let inner3084: &[u8] = ProjectItemTypeDirectory::get_project_item_type_id();
+        transition ProjectItemSortOrder::paths_equal(&sort_order, inner3083, inner3084) {
+            true -> (true)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state extension_probe(project_item_path: &[u8], project: &Project, item_ref: &ProjectItemRef) -> bool {
+        (ProjectItemFileMutation::path_has_no_extension(project_item_path))
+    }
+}
+
+// No '.' after the last '/' — upstream `extension().is_none()`.
+pub machine ProjectItemFileMutation::path_has_no_extension(path: &[u8]) -> bool {
+    let last_sep: u64 = ProjectItemFileMutation::find_last_separator(path);
+    transition {
+        _ -> dot_scan(path, last_sep)
+    }
+    state dot_scan(path: &[u8], position: u64) -> bool {
+        transition position < path.len {
+            true -> dot_at(path, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state dot_at(path: &[u8], position: u64) -> bool
+        requires position < path.len;
+    {
+        transition path[position] == 46 {
+            true -> (false)
+            false -> dot_scan(path, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+pub machine ProjectItemFileMutation::find_last_separator(path: &[u8]) -> u64 {
+    transition {
+        _ -> scan(path, path.len, 0)
+    }
+    // Walk backwards for '/'; returns the index just after it, or 0.
+    state scan(path: &[u8], remaining: u64, found: u64) -> u64 {
+        transition remaining > 0 {
+            true -> probe(path, remaining, found)
+            false -> (found)
+            _ -> (found)
+        }
+    }
+    state probe(path: &[u8], remaining: u64, found: u64) -> u64 {
+        let mut index: u64 = ((remaining as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition index < path.len {
+            true -> byte(path, index, found)
+            false -> (found)
+            _ -> (found)
+        }
+    }
+    state byte(path: &[u8], index: u64, found: u64) -> u64
+        requires index < path.len;
+    {
+        transition path[index] == 47 {
+            true -> ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64
+            false -> scan(path, index, found)
+            _ -> (found)
+        }
+    }
+}
+
+// Upstream `strip_project_directory_prefix`: normalize both sides, then
+// prefix-strip (component-wise). Returns the relative path bytes.
+pub machine ProjectItemFileMutation::strip_project_directory_prefix(
+    project_directory_path: &[u8],
+    project_item_path: &[u8],
+    out_relative: &mut ManifestPathScratch
+) -> bool {
+    let mut normalized_directory: ManifestPathScratch;
+    ManifestPathScratch::new(&mut normalized_directory);
+    let mut normalized_item: ManifestPathScratch;
+    ManifestPathScratch::new(&mut normalized_item);
+    _ = ProjectItemFileMutation::normalize_project_item_path(project_directory_path, &mut normalized_directory);
+    _ = ProjectItemFileMutation::normalize_project_item_path(project_item_path, &mut normalized_item);
+    transition normalized_directory.len <= 512 && normalized_item.len <= 512 {
+        true -> strip(ManifestPathScratch::get_bytes(&normalized_directory), ManifestPathScratch::get_bytes(&normalized_item), out_relative)
+        false -> (false)
+        _ -> (false)
+    }
+    state strip(normalized_directory: &[u8], normalized_item: &[u8], out_relative: &mut ManifestPathScratch) -> bool
+        requires normalized_directory.len <= 512 && normalized_item.len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        (ProjectItemSortOrder::strip_directory_prefix(&sort_order, normalized_directory, normalized_item, out_relative))
+    }
+}
+
+// Upstream `resolve_project_item_path`: absolute -> itself; relative
+// under the project root after normalization -> dir-joined rel; else
+// dir-joined item verbatim.
+pub machine ProjectItemFileMutation::resolve_project_item_path(
+    project_directory_path: &[u8],
+    project_item_path: &[u8],
+    out_resolved: &mut ManifestPathScratch
+) -> bool {
+    let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+    transition FileSystemUtils::is_cross_platform_absolute_path(project_item_path) {
+        true -> (ProjectItemSortOrder::copy_into(&sort_order, project_item_path, out_resolved))
+        false -> strip_try(project_directory_path, project_item_path, out_resolved)
+        _ -> (false)
+    }
+    state strip_try(project_directory_path: &[u8], project_item_path: &[u8], out_resolved: &mut ManifestPathScratch) -> bool {
+        let mut relative: ManifestPathScratch;
+        ManifestPathScratch::new(&mut relative);
+        transition ProjectItemFileMutation::strip_project_directory_prefix(project_directory_path, project_item_path, &mut relative) && relative.len <= 512 {
+            true -> rejoin(project_directory_path, project_item_path, out_resolved, &relative)
+            false -> plain_join(project_directory_path, project_item_path, out_resolved)
+            _ -> (false)
+        }
+    }
+    state rejoin(project_directory_path: &[u8], project_item_path: &[u8], out_resolved: &mut ManifestPathScratch, relative: &ManifestPathScratch) -> bool
+        requires relative.len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3085: &[u8] = ManifestPathScratch::get_bytes(&relative);
+        (ProjectItemSortOrder::join_path(&sort_order, project_directory_path, inner3085, out_resolved))
+    }
+    state plain_join(project_directory_path: &[u8], project_item_path: &[u8], out_resolved: &mut ManifestPathScratch) -> bool {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        (ProjectItemSortOrder::join_path(&sort_order, project_directory_path, project_item_path, out_resolved))
+    }
+}
+
+// Upstream `resolve_project_file_parent_directory_path` — requests
+// outside the project_items root clamp to it.
+pub machine ProjectItemFileMutation::resolve_project_file_parent_directory_path(
+    project_directory_path: &[u8],
+    requested_parent_directory_path: &[u8],
+    out_resolved: &mut ManifestPathScratch
+) -> bool {
+    let mut project_root: ManifestPathScratch;
+    ManifestPathScratch::new(&mut project_root);
+    let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+    _ = ProjectItemSortOrder::join_path(&sort_order, project_directory_path, Project::PROJECT_DIR, &mut project_root);
+    let mut resolved_parent: ManifestPathScratch;
+    ManifestPathScratch::new(&mut resolved_parent);
+    _ = ProjectItemFileMutation::resolve_project_item_path(project_directory_path, requested_parent_directory_path, &mut resolved_parent);
+    transition project_root.len <= 512 && resolved_parent.len <= 512 {
+        true -> clamp(&project_root, &resolved_parent, out_resolved)
+        false -> (false)
+        _ -> (false)
+    }
+    state clamp(project_root: &ManifestPathScratch, resolved_parent: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch) -> bool
+        requires project_root.len <= 512 && resolved_parent.len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3086: &[u8] = ManifestPathScratch::get_bytes(&resolved_parent);
+        let inner3087: &[u8] = ManifestPathScratch::get_bytes(project_root);
+        transition ProjectItemSortOrder::path_starts_with(&sort_order, inner3086, inner3087) {
+            true -> (ProjectItemSortOrder::copy_into(&sort_order, ManifestPathScratch::get_bytes(&resolved_parent), out_resolved))
+            false -> (ProjectItemSortOrder::copy_into(&sort_order, ManifestPathScratch::get_bytes(project_root), out_resolved))
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `resolve_selected_directory_path` — no target -> root; file
+// target -> its parent; out-of-root -> clamp.
+pub machine ProjectItemFileMutation::resolve_selected_directory_path(
+    project_directory_path: &[u8],
+    target_directory_path: &[u8],
+    has_target_directory_path: bool,
+    project: &Project,
+    out_resolved: &mut ManifestPathScratch
+) -> bool {
+    let mut project_root: ManifestPathScratch;
+    ManifestPathScratch::new(&mut project_root);
+    let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+    _ = ProjectItemSortOrder::join_path(&sort_order, project_directory_path, Project::PROJECT_DIR, &mut project_root);
+    transition has_target_directory_path {
+        true -> target(project_directory_path, target_directory_path, project, &project_root, out_resolved)
+        false -> copy_root(&project_root, out_resolved)
+        _ -> (false)
+    }
+    state copy_root(project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch) -> bool
+        requires project_root.len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3088: &[u8] = ManifestPathScratch::get_bytes(project_root);
+        (ProjectItemSortOrder::copy_into(&sort_order, inner3088, out_resolved))
+    }
+    state target(project_directory_path: &[u8], target_directory_path: &[u8], project: &Project, project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch) -> bool
+        requires project_root.len <= 512;
+    {
+        let mut resolved_target: ManifestPathScratch;
+        ManifestPathScratch::new(&mut resolved_target);
+        _ = ProjectItemFileMutation::resolve_project_item_path(project_directory_path, target_directory_path, &mut resolved_target);
+        transition resolved_target.len <= 512 {
+            true -> kind(project_directory_path, ManifestPathScratch::get_bytes(&resolved_target), project, project_root, out_resolved, &resolved_target)
+            false -> copy_root(project_root, out_resolved)
+            _ -> (false)
+        }
+    }
+    state kind(project_directory_path: &[u8], resolved_target_bytes: &[u8], project: &Project, project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch, resolved_target: &ManifestPathScratch) -> bool
+        requires project_root.len <= 512 && resolved_target.len <= 512;
+    {
+        let inner3089: &[u8] = ManifestPathScratch::get_bytes(&resolved_target);
+        transition ProjectItemFileMutation::is_directory_path(inner3089, project) {
+            true -> clamp_out(ManifestPathScratch::get_bytes(&resolved_target), project_root, out_resolved)
+            false -> parent(ManifestPathScratch::get_bytes(&resolved_target), project_root, out_resolved)
+            _ -> (false)
+        }
+    }
+    // The target is a file — take everything before its last '/'.
+    state parent(resolved_target: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch) -> bool
+        requires project_root.len <= 512;
+    {
+        let last_sep: u64 = ProjectItemFileMutation::find_last_separator(resolved_target);
+        transition last_sep > 0 {
+            true -> parent_copy(resolved_target, project_root, out_resolved, last_sep)
+            false -> copy_root(project_root, out_resolved)
+            _ -> (false)
+        }
+    }
+    state parent_copy(resolved_target: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch, last_sep: u64) -> bool
+        requires project_root.len <= 512 && last_sep <= resolved_target.len;
+    {
+        // Strip a trailing '/' component — parent is [0..last_sep-1].
+        let mut parent_len: u64 = last_sep;
+        transition parent_len > 0 && last_sep <= resolved_target.len && last_sep >= 1 {
+            true -> parent_copy_do(resolved_target, project_root, out_resolved, last_sep)
+            false -> copy_root(project_root, out_resolved)
+            _ -> (false)
+        }
+    }
+    state parent_copy_do(resolved_target: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch, last_sep: u64) -> bool
+        requires project_root.len <= 512 && last_sep <= resolved_target.len && last_sep >= 1;
+    {
+        let mut parent_end: u64 = ((last_sep as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition parent_end <= resolved_target.len {
+            true -> parent_slice(resolved_target, project_root, out_resolved, parent_end)
+            false -> copy_root(project_root, out_resolved)
+            _ -> (false)
+        }
+    }
+    state parent_slice(resolved_target: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch, parent_end: u64) -> bool
+        requires parent_end <= resolved_target.len;
+    {
+        ManifestPathScratch::clear(out_resolved);
+        transition {
+            _ -> parent_slice_copy(resolved_target, project_root, out_resolved, parent_end, 0)
+        }
+    }
+    state parent_slice_copy(resolved_target: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch, parent_end: u64, position: u64) -> bool
+        requires parent_end <= resolved_target.len;
+    {
+        transition position < parent_end && out_resolved.len < 512 {
+            true -> parent_slice_byte(resolved_target, project_root, out_resolved, parent_end, position)
+            false -> clamp_out(ManifestPathScratch::get_bytes(out_resolved), project_root, out_resolved)
+            _ -> (false)
+        }
+    }
+    state parent_slice_byte(resolved_target: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch, parent_end: u64, position: u64) -> bool
+        requires parent_end <= resolved_target.len && position < parent_end && out_resolved.len < 512;
+    {
+        out_resolved.bytes[out_resolved.len] = resolved_target[position];
+        out_resolved.len = ((out_resolved.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> parent_slice_copy(resolved_target, project_root, out_resolved, parent_end, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state clamp_out(candidate: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch) -> bool
+        requires project_root.len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3090: &[u8] = ManifestPathScratch::get_bytes(project_root);
+        transition ProjectItemSortOrder::path_starts_with(&sort_order, candidate, inner3090) {
+            true -> keep_candidate(candidate, project_root, out_resolved)
+            false -> copy_root(project_root, out_resolved)
+            _ -> (false)
+        }
+    }
+    state keep_candidate(candidate: &[u8], project_root: &ManifestPathScratch, out_resolved: &mut ManifestPathScratch) -> bool
+        requires project_root.len <= 512;
+    {
+        let mut scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut scratch);
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::copy_into(&sort_order, candidate, &mut scratch);
+        transition scratch.len <= 512 {
+            true -> (ProjectItemSortOrder::copy_into(&sort_order, ManifestPathScratch::get_bytes(&scratch), out_resolved))
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `sanitize_file_name_component` — alnum kept, other bytes ->
+// '_', '_' runs collapsed, leading/trailing '_' trimmed, empty ->
+// fallback.
+pub machine ProjectItemFileMutation::sanitize_file_name_component(
+    file_name_component: &[u8],
+    fallback_name: &[u8],
+    out_sanitized: &mut ManifestPathScratch
+) -> bool {
+    ManifestPathScratch::clear(out_sanitized);
+    transition {
+        _ -> scan(file_name_component, fallback_name, out_sanitized, 0, false)
+    }
+    state scan(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, position: u64, previous_underscore: bool) -> bool {
+        transition position < file_name_component.len {
+            true -> byte(file_name_component, fallback_name, out_sanitized, position, previous_underscore)
+            false -> trim(file_name_component, fallback_name, out_sanitized)
+            _ -> (false)
+        }
+    }
+    state byte(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, position: u64, previous_underscore: bool) -> bool
+        requires position < file_name_component.len;
+    {
+        let value: u8 = file_name_component[position];
+        let is_alnum: bool = (value >= 48 && value <= 57) || (value >= 65 && value <= 90) || (value >= 97 && value <= 122);
+        transition is_alnum {
+            true -> keep(file_name_component, fallback_name, out_sanitized, position, value)
+            false -> underscore(file_name_component, fallback_name, out_sanitized, position, previous_underscore)
+            _ -> (false)
+        }
+    }
+    state keep(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, position: u64, value: u8) -> bool
+        requires position < file_name_component.len;
+    {
+        transition out_sanitized.len < 512 {
+            true -> keep_write(file_name_component, fallback_name, out_sanitized, position, value)
+            false -> trim(file_name_component, fallback_name, out_sanitized)
+            _ -> (false)
+        }
+    }
+    state keep_write(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, position: u64, value: u8) -> bool
+        requires out_sanitized.len < 512;
+    {
+        out_sanitized.bytes[out_sanitized.len] = value;
+        out_sanitized.len = ((out_sanitized.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> scan(file_name_component, fallback_name, out_sanitized, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, false)
+        }
+    }
+    state underscore(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, position: u64, previous_underscore: bool) -> bool
+        requires position < file_name_component.len;
+    {
+        transition previous_underscore {
+            true -> scan(file_name_component, fallback_name, out_sanitized, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, true)
+            false -> push_underscore(file_name_component, fallback_name, out_sanitized, position)
+            _ -> (false)
+        }
+    }
+    state push_underscore(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, position: u64) -> bool {
+        transition out_sanitized.len < 512 {
+            true -> push_underscore_write(file_name_component, fallback_name, out_sanitized, position)
+            false -> trim(file_name_component, fallback_name, out_sanitized)
+            _ -> (false)
+        }
+    }
+    state push_underscore_write(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, position: u64) -> bool
+        requires out_sanitized.len < 512;
+    {
+        out_sanitized.bytes[out_sanitized.len] = 95;
+        out_sanitized.len = ((out_sanitized.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> scan(file_name_component, fallback_name, out_sanitized, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, true)
+        }
+    }
+    // trim_matches('_') — drop leading and trailing underscores.
+    state trim(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch) -> bool {
+        transition {
+            _ -> trim_head(file_name_component, fallback_name, out_sanitized, 0)
+        }
+    }
+    state trim_head(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64) -> bool {
+        transition head < out_sanitized.len && head < 512 {
+            true -> head_byte(file_name_component, fallback_name, out_sanitized, head)
+            false -> tail(file_name_component, fallback_name, out_sanitized, head)
+            _ -> (false)
+        }
+    }
+    state head_byte(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64) -> bool
+        requires head < out_sanitized.len && head < 512;
+    {
+        transition out_sanitized.bytes[head] == 95 {
+            true -> trim_head(file_name_component, fallback_name, out_sanitized, ((head as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> tail(file_name_component, fallback_name, out_sanitized, head)
+            _ -> (false)
+        }
+    }
+    state tail(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64) -> bool {
+        let mut tail_len: u64 = out_sanitized.len;
+        transition {
+            _ -> tail_walk(file_name_component, fallback_name, out_sanitized, head, tail_len)
+        }
+    }
+    state tail_walk(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64, tail_len: u64) -> bool {
+        transition tail_len > head {
+            true -> tail_byte(file_name_component, fallback_name, out_sanitized, head, tail_len)
+            false -> finish(file_name_component, fallback_name, out_sanitized, head, tail_len)
+            _ -> (false)
+        }
+    }
+    state tail_byte(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64, tail_len: u64) -> bool
+        requires tail_len > 0 && tail_len <= 512 && tail_len > head;
+    {
+        let mut back: u64 = ((tail_len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition back < 512 && back < out_sanitized.len {
+            true -> tail_byte_at(file_name_component, fallback_name, out_sanitized, head, tail_len, back)
+            false -> finish(file_name_component, fallback_name, out_sanitized, head, tail_len)
+            _ -> (false)
+        }
+    }
+    state tail_byte_at(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64, tail_len: u64, back: u64) -> bool
+        requires back < out_sanitized.len && back < 512;
+    {
+        transition out_sanitized.bytes[back] == 95 {
+            true -> tail_walk(file_name_component, fallback_name, out_sanitized, head, back)
+            false -> finish(file_name_component, fallback_name, out_sanitized, head, tail_len)
+            _ -> (false)
+        }
+    }
+    state finish(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64, tail_len: u64) -> bool
+        requires head <= 512 && tail_len <= 512;
+    {
+        // Shift [head..tail_len) to the front in place.
+        transition {
+            _ -> shift(file_name_component, fallback_name, out_sanitized, head, tail_len, 0)
+        }
+    }
+    state shift(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64, tail_len: u64, position: u64) -> bool
+        requires head <= 512 && tail_len <= 512;
+    {
+        let mut source: u64 = ((head as u64 in Wrapping) + (position as u64 in Wrapping)) as u64;
+        transition source < tail_len && position < 512 {
+            true -> shift_byte(file_name_component, fallback_name, out_sanitized, head, tail_len, position, source)
+            false -> shifted(file_name_component, fallback_name, out_sanitized, position)
+            _ -> (false)
+        }
+    }
+    state shift_byte(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, head: u64, tail_len: u64, position: u64, source: u64) -> bool
+        requires source < 512 && position < 512 && source < out_sanitized.len;
+    {
+        out_sanitized.bytes[position] = out_sanitized.bytes[source];
+        transition {
+            _ -> shift(file_name_component, fallback_name, out_sanitized, head, tail_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state shifted(file_name_component: &[u8], fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch, new_len: u64) -> bool
+        requires new_len <= 512;
+    {
+        out_sanitized.len = new_len;
+        transition out_sanitized.len > 0 {
+            true -> (true)
+            false -> use_fallback(fallback_name, out_sanitized)
+            _ -> (false)
+        }
+    }
+    state use_fallback(fallback_name: &[u8], out_sanitized: &mut ManifestPathScratch) -> bool {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        (ProjectItemSortOrder::copy_into(&sort_order, fallback_name, out_sanitized))
+    }
+}
+
+// Upstream `generate_unique_project_item_file_path(_allowing)` —
+// "stem.json" then "stem_N.json" probing items-table + disk. The probe
+// loop caps at 999 (upstream saturating is unbounded in theory; the cap
+// is the documented bound — a refusal returns the 999th candidate).
+pub machine ProjectItemFileMutation::generate_unique_project_item_file_path(
+    parent_directory_path: &[u8],
+    project: &Project,
+    project_item_file_stem: &[u8],
+    out_path: &mut ManifestPathScratch
+) -> bool {
+    let mut allowed: ManifestPathScratch;
+    ManifestPathScratch::new(&mut allowed);
+    allowed.len = 0;
+    transition {
+        _ -> (ProjectItemFileMutation::generate_unique_project_item_file_path_allowing(parent_directory_path, project, project_item_file_stem, ManifestPathScratch::get_bytes(&allowed), false, out_path))
+    }
+}
+
+pub machine ProjectItemFileMutation::generate_unique_project_item_file_path_allowing(
+    parent_directory_path: &[u8],
+    project: &Project,
+    project_item_file_stem: &[u8],
+    allowed_existing_project_item_path: &[u8],
+    has_allowed_existing_project_item_path: bool,
+    out_path: &mut ManifestPathScratch
+) -> bool {
+    transition {
+        _ -> attempt(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, 0)
+    }
+    state attempt(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64) -> bool {
+        transition sequence <= 999 {
+            true -> build_name(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state build_name(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64) -> bool {
+        let mut file_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut file_name);
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::copy_into(&sort_order, project_item_file_stem, &mut file_name);
+        transition sequence == 0 {
+            true -> extension(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &mut file_name)
+            false -> suffix(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &mut file_name)
+            _ -> (false)
+        }
+    }
+    // "_<decimal>" suffix — bounded u64-to-decimal emit.
+    state suffix(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch) -> bool {
+        transition file_name.len < 512 {
+            true -> suffix_sep(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &mut file_name)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state suffix_sep(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch) -> bool
+        requires file_name.len < 512;
+    {
+        file_name.bytes[file_name.len] = 95;
+        file_name.len = ((file_name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> digits(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, sequence, 1)
+        }
+    }
+    // magnitude = largest power of ten <= sequence.
+    state digits(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch, value: u64, magnitude: u64) -> bool {
+        let mut next_magnitude: u64 = ((magnitude as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64;
+        transition next_magnitude <= value && next_magnitude <= 999 && magnitude < 100 {
+            true -> digits(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, value, next_magnitude)
+            false -> emit_digit(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, value, magnitude)
+            _ -> (false)
+        }
+    }
+    state emit_digit(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch, value: u64, magnitude: u64) -> bool {
+        transition magnitude > 0 {
+            true -> emit_digit_byte(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, value, magnitude)
+            false -> extension(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &mut file_name)
+            _ -> (false)
+        }
+    }
+    state emit_digit_byte(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch, value: u64, magnitude: u64) -> bool {
+        let mut digit: u64 = value / magnitude;
+        transition digit <= 9 && file_name.len < 512 {
+            true -> emit_digit_write(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, value, magnitude, digit)
+            false -> extension(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &mut file_name)
+            _ -> (false)
+        }
+    }
+    state emit_digit_write(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch, value: u64, magnitude: u64, digit: u64) -> bool
+        requires file_name.len < 512 && digit <= 9;
+    {
+        file_name.bytes[file_name.len] = (48 + digit) as u8;
+        file_name.len = ((file_name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let mut remainder: u64 = value % magnitude;
+        let mut next_magnitude: u64 = magnitude / 10;
+        transition {
+            _ -> emit_digit(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, remainder, next_magnitude)
+        }
+    }
+    state extension(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch) -> bool {
+        transition file_name.len < 512 {
+            true -> extension_dot(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &mut file_name)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state extension_dot(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch) -> bool
+        requires file_name.len < 512;
+    {
+        file_name.bytes[file_name.len] = 46;
+        file_name.len = ((file_name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> extension_bytes(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, 0)
+        }
+    }
+    state extension_bytes(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch, position: u64) -> bool {
+        let extension: &[u8] = Project::get_project_item_extension();
+        transition position < extension.len && file_name.len < 512 {
+            true -> extension_byte(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &mut file_name, position)
+            false -> join_probe(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, &file_name)
+            _ -> (false)
+        }
+    }
+    state extension_byte(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &mut ManifestPathScratch, position: u64) -> bool
+        requires position < Project::get_project_item_extension().len && file_name.len < 512;
+    {
+        file_name.bytes[file_name.len] = Project::get_project_item_extension()[position];
+        file_name.len = ((file_name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> extension_bytes(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence, file_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state join_probe(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64, file_name: &ManifestPathScratch) -> bool
+        requires file_name.len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3091: &[u8] = ManifestPathScratch::get_bytes(&file_name);
+        _ = ProjectItemSortOrder::join_path(&sort_order, parent_directory_path, inner3091, out_path);
+        transition out_path.len <= 512 {
+            true -> probe_allowed(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state probe_allowed(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64) -> bool
+        requires out_path.len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3092: &[u8] = ManifestPathScratch::get_bytes(out_path);
+        transition has_allowed_existing_project_item_path && ProjectItemSortOrder::paths_equal(&sort_order, inner3092, allowed_existing_project_item_path) {
+            true -> (true)
+            false -> probe_items(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence)
+            _ -> (false)
+        }
+    }
+    state probe_items(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64) -> bool
+        requires out_path.len <= 512;
+    {
+        let mut item_ref: ProjectItemRef = ProjectItemRef::new(ManifestPathScratch::get_bytes(out_path));
+        let outcome: ProjectItemLookup = Project::lookup_project_item_index(project, &item_ref);
+        transition outcome {
+            ProjectItemLookup::Found { index } -> retry(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence)
+            _ -> probe_disk(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence)
+        }
+    }
+    state probe_disk(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64) -> bool
+        requires out_path.len <= 512;
+    {
+        let inner3093: &[u8] = ManifestPathScratch::get_bytes(out_path);
+        transition FileSystemUtils::path_exists(inner3093) {
+            true -> retry(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, sequence)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state retry(parent_directory_path: &[u8], project: &Project, project_item_file_stem: &[u8], allowed_existing_project_item_path: &[u8], has_allowed_existing_project_item_path: bool, out_path: &mut ManifestPathScratch, sequence: u64) -> bool {
+        let mut next_sequence: u64 = ((sequence as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next_sequence <= 999 {
+            true -> attempt(parent_directory_path, project, project_item_file_stem, allowed_existing_project_item_path, has_allowed_existing_project_item_path, out_path, next_sequence)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `create_placeholder_file` — create the parent chain then
+// create the file when absent (no truncate of an existing file).
+pub linux_x86_64 machine ProjectItemFileMutation::create_placeholder_file(file_path: &[u8]) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition {
+        _ -> parent(file_path)
+    }
+    state parent(file_path: &[u8]) -> bool {
+        let last_sep: u64 = ProjectItemFileMutation::find_last_separator(file_path);
+        transition last_sep > 1 {
+            true -> parent_create(file_path, last_sep)
+            false -> exists(file_path)
+            _ -> (false)
+        }
+    }
+    state parent_create(file_path: &[u8], last_sep: u64) -> bool
+        requires last_sep <= file_path.len && last_sep >= 1;
+    {
+        let mut parent_end: u64 = ((last_sep as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition parent_end <= file_path.len {
+            true -> parent_dirs(file_path, parent_end)
+            false -> exists(file_path)
+            _ -> (false)
+        }
+    }
+    state parent_dirs(file_path: &[u8], parent_end: u64) -> bool
+        requires parent_end <= file_path.len;
+    {
+        transition {
+            _ -> (FileSystemUtils::create_dir_all_path(&file_path[0..parent_end]))
+        }
+    }
+    state exists(file_path: &[u8]) -> bool {
+        transition FileSystemUtils::path_exists(file_path) {
+            true -> (true)
+            false -> create(file_path)
+            _ -> (false)
+        }
+    }
+    state create(file_path: &[u8]) -> bool {
+        let fd: i32 = FileSystemUtils::open_path(file_path, 577);
+        transition fd >= 0 {
+            true -> close_file(fd)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state close_file(fd: i32) -> bool {
+        _ = FilesystemHost::close(fd);
+        (true)
+    }
+}
+
+// Upstream `create_placeholder_files` — the callers hand over resolved
+// paths one at a time; a bounded list of up to 64 suffices (upstream
+// Vec<PathBuf> slice).
+pub linux_x86_64 machine ProjectItemFileMutation::create_placeholder_files(file_paths: &ProjectPathList) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition {
+        _ -> scan(file_paths, 0)
+    }
+    state scan(file_paths: &ProjectPathList, position: u64) -> bool {
+        transition position < ProjectPathList::get_path_count(file_paths) {
+            true -> create_at(file_paths, position)
+            false -> (true)
+            _ -> (false)
+        }
+    }
+    state create_at(file_paths: &ProjectPathList, position: u64) -> bool {
+        let inner3094: &[u8] = ProjectPathList::get_path(file_paths, position);
+        transition ProjectItemFileMutation::create_placeholder_file(inner3094) {
+            true -> scan(file_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+}

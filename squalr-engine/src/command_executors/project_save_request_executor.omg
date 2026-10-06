@@ -1,0 +1,161 @@
+module src::command_executors::project_save_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::plugins::list::plugin_list_response::PluginListResponse;
+use squalr_engine_api::src::commands::project::save::project_save_request::ProjectSaveRequest;
+use squalr_engine_api::src::commands::project::save::project_save_response::ProjectSaveResponse;
+use squalr_engine_api::src::plugins::plugin_configuration::PluginConfiguration;
+use squalr_engine_api::src::plugins::plugin_configuration::PluginConfigurationProbe;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_plugin_sync::PluginSnapshot;
+use src::services::projects::project_plugin_sync::PluginSnapshotProbe;
+use src::services::projects::project_plugin_sync::ProjectPluginSync;
+
+// Port of command_executors/project/save/project_save_request_executor.rs —
+// fold the live plugin snapshot into the stored plugin configuration when
+// it drifted, then persist the project. Upstream saves through
+// `save_to_path(directory)`; the port's executor only ever holds runtime
+// path bytes, so it opens the directory (FileSystemUtils::open_path) and
+// drives the dirfd twin `save_at` — identical payload and file layout.
+pub data ProjectSaveRequestExecutor {}
+
+pub machine ProjectSaveRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_save_request: &ProjectSaveRequest
+) -> ProjectSaveResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+    transition ProjectManager::get_has_opened_project(project_manager) {
+        true -> snapshot(engine_unprivileged_state, engine_bindings)
+        _ -> refused()
+    }
+
+    state refused() -> ProjectSaveResponse {
+        (ProjectSaveResponse::new())
+    }
+
+    // Upstream `get_plugin_snapshot` -> `PluginConfiguration::
+    // from_plugin_states` -> diff against the stored configuration; when
+    // drifted, store the new configuration and mark unsaved-changes.
+    state snapshot(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings
+    ) -> ProjectSaveResponse {
+        transition ProjectPluginSync::get_plugin_snapshot(engine_bindings) {
+            PluginSnapshotProbe::Present { snapshot } -> configure(engine_unprivileged_state, &snapshot)
+            _ -> persist(engine_unprivileged_state)
+        }
+    }
+
+    state configure(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        plugin_snapshot: &PluginSnapshot
+    ) -> ProjectSaveResponse {
+        let inner28: &PluginListResponse = PluginSnapshot::get_plugin_list_response(plugin_snapshot);
+        let probe: PluginConfigurationProbe = PluginConfiguration::from_plugin_states(inner28);
+        transition probe {
+            PluginConfigurationProbe::Present { configuration } -> compare(engine_unprivileged_state, &configuration)
+            _ -> persist(engine_unprivileged_state)
+        }
+    }
+
+    state compare(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        current: &PluginConfiguration
+    ) -> ProjectSaveResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let same: bool = ProjectInfo::has_plugin_configuration(project_info)
+            && PluginConfiguration::equals(ProjectInfo::get_plugin_configuration(project_info), current);
+        transition same {
+            true -> persist(engine_unprivileged_state)
+            _ -> apply(engine_unprivileged_state, current)
+        }
+    }
+
+    state apply(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        current: &PluginConfiguration
+    ) -> ProjectSaveResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_info: &mut ProjectInfo = Project::borrow_project_info_mut(opened_project);
+        ProjectInfo::set_plugin_configuration(project_info, current);
+        ProjectInfo::set_has_unsaved_changes(project_info, true);
+        transition { _ -> persist(engine_unprivileged_state) }
+    }
+
+    state persist(engine_unprivileged_state: &mut EngineUnprivilegedState) -> ProjectSaveResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut project_directory: [u8; 512];
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition ProjectInfo::get_project_directory(project_info, &mut project_directory) {
+            true -> open(engine_unprivileged_state, project_directory, directory_len)
+            _ -> refused()
+        }
+    }
+
+    state open(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_directory: [u8; 512],
+        directory_len: u64
+    ) -> ProjectSaveResponse {
+        transition directory_len > 0 && directory_len <= 512 {
+            true -> open_at(engine_unprivileged_state, project_directory, directory_len)
+            _ -> refused()
+        }
+    }
+
+    state open_at(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        project_directory: [u8; 512],
+        directory_len: u64
+    ) -> ProjectSaveResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&project_directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> save(engine_unprivileged_state, dir_fd, &project_directory[0..directory_len])
+            _ -> refused()
+        }
+    }
+
+    state save(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        dir_fd: i32,
+        project_directory: &[u8]
+    ) -> ProjectSaveResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, project_directory, false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> succeeded()
+            _ -> refused()
+        }
+    }
+
+    state succeeded() -> ProjectSaveResponse {
+        let mut response: ProjectSaveResponse = ProjectSaveResponse::new();
+        ProjectSaveResponse::set_success(&mut response, true);
+        (response)
+    }
+}

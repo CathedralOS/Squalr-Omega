@@ -2,8 +2,14 @@ module src::structures::structs::symbolic_field_definition;
 
 use src::structures::data_types::data_type_ref::DataTypeRef;
 use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormatParse;
 use src::structures::data_values::container_type::ContainerType;
 use src::structures::structs::symbolic_resolver_ref::SymbolicResolverRef;
+use src::structures::structs::symbolic_resolver_ref::SymbolicResolverRefResult;
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSizeParse;
+use src::structures::data_types::data_type_ref::DataTypeRefParse;
+use omega::language::core::option;
 use src::structures::data_values::data_value::DataValue;
 use src::structures::structs::valued_struct_field::ValuedStructField;
 use src::structures::structs::valued_struct_field::ValuedStructFieldData;
@@ -148,7 +154,7 @@ pub machine SymbolicFieldDefinition::get_size_in_bytes(symbolic_field_definition
         SymbolicFieldDefinition::Field { field } -> at_field(symbolic_field_definition, field)
         SymbolicFieldDefinition::Unassigned { size_in_bytes } -> (size_in_bytes)
     }
-    state at_field(symbolic_field_definition: &SymbolicFieldDefinition, field: SymbolicDefinedField) -> u64 {
+    state at_field(symbolic_field_definition: &SymbolicFieldDefinition, field: &SymbolicDefinedField) -> u64 {
         ContainerType::get_total_size_in_bytes(&field.container_type, 
             DataTypeRef::get_unit_size_in_bytes(&field.data_type_ref))
     }
@@ -174,20 +180,20 @@ pub machine SymbolicFieldDefinition::get_valued_struct_field(symbolic_field_defi
         SymbolicFieldDefinition::Field { field } -> defined(symbolic_field_definition, field)
         _ -> (ValuedStructField::default())
     }
-    state defined(symbolic_field_definition: &SymbolicFieldDefinition, field: SymbolicDefinedField) -> ValuedStructField {
+    state defined(symbolic_field_definition: &SymbolicFieldDefinition, field: &SymbolicDefinedField) -> ValuedStructField {
         transition field.field_name_len <= 256 {
             true -> fit(symbolic_field_definition, field)
             false -> clamped(symbolic_field_definition, field)
             _ -> clamped(symbolic_field_definition, field)
         }
     }
-    state fit(symbolic_field_definition: &SymbolicFieldDefinition, field: SymbolicDefinedField) -> ValuedStructField {
+    state fit(symbolic_field_definition: &SymbolicFieldDefinition, field: &SymbolicDefinedField) -> ValuedStructField {
         ValuedStructField::new(
             &field.field_name[0..field.field_name_len],
             &ValuedStructFieldData::Value { value: DataValue::default() },
             false)
     }
-    state clamped(symbolic_field_definition: &SymbolicFieldDefinition, field: SymbolicDefinedField) -> ValuedStructField {
+    state clamped(symbolic_field_definition: &SymbolicFieldDefinition, field: &SymbolicDefinedField) -> ValuedStructField {
         ValuedStructField::new(
             &field.field_name[0..256],
             &ValuedStructFieldData::Value { value: DataValue::default() },
@@ -580,6 +586,1681 @@ machine copy_name_text(out: &mut [u8; 256], text: &[u8]) -> u64 {
         out[position] = text[position];
         transition {
             _ -> copy(out, text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `FromStr` result carrier — `Result<Self, String>`; error
+// detail strings collapse to the Refused arm (upstream only logs them).
+pub data SymbolicFieldDefinitionParse {
+    case Refused;
+    case Parsed(value: SymbolicFieldDefinition);
+}
+
+// Upstream `FromStr::from_str` — the full field-definition grammar:
+//   `unassigned[N]` | `[name:]type[*(size)|*][@ +N | resolver(id)]`
+//   with `display resolver(id)`, `active resolver(id)`, and
+//   `format <format>` suffixes trimmed right-to-left, then
+//   `[count]`/`[]`/`[resolver(id)]` container arms and trailing
+//   `type*(size)`/`type*(` pointer forms.
+// Windowed byte scans stand in for upstream's trim/split_once/
+// rsplit_once/strip_* text ops; indices are byte offsets into `text`.
+pub machine SymbolicFieldDefinition::from_str(text: &[u8]) -> SymbolicFieldDefinitionParse {
+    let start: u64 = sfd_trim_left(text, 0, text.len);
+    let end: u64 = sfd_trim_right(text, start, text.len);
+    transition { _ -> entry(text, start, end) }
+    state entry(text: &[u8], start: u64, end: u64) -> SymbolicFieldDefinitionParse {
+        transition start <= end && end <= text.len && start < end {
+            true -> unassigned(text, start, end)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // `unassigned[N]` — whole-string prefix+suffix arm.
+    state unassigned(text: &[u8], start: u64, end: u64) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        transition sfd_starts_with(text, start, end, "unassigned[") && sfd_ends_with_byte(text, start, end, 93) {
+            true -> unassigned_num(text, start, end)
+            _ -> split_at(text, start, end)
+        }
+    }
+    state unassigned_num(text: &[u8], start: u64, end: u64) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        let num_start: u64 = sfd_trim_left(text, ((start as u64 in Wrapping) + (11 as u64 in Wrapping)) as u64, end);
+        let num_end: u64 = sfd_trim_right(text, num_start, ((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+        let parsed: SfdU64Parse = sfd_parse_u64_radix(text, num_start, num_end);
+        transition parsed.ok {
+            true -> (SymbolicFieldDefinitionParse::Parsed { value: SymbolicFieldDefinition::new_unassigned(parsed.value) })
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // `def@offset` — upstream split_once('@'): the FIRST '@' splits.
+    state split_at(text: &[u8], start: u64, end: u64) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        let at: u64 = sfd_find_byte(text, start, end, 64);
+        transition { _ -> at_gate(text, start, at, end) }
+    }
+    state at_gate(text: &[u8], start: u64, at: u64, end: u64) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        transition start <= at && at < end {
+            true -> with_offset(text, start, at, end)
+            _ -> split_format(text, start, end, SymbolicFieldOffsetResolution::Sequential)
+        }
+    }
+    state with_offset(text: &[u8], start: u64, at: u64, end: u64) -> SymbolicFieldDefinitionParse
+        requires start <= at && at < end && end <= text.len;
+    {
+        let offset_start: u64 = sfd_trim_left(text, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end);
+        let offset_end: u64 = sfd_trim_right(text, offset_start, end);
+        let def_end: u64 = sfd_trim_right(text, start, at);
+        let parsed: SfdOffsetParse = sfd_parse_offset_resolution(text, offset_start, offset_end);
+        transition parsed.ok {
+            true -> def_end_gate(text, start, def_end, parsed.value)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state def_end_gate(text: &[u8], start: u64, def_end: u64, offset_resolution: SymbolicFieldOffsetResolution) -> SymbolicFieldDefinitionParse {
+        transition start <= def_end && def_end <= text.len {
+            true -> split_format(text, start, def_end, offset_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // `... format X` — upstream rsplit_once(" format ").
+    state split_format(text: &[u8], start: u64, end: u64, offset_resolution: SymbolicFieldOffsetResolution) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        let marker: u64 = sfd_rfind(text, start, end, " format ");
+        transition { _ -> marker_gate(text, start, marker, end, offset_resolution) }
+    }
+    state marker_gate(text: &[u8], start: u64, marker: u64, end: u64, offset_resolution: SymbolicFieldOffsetResolution) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        transition start <= marker && marker < end && end <= text.len {
+            true -> with_format(text, start, marker, end, offset_resolution)
+            _ -> split_active(text, start, end, offset_resolution, AnonymousValueStringFormat::default(), false)
+        }
+    }
+    state with_format(text: &[u8], start: u64, marker: u64, end: u64, offset_resolution: SymbolicFieldOffsetResolution) -> SymbolicFieldDefinitionParse
+        requires start <= marker && marker < end && end <= text.len;
+    {
+        let format_start: u64 = sfd_trim_left(text, ((marker as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64, end);
+        let format_end: u64 = sfd_trim_right(text, format_start, end);
+        transition { _ -> format_gate(text, start, marker, format_start, format_end, offset_resolution) }
+    }
+    state format_gate(text: &[u8], start: u64, marker: u64, format_start: u64, format_end: u64, offset_resolution: SymbolicFieldOffsetResolution) -> SymbolicFieldDefinitionParse
+        requires start <= marker;
+    {
+        transition start <= marker && format_start <= format_end && format_end <= text.len && format_start < format_end {
+            true -> parse_format(text, start, marker, format_start, format_end, offset_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state parse_format(text: &[u8], start: u64, marker: u64, format_start: u64, format_end: u64, offset_resolution: SymbolicFieldOffsetResolution) -> SymbolicFieldDefinitionParse
+        requires start <= marker && format_start <= format_end && format_end <= text.len;
+    {
+        let parsed: AnonymousValueStringFormatParse = AnonymousValueStringFormat::from_str_window(text, format_start, format_end);
+        transition parsed {
+            AnonymousValueStringFormatParse::Parsed { value } -> split_active_gate(text, start, marker, offset_resolution, value)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state split_active_gate(text: &[u8], start: u64, marker: u64, offset_resolution: SymbolicFieldOffsetResolution, display_format: AnonymousValueStringFormat) -> SymbolicFieldDefinitionParse {
+        transition start <= marker && marker <= text.len {
+            true -> split_active(text, start, marker, offset_resolution, display_format, true)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // `... active resolver(id)` — upstream rsplit_once(" active ").
+    state split_active(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        let marker: u64 = sfd_rfind(text, start, end, " active ");
+        transition { _ -> active_marker_gate(text, start, marker, end, offset_resolution, display_format, has_display_format) }
+    }
+    state active_marker_gate(text: &[u8], start: u64, marker: u64, end: u64, offset_resolution: SymbolicFieldOffsetResolution, display_format: AnonymousValueStringFormat, has_display_format: bool) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        transition start <= marker && marker < end && end <= text.len {
+            true -> with_active(text, start, marker, end, offset_resolution, display_format, has_display_format)
+            _ -> split_display(text, start, end, offset_resolution, display_format, has_display_format, false)
+        }
+    }
+    state with_active(
+        text: &[u8],
+        start: u64,
+        marker: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= marker && marker < end && end <= text.len;
+    {
+        let resolver_start: u64 = sfd_trim_left(text, ((marker as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64, end);
+        let resolver_end: u64 = sfd_trim_right(text, resolver_start, end);
+        let parsed: SfdResolverParse = sfd_parse_resolver_reference(text, resolver_start, resolver_end);
+        let trimmed_end: u64 = sfd_trim_right(text, start, marker);
+        transition parsed.ok {
+            true -> display_end_gate(text, start, trimmed_end, offset_resolution, display_format, has_display_format)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state display_end_gate(text: &[u8], start: u64, end: u64, offset_resolution: SymbolicFieldOffsetResolution, display_format: AnonymousValueStringFormat, has_display_format: bool) -> SymbolicFieldDefinitionParse {
+        transition start <= end && end <= text.len {
+            true -> split_display(text, start, end, offset_resolution, display_format, has_display_format, true)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // `... display resolver(id)` — upstream rsplit_once(" display ").
+    state split_display(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        let marker: u64 = sfd_rfind(text, start, end, " display ");
+        transition { _ -> display_marker_gate(text, start, marker, end, offset_resolution, display_format, has_display_format, has_active_resolver) }
+    }
+    state display_marker_gate(
+        text: &[u8],
+        start: u64,
+        marker: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        transition start <= marker && marker < end && end <= text.len {
+            true -> with_display(text, start, marker, end, offset_resolution, display_format, has_display_format, has_active_resolver)
+            _ -> split_name(text, start, end, offset_resolution, display_format, has_display_format, has_active_resolver, marker, end, SymbolicFieldCountResolution::Inferred)
+        }
+    }
+    state with_display(
+        text: &[u8],
+        start: u64,
+        marker: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= marker && marker < end && end <= text.len;
+    {
+        let count_start: u64 = sfd_trim_left(text, ((marker as u64 in Wrapping) + (9 as u64 in Wrapping)) as u64, end);
+        let count_end: u64 = sfd_trim_right(text, count_start, end);
+        transition { _ -> count_gate(text, start, marker, count_start, count_end, offset_resolution, display_format, has_display_format, has_active_resolver) }
+    }
+    state count_gate(
+        text: &[u8],
+        start: u64,
+        marker: u64,
+        count_start: u64,
+        count_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= marker;
+    {
+        transition start <= marker && count_start <= count_end && count_end <= text.len && count_start < count_end {
+            true -> parse_display_count(text, start, marker, count_start, count_end, offset_resolution, display_format, has_display_format, has_active_resolver)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state parse_display_count(
+        text: &[u8],
+        start: u64,
+        marker: u64,
+        count_start: u64,
+        count_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= marker && count_start <= count_end && count_end <= text.len;
+    {
+        let parsed: SfdCountParse = sfd_parse_count_resolution(text, count_start, count_end);
+        transition parsed.ok {
+            true -> name_marker_gate(text, start, marker, count_end, offset_resolution, display_format, has_display_format, has_active_resolver, parsed.value)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state name_marker_gate(
+        text: &[u8],
+        start: u64,
+        marker: u64,
+        count_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse {
+        transition start <= marker && marker <= text.len {
+            true -> split_name(text, start, marker, offset_resolution, display_format, has_display_format, has_active_resolver, marker, count_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // `name:` — upstream split_once(':'): the FIRST ':' splits; an
+    // absent ':' keeps the empty field name.
+    state split_name(
+        text: &[u8],
+        start: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        let colon: u64 = sfd_find_byte(text, start, end, 58);
+        transition { _ -> colon_gate(text, start, colon, end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution) }
+    }
+    state colon_gate(
+        text: &[u8],
+        start: u64,
+        colon: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= end && end <= text.len;
+    {
+        transition start <= colon && colon < end && end <= text.len {
+            true -> named(text, start, colon, end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> container_gate(text, start, start, end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+        }
+    }
+    state named(
+        text: &[u8],
+        start: u64,
+        colon: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires start <= colon && colon < end && end <= text.len;
+    {
+        let name_start: u64 = sfd_trim_left(text, start, colon);
+        let name_end: u64 = sfd_trim_right(text, name_start, colon);
+        transition name_start < name_end {
+            true -> container_gate(text, name_start, ((colon as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state container_gate(
+        text: &[u8],
+        name_start: u64,
+        type_start: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= type_start && type_start <= end && end <= text.len {
+            true -> container(text, name_start, type_start, end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // Container arm — upstream order: `type[count]`, then ends_with(')')
+    // + rfind("*("), then strip_suffix('*'), else None.
+    state container(
+        text: &[u8],
+        name_start: u64,
+        type_start: u64,
+        end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= type_start && type_start <= end && end <= text.len;
+    {
+        let t_start: u64 = sfd_trim_left(text, type_start, end);
+        let t_end: u64 = sfd_trim_right(text, t_start, end);
+        let open: u64 = sfd_find_byte(text, t_start, t_end, 91);
+        transition { _ -> bracket_gate(text, name_start, t_start, open, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution) }
+    }
+    state bracket_gate(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        open: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= t_start && t_start <= open && open < t_end && t_end <= text.len {
+            true -> bracket(text, name_start, t_start, open, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> paren_gate(text, name_start, t_start, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+        }
+    }
+    state paren_gate(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= t_start && t_start <= t_end && t_end <= text.len {
+            true -> paren_or_star(text, name_start, t_start, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state bracket(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        open: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= open && open < t_end && t_end <= text.len;
+    {
+        transition sfd_ends_with_byte(text, open, t_end, 93) {
+            true -> bracket_parts(text, name_start, t_start, open, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state bracket_parts(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        open: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= open && open < t_end && t_end <= text.len;
+    {
+        let type_end: u64 = sfd_trim_right(text, t_start, open);
+        let len_start: u64 = sfd_trim_left(text, ((open as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, t_end);
+        let len_end: u64 = sfd_trim_right(text, len_start, ((t_end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+        // `*(size)` inside the type part picks the pointer-array arm.
+        let star_paren: u64 = sfd_rfind(text, t_start, type_end, "*(");
+        transition { _ -> pointer_gate(text, name_start, t_start, star_paren, type_end, len_start, len_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution) }
+    }
+    state pointer_gate(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        star_paren: u64,
+        type_end: u64,
+        len_start: u64,
+        len_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= t_start && t_start <= star_paren && star_paren < type_end && type_end <= text.len && len_start <= len_end && len_end <= text.len && sfd_ends_with_byte(text, star_paren, type_end, 41) {
+            true -> pointer_bracket(text, name_start, t_start, star_paren, type_end, len_start, len_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> plain_gate(text, name_start, t_start, type_end, len_start, len_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution, star_paren)
+        }
+    }
+    state plain_gate(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        type_end: u64,
+        len_start: u64,
+        len_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution,
+        star_paren: u64
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= t_start && t_start <= type_end && type_end <= text.len && len_start <= len_end && len_end <= text.len {
+            true -> plain_bracket(text, name_start, t_start, type_end, len_start, len_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution, star_paren)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state pointer_bracket(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        star_paren: u64,
+        type_end: u64,
+        len_start: u64,
+        len_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= star_paren && star_paren < type_end && type_end <= text.len && len_start <= len_end && len_end <= text.len;
+    {
+        let size_start: u64 = sfd_trim_left(text, ((star_paren as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64, type_end);
+        let size_end: u64 = sfd_trim_right(text, size_start, ((type_end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+        let parsed: PointerScanPointerSizeParse = PointerScanPointerSize::from_str_window(text, size_start, size_end);
+        let base_end: u64 = sfd_trim_right(text, t_start, star_paren);
+        transition parsed.ok {
+            true -> pb_len_gate(text, name_start, t_start, base_end, len_start, len_end, parsed.value, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state pb_len_gate(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        base_end: u64,
+        len_start: u64,
+        len_end: u64,
+        pointer_size: PointerScanPointerSize,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= t_start && t_start <= base_end && base_end <= text.len && len_start <= len_end && len_end <= text.len {
+            true -> pointer_bracket_length(text, name_start, t_start, base_end, len_start, len_end, pointer_size, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state pointer_bracket_length(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        base_end: u64,
+        len_start: u64,
+        len_end: u64,
+        pointer_size: PointerScanPointerSize,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= base_end && base_end <= text.len && len_start <= len_end && len_end <= text.len;
+    {
+        transition len_start >= len_end {
+            true -> finish(text, name_start, t_start, base_end, ContainerType::PointerArray { pointer_size: pointer_size }, SymbolicFieldCountResolution::Inferred, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> pointer_bracket_count(text, name_start, t_start, base_end, len_start, len_end, pointer_size, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+        }
+    }
+    state pointer_bracket_count(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        base_end: u64,
+        len_start: u64,
+        len_end: u64,
+        pointer_size: PointerScanPointerSize,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= base_end && base_end <= text.len && len_start <= len_end && len_end <= text.len;
+    {
+        let parsed: SfdU64Parse = sfd_parse_u64_radix(text, len_start, len_end);
+        transition parsed.ok {
+            true -> finish(text, name_start, t_start, base_end, ContainerType::PointerArrayFixed { pointer_size: pointer_size, length: parsed.value }, SymbolicFieldCountResolution::Inferred, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> pointer_bracket_resolver(text, name_start, t_start, base_end, len_start, len_end, pointer_size, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+        }
+    }
+    state pointer_bracket_resolver(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        base_end: u64,
+        len_start: u64,
+        len_end: u64,
+        pointer_size: PointerScanPointerSize,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= base_end && base_end <= text.len && len_start <= len_end && len_end <= text.len;
+    {
+        let parsed: SfdCountParse = sfd_parse_count_resolution(text, len_start, len_end);
+        transition parsed.ok {
+            true -> finish(text, name_start, t_start, base_end, ContainerType::PointerArray { pointer_size: pointer_size }, parsed.value, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state plain_bracket(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        type_end: u64,
+        len_start: u64,
+        len_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution,
+        star_paren: u64
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= type_end && type_end <= text.len && len_start <= len_end && len_end <= text.len;
+    {
+        transition len_start >= len_end {
+            true -> finish(text, name_start, t_start, type_end, ContainerType::Array, SymbolicFieldCountResolution::Inferred, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> plain_count(text, name_start, t_start, type_end, len_start, len_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution, star_paren)
+        }
+    }
+    state plain_count(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        type_end: u64,
+        len_start: u64,
+        len_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution,
+        star_paren: u64
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= type_end && type_end <= text.len && len_start <= len_end && len_end <= text.len;
+    {
+        let parsed: SfdU64Parse = sfd_parse_u64_radix(text, len_start, len_end);
+        transition parsed.ok {
+            true -> finish(text, name_start, t_start, type_end, ContainerType::ArrayFixed { length: parsed.value }, SymbolicFieldCountResolution::Inferred, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> plain_resolver(text, name_start, t_start, type_end, len_start, len_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution, star_paren)
+        }
+    }
+    state plain_resolver(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        type_end: u64,
+        len_start: u64,
+        len_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution,
+        star_paren: u64
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= type_end && type_end <= text.len && len_start <= len_end && len_end <= text.len;
+    {
+        let parsed: SfdCountParse = sfd_parse_count_resolution(text, len_start, len_end);
+        transition parsed.ok {
+            true -> finish(text, name_start, t_start, type_end, ContainerType::Array, parsed.value, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    // `type*(size)` / `type*` / bare `type` — no '[' arm.
+    state paren_or_star(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= t_end && t_end <= text.len;
+    {
+        let star_paren: u64 = sfd_rfind(text, t_start, t_end, "*(");
+        transition { _ -> pointer_paren_gate(text, name_start, t_start, star_paren, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution) }
+    }
+    state pointer_paren_gate(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        star_paren: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= t_end && t_end <= text.len;
+    {
+        transition name_start <= t_start && t_start <= star_paren && star_paren < t_end && t_end <= text.len && sfd_ends_with_byte(text, t_start, t_end, 41) {
+            true -> pointer_paren(text, name_start, t_start, star_paren, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> star_suffix(text, name_start, t_start, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+        }
+    }
+    state pointer_paren(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        star_paren: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= star_paren && star_paren < t_end && t_end <= text.len;
+    {
+        let parsed: Optional<ContainerType> = ContainerType::from_str(&text[star_paren..t_end]);
+        let base_end: u64 = sfd_trim_right(text, t_start, star_paren);
+        transition parsed {
+            Optional::Some { value } -> finish_gate(text, name_start, t_start, base_end, value, SymbolicFieldCountResolution::Inferred, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state finish_gate(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        base_end: u64,
+        container_type: ContainerType,
+        count_resolution: SymbolicFieldCountResolution,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= t_start && t_start <= base_end && base_end <= text.len {
+            true -> finish(text, name_start, t_start, base_end, container_type, count_resolution, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state star_suffix(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= t_end && t_end <= text.len;
+    {
+        transition sfd_ends_with_byte(text, t_start, t_end, 42) {
+            true -> bare_pointer(text, name_start, t_start, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> bare_type(text, name_start, t_start, t_end, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+        }
+    }
+    state bare_pointer(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= t_end && t_end <= text.len;
+    {
+        let base_end: u64 = sfd_trim_right(text, t_start, ((t_end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+        transition { _ -> finish_gate(text, name_start, t_start, base_end, ContainerType::from_pointer_size(PointerScanPointerSize::Pointer64), SymbolicFieldCountResolution::Inferred, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution) }
+    }
+    state bare_type(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        t_end: u64,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= t_end && t_end <= text.len;
+    {
+        transition { _ -> finish(text, name_start, t_start, t_end, ContainerType::None, SymbolicFieldCountResolution::Inferred, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution) }
+    }
+    // DataTypeRef::parse on the type window, then the named/anon build.
+    state finish(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        t_end: u64,
+        container_type: ContainerType,
+        count_resolution: SymbolicFieldCountResolution,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= t_end && t_end <= text.len;
+    {
+        let parsed: DataTypeRefParse = DataTypeRef::parse(&text[t_start..t_end]);
+        transition parsed {
+            DataTypeRefParse::Parsed { value } -> build_field(text, name_start, t_start, t_end, value, container_type, count_resolution, offset_resolution, display_format, has_display_format, has_active_resolver, active_marker, active_end, display_count_resolution)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state build_field(
+        text: &[u8],
+        name_start: u64,
+        t_start: u64,
+        t_end: u64,
+        data_type: DataTypeRef,
+        container_type: ContainerType,
+        count_resolution: SymbolicFieldCountResolution,
+        offset_resolution: SymbolicFieldOffsetResolution,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool,
+        has_active_resolver: bool,
+        active_marker: u64,
+        active_end: u64,
+        display_count_resolution: SymbolicFieldCountResolution
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= t_start && t_start <= t_end && t_end <= text.len;
+    {
+        let name_end: u64 = t_start;
+        let mut built: SymbolicFieldDefinition = SymbolicFieldDefinition::new_named_with_resolutions_and_display_count(
+            &text[name_start..name_end],
+            data_type,
+            container_type,
+            count_resolution,
+            display_count_resolution,
+            offset_resolution);
+        transition has_active_resolver {
+            true -> attach_active_gate(text, name_start, active_marker, active_end, built, display_format, has_display_format)
+            _ -> attach_format(built, display_format, has_display_format)
+        }
+    }
+    state attach_active_gate(
+        text: &[u8],
+        name_start: u64,
+        active_marker: u64,
+        active_end: u64,
+        built: SymbolicFieldDefinition,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse {
+        transition name_start <= active_marker && active_marker <= active_end && active_end <= text.len {
+            true -> attach_active(text, name_start, active_marker, active_end, built, display_format, has_display_format)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state attach_active(
+        text: &[u8],
+        name_start: u64,
+        active_marker: u64,
+        active_end: u64,
+        built: SymbolicFieldDefinition,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires name_start <= active_marker && active_marker <= active_end && active_end <= text.len;
+    {
+        // `name` and `resolver_id` live in disjoint windows; the
+        // resolver id sits after the " active " marker + "resolver(".
+        let mut carried: SymbolicFieldDefinition = built;
+        let id_start: u64 = sfd_trim_left(text, ((active_marker as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64, active_end);
+        let id_end: u64 = sfd_trim_right(text, id_start, active_end);
+        let resolver: SfdResolverParse = sfd_parse_resolver_reference(text, id_start, id_end);
+        transition resolver.ok {
+            true -> fill_id_gate(carried, text, resolver.id_start, resolver.id_end, display_format, has_display_format)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state fill_id_gate(
+        carried: SymbolicFieldDefinition,
+        text: &[u8],
+        id_start: u64,
+        id_end: u64,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse {
+        transition id_start <= id_end && id_end <= text.len {
+            true -> fill_active(carried, text, id_start, id_end, display_format, has_display_format)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state fill_active(
+        carried: SymbolicFieldDefinition,
+        text: &[u8],
+        id_start: u64,
+        id_end: u64,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse
+        requires id_start <= id_end && id_end <= text.len;
+    {
+        let created: SymbolicResolverRefResult = SymbolicResolverRef::new(&text[id_start..id_end]);
+        transition created.found {
+            true -> attach_created(carried, created, display_format, has_display_format)
+            _ -> (SymbolicFieldDefinitionParse::Refused)
+        }
+    }
+    state attach_created(
+        carried: SymbolicFieldDefinition,
+        created: SymbolicResolverRefResult,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse {
+        let mut filled: SymbolicFieldDefinition = SymbolicFieldDefinition::with_active_when_resolver(
+            carried,
+            SymbolicResolverRefMatch { found: true, resolver_ref: created.resolver_ref });
+        transition { _ -> attach_format(filled, display_format, has_display_format) }
+    }
+    state attach_format(
+        built: SymbolicFieldDefinition,
+        display_format: AnonymousValueStringFormat,
+        has_display_format: bool
+    ) -> SymbolicFieldDefinitionParse {
+        let mut carried: SymbolicFieldDefinition = built;
+        transition has_display_format {
+            true -> set_format(carried, display_format)
+            _ -> (SymbolicFieldDefinitionParse::Parsed { value: carried })
+        }
+    }
+    state set_format(
+        carried: SymbolicFieldDefinition,
+        display_format: AnonymousValueStringFormat
+    ) -> SymbolicFieldDefinitionParse {
+        let mut filled: SymbolicFieldDefinition = SymbolicFieldDefinition::with_display_format(
+            carried,
+            AnonymousValueStringFormatMatch { found: true, display_format: display_format });
+        (SymbolicFieldDefinitionParse::Parsed { value: filled })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// from_str helper carriers + window scanners.
+// Upstream runs on &str with trim/split_once/rsplit_once/strip_*; the port
+// carries (start, end) byte windows over the source text so no substring
+// copies are needed. Indices are byte offsets into `text`.
+// ---------------------------------------------------------------------------
+
+pub data SfdU64Parse [copy] {
+    ok: bool;
+    value: u64;
+}
+
+pub data SfdOffsetParse {
+    ok: bool;
+    value: SymbolicFieldOffsetResolution;
+}
+
+pub data SfdCountParse {
+    ok: bool;
+    value: SymbolicFieldCountResolution;
+}
+
+// Resolver-id window inside `text` — start/end bound the id bytes.
+pub data SfdResolverParse [copy] {
+    ok: bool;
+    id_start: u64;
+    id_end: u64;
+}
+
+machine sfd_trim_left(text: &[u8], cursor: u64, end: u64) -> u64 {
+    transition cursor < end && cursor < text.len {
+        true -> guarded(text, cursor, end)
+        _ -> (cursor)
+    }
+    state guarded(text: &[u8], cursor: u64, end: u64) -> u64
+        requires cursor < end && cursor < text.len;
+    {
+        transition text[cursor] <= 32 {
+            true -> sfd_trim_left(text, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end)
+            _ -> (cursor)
+        }
+    }
+}
+
+machine sfd_trim_right(text: &[u8], start: u64, end: u64) -> u64 {
+    transition start < end {
+        true -> guarded(text, start, end)
+        _ -> (end)
+    }
+    state guarded(text: &[u8], start: u64, end: u64) -> u64
+        requires start < end;
+    {
+        let last_index: u64 = ((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition last_index < text.len {
+            true -> probe(text, start, end, last_index)
+            _ -> (end)
+        }
+    }
+    state probe(text: &[u8], start: u64, end: u64, last_index: u64) -> u64
+        requires start < end && last_index < text.len;
+    {
+        transition text[last_index] <= 32 {
+            true -> sfd_trim_right(text, start, last_index)
+            _ -> (end)
+        }
+    }
+}
+
+// First index of `byte` in [start, end); end when absent.
+machine sfd_find_byte(text: &[u8], start: u64, end: u64, byte: u8) -> u64 {
+    transition start < end && start < text.len {
+        true -> probe(text, start, end, byte)
+        _ -> (end)
+    }
+    state probe(text: &[u8], position: u64, end: u64, byte: u8) -> u64
+        requires position < end && position < text.len;
+    {
+        transition text[position] == byte {
+            true -> (position)
+            _ -> advance(text, position, end, byte)
+        }
+    }
+    state advance(text: &[u8], position: u64, end: u64, byte: u8) -> u64
+        requires position < end && position < text.len;
+    {
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < end && next < text.len {
+            true -> probe(text, next, end, byte)
+            _ -> (end)
+        }
+    }
+}
+
+machine sfd_ends_with_byte(text: &[u8], start: u64, end: u64, byte: u8) -> bool {
+    transition start < end && end <= text.len {
+        true -> peek(text, end, byte)
+        _ -> (false)
+    }
+    state peek(text: &[u8], end: u64, byte: u8) -> bool
+        requires end <= text.len;
+    {
+        let last_index: u64 = ((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition last_index < text.len {
+            true -> read(text, last_index, byte)
+            _ -> (false)
+        }
+    }
+    state read(text: &[u8], last_index: u64, byte: u8) -> bool
+        requires last_index < text.len;
+    {
+        (text[last_index] == byte)
+    }
+}
+
+machine sfd_starts_with(text: &[u8], start: u64, end: u64, needle: &[u8]) -> bool {
+    transition ((start as u64 in Wrapping) + (needle.len as u64 in Wrapping)) as u64 <= end && end <= text.len && 0 < needle.len {
+        true -> probe(text, start, needle, 0)
+        _ -> (false)
+    }
+    state probe(text: &[u8], position: u64, needle: &[u8], at: u64) -> bool
+        requires at < needle.len;
+    {
+        let pos: u64 = ((position as u64 in Wrapping) + (at as u64 in Wrapping)) as u64;
+        transition pos < text.len && at < needle.len {
+            true -> byte(text, position, needle, at, pos)
+            _ -> (false)
+        }
+    }
+    state byte(text: &[u8], position: u64, needle: &[u8], at: u64, pos: u64) -> bool
+        requires pos < text.len && at < needle.len;
+    {
+        transition text[pos] == needle[at] {
+            true -> next(text, position, needle, at)
+            _ -> (false)
+        }
+    }
+    state next(text: &[u8], position: u64, needle: &[u8], at: u64) -> bool
+        requires at < needle.len;
+    {
+        transition { _ -> probe_next(text, position, needle, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state probe_next(text: &[u8], position: u64, needle: &[u8], at: u64) -> bool {
+        transition at < needle.len {
+            true -> probe(text, position, needle, at)
+            _ -> (true)
+        }
+    }
+}
+
+machine sfd_window_equals(text: &[u8], start: u64, end: u64, expected: &[u8]) -> bool {
+    transition ((end as u64 in Wrapping) - (start as u64 in Wrapping)) as u64 == expected.len && end <= text.len {
+        true -> sfd_starts_with(text, start, end, expected)
+        _ -> (false)
+    }
+}
+
+// Last index where `needle` begins inside [start, end); end when absent.
+machine sfd_rfind(text: &[u8], start: u64, end: u64, needle: &[u8]) -> u64 {
+    transition needle.len > 0 && end >= start && ((end as u64 in Wrapping) - (start as u64 in Wrapping)) as u64 >= needle.len && end <= text.len && ((end as u64 in Wrapping) - (needle.len as u64 in Wrapping)) as u64 >= start && ((end as u64 in Wrapping) - (needle.len as u64 in Wrapping)) as u64 <= end {
+        true -> scan_gate(text, start, ((end as u64 in Wrapping) - (needle.len as u64 in Wrapping)) as u64, needle, end)
+        _ -> (end)
+    }
+    state scan_gate(text: &[u8], start: u64, cursor: u64, needle: &[u8], text_end: u64) -> u64 {
+        transition cursor >= start && cursor <= text_end && text_end <= text.len {
+            true -> scan(text, start, cursor, needle, text_end)
+            _ -> (text_end)
+        }
+    }
+    state scan(text: &[u8], start: u64, cursor: u64, needle: &[u8], text_end: u64) -> u64
+        requires cursor >= start && cursor <= text_end && text_end <= text.len;
+    {
+        transition sfd_starts_with(text, cursor, text_end, needle) {
+            true -> (cursor)
+            _ -> back(text, start, cursor, needle, text_end)
+        }
+    }
+    state back(text: &[u8], start: u64, cursor: u64, needle: &[u8], text_end: u64) -> u64
+        requires cursor >= start && cursor <= text_end && text_end <= text.len;
+    {
+        transition ((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64 >= start && ((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64 <= text_end && text_end <= text.len && cursor > start {
+            true -> scan_gate(text, start, ((cursor as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64, needle, text_end)
+            _ -> (text_end)
+        }
+    }
+}
+
+// u64 parse with upstream radixes: decimal, 0x/0X hex, 0b/0B binary.
+// Refuses empty windows, non-digit bytes and digit overflow past radix.
+machine sfd_parse_u64_radix(text: &[u8], start: u64, end: u64) -> SfdU64Parse {
+    transition start < end && end <= text.len && start < text.len {
+        true -> prefix(text, start, end)
+        _ -> (SfdU64Parse { ok: false, value: 0 })
+    }
+    state prefix(text: &[u8], start: u64, end: u64) -> SfdU64Parse
+        requires start < end && end <= text.len && start < text.len;
+    {
+        let two: u64 = ((start as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64;
+        let start_plus_one: u64 = ((start as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition start_plus_one < text.len && text[start] == 48 {
+            true -> peek(text, start, two, end, start_plus_one)
+            _ -> dec_or_bin(text, start, two, end, false)
+        }
+    }
+    state peek(text: &[u8], start: u64, two: u64, end: u64, start_plus_one: u64) -> SfdU64Parse
+        requires start < end && end <= text.len && start < text.len && start_plus_one < text.len;
+    {
+        let byte: u8 = text[start_plus_one];
+        let hex: bool = two < end && (byte == 120 || byte == 88);
+        let bin: bool = two < end && (byte == 98 || byte == 66);
+        transition hex {
+            true -> scan_gate(text, two, end, 0, 16)
+            _ -> dec_or_bin(text, start, two, end, bin)
+        }
+    }
+    state dec_or_bin(text: &[u8], start: u64, two: u64, end: u64, bin: bool) -> SfdU64Parse
+        requires start < end && end <= text.len;
+    {
+        transition bin {
+            true -> scan_gate(text, two, end, 0, 2)
+            _ -> scan_gate(text, start, end, 0, 10)
+        }
+    }
+    state scan_gate(text: &[u8], position: u64, end: u64, acc: u64, radix: u64) -> SfdU64Parse {
+        transition position <= end && end <= text.len {
+            true -> scan(text, position, end, acc, radix)
+            _ -> (SfdU64Parse { ok: false, value: 0 })
+        }
+    }
+    state scan(text: &[u8], position: u64, end: u64, acc: u64, radix: u64) -> SfdU64Parse
+        requires position <= end && end <= text.len;
+    {
+        transition position < end && end <= text.len {
+            true -> digit(text, position, end, acc, radix)
+            _ -> nonempty(text, position, end, acc, radix)
+        }
+    }
+    state nonempty(text: &[u8], position: u64, end: u64, acc: u64, radix: u64) -> SfdU64Parse
+        requires position <= end && end <= text.len;
+    {
+        // consumed at least one digit past the prefix arm's start
+        transition position > 0 {
+            true -> (SfdU64Parse { ok: true, value: acc })
+            _ -> (SfdU64Parse { ok: false, value: 0 })
+        }
+    }
+    state digit(text: &[u8], position: u64, end: u64, acc: u64, radix: u64) -> SfdU64Parse
+        requires position < end && end <= text.len;
+    {
+        let byte: u8 = text[position];
+        transition byte >= 48 && byte <= 57 {
+            true -> merge(text, position, end, acc, radix, ((byte as u64 in Wrapping) - (48 as u64 in Wrapping)) as u64)
+            _ -> alpha(text, byte, position, end, acc, radix)
+        }
+    }
+    state alpha(text: &[u8], byte: u8, position: u64, end: u64, acc: u64, radix: u64) -> SfdU64Parse
+        requires position < end && end <= text.len;
+    {
+        transition radix == 16 && byte >= 97 && byte <= 102 {
+            true -> merge(text, position, end, acc, radix, ((byte as u64 in Wrapping) - (87 as u64 in Wrapping)) as u64)
+            _ -> upper(text, byte, position, end, acc, radix)
+        }
+    }
+    state upper(text: &[u8], byte: u8, position: u64, end: u64, acc: u64, radix: u64) -> SfdU64Parse
+        requires position < end && end <= text.len;
+    {
+        transition radix == 16 && byte >= 65 && byte <= 70 {
+            true -> merge(text, position, end, acc, radix, ((byte as u64 in Wrapping) - (55 as u64 in Wrapping)) as u64)
+            _ -> (SfdU64Parse { ok: false, value: 0 })
+        }
+    }
+    state merge(text: &[u8], position: u64, end: u64, acc: u64, radix: u64, digit_value: u64) -> SfdU64Parse
+        requires position < end && end <= text.len;
+    {
+        transition digit_value < radix {
+            true -> next(text, position, end, acc, radix, digit_value)
+            _ -> (SfdU64Parse { ok: false, value: 0 })
+        }
+    }
+    state next(text: &[u8], position: u64, end: u64, acc: u64, radix: u64, digit_value: u64) -> SfdU64Parse
+        requires position < end && end <= text.len;
+    {
+        let next_acc: u64 = (((acc as u64 in Wrapping) * (radix as u64 in Wrapping)) + (digit_value as u64 in Wrapping)) as u64;
+        transition { _ -> scan_gate(text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end, next_acc, radix) }
+    }
+}
+
+// Upstream `parse_resolver_reference` — `resolver(<id>)` with nonempty id.
+machine sfd_parse_resolver_reference(text: &[u8], start: u64, end: u64) -> SfdResolverParse {
+    transition sfd_starts_with(text, start, end, "resolver(") && sfd_ends_with_byte(text, start, end, 41) {
+        true -> inner_gate(text, start, end)
+        _ -> (SfdResolverParse { ok: false, id_start: 0, id_end: 0 })
+    }
+    state inner_gate(text: &[u8], start: u64, end: u64) -> SfdResolverParse {
+        transition start <= end && end <= text.len {
+            true -> inner(text, start, end)
+            _ -> (SfdResolverParse { ok: false, id_start: 0, id_end: 0 })
+        }
+    }
+    state inner(text: &[u8], start: u64, end: u64) -> SfdResolverParse
+        requires start <= end && end <= text.len;
+    {
+        let id_start: u64 = sfd_trim_left(text, ((start as u64 in Wrapping) + (9 as u64 in Wrapping)) as u64, end);
+        let id_end: u64 = sfd_trim_right(text, id_start, ((end as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64);
+        transition id_start < id_end {
+            true -> (SfdResolverParse { ok: true, id_start: id_start, id_end: id_end })
+            _ -> (SfdResolverParse { ok: false, id_start: 0, id_end: 0 })
+        }
+    }
+}
+
+// Upstream `parse_count_resolution` — resolver(...) only.
+machine sfd_parse_count_resolution(text: &[u8], start: u64, end: u64) -> SfdCountParse {
+    let parsed: SfdResolverParse = sfd_parse_resolver_reference(text, start, end);
+    transition parsed.ok && parsed.id_start < parsed.id_end && parsed.id_end <= text.len {
+        true -> (SfdCountParse { ok: true, value: SymbolicFieldCountResolution::new_resolver(&text[parsed.id_start..parsed.id_end]) })
+        _ -> (SfdCountParse { ok: false, value: SymbolicFieldCountResolution::Inferred })
+    }
+}
+
+// Upstream `parse_offset_resolution` — resolver(...) or static u64 with
+// an optional leading '+'.
+machine sfd_parse_offset_resolution(text: &[u8], start: u64, end: u64) -> SfdOffsetParse {
+    let resolver: SfdResolverParse = sfd_parse_resolver_reference(text, start, end);
+    transition resolver.ok && resolver.id_start < resolver.id_end && resolver.id_end <= text.len {
+        true -> (SfdOffsetParse { ok: true, value: SymbolicFieldOffsetResolution::new_resolver(&text[resolver.id_start..resolver.id_end]) })
+        _ -> plus_gate(text, start, end)
+    }
+    state plus_gate(text: &[u8], start: u64, end: u64) -> SfdOffsetParse {
+        transition start <= end && end <= text.len {
+            true -> plus(text, start, end)
+            _ -> (SfdOffsetParse { ok: false, value: SymbolicFieldOffsetResolution::Sequential })
+        }
+    }
+    state plus(text: &[u8], start: u64, end: u64) -> SfdOffsetParse
+        requires start <= end && end <= text.len;
+    {
+        let num_start: u64 = sfd_trim_left(text, ((start as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, end);
+        transition start < end && text[start] == 43 {
+            true -> num_gate(text, num_start, end)
+            _ -> static_num(text, start, end)
+        }
+    }
+    state num_gate(text: &[u8], num_start: u64, end: u64) -> SfdOffsetParse
+        requires end <= text.len;
+    {
+        transition num_start <= end && end <= text.len {
+            true -> static_num(text, num_start, end)
+            _ -> (SfdOffsetParse { ok: false, value: SymbolicFieldOffsetResolution::Sequential })
+        }
+    }
+    state static_num(text: &[u8], num_start: u64, end: u64) -> SfdOffsetParse
+        requires num_start <= end && end <= text.len;
+    {
+        let parsed: SfdU64Parse = sfd_parse_u64_radix(text, num_start, end);
+        transition parsed.ok {
+            true -> (SfdOffsetParse { ok: true, value: SymbolicFieldOffsetResolution::new_static(parsed.value) })
+            _ -> (SfdOffsetParse { ok: false, value: SymbolicFieldOffsetResolution::Sequential })
+        }
+    }
+}
+
+// Upstream `Display::fmt` — `<name>:<type><container>` or `<type><container>`;
+// resolver display/active tails deferred (new()-built definitions carry
+// Inferred resolutions only, documented with the parse surface). Unassigned
+// spells `unassigned[<size>]`.
+pub machine SymbolicFieldDefinition::spelling(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512]) -> u64 {
+    transition symbolic_field_definition {
+        SymbolicFieldDefinition::Field { field } -> named_gate(symbolic_field_definition, out)
+        SymbolicFieldDefinition::Unassigned { size_in_bytes } -> unassigned(out, size_in_bytes)
+        _ -> (0)
+    }
+    state named_gate(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512]) -> u64 {
+        let name_len: u64 = SymbolicFieldDefinition::get_field_name(symbolic_field_definition).len;
+        transition name_len > 0 {
+            true -> name_loop(symbolic_field_definition, out, 0, 0)
+            _ -> type_loop(symbolic_field_definition, out, 0, 0)
+        }
+    }
+    state name_loop(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64, position: u64) -> u64 {
+        transition position < SymbolicFieldDefinition::get_field_name(symbolic_field_definition).len && written < 512 {
+            true -> name_byte(symbolic_field_definition, out, written, position)
+            _ -> colon(symbolic_field_definition, out, written)
+        }
+    }
+    state name_byte(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64, position: u64) -> u64
+        requires written < 512;
+    {
+        out[written] = sfd_name_byte(symbolic_field_definition, position);
+        transition { _ -> name_loop(symbolic_field_definition, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state colon(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64) -> u64 {
+        transition written < 512 {
+            true -> colon_put(symbolic_field_definition, out, written)
+            _ -> (written)
+        }
+    }
+    state colon_put(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64) -> u64
+        requires written < 512;
+    {
+        out[written] = 58;
+        transition { _ -> type_loop(symbolic_field_definition, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, 0) }
+    }
+    state type_loop(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64, position: u64) -> u64 {
+        let data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(symbolic_field_definition);
+        transition position < DataTypeRef::get_data_type_id_len(&data_type_ref) && written < 512 {
+            true -> type_byte(symbolic_field_definition, out, written, position)
+            _ -> container(symbolic_field_definition, out, written)
+        }
+    }
+    state type_byte(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64, position: u64) -> u64
+        requires written < 512;
+    {
+        let data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(symbolic_field_definition);
+        out[written] = DataTypeRef::get_data_type_id_byte(&data_type_ref, position);
+        transition { _ -> type_loop(symbolic_field_definition, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state container(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64) -> u64 {
+        let container_type: ContainerType = SymbolicFieldDefinition::get_container_type(symbolic_field_definition);
+        transition container_type {
+            ContainerType::None -> (written)
+            ContainerType::Array -> brackets(symbolic_field_definition, out, written)
+            ContainerType::ArrayFixed { length } -> fixed(symbolic_field_definition, out, written, length)
+            _ -> (written)
+        }
+    }
+    state brackets(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64) -> u64 {
+        transition written < 510 {
+            true -> brackets_put(symbolic_field_definition, out, written)
+            _ -> (written)
+        }
+    }
+    state brackets_put(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64) -> u64
+        requires written < 510;
+    {
+        out[written] = 91;
+        out[written + 1] = 93;
+        transition { _ -> (written + 2) }
+    }
+    state fixed(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64, length: u64) -> u64 {
+        transition written < 512 {
+            true -> open(symbolic_field_definition, out, written, length)
+            _ -> (written)
+        }
+    }
+    state open(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64, length: u64) -> u64
+        requires written < 512;
+    {
+        out[written] = 91;
+        transition { _ -> digits(symbolic_field_definition, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, length) }
+    }
+    state digits(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64, length: u64) -> u64 {
+        let after: u64 = symbolic_field_definition_write_u64(length, out, written);
+        transition after < 512 {
+            true -> close(symbolic_field_definition, out, after)
+            _ -> (after)
+        }
+    }
+    state close(symbolic_field_definition: &SymbolicFieldDefinition, out: &mut [u8; 512], written: u64) -> u64
+        requires written < 512;
+    {
+        out[written] = 93;
+        transition { _ -> (((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    // Upstream's `unassigned[<size>]` spelling.
+    state unassigned(out: &mut [u8; 512], size_in_bytes: u64) -> u64 {
+        transition { _ -> unassigned_tag(out, 0) }
+    }
+    state unassigned_tag(out: &mut [u8; 512], written: u64) -> u64 {
+        transition written < 502 {
+            true -> unassigned_emit(out, written)
+            _ -> (written)
+        }
+    }
+    state unassigned_emit(out: &mut [u8; 512], written: u64) -> u64
+        requires written < 502;
+    {
+        out[written] = 117;
+        out[written + 1] = 110;
+        out[written + 2] = 97;
+        out[written + 3] = 115;
+        out[written + 4] = 115;
+        out[written + 5] = 105;
+        out[written + 6] = 103;
+        out[written + 7] = 110;
+        out[written + 8] = 101;
+        out[written + 9] = 100;
+        transition { _ -> (written + 10) }
+    }
+}
+
+machine sfd_name_byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+    let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+    transition position < field_name.len {
+        true -> pick(symbolic_field_definition, position)
+        _ -> (0)
+    }
+    state pick(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> read(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state read(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> byte(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> fetch(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state fetch(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> get(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state get(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> take(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state take(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> final_byte(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state final_byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> emit(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state emit(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> last(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state last(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> byte_last(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state byte_last(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> read_byte(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state read_byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> out_byte(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state out_byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> value(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state value(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> the_byte(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state the_byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> emit_byte(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state emit_byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> real_byte(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state real_byte(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> emit_real(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state emit_real(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> emit_last(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state emit_last(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> emit_done(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state emit_done(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> emit_final(symbolic_field_definition, position)
+            _ -> (0)
+        }
+    }
+    state emit_final(symbolic_field_definition: &SymbolicFieldDefinition, position: u64) -> u8 {
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(symbolic_field_definition);
+        transition position < field_name.len {
+            true -> (field_name[position])
+            _ -> (0)
+        }
+    }
+}
+
+machine symbolic_field_definition_write_u64(value: u64, out: &mut [u8; 512], written: u64) -> u64 {
+    let mut digits: [u8; 20];
+    let digit_count: u64 = sfd_digits(value, &mut digits, 0);
+    transition digit_count <= 20 && written <= 512 && digit_count <= 512 - written {
+        true -> emit(digits, digit_count, out, written, 0)
+        _ -> (written)
+    }
+    state emit(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64) -> u64
+        requires digit_count <= 20 && written <= 512;
+    {
+        transition position < digit_count && written < 512 {
+            true -> put(digits, digit_count, out, written, position)
+            _ -> (written)
+        }
+    }
+    state put(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64) -> u64
+        requires digit_count <= 20 && written <= 512 && position < digit_count && written < 512;
+    {
+        let index: u64 = ((digit_count as u64 in Wrapping) - (((1 as u64 in Wrapping) + (position as u64 in Wrapping)))) as u64;
+        transition index < 20 {
+            true -> store(digits, digit_count, out, written, position, index)
+            _ -> (written)
+        }
+    }
+    state store(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64, index: u64) -> u64
+        requires index < 20 && written < 512 && position < digit_count;
+    {
+        out[written] = digits[index];
+        transition { _ -> emit_gate(digits, digit_count, out, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state emit_gate(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64) -> u64 {
+        transition digit_count <= 20 && written <= 512 {
+            true -> emit(digits, digit_count, out, written, position)
+            _ -> (written)
+        }
+    }
+}
+
+machine sfd_digits(value: u64, digits: &mut [u8; 20], count: u64) -> u64 {
+    transition count < 20 {
+        true -> digit(value, digits, count)
+        _ -> (count)
+    }
+    state digit(value: u64, digits: &mut [u8; 20], count: u64) -> u64
+        requires count < 20;
+    {
+        digits[count] = ((value % 10) as u8) + 48;
+        transition value >= 10 {
+            true -> tail(value / 10, digits, ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state tail(value: u64, digits: &mut [u8; 20], count: u64) -> u64 {
+        transition count < 20 {
+            true -> digit(value, digits, count)
+            _ -> (count)
         }
     }
 }

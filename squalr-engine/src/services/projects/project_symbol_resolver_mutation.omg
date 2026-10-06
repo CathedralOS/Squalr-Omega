@@ -1,0 +1,172 @@
+// Port of squalr-engine/src/services/projects/project_symbol_resolver_mutation.rs.
+//
+// Symbolic-resolver descriptor upsert/delete with the same conflict,
+// sorted-rebuild, and local-dependency validation semantics. Upstream
+// `Result<(), String>` folds to ResolverMutationResult{Succeeded,
+// Refused} (error text was diagnostic-only); validate's `Result` folds
+// to bool — a failed dependency check refuses.
+
+module src::services::projects::project_symbol_resolver_mutation;
+
+use squalr_engine_api::src::registries::symbols::symbolic_resolver_descriptor::SymbolicResolverDescriptor;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+
+pub data ProjectSymbolResolverMutation {}
+
+pub data ResolverMutationResult {
+    case Succeeded;
+    case Refused;
+}
+
+// Upstream `upsert_resolver_descriptor`: a rename onto a different live
+// resolver id conflicts; otherwise the descriptor replaces same-id and
+// rename-source entries, sorts in, then local dependency validation runs.
+pub machine ProjectSymbolResolverMutation::upsert_resolver_descriptor(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_resolver_id: bool,
+        original_resolver_id: &[u8],
+        resolver_descriptor: &SymbolicResolverDescriptor
+     )
+     -> ResolverMutationResult {
+    let renamed: bool = has_original_resolver_id
+        && !FileSystemUtils::bytes_equal(original_resolver_id, SymbolicResolverDescriptor::get_resolver_id(resolver_descriptor));
+    transition renamed {
+        true -> probe(project_symbol_resolver_mutation, project_symbol_catalog, has_original_resolver_id, original_resolver_id, resolver_descriptor)
+        false -> rebuild(project_symbol_resolver_mutation, project_symbol_catalog, has_original_resolver_id, original_resolver_id, resolver_descriptor, 0)
+    }
+    state probe(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_resolver_id: bool,
+        original_resolver_id: &[u8],
+        resolver_descriptor: &SymbolicResolverDescriptor
+     )
+     -> ResolverMutationResult {
+        let resolver_id: &[u8] = SymbolicResolverDescriptor::get_resolver_id(resolver_descriptor);
+        let position: u64 = ProjectSymbolCatalog::find_symbolic_resolver_descriptor_position(project_symbol_catalog, resolver_id);
+        let descriptor_count: u64 = ProjectSymbolCatalog::get_symbolic_resolver_descriptor_count(project_symbol_catalog);
+        transition position < descriptor_count && position < 64 {
+            true -> (ResolverMutationResult::Refused)
+            false -> rebuild(project_symbol_resolver_mutation, project_symbol_catalog, has_original_resolver_id, original_resolver_id, resolver_descriptor, 0)
+        }
+    }
+    // Upstream retains ids ∉ {original, replacement}; a removal shifts
+    // the next descriptor into the same slot, so the cursor stays put.
+    state rebuild(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_resolver_id: bool,
+        original_resolver_id: &[u8],
+        resolver_descriptor: &SymbolicResolverDescriptor,
+        remove_cursor: u64
+     )
+     -> ResolverMutationResult {
+        let descriptor_count: u64 = ProjectSymbolCatalog::get_symbolic_resolver_descriptor_count(project_symbol_catalog);
+        transition remove_cursor < descriptor_count && remove_cursor < 64 {
+            true -> decide(project_symbol_resolver_mutation, project_symbol_catalog, has_original_resolver_id, original_resolver_id, resolver_descriptor, remove_cursor, descriptor_count)
+            false -> insert(project_symbol_resolver_mutation, project_symbol_catalog, resolver_descriptor)
+        }
+    }
+    state decide(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_resolver_id: bool,
+        original_resolver_id: &[u8],
+        resolver_descriptor: &SymbolicResolverDescriptor,
+        remove_cursor: u64,
+        descriptor_count: u64
+     )
+     -> ResolverMutationResult
+        requires remove_cursor < descriptor_count && remove_cursor < 64
+    {
+        let descriptor: &SymbolicResolverDescriptor = ProjectSymbolCatalog::get_symbolic_resolver_descriptor(project_symbol_catalog, remove_cursor);
+        let descriptor_id: &[u8] = SymbolicResolverDescriptor::get_resolver_id(descriptor);
+        let drops: bool = FileSystemUtils::bytes_equal(descriptor_id, SymbolicResolverDescriptor::get_resolver_id(resolver_descriptor))
+            || (has_original_resolver_id && FileSystemUtils::bytes_equal(descriptor_id, original_resolver_id));
+        transition drops {
+            true -> drop_match(project_symbol_resolver_mutation, project_symbol_catalog, has_original_resolver_id, original_resolver_id, resolver_descriptor, remove_cursor, descriptor_count)
+            false -> rebuild(project_symbol_resolver_mutation, project_symbol_catalog, has_original_resolver_id, original_resolver_id, resolver_descriptor, ((remove_cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state drop_match(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        has_original_resolver_id: bool,
+        original_resolver_id: &[u8],
+        resolver_descriptor: &SymbolicResolverDescriptor,
+        remove_cursor: u64,
+        descriptor_count: u64
+     )
+     -> ResolverMutationResult
+        requires remove_cursor < descriptor_count && remove_cursor < 64
+    {
+        _ = ProjectSymbolCatalog::remove_symbolic_resolver_descriptor_at(project_symbol_catalog, remove_cursor);
+        transition {
+            _ -> rebuild(project_symbol_resolver_mutation, project_symbol_catalog, has_original_resolver_id, original_resolver_id, resolver_descriptor, remove_cursor)
+        }
+    }
+    state insert(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        resolver_descriptor: &SymbolicResolverDescriptor
+     )
+     -> ResolverMutationResult {
+        // Upstream pushes then sorts; sorted-insert keeps the same order.
+        let inserted: bool = ProjectSymbolCatalog::insert_symbolic_resolver_descriptor_sorted(project_symbol_catalog, resolver_descriptor);
+        transition inserted {
+            true -> validate(project_symbol_resolver_mutation, project_symbol_catalog)
+            false -> (ResolverMutationResult::Refused)
+        }
+    }
+    state validate(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog
+     )
+     -> ResolverMutationResult {
+        let valid: bool = ProjectSymbolCatalog::validate_local_resolver_dependencies(project_symbol_catalog);
+        transition valid {
+            true -> (ResolverMutationResult::Succeeded)
+            false -> (ResolverMutationResult::Refused)
+        }
+    }
+}
+
+// Upstream `delete_resolver`: find by id, remove, revalidate.
+pub machine ProjectSymbolResolverMutation::delete_resolver(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        resolver_id: &[u8]
+     )
+     -> ResolverMutationResult {
+    let position: u64 = ProjectSymbolCatalog::find_symbolic_resolver_descriptor_position(project_symbol_catalog, resolver_id);
+    let descriptor_count: u64 = ProjectSymbolCatalog::get_symbolic_resolver_descriptor_count(project_symbol_catalog);
+    transition position < descriptor_count && position < 64 {
+        true -> remove(project_symbol_resolver_mutation, project_symbol_catalog, position)
+        false -> (ResolverMutationResult::Refused)
+    }
+    state remove(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        position: u64
+     )
+     -> ResolverMutationResult {
+        let removed: bool = ProjectSymbolCatalog::remove_symbolic_resolver_descriptor_at(project_symbol_catalog, position);
+        transition removed {
+            true -> validate(project_symbol_resolver_mutation, project_symbol_catalog)
+            false -> (ResolverMutationResult::Refused)
+        }
+    }
+    state validate(
+        project_symbol_resolver_mutation: &mut ProjectSymbolResolverMutation,
+        project_symbol_catalog: &mut ProjectSymbolCatalog
+     )
+     -> ResolverMutationResult {
+        let valid: bool = ProjectSymbolCatalog::validate_local_resolver_dependencies(project_symbol_catalog);
+        transition valid {
+            true -> (ResolverMutationResult::Succeeded)
+            false -> (ResolverMutationResult::Refused)
+        }
+    }
+}

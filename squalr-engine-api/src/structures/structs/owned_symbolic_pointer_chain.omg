@@ -3,6 +3,7 @@ module src::structures::structs::owned_symbolic_pointer_chain;
 use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
 use src::structures::memory::symbolic_pointer_chain::SymbolicLinkOffset;
 use src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use src::structures::memory::symbolic_pointer_chain::SymbolicTailOffsets;
 
 // Owned projection of upstream `SymbolicPointerChain` {module_name, links:
 // Vec<SymbolicPointerChainLink>, pointer_size} for records that own their
@@ -73,7 +74,7 @@ pub machine OwnedSymbolicPointerChain::get_link_count(owned_symbolic_pointer_cha
 }
 
 pub machine OwnedSymbolicPointerChain::get_link(owned_symbolic_pointer_chain: &OwnedSymbolicPointerChain, position: u64) -> SymbolicPointerChainLink
-    requires position < owned_symbolic_pointer_chain.link_count && position < 64
+    requires position < 64
 {
     (owned_symbolic_pointer_chain.links[position])
 }
@@ -217,4 +218,137 @@ pub machine OwnedSymbolicPointerChain::new_with_links(module_name: &[u8], links:
             _ -> copy_links(chain, links, position)
         }
     }
+}
+
+// Upstream `PartialEq` over the chain record — module bytes, pointer
+// size case, link count, then per-link payload equality.
+pub machine OwnedSymbolicPointerChain::chains_equal(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+    transition left.module_name_len == right.module_name_len && left.link_count == right.link_count && left.link_count <= 64 && left.module_name_len <= 256 {
+        true -> size_match(left, right)
+        _ -> (false)
+    }
+    state size_match(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+        transition left.pointer_size {
+            PointerScanPointerSize::Pointer24be -> right_24be(left, right)
+            PointerScanPointerSize::Pointer24 -> right_24(left, right)
+            PointerScanPointerSize::Pointer32be -> right_32be(left, right)
+            PointerScanPointerSize::Pointer32 -> right_32(left, right)
+            PointerScanPointerSize::Pointer64be -> right_64be(left, right)
+            PointerScanPointerSize::Pointer64 -> right_64(left, right)
+            _ -> (false)
+        }
+    }
+    state right_24be(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+        transition right.pointer_size {
+            PointerScanPointerSize::Pointer24be -> module_bytes(left, right, 0)
+            _ -> (false)
+        }
+    }
+    state right_24(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+        transition right.pointer_size {
+            PointerScanPointerSize::Pointer24 -> module_bytes(left, right, 0)
+            _ -> (false)
+        }
+    }
+    state right_32be(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+        transition right.pointer_size {
+            PointerScanPointerSize::Pointer32be -> module_bytes(left, right, 0)
+            _ -> (false)
+        }
+    }
+    state right_32(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+        transition right.pointer_size {
+            PointerScanPointerSize::Pointer32 -> module_bytes(left, right, 0)
+            _ -> (false)
+        }
+    }
+    state right_64be(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+        transition right.pointer_size {
+            PointerScanPointerSize::Pointer64be -> module_bytes(left, right, 0)
+            _ -> (false)
+        }
+    }
+    state right_64(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain) -> bool {
+        transition right.pointer_size {
+            PointerScanPointerSize::Pointer64 -> module_bytes(left, right, 0)
+            _ -> (false)
+        }
+    }
+    state module_bytes(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain, position: u64) -> bool {
+        transition position < left.module_name_len {
+            true -> module_probe(left, right, position)
+            _ -> link_at(left, right, 0)
+        }
+    }
+    state module_probe(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain, position: u64) -> bool
+        requires position < left.module_name_len;
+    {
+        transition position < 256 && left.module_name[position] == right.module_name[position] {
+            true -> module_bytes(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state link_at(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain, position: u64) -> bool {
+        transition position < left.link_count {
+            true -> link_probe(left, right, position)
+            _ -> (true)
+        }
+    }
+    state link_probe(left: &OwnedSymbolicPointerChain, right: &OwnedSymbolicPointerChain, position: u64) -> bool
+        requires position < left.link_count;
+    {
+        transition position < 64 && SymbolicPointerChainLink::links_equal(&left.links[position], &right.links[position]) {
+            true -> link_at(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `SymbolicPointerChain::get_numeric_tail_offsets` on the owned
+// layout — every tail link resolved numerically or the request refuses.
+pub machine OwnedSymbolicPointerChain::get_numeric_tail_offsets(owned_symbolic_pointer_chain: &OwnedSymbolicPointerChain, out: &mut [i64]) -> SymbolicTailOffsets {
+    let held_count: u64 = OwnedSymbolicPointerChain::get_link_count(owned_symbolic_pointer_chain);
+    transition held_count > 1 {
+        true -> scan(owned_symbolic_pointer_chain, out, 1, 0, held_count)
+        false -> (SymbolicTailOffsets { found: true, count: 0 })
+    }
+    state scan(owned_symbolic_pointer_chain: &OwnedSymbolicPointerChain, out: &mut [i64], index: u64, written: u64, held_count: u64) -> SymbolicTailOffsets {
+        transition index < held_count && index < 64 {
+            true -> at(owned_symbolic_pointer_chain, out, index, written, held_count)
+            false -> (SymbolicTailOffsets { found: true, count: written })
+        }
+    }
+    state at(owned_symbolic_pointer_chain: &OwnedSymbolicPointerChain, out: &mut [i64], index: u64, written: u64, held_count: u64) -> SymbolicTailOffsets
+        requires index < held_count && index < 64;
+    {
+        let link: SymbolicPointerChainLink = OwnedSymbolicPointerChain::get_link(owned_symbolic_pointer_chain, index);
+        let resolved: SymbolicLinkOffset = SymbolicPointerChainLink::as_offset(&link);
+        transition resolved.found {
+            true -> store(owned_symbolic_pointer_chain, out, resolved.offset, index, written, held_count)
+            false -> (SymbolicTailOffsets { found: false, count: 0 })
+        }
+    }
+    state store(owned_symbolic_pointer_chain: &OwnedSymbolicPointerChain, out: &mut [i64], offset: i64, index: u64, written: u64, held_count: u64) -> SymbolicTailOffsets {
+        transition written < out.len {
+            true -> write(owned_symbolic_pointer_chain, out, offset, index, written, held_count)
+            false -> (SymbolicTailOffsets { found: false, count: 0 })
+        }
+    }
+    state write(owned_symbolic_pointer_chain: &OwnedSymbolicPointerChain, out: &mut [i64], offset: i64, index: u64, written: u64, held_count: u64) -> SymbolicTailOffsets
+        requires written < out.len;
+    {
+        out[written] = offset;
+        transition {
+            _ -> scan(owned_symbolic_pointer_chain, out, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, held_count)
+        }
+    }
+}
+
+// Upstream chain link overwrite — rebuilds the chain carrying the same
+// module name and pointer size under the new links.
+pub machine OwnedSymbolicPointerChain::set_links(owned_symbolic_pointer_chain: &mut OwnedSymbolicPointerChain, links: &[SymbolicPointerChainLink]) {
+    let held_name: &[u8] = OwnedSymbolicPointerChain::get_module_name(owned_symbolic_pointer_chain);
+    let held_size: PointerScanPointerSize = OwnedSymbolicPointerChain::get_pointer_size(owned_symbolic_pointer_chain);
+    let mut rebuilt: OwnedSymbolicPointerChain = OwnedSymbolicPointerChain::new_with_links(held_name, links, held_size);
+    OwnedSymbolicPointerChain::clone_from(owned_symbolic_pointer_chain, &rebuilt);
 }

@@ -1,0 +1,363 @@
+module src::command_executors::project_rename_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project::rename::project_rename_request::ProjectRenameRequest;
+use squalr_engine_api::src::commands::project::rename::project_rename_response::ProjectRenameResponse;
+use squalr_engine_api::src::structures::processes::process_icon::ProcessIcon;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_manifest::ProjectManifest;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_info_serialization;
+use squalr_engine_projects::src::project::serialization::project_info_serialization::ProjectInfoLoad;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::project_serialization::ProjectLoad;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+// Port of command_executors/project/rename/project_rename_request_executor.rs —
+// snapshot whether the rename touches the opened project, derive the new
+// path as parent + new name, capture the pre-rename ProjectInfo (load or
+// default fallback), `fs::rename` (copy + remove via rename_tree_commit —
+// upstream's atomic rename has no host op, the two-phase tree move is the
+// port's documented equivalent), full reload when the renamed dir was
+// opened, then deleted+created notifications (and watch/items-changed when
+// the open moved).
+pub data ProjectRenameRequestExecutor {}
+
+pub machine ProjectRenameRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_rename_request: &ProjectRenameRequest
+) -> ProjectRenameResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_directory_path: &[u8] = ProjectRenameRequest::get_project_directory_path(project_rename_request);
+    let mut dir: [u8; 512];
+    let dir_len: u64 = project_directory_path.len;
+    transition dir_len > 0 && dir_len <= 512 {
+        true -> copy_dir(engine_unprivileged_state, project_rename_request, dir, dir_len, 0)
+        _ -> refused()
+    }
+
+    state copy_dir(engine_unprivileged_state: &mut EngineUnprivilegedState, project_rename_request: &ProjectRenameRequest, mut dir: [u8; 512], dir_len: u64, position: u64) -> ProjectRenameResponse
+        requires dir_len <= 512;
+    {
+        let project_directory_path: &[u8] = ProjectRenameRequest::get_project_directory_path(project_rename_request);
+        transition position < project_directory_path.len && position < 512 {
+            true -> write_dir(engine_unprivileged_state, project_rename_request, dir, dir_len, position)
+            _ -> copy_name_entry(engine_unprivileged_state, project_rename_request, dir, dir_len)
+        }
+    }
+    state write_dir(engine_unprivileged_state: &mut EngineUnprivilegedState, project_rename_request: &ProjectRenameRequest, mut dir: [u8; 512], dir_len: u64, position: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && position < 512;
+    {
+        let project_directory_path: &[u8] = ProjectRenameRequest::get_project_directory_path(project_rename_request);
+        transition position < project_directory_path.len {
+            true -> put_dir(engine_unprivileged_state, project_rename_request, dir, dir_len, position, project_directory_path[position])
+            _ -> copy_name_entry(engine_unprivileged_state, project_rename_request, dir, dir_len)
+        }
+    }
+    state put_dir(engine_unprivileged_state: &mut EngineUnprivilegedState, project_rename_request: &ProjectRenameRequest, mut dir: [u8; 512], dir_len: u64, position: u64, byte: u8) -> ProjectRenameResponse
+        requires dir_len <= 512 && position < 512;
+    {
+        dir[position] = byte;
+        transition { _ -> copy_dir(engine_unprivileged_state, project_rename_request, dir, dir_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state copy_name_entry(engine_unprivileged_state: &mut EngineUnprivilegedState, project_rename_request: &ProjectRenameRequest, dir: [u8; 512], dir_len: u64) -> ProjectRenameResponse
+        requires dir_len <= 512;
+    {
+        let new_project_name: &[u8] = ProjectRenameRequest::get_new_project_name(project_rename_request);
+        let mut new_name: [u8; 512];
+        let new_name_len: u64 = new_project_name.len;
+        transition new_name_len > 0 && new_name_len <= 512 {
+            true -> copy_name(engine_unprivileged_state, project_rename_request, dir, dir_len, new_name, new_name_len, 0)
+            _ -> refused()
+        }
+    }
+    state copy_name(engine_unprivileged_state: &mut EngineUnprivilegedState, project_rename_request: &ProjectRenameRequest, dir: [u8; 512], dir_len: u64, mut new_name: [u8; 512], new_name_len: u64, position: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512;
+    {
+        let new_project_name: &[u8] = ProjectRenameRequest::get_new_project_name(project_rename_request);
+        transition position < new_project_name.len && position < 512 {
+            true -> put_name(engine_unprivileged_state, project_rename_request, dir, dir_len, new_name, new_name_len, position, new_project_name[position])
+            _ -> opened_probe(engine_unprivileged_state, dir, dir_len, new_name, new_name_len)
+        }
+    }
+    state put_name(engine_unprivileged_state: &mut EngineUnprivilegedState, project_rename_request: &ProjectRenameRequest, dir: [u8; 512], dir_len: u64, mut new_name: [u8; 512], new_name_len: u64, position: u64, byte: u8) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && position < 512;
+    {
+        new_name[position] = byte;
+        transition { _ -> copy_name(engine_unprivileged_state, project_rename_request, dir, dir_len, new_name, new_name_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // Upstream `opened.get_project_info().get_project_directory()
+    // .unwrap_or_default() == self.project_directory_path` — byte
+    // equality via ProjectItemRef::path_equals on the two slices.
+    state opened_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> compare_opened(engine_unprivileged_state, dir, dir_len, new_name, new_name_len)
+            _ -> build_new(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, false)
+        }
+    }
+
+    state compare_opened(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened);
+        let mut opened_directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut opened_directory) {
+            true -> measure_opened(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, opened_directory)
+            _ -> build_new(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, false)
+        }
+    }
+
+    state measure_opened(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, opened_directory: [u8; 512]) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened);
+        let opened_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition opened_len <= 512 {
+            true -> finish_compare(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, opened_directory, opened_len)
+            _ -> build_new(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, false)
+        }
+    }
+    state finish_compare(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, opened_directory: [u8; 512], opened_len: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && opened_len <= 512;
+    {
+        let left: ProjectItemRef = ProjectItemRef::new(&opened_directory[0..opened_len]);
+        let right: ProjectItemRef = ProjectItemRef::new(&dir[0..dir_len]);
+        let is_renaming_opened: bool = ProjectItemRef::path_equals(&left, &right);
+        transition { _ -> build_new(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened) }
+    }
+
+    // Upstream `dir.parent()` — last-separator split on the byte slice —
+    // then `parent.join(new_project_name)`.
+    state build_new(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512;
+    {
+        transition { _ -> split(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, dir_len, 0) }
+    }
+    state split(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, scan: u64, sep: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && scan <= dir_len;
+    {
+        transition scan > 0 {
+            true -> probe_sep(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, scan, sep)
+            _ -> refused()
+        }
+    }
+    state probe_sep(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, scan: u64, sep: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && scan <= dir_len && scan > 0;
+    {
+        let byte_index: u64 = ((scan as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition byte_index < dir_len {
+            true -> read_sep(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, byte_index)
+            _ -> refused()
+        }
+    }
+    state read_sep(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, byte_index: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && byte_index < dir_len;
+    {
+        transition dir[byte_index] == 47 {
+            true -> join_new(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, ((byte_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> split(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, byte_index, 0)
+        }
+    }
+
+    state join_new(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, parent_len: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && parent_len <= 512 && parent_len > 0;
+    {
+        let mut new_path: [u8; 512];
+        let new_len: u64 = FileSystemUtils::join_path(&dir[0..parent_len], &new_name[0..new_name_len], &mut new_path);
+        transition new_len > 0 && new_len <= 512 {
+            true -> prev_info(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, new_path, new_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `ProjectInfo::load_from_path(dir.join(PROJECT_FILE))
+    // .unwrap_or_else(default)` — the pre-rename info for the
+    // deleted-notification.
+    state prev_info(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && new_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&dir[0..dir_len], 0);
+        transition dir_fd >= 0 {
+            true -> prev_info_load(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, new_path, new_len, dir_fd)
+            _ -> prev_info_fallback(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, new_path, new_len)
+        }
+    }
+    state prev_info_load(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, dir_fd: i32) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && new_len <= 512;
+    {
+        let loaded: ProjectInfoLoad = ProjectInfo::load_at(dir_fd, &dir[0..dir_len]);
+        _ = FilesystemHost::close(dir_fd);
+        transition loaded {
+            ProjectInfoLoad::Loaded { project_info } -> rename_tree(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, new_path, new_len, project_info)
+            _ -> prev_info_fallback(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, new_path, new_len)
+        }
+    }
+    state prev_info_fallback(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && new_len <= 512;
+    {
+        let mut file_path: [u8; 512];
+        let file_len: u64 = FileSystemUtils::join_path(&dir[0..dir_len], "project.json", &mut file_path);
+        let default_icon: ProcessIcon = ProcessIcon::default();
+        let manifest: ProjectManifest = ProjectManifest::default();
+        transition file_len > 0 && file_len <= 512 {
+            true -> prev_info_build(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, new_path, new_len, file_path, file_len, manifest, default_icon)
+            _ -> refused()
+        }
+    }
+    state prev_info_build(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, file_path: [u8; 512], file_len: u64, manifest: ProjectManifest, default_icon: ProcessIcon) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && new_len <= 512 && file_len <= 512;
+    {
+        let mut project_info: ProjectInfo = ProjectInfo::new(&file_path[0..file_len], &default_icon, manifest);
+        ProjectInfo::clear_project_icon_rgba(&mut project_info);
+        transition { _ -> rename_tree(engine_unprivileged_state, dir, dir_len, new_name, new_name_len, is_renaming_opened, new_path, new_len, project_info) }
+    }
+
+    // Upstream `fs::rename(dir, new)` — dirfd-free tree copy + remove.
+    state rename_tree(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_name: [u8; 512], new_name_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_name_len <= 512 && new_len <= 512;
+    {
+        transition FileSystemUtils::rename_tree_commit(&dir[0..dir_len], &new_path[0..new_len]) {
+            true -> reopen_check(engine_unprivileged_state, dir, dir_len, is_renaming_opened, new_path, new_len, previous_project_info)
+            _ -> refused()
+        }
+    }
+
+    // Renaming the opened project: upstream reloads the whole project at
+    // the new path, clearing the open on failure.
+    state reopen_check(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        transition is_renaming_opened {
+            true -> reopen(engine_unprivileged_state, dir, dir_len, new_path, new_len, previous_project_info)
+            _ -> new_info(engine_unprivileged_state, dir, dir_len, is_renaming_opened, new_path, new_len, previous_project_info)
+        }
+    }
+    state reopen(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        let new_fd: i32 = FileSystemUtils::open_path(&new_path[0..new_len], 0);
+        transition new_fd >= 0 {
+            true -> reopen_load(engine_unprivileged_state, dir, dir_len, new_path, new_len, previous_project_info, new_fd)
+            _ -> clear_open(engine_unprivileged_state, dir, dir_len, new_path, new_len, previous_project_info)
+        }
+    }
+    state reopen_load(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo, new_fd: i32) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        let loaded: ProjectLoad = Project::load_at(new_fd, &new_path[0..new_len]);
+        _ = FilesystemHost::close(new_fd);
+        transition loaded {
+            ProjectLoad::Loaded { project } -> store_reopen(engine_unprivileged_state, dir, dir_len, new_path, new_len, previous_project_info, project)
+            _ -> clear_open(engine_unprivileged_state, dir, dir_len, new_path, new_len, previous_project_info)
+        }
+    }
+    state store_reopen(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo, project: Project) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::set_opened_project(project_manager, &project);
+        transition { _ -> new_info(engine_unprivileged_state, dir, dir_len, true, new_path, new_len, previous_project_info) }
+    }
+    state clear_open(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::clear_opened_project(project_manager);
+        transition { _ -> new_info(engine_unprivileged_state, dir, dir_len, true, new_path, new_len, previous_project_info) }
+    }
+
+    // The post-rename info for the created-notification — same load or
+    // default-fallback shape as the pre-rename capture.
+    state new_info(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        let new_fd: i32 = FileSystemUtils::open_path(&new_path[0..new_len], 0);
+        transition new_fd >= 0 {
+            true -> new_info_load(engine_unprivileged_state, dir, dir_len, is_renaming_opened, new_path, new_len, previous_project_info, new_fd)
+            _ -> new_info_fallback(engine_unprivileged_state, dir, dir_len, is_renaming_opened, new_path, new_len, previous_project_info)
+        }
+    }
+    state new_info_load(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo, new_fd: i32) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        let loaded: ProjectInfoLoad = ProjectInfo::load_at(new_fd, &new_path[0..new_len]);
+        _ = FilesystemHost::close(new_fd);
+        transition loaded {
+            ProjectInfoLoad::Loaded { project_info } -> notify(engine_unprivileged_state, is_renaming_opened, new_path, new_len, previous_project_info, project_info)
+            _ -> new_info_fallback(engine_unprivileged_state, dir, dir_len, is_renaming_opened, new_path, new_len, previous_project_info)
+        }
+    }
+    state new_info_fallback(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo) -> ProjectRenameResponse
+        requires dir_len <= 512 && new_len <= 512;
+    {
+        let mut file_path: [u8; 512];
+        let file_len: u64 = FileSystemUtils::join_path(&new_path[0..new_len], "project.json", &mut file_path);
+        let default_icon: ProcessIcon = ProcessIcon::default();
+        let manifest: ProjectManifest = ProjectManifest::default();
+        transition file_len > 0 && file_len <= 512 {
+            true -> new_info_build(engine_unprivileged_state, is_renaming_opened, new_path, new_len, previous_project_info, file_path, file_len, manifest, default_icon)
+            _ -> refused()
+        }
+    }
+    state new_info_build(engine_unprivileged_state: &mut EngineUnprivilegedState, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo, file_path: [u8; 512], file_len: u64, manifest: ProjectManifest, default_icon: ProcessIcon) -> ProjectRenameResponse
+        requires new_len <= 512 && file_len <= 512;
+    {
+        let mut project_info: ProjectInfo = ProjectInfo::new(&file_path[0..file_len], &default_icon, manifest);
+        ProjectInfo::clear_project_icon_rgba(&mut project_info);
+        transition { _ -> notify(engine_unprivileged_state, is_renaming_opened, new_path, new_len, previous_project_info, project_info) }
+    }
+
+    // Upstream `notify_project_deleted(previous)` +
+    // `notify_project_created(new)` — and, when the open moved,
+    // `watch_opened_project` + `notify_project_items_changed`.
+    state notify(engine_unprivileged_state: &mut EngineUnprivilegedState, is_renaming_opened: bool, new_path: [u8; 512], new_len: u64, previous_project_info: ProjectInfo, new_project_info: ProjectInfo) -> ProjectRenameResponse
+        requires new_len <= 512;
+    {
+        EngineUnprivilegedState::notify_project_deleted(engine_unprivileged_state, &previous_project_info);
+        EngineUnprivilegedState::notify_project_created(engine_unprivileged_state, &new_project_info);
+        transition is_renaming_opened {
+            true -> watch(engine_unprivileged_state, new_path, new_len)
+            _ -> finish(new_path, new_len)
+        }
+    }
+    state watch(engine_unprivileged_state: &mut EngineUnprivilegedState, new_path: [u8; 512], new_len: u64) -> ProjectRenameResponse
+        requires new_len <= 512;
+    {
+        EngineUnprivilegedState::watch_opened_project(engine_unprivileged_state, &new_path[0..new_len], true);
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> finish(new_path, new_len) }
+    }
+    state finish(new_path: [u8; 512], new_len: u64) -> ProjectRenameResponse
+        requires new_len <= 512;
+    {
+        let mut response: ProjectRenameResponse = ProjectRenameResponse::new();
+        ProjectRenameResponse::set_success(&mut response, true);
+        ProjectRenameResponse::set_new_project_path(&mut response, &new_path[0..new_len]);
+        (response)
+    }
+
+    state refused() -> ProjectRenameResponse {
+        (ProjectRenameResponse::new())
+    }
+}

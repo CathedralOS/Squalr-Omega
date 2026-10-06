@@ -1,0 +1,469 @@
+module src::services::projects::project_item_activation;
+
+// Port of squalr-engine/src/services/projects/project_item_activation.rs.
+//
+// Toggles activation on every opened item whose stored path is under a
+// requested path (upstream `PathBuf::starts_with` — path-component prefix),
+// collecting a memory-freeze target per newly-(de)activated concrete item,
+// then dispatches one privileged MemoryFreeze request.
+//
+// Named deviations:
+// - `HashMap<ProjectItemRef, ProjectItem>` is the project's pair table
+//   (bounded 256) — iteration is index-order over stored pairs.
+// - `HashSet<PathBuf>` membership is answered by re-running the component-
+//   prefix test per item — the collected set is never materialized (the
+//   upstream semantics are per-item containment anyway).
+// - The component boundary is '/' — headless Linux host; upstream
+//   PathBuf::starts_with on Windows also accepts '\', a documented
+//   portability deviation.
+// - `dispatch_memory_freeze_request` returns void upstream and only logs;
+//   the port drops the delivered response identically (mailbox consumed).
+
+use omega::language::core::option;
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::memory::freeze::memory_freeze_request::MemoryFreezeRequest;
+use squalr_engine_api::src::commands::memory::freeze::memory_freeze_request::MemoryFreezeTargetList;
+use squalr_engine_api::src::commands::memory::freeze::memory_freeze_target::MemoryFreezeTarget;
+use squalr_engine_api::src::commands::memory::memory_command::MemoryCommand;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::memory::pointer::Pointer;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::SymbolicLinkOffset;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::ProjectItemTypeAddress;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::SymbolicStructRefMatch;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::OwnedRuntimePointer;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::ProjectItemAddressTarget;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::RuntimePointerMatch;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_pointer::ProjectItemTypePointer;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::structures::structs::symbolic_struct_ref::SymbolicStructRef;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+pub data ProjectItemActivation {}
+
+// Upstream `ProjectItemActivationChangeSet`.
+pub data ActivationChangeSet {
+    has_activation_changes: bool;
+    freeze_targets: MemoryFreezeTargetList;
+}
+
+// `Option<MemoryFreezeTarget>` carrier.
+pub data FreezeTargetMatch {
+    found: bool;
+    target: MemoryFreezeTarget;
+}
+
+// Upstream `apply_project_item_activation` — `project_items` is the opened
+// project's pair table; requested paths ride the api's bounded
+// `ProjectPathList`.
+pub machine ProjectItemActivation::apply_project_item_activation(
+    opened_project: &mut Project,
+    requested_project_item_paths: &ProjectPathList,
+    is_activated: bool
+) -> ActivationChangeSet {
+    let mut change_set: ActivationChangeSet = ActivationChangeSet {
+        has_activation_changes: false,
+        freeze_targets: MemoryFreezeTargetList::empty(),
+    };
+    transition { _ -> each(opened_project, requested_project_item_paths, is_activated, 0, change_set) }
+    state each(
+        opened_project: &mut Project,
+        requested_project_item_paths: &ProjectPathList,
+        is_activated: bool,
+        at: u64,
+        change_set: ActivationChangeSet
+    ) -> ActivationChangeSet {
+        transition at < Project::get_project_items_len(opened_project) && at < 256 {
+            true -> consider(opened_project, requested_project_item_paths, is_activated, at, change_set)
+            _ -> (change_set)
+        }
+    }
+    state consider(
+        opened_project: &mut Project,
+        requested_project_item_paths: &ProjectPathList,
+        is_activated: bool,
+        at: u64,
+        change_set: ActivationChangeSet
+    ) -> ActivationChangeSet
+        requires at < 256;
+    {
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, at);
+        let item_ref: &ProjectItemRef = ProjectItemPair::get_project_item_ref(pair);
+        let item_path: &[u8] = ProjectItemRef::get_project_item_path(item_ref);
+        transition ProjectItemActivation::is_requested_path(item_path, requested_project_item_paths) {
+            true -> toggle(opened_project, requested_project_item_paths, is_activated, at, change_set)
+            _ -> advance(opened_project, requested_project_item_paths, is_activated, at, change_set)
+        }
+    }
+    state toggle(
+        opened_project: &mut Project,
+        requested_project_item_paths: &ProjectPathList,
+        is_activated: bool,
+        at: u64,
+        change_set: ActivationChangeSet
+    ) -> ActivationChangeSet
+        requires at < 256;
+    {
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, at);
+        let project_item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        transition ProjectItem::get_is_activated(project_item) != is_activated {
+            true -> flip(opened_project, requested_project_item_paths, is_activated, at, change_set)
+            _ -> advance(opened_project, requested_project_item_paths, is_activated, at, change_set)
+        }
+    }
+    state flip(
+        opened_project: &mut Project,
+        requested_project_item_paths: &ProjectPathList,
+        is_activated: bool,
+        at: u64,
+        change_set: ActivationChangeSet
+    ) -> ActivationChangeSet
+        requires at < 256;
+    {
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, at);
+        let project_item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        ProjectItem::toggle_activated(project_item);
+        let mut carried: ActivationChangeSet = change_set;
+        carried.has_activation_changes = true;
+        let freeze_target: FreezeTargetMatch = ProjectItemActivation::create_memory_freeze_target(project_item);
+        transition freeze_target.found {
+            true -> push(opened_project, requested_project_item_paths, is_activated, at, carried, freeze_target.target)
+            _ -> advance(opened_project, requested_project_item_paths, is_activated, at, carried)
+        }
+    }
+    state push(
+        opened_project: &mut Project,
+        requested_project_item_paths: &ProjectPathList,
+        is_activated: bool,
+        at: u64,
+        change_set: ActivationChangeSet,
+        freeze_target: MemoryFreezeTarget
+    ) -> ActivationChangeSet
+        requires at < 256;
+    {
+        let mut carried: ActivationChangeSet = change_set;
+        _ = MemoryFreezeTargetList::push(&mut carried.freeze_targets, &freeze_target);
+        transition { _ -> advance(opened_project, requested_project_item_paths, is_activated, at, carried) }
+    }
+    state advance(
+        opened_project: &mut Project,
+        requested_project_item_paths: &ProjectPathList,
+        is_activated: bool,
+        at: u64,
+        change_set: ActivationChangeSet
+    ) -> ActivationChangeSet
+        requires at < 256;
+    {
+        transition { _ -> each(opened_project, requested_project_item_paths, is_activated, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, change_set) }
+    }
+}
+
+// Upstream `collect_project_item_paths_for_activation` — inlined per item:
+// true when the item path is at-or-under any requested path (component
+// boundary: exact match or next byte is '/').
+machine ProjectItemActivation::is_requested_path(item_path: &[u8], requested_project_item_paths: &ProjectPathList) -> bool {
+    transition { _ -> scan(item_path, requested_project_item_paths, 0) }
+    state scan(item_path: &[u8], requested_project_item_paths: &ProjectPathList, at: u64) -> bool {
+        transition at < ProjectPathList::get_path_count(requested_project_item_paths) && at < 64 {
+            true -> check(item_path, requested_project_item_paths, at)
+            _ -> (false)
+        }
+    }
+    state check(item_path: &[u8], requested_project_item_paths: &ProjectPathList, at: u64) -> bool
+        requires at < 64;
+    {
+        let requested: &[u8] = ProjectPathList::get_path(requested_project_item_paths, at);
+        transition ProjectItemActivation::is_path_prefix(item_path, requested) {
+            true -> (true)
+            _ -> scan(item_path, requested_project_item_paths, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Path-component prefix: requested is a prefix of item_path and the match
+// ends on a component boundary (full match or a '/' follows).
+machine ProjectItemActivation::is_path_prefix(item_path: &[u8], requested: &[u8]) -> bool {
+    transition requested.len <= item_path.len && requested.len > 0 {
+        true -> probe(item_path, requested, 0)
+        _ -> (false)
+    }
+    state probe(item_path: &[u8], requested: &[u8], at: u64) -> bool {
+        transition at < requested.len && at < item_path.len {
+            true -> byte(item_path, requested, at)
+            _ -> boundary(item_path, requested)
+        }
+    }
+    state byte(item_path: &[u8], requested: &[u8], at: u64) -> bool
+        requires at < requested.len && at < item_path.len;
+    {
+        transition item_path[at] == requested[at] {
+            true -> probe(item_path, requested, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state boundary(item_path: &[u8], requested: &[u8]) -> bool {
+        transition requested.len == item_path.len {
+            true -> (true)
+            _ -> slash(item_path, requested)
+        }
+    }
+    state slash(item_path: &[u8], requested: &[u8]) -> bool {
+        transition requested.len < item_path.len {
+            true -> check_slash(item_path, requested)
+            _ -> (false)
+        }
+    }
+    state check_slash(item_path: &[u8], requested: &[u8]) -> bool
+        requires requested.len < item_path.len;
+    {
+        item_path[requested.len] == 47
+    }
+}
+
+// Upstream `create_memory_freeze_target`.
+pub machine ProjectItemActivation::create_memory_freeze_target(project_item: &mut ProjectItem) -> FreezeTargetMatch {
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    transition ProjectItemActivation::type_id_is(item_type_id, "address") {
+        true -> from_address(project_item)
+        _ -> from_pointer(project_item, item_type_id)
+    }
+    state from_address(project_item: &mut ProjectItem) -> FreezeTargetMatch {
+        let address_target: ProjectItemAddressTarget = ProjectItemTypeAddress::get_address_target(project_item);
+        let layout: SymbolicStructRefMatch = ProjectItemTypeAddress::get_field_symbolic_struct_definition_reference(project_item);
+        transition layout.found {
+            true -> address_target_build(project_item, address_target, layout)
+            _ -> absent()
+        }
+    }
+    state address_target_build(project_item: &mut ProjectItem, address_target: ProjectItemAddressTarget, layout: SymbolicStructRefMatch) -> FreezeTargetMatch {
+        let data_type_id: &[u8] = SymbolicStructRef::get_symbolic_struct_namespace(&layout.symbolic_struct_ref);
+        transition data_type_id.len > 0 {
+            true -> build_from_address_target(address_target, data_type_id)
+            _ -> absent()
+        }
+    }
+    state build_from_address_target(address_target: ProjectItemAddressTarget, data_type_id: &[u8]) -> FreezeTargetMatch {
+        // Upstream `build_memory_freeze_target_from_address_target` —
+        // to_runtime_pointer then symbolic-offset veto.
+        let runtime_pointer: RuntimePointerMatch = ProjectItemAddressTarget::to_runtime_pointer(&address_target);
+        transition runtime_pointer.found {
+            true -> veto(runtime_pointer.pointer, data_type_id)
+            _ -> absent()
+        }
+    }
+    state veto(runtime_pointer: OwnedRuntimePointer, data_type_id: &[u8]) -> FreezeTargetMatch {
+        transition ProjectItemActivation::owned_has_symbolic_offsets(&runtime_pointer) {
+            true -> absent()
+            _ -> build_from_pointer(runtime_pointer, data_type_id)
+        }
+    }
+    state build_from_pointer(runtime_pointer: OwnedRuntimePointer, data_type_id: &[u8]) -> FreezeTargetMatch {
+        let module_slice: &[u8] = OwnedRuntimePointer::get_module_name(&runtime_pointer);
+        let mut target: MemoryFreezeTarget = MemoryFreezeTarget::new(
+            OwnedRuntimePointer::get_address(&runtime_pointer),
+            module_slice,
+            data_type_id,
+            OwnedRuntimePointer::get_pointer_size(&runtime_pointer));
+        ProjectItemActivation::fill_owned_offsets(&runtime_pointer, &mut target);
+        (FreezeTargetMatch { found: true, target: target })
+    }
+    state from_pointer(project_item: &mut ProjectItem, item_type_id: &[u8]) -> FreezeTargetMatch {
+        transition ProjectItemActivation::type_id_is(item_type_id, "pointer") {
+            true -> pointer_target(project_item)
+            _ -> absent()
+        }
+    }
+    state pointer_target(project_item: &mut ProjectItem) -> FreezeTargetMatch {
+        let layout: SymbolicStructRefMatch = ProjectItemTypePointer::get_field_symbolic_struct_definition_reference(project_item);
+        transition layout.found {
+            true -> pointer_layout(project_item, layout)
+            _ -> absent()
+        }
+    }
+    state pointer_layout(project_item: &mut ProjectItem, layout: SymbolicStructRefMatch) -> FreezeTargetMatch {
+        let data_type_id: &[u8] = SymbolicStructRef::get_symbolic_struct_namespace(&layout.symbolic_struct_ref);
+        transition data_type_id.len > 0 {
+            true -> pointer_veto(project_item, data_type_id)
+            _ -> absent()
+        }
+    }
+    state pointer_veto(project_item: &mut ProjectItem, data_type_id: &[u8]) -> FreezeTargetMatch {
+        let pointer: OwnedRuntimePointer = ProjectItemTypePointer::get_field_pointer(project_item);
+        transition ProjectItemActivation::owned_has_symbolic_offsets(&pointer) {
+            true -> absent()
+            _ -> pointer_build(pointer, data_type_id)
+        }
+    }
+    state pointer_build(pointer: OwnedRuntimePointer, data_type_id: &[u8]) -> FreezeTargetMatch {
+        let module_slice: &[u8] = OwnedRuntimePointer::get_module_name(&pointer);
+        let mut target: MemoryFreezeTarget = MemoryFreezeTarget::new(
+            OwnedRuntimePointer::get_address(&pointer),
+            module_slice,
+            data_type_id,
+            OwnedRuntimePointer::get_pointer_size(&pointer));
+        ProjectItemActivation::fill_owned_offsets(&pointer, &mut target);
+        (FreezeTargetMatch { found: true, target: target })
+    }
+    state absent() -> FreezeTargetMatch {
+        let inner3082: PointerScanPointerSize = PointerScanPointerSize::default();
+        (FreezeTargetMatch { found: false, target: MemoryFreezeTarget::new(0, "", "", inner3082) })
+    }
+}
+
+// Upstream `dispatch_memory_freeze_request` — empty list short-circuits,
+// one privileged MemoryFreeze command, the response is consumed and
+// dropped (upstream only logs failure counts).
+pub machine ProjectItemActivation::dispatch_memory_freeze_request(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    freeze_targets: &MemoryFreezeTargetList,
+    is_frozen: bool
+)
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition MemoryFreezeTargetList::get_count(freeze_targets) == 0 {
+        true -> done()
+        _ -> dispatch(engine_bindings, freeze_targets, is_frozen)
+    }
+    state dispatch(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        freeze_targets: &MemoryFreezeTargetList,
+        is_frozen: bool
+    )
+    {
+        let mut targets: MemoryFreezeTargetList = MemoryFreezeTargetList::empty();
+        ProjectItemActivation::copy_targets(freeze_targets, &mut targets);
+        let request: MemoryFreezeRequest = MemoryFreezeRequest::new(targets, is_frozen);
+        let command: PrivilegedCommand = PrivilegedCommand::Memory { command: MemoryCommand::Freeze { request: request } };
+        let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+        _ = StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(engine_bindings, &command, &mut mailbox);
+        transition { _ -> done() }
+    }
+    state done() { }
+}
+
+// ---- helpers ----
+
+machine ProjectItemActivation::owned_has_symbolic_offsets(runtime_pointer: &OwnedRuntimePointer) -> bool {
+    transition { _ -> scan(runtime_pointer, 0) }
+    state scan(runtime_pointer: &OwnedRuntimePointer, at: u64) -> bool {
+        transition at < runtime_pointer.offset_count && at < 64 {
+            true -> link(runtime_pointer, at)
+            _ -> (false)
+        }
+    }
+    state link(runtime_pointer: &OwnedRuntimePointer, at: u64) -> bool
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        let resolved: SymbolicLinkOffset = SymbolicPointerChainLink::as_offset(&runtime_pointer.offset_segments[at]);
+        transition resolved.found {
+            true -> scan(runtime_pointer, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (true)
+        }
+    }
+}
+
+// Numeric tail offsets into the freeze target's [i64;32] (upstream Vec).
+machine ProjectItemActivation::fill_owned_offsets(runtime_pointer: &OwnedRuntimePointer, target: &mut MemoryFreezeTarget) {
+    transition { _ -> each(runtime_pointer, target, 0) }
+    state each(runtime_pointer: &OwnedRuntimePointer, target: &mut MemoryFreezeTarget, at: u64) {
+        transition at < runtime_pointer.offset_count && at < 64 {
+            true -> link(runtime_pointer, target, at)
+            _ -> done(target)
+        }
+    }
+    state link(runtime_pointer: &OwnedRuntimePointer, target: &mut MemoryFreezeTarget, at: u64)
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        let resolved: SymbolicLinkOffset = SymbolicPointerChainLink::as_offset(&runtime_pointer.offset_segments[at]);
+        transition resolved.found && target.pointer_offset_count < 32 {
+            true -> store(runtime_pointer, target, resolved.offset, at)
+            _ -> skip(runtime_pointer, target, at)
+        }
+    }
+    state store(runtime_pointer: &OwnedRuntimePointer, target: &mut MemoryFreezeTarget, offset: i64, at: u64)
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        target.pointer_offsets[target.pointer_offset_count] = offset;
+        target.pointer_offset_count = ((target.pointer_offset_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> each(runtime_pointer, target, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state skip(runtime_pointer: &OwnedRuntimePointer, target: &mut MemoryFreezeTarget, at: u64)
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        transition { _ -> each(runtime_pointer, target, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done(target: &mut MemoryFreezeTarget) { }
+}
+
+machine ProjectItemActivation::store_offsets(offsets: &[i64; 32], offset_count: u64, target: &mut MemoryFreezeTarget) {
+    transition { _ -> each(offsets, offset_count, target, 0) }
+    state each(offsets: &[i64; 32], offset_count: u64, target: &mut MemoryFreezeTarget, at: u64) {
+        transition at < offset_count && at < 32 {
+            true -> store(offsets, offset_count, target, at)
+            _ -> done(offset_count, target)
+        }
+    }
+    state store(offsets: &[i64; 32], offset_count: u64, target: &mut MemoryFreezeTarget, at: u64)
+        requires at < offset_count && at < 32;
+    {
+        target.pointer_offsets[at] = offsets[at];
+        transition { _ -> each(offsets, offset_count, target, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done(offset_count: u64, target: &mut MemoryFreezeTarget) {
+        target.pointer_offset_count = offset_count;
+    }
+}
+
+machine ProjectItemActivation::type_id_is(item_type_id: &[u8], expected: &[u8]) -> bool {
+    transition item_type_id.len == expected.len {
+        true -> probe(item_type_id, expected, 0)
+        _ -> (false)
+    }
+    state probe(item_type_id: &[u8], expected: &[u8], at: u64) -> bool {
+        transition at < item_type_id.len && at < expected.len {
+            true -> byte(item_type_id, expected, at)
+            _ -> (true)
+        }
+    }
+    state byte(item_type_id: &[u8], expected: &[u8], at: u64) -> bool
+        requires at < item_type_id.len && at < expected.len;
+    {
+        transition item_type_id[at] == expected[at] {
+            true -> probe(item_type_id, expected, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// MemoryFreezeTargetList copy — no clone_from on the api list; re-push.
+machine ProjectItemActivation::copy_targets(source: &MemoryFreezeTargetList, out: &mut MemoryFreezeTargetList) {
+    transition { _ -> each(source, out, 0) }
+    state each(source: &MemoryFreezeTargetList, out: &mut MemoryFreezeTargetList, at: u64) {
+        transition at < MemoryFreezeTargetList::get_count(source) && at < 64 {
+            true -> push(source, out, at)
+            _ -> done()
+        }
+    }
+    state push(source: &MemoryFreezeTargetList, out: &mut MemoryFreezeTargetList, at: u64)
+        requires at < 64;
+    {
+        let target: &MemoryFreezeTarget = MemoryFreezeTargetList::get_target(source, at);
+        _ = MemoryFreezeTargetList::push(out, target);
+        transition { _ -> each(source, out, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done() { }
+}

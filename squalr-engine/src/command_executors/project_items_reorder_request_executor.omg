@@ -1,0 +1,110 @@
+module src::command_executors::project_items_reorder_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::reorder::project_items_reorder_request::ProjectItemsReorderRequest;
+use squalr_engine_api::src::commands::project_items::reorder::project_items_reorder_response::ProjectItemsReorderResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/reorder/
+// project_items_reorder_request_executor.rs — apply the reorder subset to
+// the manifest sort order, persist via `Project::save_at` (dirfd twin of
+// `save_to_path`), notify, report the requested count.
+pub data ProjectItemsReorderRequestExecutor {}
+
+pub machine ProjectItemsReorderRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_reorder_request: &ProjectItemsReorderRequest
+) -> ProjectItemsReorderResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+    transition ProjectManager::get_has_opened_project(project_manager) {
+        true -> directory(engine_unprivileged_state, project_items_reorder_request)
+        _ -> refused()
+    }
+
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_reorder_request: &ProjectItemsReorderRequest) -> ProjectItemsReorderResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> measure(engine_unprivileged_state, project_items_reorder_request, directory)
+            _ -> refused()
+        }
+    }
+
+    state measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_reorder_request: &ProjectItemsReorderRequest, directory: [u8; 512]) -> ProjectItemsReorderResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> apply(engine_unprivileged_state, project_items_reorder_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `apply_reorder_subset_to_sort_order`.
+    state apply(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_reorder_request: &ProjectItemsReorderRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsReorderResponse
+        requires directory_len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let paths: &ProjectPathList = ProjectItemsReorderRequest::get_project_item_paths(project_items_reorder_request);
+        _ = ProjectItemSortOrder::apply_project_item_reorder_to_sort_order(&sort_order, opened_project, &directory[0..directory_len], paths);
+        transition { _ -> persist(engine_unprivileged_state, project_items_reorder_request, directory, directory_len) }
+    }
+
+    // Upstream `opened_project.save_to_path(&project_directory_path, false)`.
+    state persist(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_reorder_request: &ProjectItemsReorderRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsReorderResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> persist_at(engine_unprivileged_state, project_items_reorder_request, dir_fd, directory, directory_len)
+            _ -> refused()
+        }
+    }
+    state persist_at(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_reorder_request: &ProjectItemsReorderRequest, dir_fd: i32, directory: [u8; 512], directory_len: u64) -> ProjectItemsReorderResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify(engine_unprivileged_state, project_items_reorder_request)
+            _ -> refused()
+        }
+    }
+
+    state notify(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_reorder_request: &ProjectItemsReorderRequest) -> ProjectItemsReorderResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        let mut response: ProjectItemsReorderResponse = ProjectItemsReorderResponse::new();
+        ProjectItemsReorderResponse::set_success(&mut response, true);
+        ProjectItemsReorderResponse::set_reordered_project_item_count(&mut response, ProjectPathList::get_path_count(ProjectItemsReorderRequest::get_project_item_paths(project_items_reorder_request)));
+        (response)
+    }
+
+    state refused() -> ProjectItemsReorderResponse {
+        (ProjectItemsReorderResponse::new())
+    }
+}

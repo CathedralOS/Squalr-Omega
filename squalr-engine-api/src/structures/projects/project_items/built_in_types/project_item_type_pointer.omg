@@ -1,0 +1,962 @@
+module src::structures::projects::project_items::built_in_types::project_item_type_pointer;
+
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::data_value::DataValue;
+use src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use src::structures::memory::symbolic_pointer_chain::PointerChainSymbol;
+use src::structures::memory::symbolic_pointer_chain::SymbolicLinkBuild;
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::structures::projects::project_items::built_in_types::project_item_type_address_target::OwnedRuntimePointer;
+use src::structures::projects::project_items::project_item::ProjectItem;
+use src::structures::projects::project_items::built_in_types::project_item_type_address::SymbolicStructRefMatch;
+use src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use src::structures::structs::symbolic_field_definition::AnonymousValueStringFormatMatch;
+use src::structures::structs::symbolic_struct_ref::SymbolicStructRef;
+use src::structures::structs::valued_struct_field::ValuedStructField;
+use src::structures::structs::valued_struct::ValuedStruct;
+use src::structures::structs::valued_struct_field::ValuedStructFieldData;
+use src::structures::structs::valued_struct::ValuedStructFieldLookup;
+
+// Port of structures/projects/project_items/built_in_types/
+// project_item_type_pointer.rs — the pointer item type. Upstream keeps
+// the pointer offsets as serde_json text inside PROPERTY_POINTER_OFFSETS;
+// the port stores a bounded binary codec in the same field (raw bytes,
+// utf8 not guaranteed — documented deviation shared with the address
+// target codec). Upstream `&Pointer` is a borrowed view — the port's
+// owned projection is `OwnedRuntimePointer`.
+pub data ProjectItemTypePointer {
+}
+
+// Decode carrier for the stored segment list.
+pub data PointerSegmentList {
+    found: bool;
+    segments: [SymbolicPointerChainLink; 64];
+    count: u64;
+}
+
+// `Option<u64>` carrier for read_u64_field.
+pub data PointerOffsetMatch [copy] {
+    found: bool;
+    value: u64;
+}
+
+pub machine ProjectItemTypePointer::get_project_item_type_id() -> &[u8] {
+    ("pointer")
+}
+
+// ---- field plumbing ---------------------------------------------------------
+
+machine pointer_read_string_field(project_item: &ProjectItem, field_name: &[u8], out: &mut [u8; 512]) -> u64 {
+    let properties: &ValuedStruct = ProjectItem::get_properties(project_item);
+    let lookup: ValuedStructFieldLookup = ValuedStruct::find_field(properties, field_name);
+    transition lookup {
+        ValuedStructFieldLookup::Found { index } -> found(project_item, index, out)
+        ValuedStructFieldLookup::Missing -> (0)
+        _ -> (0)
+    }
+    state found(project_item: &ProjectItem, index: u64, out: &mut [u8; 512]) -> u64 {
+        let properties: &ValuedStruct = ProjectItem::get_properties(project_item);
+        let field: ValuedStructField = ValuedStruct::get_field_at(properties, index);
+        transition ValuedStructField::is_value(&field) {
+            true -> copy(field, out)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state copy(field: ValuedStructField, out: &mut [u8; 512]) -> u64 {
+        let data_value: DataValue = ValuedStructField::get_data_value(&field);
+        let bytes: &[u8] = DataValue::get_value_bytes(&data_value);
+        transition {
+            _ -> walk(bytes, out, 0)
+        }
+    }
+    state walk(bytes: &[u8], out: &mut [u8; 512], position: u64) -> u64 {
+        transition position < bytes.len && position < 512 {
+            true -> store(bytes, out, position)
+            false -> (position)
+        }
+    }
+    state store(bytes: &[u8], out: &mut [u8; 512], position: u64) -> u64 {
+        out[position] = bytes[position];
+        transition {
+            _ -> walk(bytes, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine pointer_write_string_field(project_item: &mut ProjectItem, field_name: &[u8], value: &[u8], is_read_only: bool) {
+    let data_type_ref: DataTypeRef = DataTypeRef::new("string_utf8");
+    let data_value: DataValue = DataValue::new(&data_type_ref, value);
+    let field_data: ValuedStructFieldData = ValuedStructFieldData::Value { value: data_value };
+    let properties: &mut ValuedStruct = ProjectItem::borrow_properties_mut(project_item);
+    ValuedStruct::set_field_data(properties, field_name, &field_data, is_read_only);
+}
+
+// Upstream `read_u64_field` — the stored bytes decode little-endian at
+// width 8 or 4; anything else is absent.
+machine pointer_read_u64_field(project_item: &ProjectItem, field_name: &[u8]) -> PointerOffsetMatch {
+    let properties: &ValuedStruct = ProjectItem::get_properties(project_item);
+    let lookup: ValuedStructFieldLookup = ValuedStruct::find_field(properties, field_name);
+    transition lookup {
+        ValuedStructFieldLookup::Found { index } -> found(project_item, index)
+        ValuedStructFieldLookup::Missing -> (PointerOffsetMatch { found: false, value: 0 })
+        _ -> (PointerOffsetMatch { found: false, value: 0 })
+    }
+    state found(project_item: &ProjectItem, index: u64) -> PointerOffsetMatch {
+        let properties: &ValuedStruct = ProjectItem::get_properties(project_item);
+        let field: ValuedStructField = ValuedStruct::get_field_at(properties, index);
+        transition ValuedStructField::is_value(&field) {
+            true -> copy(field)
+            false -> (PointerOffsetMatch { found: false, value: 0 })
+            _ -> (PointerOffsetMatch { found: false, value: 0 })
+        }
+    }
+    state copy(field: ValuedStructField) -> PointerOffsetMatch {
+        let data_value: DataValue = ValuedStructField::get_data_value(&field);
+        let bytes: &[u8] = DataValue::get_value_bytes(&data_value);
+        transition bytes.len == 8 {
+            true -> wide(bytes)
+            false -> narrow(bytes)
+            _ -> (PointerOffsetMatch { found: false, value: 0 })
+        }
+    }
+    state wide(bytes: &[u8]) -> PointerOffsetMatch
+        requires bytes.len == 8
+    {
+        (PointerOffsetMatch { found: true, value: pointer_get_u64_le(bytes, 0) })
+    }
+    state narrow(bytes: &[u8]) -> PointerOffsetMatch {
+        transition bytes.len == 4 {
+            true -> half(bytes)
+            false -> (PointerOffsetMatch { found: false, value: 0 })
+            _ -> (PointerOffsetMatch { found: false, value: 0 })
+        }
+    }
+    state half(bytes: &[u8]) -> PointerOffsetMatch {
+        transition 0 < bytes.len {
+            true -> half0(bytes)
+            false -> (PointerOffsetMatch { found: false, value: 0 })
+        }
+    }
+    state half0(bytes: &[u8]) -> PointerOffsetMatch
+        requires 0 < bytes.len
+    {
+        let low: u64 = ((bytes[0] as u64 in Wrapping)) as u64;
+        transition 1 < bytes.len {
+            true -> half1(bytes, low)
+            false -> (PointerOffsetMatch { found: false, value: 0 })
+        }
+    }
+    state half1(bytes: &[u8], low: u64) -> PointerOffsetMatch
+        requires 1 < bytes.len
+    {
+        let low2: u64 = ((low as u64 in Wrapping) + (((bytes[1] as u64 in Wrapping)) * 256)) as u64;
+        transition 2 < bytes.len {
+            true -> half2(bytes, low2)
+            false -> (PointerOffsetMatch { found: false, value: 0 })
+        }
+    }
+    state half2(bytes: &[u8], low: u64) -> PointerOffsetMatch
+        requires 2 < bytes.len
+    {
+        let low3: u64 = ((low as u64 in Wrapping) + (((bytes[2] as u64 in Wrapping)) * 65536)) as u64;
+        transition 3 < bytes.len {
+            true -> half3(bytes, low3)
+            false -> (PointerOffsetMatch { found: false, value: 0 })
+        }
+    }
+    state half3(bytes: &[u8], low: u64) -> PointerOffsetMatch
+        requires 3 < bytes.len
+    {
+        (PointerOffsetMatch { found: true, value: ((low as u64 in Wrapping) + (((bytes[3] as u64 in Wrapping)) * 16777216)) as u64 })
+    }
+}
+
+machine pointer_get_u64_le(bytes: &[u8], position: u64) -> u64 {
+    transition position < bytes.len {
+        true -> byte0(bytes, position)
+        false -> (0)
+    }
+    state byte0(buffer: &[u8], position: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc: u64 = ((buffer[position] as u64 in Wrapping)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte1(buffer, next, acc)
+            false -> (acc)
+        }
+    }
+    state byte1(buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 256)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte2(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte2(buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 65536)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte3(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte3(buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 16777216)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte4(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte4(buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 4294967296)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte5(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte5(buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 1099511627776)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte6(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte6(buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        let acc2: u64 = ((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 281474976710656)) as u64;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < buffer.len {
+            true -> byte7(buffer, next, acc2)
+            false -> (acc2)
+        }
+    }
+    state byte7(buffer: &[u8], position: u64, acc: u64) -> u64
+        requires position < buffer.len
+    {
+        (((acc as u64 in Wrapping) + (((buffer[position] as u64 in Wrapping)) * 72057594037927936)) as u64)
+    }
+}
+
+machine pl_put_u64(out: &mut [u8; 512], position: u64, value: u64) -> u64
+    requires position <= 504
+{
+    out[position] = ((value & 255) as u8 in Wrapping) as u8;
+    let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    transition next < 512 {
+        true -> byte1(out, next, value)
+        false -> (next)
+    }
+    state byte1(out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 256) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte2(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte2(out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 65536) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte3(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte3(out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 16777216) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte4(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte4(out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 4294967296) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte5(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte5(out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 1099511627776) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte6(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte6(out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 281474976710656) & 255) as u8 in Wrapping) as u8;
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < 512 {
+            true -> byte7(out, next, value)
+            false -> (next)
+        }
+    }
+    state byte7(out: &mut [u8; 512], position: u64, value: u64) -> u64
+        requires position < 512
+    {
+        out[position] = (((value / 72057594037927936) & 255) as u8 in Wrapping) as u8;
+        (((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+    }
+}
+
+machine pl_copy_into(out: &mut [u8; 512], position: u64, bytes: &[u8], byte_count: u64) -> u64 {
+    transition {
+        _ -> scan(out, position, bytes, byte_count, 0)
+    }
+    state scan(out: &mut [u8; 512], position: u64, bytes: &[u8], byte_count: u64, index: u64) -> u64 {
+        transition index < byte_count && index < bytes.len && position < 512 {
+            true -> store(out, position, bytes, byte_count, index)
+            false -> (position)
+        }
+    }
+    state store(out: &mut [u8; 512], position: u64, bytes: &[u8], byte_count: u64, index: u64) -> u64 {
+        out[position] = bytes[index];
+        transition {
+            _ -> scan(out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, bytes, byte_count, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine pointer_encode_segments(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512]) -> u64 {
+    transition {
+        _ -> count_put(segments, segment_count, out)
+    }
+    state count_put(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512]) -> u64 {
+        let after: u64 = pl_put_u64(out, 0, segment_count);
+        transition {
+            _ -> links(segments, segment_count, out, after, 0)
+        }
+    }
+    state links(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512], position: u64, link_position: u64) -> u64 {
+        transition link_position < segment_count && link_position < segments.len && position < 512 {
+            true -> link(segments, segment_count, out, position, link_position)
+            false -> (position)
+        }
+    }
+    state link(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512], position: u64, link_position: u64) -> u64
+        requires position < 512 && link_position < segments.len
+    {
+        let source: SymbolicPointerChainLink = segments[link_position];
+        transition source {
+            SymbolicPointerChainLink::Offset { offset } -> offset_link(segments, segment_count, out, position, link_position, offset)
+            SymbolicPointerChainLink::Symbol { symbol } -> symbol_link(segments, segment_count, out, position, link_position, symbol)
+            _ -> (position)
+        }
+    }
+    state offset_link(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512], position: u64, link_position: u64, offset: i64) -> u64
+        requires position < 512
+    {
+        out[position] = 0;
+        let after_tag: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition after_tag <= 504 {
+            true -> offset_value(segments, segment_count, out, after_tag, link_position, offset)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state offset_value(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512], position: u64, link_position: u64, offset: i64) -> u64
+        requires position <= 504
+    {
+        let offset_bits: u64 = ((offset as u64 in Wrapping)) as u64;
+        let after: u64 = pl_put_u64(out, position, offset_bits);
+        transition {
+            _ -> links(segments, segment_count, out, after, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state symbol_link(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512], position: u64, link_position: u64, symbol: PointerChainSymbol) -> u64
+        requires position < 512
+    {
+        out[position] = 1;
+        let after_tag: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition symbol.symbol_name_len <= 256 && after_tag <= 504 {
+            true -> symbol_len(segments, segment_count, out, after_tag, link_position, symbol)
+            false -> (0)
+            _ -> (0)
+        }
+    }
+    state symbol_len(segments: &[SymbolicPointerChainLink], segment_count: u64, out: &mut [u8; 512], position: u64, link_position: u64, symbol: PointerChainSymbol) -> u64
+        requires position <= 504 && symbol.symbol_name_len <= 256
+    {
+        let after_len: u64 = pl_put_u64(out, position, symbol.symbol_name_len);
+        let after_name: u64 = pl_copy_into(out, after_len, &symbol.symbol_name[0..symbol.symbol_name_len], symbol.symbol_name_len);
+        transition {
+            _ -> links(segments, segment_count, out, after_name, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Decode scratch for the segment list.
+data PointerSegmentDecodeScratch {
+    links: [SymbolicPointerChainLink; 64];
+    link_count: u64;
+    symbol_name: [u8; 256];
+    symbol_name_len: u64;
+}
+
+machine pointer_decode_segments(serialized: &[u8], serialized_len: u64) -> PointerSegmentList {
+    let mut scratch: PointerSegmentDecodeScratch = PointerSegmentDecodeScratch {
+        link_count: 0,
+        symbol_name_len: 0,
+    };
+    transition serialized_len <= 512 {
+        true -> count(serialized, serialized_len, &mut scratch, 0)
+        false -> (PointerSegmentList { found: false, count: 0 })
+        _ -> (PointerSegmentList { found: false, count: 0 })
+    }
+    state count(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64) -> PointerSegmentList
+        requires serialized_len <= 512
+    {
+        transition position <= 504 {
+            true -> count_get(serialized, serialized_len, scratch, position)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state count_get(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && position <= 504
+    {
+        let link_count: u64 = pointer_get_u64_le(serialized, position);
+        let after_count: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        transition link_count <= 64 {
+            true -> links(serialized, serialized_len, scratch, after_count, link_count, 0)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state links(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64) -> PointerSegmentList
+        requires serialized_len <= 512
+    {
+        transition link_position < link_count && position < serialized.len {
+            true -> link_tag(serialized, serialized_len, scratch, position, link_count, link_position)
+            false -> links_done(scratch, link_count, link_position)
+        }
+    }
+    state link_tag(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && position < serialized.len
+    {
+        let tag: u8 = serialized[position];
+        let after_tag: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition tag == 0 {
+            true -> offset_len(serialized, serialized_len, scratch, after_tag, link_count, link_position)
+            false -> symbol_len(serialized, serialized_len, scratch, after_tag, link_count, link_position, tag)
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state offset_len(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64) -> PointerSegmentList
+        requires serialized_len <= 512
+    {
+        transition position <= 504 && link_position < 64 {
+            true -> offset_get(serialized, serialized_len, scratch, position, link_count, link_position)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state offset_get(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && position <= 504 && link_position < 64
+    {
+        let offset_bits: u64 = pointer_get_u64_le(serialized, position);
+        let offset: i64 = ((offset_bits as i64 in Wrapping)) as i64;
+        scratch.links[link_position] = SymbolicPointerChainLink::new_offset(offset);
+        let after: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        transition {
+            _ -> links(serialized, serialized_len, scratch, after, link_count, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state symbol_len(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64, tag: u8) -> PointerSegmentList
+        requires serialized_len <= 512
+    {
+        transition tag == 1 && position <= 504 && link_position < 64 {
+            true -> symbol_len_get(serialized, serialized_len, scratch, position, link_count, link_position)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state symbol_len_get(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && position <= 504 && link_position < 64
+    {
+        let symbol_len: u64 = pointer_get_u64_le(serialized, position);
+        let after_len: u64 = ((position as u64 in Wrapping) + (8 as u64 in Wrapping)) as u64;
+        let symbol_end: u64 = ((after_len as u64 in Wrapping) + (symbol_len as u64 in Wrapping)) as u64;
+        transition symbol_len <= 256 && symbol_end <= serialized_len {
+            true -> symbol_scan(serialized, serialized_len, scratch, after_len, symbol_end, link_count, link_position, 0)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state symbol_scan(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, symbol_end: u64, link_count: u64, link_position: u64, index: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && link_position < 64
+    {
+        transition position < symbol_end && position < serialized.len && index < 256 {
+            true -> symbol_byte(serialized, serialized_len, scratch, position, symbol_end, link_count, link_position, index)
+            false -> symbol_done_guard(serialized, serialized_len, scratch, position, link_count, link_position, index)
+        }
+    }
+    state symbol_byte(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, symbol_end: u64, link_count: u64, link_position: u64, index: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && position < serialized.len && index < 256 && link_position < 64
+    {
+        scratch.symbol_name[index] = serialized[position];
+        transition {
+            _ -> symbol_scan(serialized, serialized_len, scratch, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, symbol_end, link_count, link_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state symbol_done_guard(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64, index: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && link_position < 64
+    {
+        transition index <= 256 {
+            true -> symbol_done(serialized, serialized_len, scratch, position, link_count, link_position, index)
+            false -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state symbol_done(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64, index: u64) -> PointerSegmentList
+        requires serialized_len <= 512 && link_position < 64 && index <= 256
+    {
+        let built: SymbolicLinkBuild = SymbolicPointerChainLink::new_symbol(&scratch.symbol_name[0..index]);
+        transition built.found {
+            true -> symbol_stored(serialized, serialized_len, scratch, position, link_count, link_position, built.link)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state symbol_stored(serialized: &[u8], serialized_len: u64, scratch: &mut PointerSegmentDecodeScratch, position: u64, link_count: u64, link_position: u64, link: SymbolicPointerChainLink) -> PointerSegmentList
+        requires serialized_len <= 512 && link_position < 64
+    {
+        scratch.links[link_position] = link;
+        transition {
+            _ -> links(serialized, serialized_len, scratch, position, link_count, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state links_done(scratch: &mut PointerSegmentDecodeScratch, link_count: u64, link_position: u64) -> PointerSegmentList {
+        transition link_position == link_count {
+            true -> assemble(scratch, link_position)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state assemble(scratch: &mut PointerSegmentDecodeScratch, link_position: u64) -> PointerSegmentList {
+        (PointerSegmentList { found: true, segments: scratch.links, count: link_position })
+    }
+}
+
+// ---- upstream surface --------------------------------------------------------
+
+// Upstream `new_project_item` — `pointer` arrives as the owned
+// projection of upstream's borrowed `&Pointer`.
+pub machine ProjectItemTypePointer::new_project_item(
+    name: &[u8],
+    pointer: &OwnedRuntimePointer,
+    description: &[u8],
+    data_type_id: &[u8]
+) -> ProjectItem {
+    let project_item_type_ref: ProjectItemTypeRef = ProjectItemTypeRef::new(ProjectItemTypePointer::get_project_item_type_id());
+    transition {
+        _ -> whitespace(name, project_item_type_ref, pointer, description, data_type_id, 0)
+    }
+    // An all-whitespace name folds to the default (upstream trim).
+    state whitespace(name: &[u8], project_item_type_ref: ProjectItemTypeRef, pointer: &OwnedRuntimePointer, description: &[u8], data_type_id: &[u8], position: u64) -> ProjectItem {
+        transition position < name.len {
+            true -> character(name, project_item_type_ref, pointer, description, data_type_id, position)
+            _ -> fallback(project_item_type_ref, pointer, description, data_type_id)
+        }
+    }
+    state character(name: &[u8], project_item_type_ref: ProjectItemTypeRef, pointer: &OwnedRuntimePointer, description: &[u8], data_type_id: &[u8], position: u64) -> ProjectItem
+        requires position < name.len;
+    {
+        let byte: u8 = name[position];
+        transition byte == 32 || byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 {
+            true -> whitespace(name, project_item_type_ref, pointer, description, data_type_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> create(name, project_item_type_ref, pointer, description, data_type_id)
+        }
+    }
+    state fallback(project_item_type_ref: ProjectItemTypeRef, pointer: &OwnedRuntimePointer, description: &[u8], data_type_id: &[u8]) -> ProjectItem {
+        let created: ProjectItem = ProjectItem::new(project_item_type_ref, "New Pointer");
+        transition {
+            _ -> populate(created, pointer, description, data_type_id)
+        }
+    }
+    state create(name: &[u8], project_item_type_ref: ProjectItemTypeRef, pointer: &OwnedRuntimePointer, description: &[u8], data_type_id: &[u8]) -> ProjectItem {
+        let created: ProjectItem = ProjectItem::new(project_item_type_ref, name);
+        transition {
+            _ -> populate(created, pointer, description, data_type_id)
+        }
+    }
+    state populate(project_item: ProjectItem, pointer: &OwnedRuntimePointer, description: &[u8], data_type_id: &[u8]) -> ProjectItem {
+        let mut carried: ProjectItem = project_item;
+        pointer_write_string_field(&mut carried, "description", description, false);
+        ProjectItemTypePointer::set_field_module(&mut carried, OwnedRuntimePointer::get_module_name(pointer));
+        ProjectItemTypePointer::set_field_offset(&mut carried, OwnedRuntimePointer::get_address(pointer));
+        ProjectItemTypePointer::set_field_pointer_chain_segments(&mut carried, pointer);
+        ProjectItemTypePointer::set_field_pointer_size(&mut carried, OwnedRuntimePointer::get_pointer_size(pointer));
+        // Default to unknown until project-item refresh reads live memory.
+        ProjectItemTypePointer::set_field_freeze_data_value_interpreter(&mut carried, "");
+        ProjectItemTypePointer::set_field_symbolic_struct_definition_reference(&mut carried, data_type_id);
+        (carried)
+    }
+}
+
+// Upstream `get_field_offset` — unwrap_or(0) on absent/malformed.
+pub machine ProjectItemTypePointer::get_field_offset(project_item: &ProjectItem) -> u64 {
+    let matched: PointerOffsetMatch = pointer_read_u64_field(project_item, "offset");
+    transition matched.found {
+        true -> (matched.value)
+        false -> (0)
+        _ -> (0)
+    }
+}
+
+pub machine ProjectItemTypePointer::set_field_offset(
+    project_item: &mut ProjectItem,
+    offset: u64
+) {
+    let mut bytes: [u8; 512];
+    let written: u64 = pl_put_u64(&mut bytes, 0, offset);
+    transition written == 8 {
+        true -> store(project_item, bytes)
+        false -> finish()
+        _ -> finish()
+    }
+    state store(project_item: &mut ProjectItem, bytes: [u8; 512]) {
+        let data_type_ref: DataTypeRef = DataTypeRef::new("u64");
+        let data_value: DataValue = DataValue::new(&data_type_ref, &bytes[0..8]);
+        let field_data: ValuedStructFieldData = ValuedStructFieldData::Value { value: data_value };
+        let properties: &mut ValuedStruct = ProjectItem::borrow_properties_mut(project_item);
+        ValuedStruct::set_field_data(properties, "offset", &field_data, false);
+    }
+    state finish() {
+    }
+}
+
+pub machine ProjectItemTypePointer::get_field_module(project_item: &ProjectItem, out_module: &mut [u8; 512]) -> u64 {
+    (pointer_read_string_field(project_item, "module", out_module))
+}
+
+pub machine ProjectItemTypePointer::set_field_module(
+    project_item: &mut ProjectItem,
+    module: &[u8]
+) {
+    pointer_write_string_field(project_item, "module", module, false);
+}
+
+// Upstream `get_field_pointer_chain_segments` — codec decode; absent or
+// malformed folds to an empty list (upstream logs + parses text, the
+// parse_text_list fallback is folded into found:false here).
+pub machine ProjectItemTypePointer::get_field_pointer_chain_segments(project_item: &ProjectItem) -> PointerSegmentList {
+    let mut serialized: [u8; 512];
+    let serialized_len: u64 = pointer_read_string_field(project_item, "pointer_offsets", &mut serialized);
+    transition serialized_len > 0 {
+        true -> decode(serialized, serialized_len)
+        false -> (PointerSegmentList { found: false, count: 0 })
+        _ -> (PointerSegmentList { found: false, count: 0 })
+    }
+    state decode(serialized: [u8; 512], serialized_len: u64) -> PointerSegmentList
+        requires serialized_len > 0
+    {
+        transition serialized_len <= 512 {
+            true -> run(serialized, serialized_len)
+            false -> (PointerSegmentList { found: false, count: 0 })
+            _ -> (PointerSegmentList { found: false, count: 0 })
+        }
+    }
+    state run(serialized: [u8; 512], serialized_len: u64) -> PointerSegmentList
+        requires serialized_len <= 512
+    {
+        (pointer_decode_segments(&serialized[0..serialized_len], serialized_len))
+    }
+}
+
+// Upstream `get_field_pointer_offsets` — the numeric-only projection.
+pub machine ProjectItemTypePointer::get_field_pointer_offsets(project_item: &ProjectItem, out_offsets: &mut [i64; 64]) -> u64 {
+    let segments: PointerSegmentList = ProjectItemTypePointer::get_field_pointer_chain_segments(project_item);
+    transition segments.found {
+        true -> walk(segments, out_offsets, 0, 0)
+        false -> (0)
+        _ -> (0)
+    }
+    state walk(segments: PointerSegmentList, out_offsets: &mut [i64; 64], position: u64, written: u64) -> u64 {
+        transition position < segments.count && position < 64 && written < 64 {
+            true -> probe(segments, out_offsets, position, written)
+            false -> (written)
+        }
+    }
+    state probe(segments: PointerSegmentList, out_offsets: &mut [i64; 64], position: u64, written: u64) -> u64
+        requires position < 64 && written < 64
+    {
+        let segment: SymbolicPointerChainLink = segments.segments[position];
+        transition segment {
+            SymbolicPointerChainLink::Offset { offset } -> keep(segments, out_offsets, position, written, offset)
+            _ -> skip(segments, out_offsets, position, written)
+        }
+    }
+    state keep(segments: PointerSegmentList, out_offsets: &mut [i64; 64], position: u64, written: u64, offset: i64) -> u64
+        requires position < 64 && written < 64
+    {
+        out_offsets[written] = offset;
+        transition {
+            _ -> walk(segments, out_offsets,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+                ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state skip(segments: PointerSegmentList, out_offsets: &mut [i64; 64], position: u64, written: u64) -> u64
+        requires position < 64 && written < 64
+    {
+        transition {
+            _ -> walk(segments, out_offsets,
+                ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64,
+                written)
+        }
+    }
+}
+
+// Upstream `set_field_pointer_offsets`/`set_field_pointer_chain_segments`
+// — the owned pointer's segment list encodes under the codec.
+pub machine ProjectItemTypePointer::set_field_pointer_chain_segments(
+    project_item: &mut ProjectItem,
+    pointer: &OwnedRuntimePointer
+) {
+    let mut serialized: [u8; 512];
+    let serialized_len: u64 = pointer_encode_segments(OwnedRuntimePointer::get_offset_segments(pointer), OwnedRuntimePointer::get_offset_count(pointer), &mut serialized);
+    transition serialized_len <= 512 {
+        true -> store(project_item, serialized, serialized_len)
+        false -> finish()
+        _ -> finish()
+    }
+    state store(project_item: &mut ProjectItem, serialized: [u8; 512], serialized_len: u64)
+        requires serialized_len <= 512
+    {
+        pointer_write_string_field(project_item, "pointer_offsets", &serialized[0..serialized_len], false);
+    }
+    state finish() {
+    }
+}
+
+pub machine ProjectItemTypePointer::get_field_pointer_size(project_item: &ProjectItem) -> PointerScanPointerSize {
+    let mut text: [u8; 512];
+    let text_len: u64 = pointer_read_string_field(project_item, "pointer_size", &mut text);
+    transition text_len <= 512 {
+        true -> parse(text, text_len)
+        false -> (PointerScanPointerSize::default())
+        _ -> (PointerScanPointerSize::default())
+    }
+    state parse(text: [u8; 512], text_len: u64) -> PointerScanPointerSize
+        requires text_len <= 512
+    {
+        let parsed: Optional<PointerScanPointerSize> = PointerScanPointerSize::from_str(&text[0..text_len]);
+        transition parsed {
+            Optional::Some { value } -> (value)
+            _ -> (PointerScanPointerSize::default())
+        }
+    }
+}
+
+pub machine ProjectItemTypePointer::set_field_pointer_size(
+    project_item: &mut ProjectItem,
+    pointer_size: PointerScanPointerSize
+) {
+    pointer_write_string_field(project_item, "pointer_size", PointerScanPointerSize::spelling(&pointer_size), false);
+}
+
+// Upstream `get_field_pointer` — the owned projection of the stored
+// fields (upstream's `Pointer` borrowed view folds to
+// `OwnedRuntimePointer`).
+pub machine ProjectItemTypePointer::get_field_pointer(project_item: &ProjectItem) -> OwnedRuntimePointer {
+    let segments: PointerSegmentList = ProjectItemTypePointer::get_field_pointer_chain_segments(project_item);
+    let offset: PointerOffsetMatch = pointer_read_u64_field(project_item, "offset");
+    let mut module_name: [u8; 512];
+    let module_name_len: u64 = pointer_read_string_field(project_item, "module", &mut module_name);
+    transition segments.found && offset.found {
+        true -> assemble(project_item, segments, offset, module_name, module_name_len)
+        false -> (OwnedRuntimePointer::default())
+        _ -> (OwnedRuntimePointer::default())
+    }
+    state assemble(
+        project_item: &ProjectItem,
+        segments: PointerSegmentList,
+        offset: PointerOffsetMatch,
+        module_name: [u8; 512],
+        module_name_len: u64) -> OwnedRuntimePointer
+
+
+
+
+
+
+        requires segments.found && offset.found
+    {
+        transition module_name_len <= 512 {
+            true -> assemble_named(project_item, segments, offset, module_name, module_name_len)
+            false -> (OwnedRuntimePointer::default())
+        }
+    }
+    state assemble_named(
+        project_item: &ProjectItem,
+        segments: PointerSegmentList,
+        offset: PointerOffsetMatch,
+        module_name: [u8; 512],
+        module_name_len: u64) -> OwnedRuntimePointer
+
+
+
+
+
+
+        requires segments.found && offset.found && module_name_len <= 512
+    {
+        let mut result_pointer: OwnedRuntimePointer = OwnedRuntimePointer {
+            address: offset.value,
+            module_name_len: 0,
+            offset_segments: segments.segments,
+            offset_count: segments.count,
+            pointer_size: PointerScanPointerSize::default(),
+        };
+        OwnedRuntimePointer::set_module_name(&mut result_pointer, &module_name[0..module_name_len]);
+        transition {
+            _ -> sized(project_item, result_pointer)
+        }
+    }
+    state sized(project_item: &ProjectItem, pointer: OwnedRuntimePointer) -> OwnedRuntimePointer {
+        let mut carried: OwnedRuntimePointer = pointer;
+        OwnedRuntimePointer::set_pointer_size(&mut carried, ProjectItemTypePointer::get_field_pointer_size(project_item));
+        (carried)
+    }
+}
+
+pub machine ProjectItemTypePointer::get_field_freeze_data_value_interpreter(project_item: &ProjectItem, out: &mut [u8; 512]) -> u64 {
+    (pointer_read_string_field(project_item, "freeze_data_value_interpreter", out))
+}
+
+pub machine ProjectItemTypePointer::set_field_freeze_data_value_interpreter(
+    project_item: &mut ProjectItem,
+    data_value_interpreter: &[u8]
+) {
+    pointer_write_string_field(project_item, "freeze_data_value_interpreter", data_value_interpreter, true);
+}
+
+// Upstream `get_field_freeze_display_format` — parses the stored text;
+// empty/unparseable folds to not-found.
+pub machine ProjectItemTypePointer::get_field_freeze_display_format(project_item: &ProjectItem) -> AnonymousValueStringFormatMatch {
+    let mut text: [u8; 512];
+    let text_len: u64 = pointer_read_string_field(project_item, "freeze_display_format", &mut text);
+    transition text_len <= 512 {
+        true -> parse(text, text_len)
+        false -> (AnonymousValueStringFormatMatch { found: false, display_format: AnonymousValueStringFormat::default() })
+        _ -> (AnonymousValueStringFormatMatch { found: false, display_format: AnonymousValueStringFormat::default() })
+    }
+    state parse(text: [u8; 512], text_len: u64) -> AnonymousValueStringFormatMatch
+        requires text_len <= 512
+    {
+        let parsed: Optional<AnonymousValueStringFormat> = AnonymousValueStringFormat::from_str(&text[0..text_len]);
+        transition parsed {
+            Optional::Some { value } -> (AnonymousValueStringFormatMatch { found: true, display_format: value })
+            _ -> (AnonymousValueStringFormatMatch { found: false, display_format: AnonymousValueStringFormat::default() })
+        }
+    }
+}
+
+pub machine ProjectItemTypePointer::set_field_freeze_display_format(
+    project_item: &mut ProjectItem,
+    display_format: AnonymousValueStringFormat
+) {
+    pointer_write_string_field(project_item, "freeze_display_format", AnonymousValueStringFormat::spelling(&display_format), true);
+}
+
+pub machine ProjectItemTypePointer::get_field_evaluated_pointer_path(project_item: &ProjectItem, out: &mut [u8; 512]) -> u64 {
+    (pointer_read_string_field(project_item, "evaluated_pointer_path", out))
+}
+
+pub machine ProjectItemTypePointer::set_field_evaluated_pointer_path(
+    project_item: &mut ProjectItem,
+    evaluated_pointer_path: &[u8]
+) {
+    pointer_write_string_field(project_item, "evaluated_pointer_path", evaluated_pointer_path, true);
+}
+
+// Upstream `get_field_symbolic_struct_definition_reference` — Option
+// folds to the Match carrier shared with the address type.
+pub machine ProjectItemTypePointer::get_field_symbolic_struct_definition_reference(project_item: &ProjectItem) -> SymbolicStructRefMatch {
+    let mut text: [u8; 512];
+    let text_len: u64 = pointer_read_string_field(project_item, "symbolic_struct_definition_reference", &mut text);
+    transition text_len > 0 && text_len <= 512 {
+        true -> build(text, text_len)
+        false -> (SymbolicStructRefMatch { found: false, symbolic_struct_ref: SymbolicStructRef::new_anonymous() })
+        _ -> (SymbolicStructRefMatch { found: false, symbolic_struct_ref: SymbolicStructRef::new_anonymous() })
+    }
+    state build(text: [u8; 512], text_len: u64) -> SymbolicStructRefMatch
+        requires text_len > 0 && text_len <= 512
+    {
+        transition text_len <= 256 {
+            true -> shrink(text, text_len)
+            false -> (SymbolicStructRefMatch { found: false, symbolic_struct_ref: SymbolicStructRef::new_anonymous() })
+            _ -> (SymbolicStructRefMatch { found: false, symbolic_struct_ref: SymbolicStructRef::new_anonymous() })
+        }
+    }
+    state shrink(text: [u8; 512], text_len: u64) -> SymbolicStructRefMatch
+        requires text_len <= 256
+    {
+        let mut narrowed: [u8; 256];
+        transition {
+            _ -> copy(text, narrowed, text_len, 0)
+        }
+    }
+    state copy(text: [u8; 512], narrowed: [u8; 256], text_len: u64, position: u64) -> SymbolicStructRefMatch
+        requires text_len <= 256
+    {
+        transition position < text_len && position < 256 {
+            true -> byte(text, narrowed, text_len, position)
+            false -> make(narrowed, text_len)
+        }
+    }
+    state byte(text: [u8; 512], narrowed: [u8; 256], text_len: u64, position: u64) -> SymbolicStructRefMatch
+        requires text_len <= 256 && position < 256
+    {
+        let mut held: [u8; 256] = narrowed;
+        held[position] = text[position];
+        transition {
+            _ -> copy(text, held, text_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state make(narrowed: [u8; 256], text_len: u64) -> SymbolicStructRefMatch
+        requires text_len <= 256
+    {
+        (SymbolicStructRefMatch { found: true, symbolic_struct_ref: SymbolicStructRef::new(&narrowed[0..text_len]) })
+    }
+}
+
+pub machine ProjectItemTypePointer::set_field_symbolic_struct_definition_reference(
+    project_item: &mut ProjectItem,
+    symbolic_struct_definition: &[u8]
+) {
+    pointer_write_string_field(project_item, "symbolic_struct_definition_reference", symbolic_struct_definition, false);
+}

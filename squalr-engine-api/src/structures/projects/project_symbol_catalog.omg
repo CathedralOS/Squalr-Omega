@@ -2,9 +2,19 @@ module src::structures::projects::project_symbol_catalog;
 
 use src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
 use src::registries::symbols::symbolic_resolver_descriptor::SymbolicResolverDescriptor;
+use src::structures::projects::project_string_list::ProjectStringList;
 use src::structures::projects::project_symbol_claim::ProjectSymbolClaim;
 use src::structures::projects::project_symbol_module::ProjectSymbolModule;
 use src::structures::projects::project_symbol_module_field::ProjectSymbolModuleField;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldCountResolution;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldOffsetResolution;
+use src::structures::structs::symbolic_field_definition::SymbolicResolverRefMatch;
+use src::structures::structs::symbolic_resolver_definition::SymbolicResolverDefinition;
+use src::structures::structs::symbolic_resolver_definition::SymbolicResolverLocalFieldList;
+use src::structures::structs::symbolic_resolver_ref::SymbolicResolverRef;
+use src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
 
 // Port of structures/projects/project_symbol_catalog.rs — the project's
 // symbol database: modules, layout descriptors, resolver descriptors and
@@ -166,6 +176,33 @@ pub machine ProjectSymbolCatalog::add_symbol_claim(project_symbol_catalog: &mut 
     }
 }
 
+// Byte-lexicographic less-than for descriptor id ordering.
+machine bytes_less(a: &[u8], b: &[u8]) -> bool {
+    transition { _ -> each(a, b, 0) }
+    state each(a: &[u8], b: &[u8], position: u64) -> bool {
+        transition position < a.len && position < b.len {
+            true -> compare(a, b, position)
+            _ -> (position < b.len && !(position < a.len))
+        }
+    }
+    state compare(a: &[u8], b: &[u8], position: u64) -> bool
+        requires position < a.len && position < b.len;
+    {
+        transition a[position] < b[position] {
+            true -> (true)
+            _ -> decide(a, b, position)
+        }
+    }
+    state decide(a: &[u8], b: &[u8], position: u64) -> bool
+        requires position < a.len && position < b.len;
+    {
+        transition a[position] > b[position] {
+            true -> (false)
+            _ -> each(a, b, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
 machine bytes_equal(a: &[u8], b: &[u8]) -> bool {
     transition (a.len == b.len) {
         true -> scan(a, b, 0)
@@ -223,6 +260,138 @@ pub data ProjectSymbolLocatorParse {
 // Upstream `find_symbol_claim` — String compare against each claim's
 // `get_symbol_locator_key()` (faithful: a non-canonical key text misses
 // upstream too). Option<&claim> respelled position-or-count.
+// Upstream `set_symbol_claims` decomposes for the bounded table: an
+// in-place replace at a known position plus the existing
+// `add_symbol_claim` append.
+pub machine ProjectSymbolCatalog::set_symbol_claim_at(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, claim: &ProjectSymbolClaim) -> bool {
+    transition position < project_symbol_catalog.symbol_claim_count && position < 128 {
+        true -> store(project_symbol_catalog, position, claim)
+        _ -> (false)
+    }
+    state store(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, claim: &ProjectSymbolClaim) -> bool
+        requires position < project_symbol_catalog.symbol_claim_count && position < 128;
+    {
+        ProjectSymbolClaim::clone_from(&mut project_symbol_catalog.symbol_claims[position], claim);
+        (true)
+    }
+}
+
+// Upstream `ensure_symbol_module`.
+pub machine ProjectSymbolCatalog::ensure_symbol_module(project_symbol_catalog: &mut ProjectSymbolCatalog, module_name: &[u8], minimum_size: u64) {
+    transition { _ -> find(project_symbol_catalog, module_name, minimum_size) }
+    state find(project_symbol_catalog: &mut ProjectSymbolCatalog, module_name: &[u8], minimum_size: u64) {
+        let position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, module_name);
+        transition position < project_symbol_catalog.symbol_module_count && position < 64 {
+            true -> grow(project_symbol_catalog, position, minimum_size)
+            _ -> push(project_symbol_catalog, module_name, minimum_size)
+        }
+    }
+    state grow(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, minimum_size: u64)
+        requires position < project_symbol_catalog.symbol_module_count && position < 64;
+    {
+        let symbol_module: &mut ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module_mut(project_symbol_catalog, position);
+        transition ProjectSymbolModule::get_size(symbol_module) < minimum_size {
+            true -> grow_apply(symbol_module, minimum_size)
+            _ -> done()
+        }
+    }
+    state grow_apply(symbol_module: &mut ProjectSymbolModule, minimum_size: u64) {
+        ProjectSymbolModule::set_size(symbol_module, minimum_size);
+        transition { _ -> done() }
+    }
+    state push(project_symbol_catalog: &mut ProjectSymbolCatalog, module_name: &[u8], minimum_size: u64) {
+        let symbol_module: ProjectSymbolModule = ProjectSymbolModule::new(module_name, minimum_size);
+        let added: bool = ProjectSymbolCatalog::add_symbol_module(project_symbol_catalog, &symbol_module);
+        transition { _ -> done() }
+    }
+    state done() { }
+}
+
+// Upstream `find` over `struct_layout_descriptors` — u64::MAX miss.
+pub machine ProjectSymbolCatalog::find_struct_layout_descriptor_position(project_symbol_catalog: &ProjectSymbolCatalog, struct_layout_id: &[u8]) -> u64 {
+    transition { _ -> scan(project_symbol_catalog, struct_layout_id, 0) }
+    state scan(project_symbol_catalog: &ProjectSymbolCatalog, struct_layout_id: &[u8], position: u64) -> u64 {
+        transition position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 {
+            true -> compare(project_symbol_catalog, struct_layout_id, position)
+            _ -> (18446744073709551615)
+        }
+    }
+    state compare(project_symbol_catalog: &ProjectSymbolCatalog, struct_layout_id: &[u8], position: u64) -> u64
+        requires position < project_symbol_catalog.struct_layout_descriptor_count && position < 128;
+    {
+        let stored: &[u8] = StructLayoutDescriptor::get_struct_layout_id(&project_symbol_catalog.struct_layout_descriptors[position]);
+        transition bytes_equal(stored, struct_layout_id) {
+            true -> (position)
+            _ -> scan(project_symbol_catalog, struct_layout_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream in-place descriptor replacement.
+pub machine ProjectSymbolCatalog::set_struct_layout_descriptor_at(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, descriptor: &StructLayoutDescriptor) -> bool {
+    transition position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 {
+        true -> store(project_symbol_catalog, position, descriptor)
+        _ -> (false)
+    }
+    state store(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, descriptor: &StructLayoutDescriptor) -> bool
+        requires position < project_symbol_catalog.struct_layout_descriptor_count && position < 128;
+    {
+        StructLayoutDescriptor::clone_from(&mut project_symbol_catalog.struct_layout_descriptors[position], descriptor);
+        (true)
+    }
+}
+
+// Upstream `sort_struct_layout_descriptors_by_id` — insertion sort on
+// the bounded table (byte-lexicographic id order).
+pub machine ProjectSymbolCatalog::sort_struct_layout_descriptors_by_id(project_symbol_catalog: &mut ProjectSymbolCatalog) {
+    transition { _ -> outer(project_symbol_catalog, 1) }
+    state outer(project_symbol_catalog: &mut ProjectSymbolCatalog, cursor: u64) {
+        transition cursor < project_symbol_catalog.struct_layout_descriptor_count && cursor < 128 {
+            true -> inner(project_symbol_catalog, cursor, cursor)
+            _ -> done()
+        }
+    }
+    state inner(project_symbol_catalog: &mut ProjectSymbolCatalog, cursor: u64, position: u64)
+        requires position < 128;
+    {
+        transition position > 0 {
+            true -> compare(project_symbol_catalog, cursor, position)
+            _ -> outer(project_symbol_catalog, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state compare(project_symbol_catalog: &mut ProjectSymbolCatalog, cursor: u64, position: u64)
+        requires position > 0 && position < 128;
+    {
+        let before: u64 = ((position as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition { _ -> before_gate(project_symbol_catalog, cursor, position, before) }
+    }
+    state before_gate(project_symbol_catalog: &mut ProjectSymbolCatalog, cursor: u64, position: u64, before: u64) {
+        transition before < 128 && before < project_symbol_catalog.struct_layout_descriptor_count && position < project_symbol_catalog.struct_layout_descriptor_count {
+            true -> swap_check(project_symbol_catalog, cursor, position, before)
+            _ -> outer(project_symbol_catalog, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state swap_check(project_symbol_catalog: &mut ProjectSymbolCatalog, cursor: u64, position: u64, before: u64)
+        requires before < project_symbol_catalog.struct_layout_descriptor_count && position < project_symbol_catalog.struct_layout_descriptor_count && before < 128;
+    {
+        let left: &[u8] = StructLayoutDescriptor::get_struct_layout_id(&project_symbol_catalog.struct_layout_descriptors[before]);
+        let right: &[u8] = StructLayoutDescriptor::get_struct_layout_id(&project_symbol_catalog.struct_layout_descriptors[position]);
+        transition bytes_less(right, left) {
+            true -> swap(project_symbol_catalog, cursor, position, before)
+            _ -> outer(project_symbol_catalog, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state swap(project_symbol_catalog: &mut ProjectSymbolCatalog, cursor: u64, position: u64, before: u64)
+        requires before < project_symbol_catalog.struct_layout_descriptor_count && position < project_symbol_catalog.struct_layout_descriptor_count && before < 128;
+    {
+        let temp: StructLayoutDescriptor = StructLayoutDescriptor::clone(&project_symbol_catalog.struct_layout_descriptors[before]);
+        project_symbol_catalog.struct_layout_descriptors[before] = StructLayoutDescriptor::clone(&project_symbol_catalog.struct_layout_descriptors[position]);
+        project_symbol_catalog.struct_layout_descriptors[position] = temp;
+        transition { _ -> inner(project_symbol_catalog, cursor, before) }
+    }
+    state done() { }
+}
+
 pub machine ProjectSymbolCatalog::find_symbol_claim_position(project_symbol_catalog: &ProjectSymbolCatalog, symbol_locator_key: &[u8]) -> u64 {
     transition {
         _ -> scan_claims(project_symbol_catalog, symbol_locator_key, 0)
@@ -635,5 +804,1032 @@ pub machine ProjectSymbolCatalog::clone_from(project_symbol_catalog: &mut Projec
     }
     state finish(project_symbol_catalog: &mut ProjectSymbolCatalog, index: u64) {
         project_symbol_catalog.symbol_claim_count = index;
+    }
+}
+
+// ============================================================
+// Mutation surface — bounded equivalents of upstream's Vec
+// remove/retain/sort_by/position operations. Ordered removals
+// shift successors left (callers rescan the same position);
+// sorted inserts open the slot by shifting right. Element moves
+// split the shared-read edge (clone) from the mut-write edge
+// (clone_from) so both loans stay exact.
+// ============================================================
+
+// Upstream `get_symbol_modules_mut` element — in-place mutation.
+pub machine ProjectSymbolCatalog::borrow_symbol_module_mut(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> &mut ProjectSymbolModule
+    requires position < project_symbol_catalog.symbol_module_count && position < 64
+{
+    (&mut project_symbol_catalog.symbol_modules[position])
+}
+
+// Upstream `get_symbol_claims_mut` element — in-place mutation.
+pub machine ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> &mut ProjectSymbolClaim
+    requires position < project_symbol_catalog.symbol_claim_count && position < 128
+{
+    (&mut project_symbol_catalog.symbol_claims[position])
+}
+
+// Upstream `symbol_modules.remove(position)` — order preserved.
+pub machine ProjectSymbolCatalog::remove_symbol_module_at(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool {
+    transition position < project_symbol_catalog.symbol_module_count && position < 64 {
+        true -> shift(project_symbol_catalog, position)
+        false -> (false)
+    }
+    state shift(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool
+        requires position < project_symbol_catalog.symbol_module_count && position < 64
+    {
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < project_symbol_catalog.symbol_module_count && next < 64 {
+            true -> move_one(project_symbol_catalog, position, next)
+            false -> shrink(project_symbol_catalog)
+        }
+    }
+    state move_one(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, next: u64) -> bool
+        requires position < project_symbol_catalog.symbol_module_count && position < 64
+             && next < project_symbol_catalog.symbol_module_count && next < 64
+    {
+        let moved: ProjectSymbolModule = ProjectSymbolModule::clone(&project_symbol_catalog.symbol_modules[next]);
+        ProjectSymbolModule::clone_from(&mut project_symbol_catalog.symbol_modules[position], &moved);
+        transition { _ -> shift(project_symbol_catalog, next) }
+    }
+    state shrink(project_symbol_catalog: &mut ProjectSymbolCatalog) -> bool {
+        project_symbol_catalog.symbol_module_count = ((project_symbol_catalog.symbol_module_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        (true)
+    }
+}
+
+// Upstream `symbolic_resolver_descriptors` retain/remove — order preserved.
+pub machine ProjectSymbolCatalog::remove_symbolic_resolver_descriptor_at(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool {
+    transition position < project_symbol_catalog.symbolic_resolver_descriptor_count && position < 64 {
+        true -> shift(project_symbol_catalog, position)
+        false -> (false)
+    }
+    state shift(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool
+        requires position < project_symbol_catalog.symbolic_resolver_descriptor_count && position < 64
+    {
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < project_symbol_catalog.symbolic_resolver_descriptor_count && next < 64 {
+            true -> move_one(project_symbol_catalog, position, next)
+            false -> shrink(project_symbol_catalog)
+        }
+    }
+    state move_one(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, next: u64) -> bool
+        requires position < project_symbol_catalog.symbolic_resolver_descriptor_count && position < 64
+             && next < project_symbol_catalog.symbolic_resolver_descriptor_count && next < 64
+    {
+        let moved: SymbolicResolverDescriptor = SymbolicResolverDescriptor::clone(&project_symbol_catalog.symbolic_resolver_descriptors[next]);
+        SymbolicResolverDescriptor::clone_from(&mut project_symbol_catalog.symbolic_resolver_descriptors[position], &moved);
+        transition { _ -> shift(project_symbol_catalog, next) }
+    }
+    state shrink(project_symbol_catalog: &mut ProjectSymbolCatalog) -> bool {
+        project_symbol_catalog.symbolic_resolver_descriptor_count = ((project_symbol_catalog.symbolic_resolver_descriptor_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        (true)
+    }
+}
+
+// Upstream `struct_layout_descriptors` retain/remove — order preserved.
+pub machine ProjectSymbolCatalog::remove_struct_layout_descriptor_at(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool {
+    transition position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 {
+        true -> shift(project_symbol_catalog, position)
+        false -> (false)
+    }
+    state shift(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool
+        requires position < project_symbol_catalog.struct_layout_descriptor_count && position < 128
+    {
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < project_symbol_catalog.struct_layout_descriptor_count && next < 128 {
+            true -> move_one(project_symbol_catalog, position, next)
+            false -> shrink(project_symbol_catalog)
+        }
+    }
+    state move_one(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, next: u64) -> bool
+        requires position < project_symbol_catalog.struct_layout_descriptor_count && position < 128
+             && next < project_symbol_catalog.struct_layout_descriptor_count && next < 128
+    {
+        let moved: StructLayoutDescriptor = StructLayoutDescriptor::clone(&project_symbol_catalog.struct_layout_descriptors[next]);
+        StructLayoutDescriptor::clone_from(&mut project_symbol_catalog.struct_layout_descriptors[position], &moved);
+        transition { _ -> shift(project_symbol_catalog, next) }
+    }
+    state shrink(project_symbol_catalog: &mut ProjectSymbolCatalog) -> bool {
+        project_symbol_catalog.struct_layout_descriptor_count = ((project_symbol_catalog.struct_layout_descriptor_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        (true)
+    }
+}
+
+// Upstream `symbol_claims` retain/remove — order preserved.
+pub machine ProjectSymbolCatalog::remove_symbol_claim_at(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool {
+    transition position < project_symbol_catalog.symbol_claim_count && position < 128 {
+        true -> shift(project_symbol_catalog, position)
+        false -> (false)
+    }
+    state shift(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64) -> bool
+        requires position < project_symbol_catalog.symbol_claim_count && position < 128
+    {
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < project_symbol_catalog.symbol_claim_count && next < 128 {
+            true -> move_one(project_symbol_catalog, position, next)
+            false -> shrink(project_symbol_catalog)
+        }
+    }
+    state move_one(project_symbol_catalog: &mut ProjectSymbolCatalog, position: u64, next: u64) -> bool
+        requires position < project_symbol_catalog.symbol_claim_count && position < 128
+             && next < project_symbol_catalog.symbol_claim_count && next < 128
+    {
+        let moved: ProjectSymbolClaim = ProjectSymbolClaim::clone(&project_symbol_catalog.symbol_claims[next]);
+        ProjectSymbolClaim::clone_from(&mut project_symbol_catalog.symbol_claims[position], &moved);
+        transition { _ -> shift(project_symbol_catalog, next) }
+    }
+    state shrink(project_symbol_catalog: &mut ProjectSymbolCatalog) -> bool {
+        project_symbol_catalog.symbol_claim_count = ((project_symbol_catalog.symbol_claim_count as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        (true)
+    }
+}
+
+// Upstream `find_symbolic_resolver_descriptor` — position or the count
+// sentinel when the id is absent (the catalog's other finders share the
+// convention).
+pub machine ProjectSymbolCatalog::find_symbolic_resolver_descriptor_position(project_symbol_catalog: &ProjectSymbolCatalog, resolver_id: &[u8]) -> u64 {
+    transition { _ -> scan(project_symbol_catalog, resolver_id, 0) }
+    state scan(project_symbol_catalog: &ProjectSymbolCatalog, resolver_id: &[u8], position: u64) -> u64 {
+        transition position < project_symbol_catalog.symbolic_resolver_descriptor_count && position < 64 {
+            true -> compare(project_symbol_catalog, resolver_id, position)
+            false -> (position)
+        }
+    }
+    state compare(project_symbol_catalog: &ProjectSymbolCatalog, resolver_id: &[u8], position: u64) -> u64
+        requires position < project_symbol_catalog.symbolic_resolver_descriptor_count && position < 64
+    {
+        let matches: bool = bytes_equal(SymbolicResolverDescriptor::get_resolver_id(&project_symbol_catalog.symbolic_resolver_descriptors[position]), resolver_id);
+        transition matches {
+            true -> (position)
+            false -> scan(project_symbol_catalog, resolver_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+
+// Upstream `delete_module_root_struct_layouts` — retain descriptors whose
+// layout id is not in the name set; returns the dropped count.
+pub machine ProjectSymbolCatalog::delete_module_root_struct_layouts(project_symbol_catalog: &mut ProjectSymbolCatalog, module_names: &ProjectStringList) -> u64 {
+    transition { _ -> scan(project_symbol_catalog, module_names, 0, 0) }
+    state scan(project_symbol_catalog: &mut ProjectSymbolCatalog, module_names: &ProjectStringList, position: u64, deleted: u64) -> u64 {
+        transition position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 {
+            true -> check(project_symbol_catalog, module_names, position, deleted)
+            false -> (deleted)
+        }
+    }
+    state check(project_symbol_catalog: &mut ProjectSymbolCatalog, module_names: &ProjectStringList, position: u64, deleted: u64) -> u64
+        requires position < project_symbol_catalog.struct_layout_descriptor_count && position < 128
+    {
+        let listed: bool = catalog_name_list_contains(module_names, StructLayoutDescriptor::get_struct_layout_id(&project_symbol_catalog.struct_layout_descriptors[position]));
+        transition listed {
+            true -> drop_descriptor(project_symbol_catalog, module_names, position, deleted)
+            false -> scan(project_symbol_catalog, module_names, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted)
+        }
+    }
+    // Removal shifts the next descriptor into this slot — rescan it.
+    state drop_descriptor(project_symbol_catalog: &mut ProjectSymbolCatalog, module_names: &ProjectStringList, position: u64, deleted: u64) -> u64
+        requires position < project_symbol_catalog.struct_layout_descriptor_count && position < 128
+    {
+        _ = ProjectSymbolCatalog::remove_struct_layout_descriptor_at(project_symbol_catalog, position);
+        transition {
+            _ -> scan(project_symbol_catalog, module_names, position, ((deleted as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Membership scan over a ProjectStringList — the port's HashSet
+// equivalent for name sets.
+machine catalog_name_list_contains(names: &ProjectStringList, needle: &[u8]) -> bool {
+    transition { _ -> scan(names, needle, 0) }
+    state scan(names: &ProjectStringList, needle: &[u8], position: u64) -> bool {
+        transition position < ProjectStringList::get_string_count(names) && position < 64 {
+            true -> compare(names, needle, position)
+            false -> (false)
+        }
+    }
+    state compare(names: &ProjectStringList, needle: &[u8], position: u64) -> bool {
+        let found: bool = bytes_equal(ProjectStringList::get_string(names, position), needle);
+        transition found {
+            true -> (true)
+            false -> scan(names, needle, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Case-insensitive ordering — upstream sort_by(to_ascii_lowercase().cmp).
+machine catalog_id_less(left: &[u8], right: &[u8]) -> bool {
+    transition { _ -> scan(left, right, 0) }
+    state scan(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> compare(left, right, position)
+            false -> (left.len < right.len)
+        }
+    }
+    state compare(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len
+    {
+        let left_byte: u8 = catalog_ascii_lower(left[position]);
+        let right_byte: u8 = catalog_ascii_lower(right[position]);
+        transition left_byte < right_byte {
+            true -> (true)
+            false -> tie(left, right, position, left_byte, right_byte)
+        }
+    }
+    state tie(left: &[u8], right: &[u8], position: u64, left_byte: u8, right_byte: u8) -> bool
+        requires position < left.len && position < right.len
+    {
+        transition left_byte > right_byte {
+            true -> (false)
+            false -> scan(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine catalog_ascii_lower(byte: u8) -> u8 {
+    transition byte >= 65 && byte <= 90 {
+        true -> (((byte as u8 in Wrapping) + (32 as u8 in Wrapping)) as u8)
+        false -> (byte)
+    }
+}
+
+// Upstream push + sort_by_id folds to a sorted insert — the resulting
+// descriptor order is identical.
+pub machine ProjectSymbolCatalog::insert_struct_layout_descriptor_sorted(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor) -> bool {
+    transition project_symbol_catalog.struct_layout_descriptor_count < 128 {
+        true -> seek(project_symbol_catalog, descriptor, StructLayoutDescriptor::get_struct_layout_id(descriptor), 0)
+        false -> (false)
+    }
+    state seek(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor, new_id: &[u8], position: u64) -> bool
+        requires position <= project_symbol_catalog.struct_layout_descriptor_count && project_symbol_catalog.struct_layout_descriptor_count < 128;
+    {
+        transition position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 {
+            true -> compare(project_symbol_catalog, descriptor, new_id, position)
+            false -> open(project_symbol_catalog, descriptor, position, project_symbol_catalog.struct_layout_descriptor_count)
+        }
+    }
+    state compare(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor, new_id: &[u8], position: u64) -> bool
+        requires position < project_symbol_catalog.struct_layout_descriptor_count && position < 128 && project_symbol_catalog.struct_layout_descriptor_count < 128
+    {
+        let before: bool = catalog_id_less(new_id, StructLayoutDescriptor::get_struct_layout_id(&project_symbol_catalog.struct_layout_descriptors[position]));
+        transition before {
+            true -> open(project_symbol_catalog, descriptor, position, project_symbol_catalog.struct_layout_descriptor_count)
+            false -> next_gate(project_symbol_catalog, descriptor, new_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state next_gate(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor, new_id: &[u8], position: u64) -> bool
+        requires project_symbol_catalog.struct_layout_descriptor_count < 128;
+    {
+        transition position <= project_symbol_catalog.struct_layout_descriptor_count && project_symbol_catalog.struct_layout_descriptor_count < 128 {
+            true -> seek(project_symbol_catalog, descriptor, new_id, position)
+            _ -> (false)
+        }
+    }
+    state open(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor, position: u64, cursor: u64) -> bool
+        requires position < 128 && cursor <= 128
+    {
+        transition cursor > position && cursor < 128 && cursor > 0 {
+            true -> pre_shift(project_symbol_catalog, descriptor, position, cursor)
+            false -> place(project_symbol_catalog, descriptor, position)
+        }
+    }
+    state pre_shift(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor, position: u64, cursor: u64) -> bool
+        requires position < 128 && cursor < 128 && cursor > position
+    {
+        let prior: u64 = ((cursor as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition prior < 128 && prior < cursor {
+            true -> shift_right(project_symbol_catalog, descriptor, position, cursor, prior)
+            false -> (false)
+        }
+    }
+    state shift_right(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor, position: u64, cursor: u64, prior: u64) -> bool
+        requires position < 128 && cursor < 128 && cursor > position && prior < 128 && prior < cursor
+    {
+        let moved: StructLayoutDescriptor = StructLayoutDescriptor::clone(&project_symbol_catalog.struct_layout_descriptors[prior]);
+        StructLayoutDescriptor::clone_from(&mut project_symbol_catalog.struct_layout_descriptors[cursor], &moved);
+        transition { _ -> open(project_symbol_catalog, descriptor, position, prior) }
+    }
+    state place(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &StructLayoutDescriptor, position: u64) -> bool
+        requires position < 128
+    {
+        StructLayoutDescriptor::clone_from(&mut project_symbol_catalog.struct_layout_descriptors[position], descriptor);
+        project_symbol_catalog.struct_layout_descriptor_count = ((project_symbol_catalog.struct_layout_descriptor_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+// Upstream resolver push + sort_by_id — same sorted-insert fold.
+pub machine ProjectSymbolCatalog::insert_symbolic_resolver_descriptor_sorted(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor) -> bool {
+    transition project_symbol_catalog.symbolic_resolver_descriptor_count < 64 {
+        true -> seek(project_symbol_catalog, descriptor, SymbolicResolverDescriptor::get_resolver_id(descriptor), 0)
+        false -> (false)
+    }
+    state seek(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor, new_id: &[u8], position: u64) -> bool
+        requires position <= project_symbol_catalog.symbolic_resolver_descriptor_count && project_symbol_catalog.symbolic_resolver_descriptor_count < 64;
+    {
+        transition position < project_symbol_catalog.symbolic_resolver_descriptor_count && position < 64 {
+            true -> compare(project_symbol_catalog, descriptor, new_id, position)
+            false -> open(project_symbol_catalog, descriptor, position, project_symbol_catalog.symbolic_resolver_descriptor_count)
+        }
+    }
+    state compare(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor, new_id: &[u8], position: u64) -> bool
+        requires position < project_symbol_catalog.symbolic_resolver_descriptor_count && position < 64 && project_symbol_catalog.symbolic_resolver_descriptor_count < 64
+    {
+        let before: bool = catalog_id_less(new_id, SymbolicResolverDescriptor::get_resolver_id(&project_symbol_catalog.symbolic_resolver_descriptors[position]));
+        transition before {
+            true -> open(project_symbol_catalog, descriptor, position, project_symbol_catalog.symbolic_resolver_descriptor_count)
+            false -> next_gate(project_symbol_catalog, descriptor, new_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state next_gate(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor, new_id: &[u8], position: u64) -> bool
+        requires project_symbol_catalog.symbolic_resolver_descriptor_count < 64;
+    {
+        transition position <= project_symbol_catalog.symbolic_resolver_descriptor_count && project_symbol_catalog.symbolic_resolver_descriptor_count < 64 {
+            true -> seek(project_symbol_catalog, descriptor, new_id, position)
+            _ -> (false)
+        }
+    }
+    state open(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor, position: u64, cursor: u64) -> bool
+        requires position < 64 && cursor <= 64
+    {
+        transition cursor > position && cursor < 64 && cursor > 0 {
+            true -> pre_shift(project_symbol_catalog, descriptor, position, cursor)
+            false -> place(project_symbol_catalog, descriptor, position)
+        }
+    }
+    state pre_shift(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor, position: u64, cursor: u64) -> bool
+        requires position < 64 && cursor < 64 && cursor > position
+    {
+        let prior: u64 = ((cursor as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition prior < 64 && prior < cursor {
+            true -> shift_right(project_symbol_catalog, descriptor, position, cursor, prior)
+            false -> (false)
+        }
+    }
+    state shift_right(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor, position: u64, cursor: u64, prior: u64) -> bool
+        requires position < 64 && cursor < 64 && cursor > position && prior < 64 && prior < cursor
+    {
+        let moved: SymbolicResolverDescriptor = SymbolicResolverDescriptor::clone(&project_symbol_catalog.symbolic_resolver_descriptors[prior]);
+        SymbolicResolverDescriptor::clone_from(&mut project_symbol_catalog.symbolic_resolver_descriptors[cursor], &moved);
+        transition { _ -> open(project_symbol_catalog, descriptor, position, prior) }
+    }
+    state place(project_symbol_catalog: &mut ProjectSymbolCatalog, descriptor: &SymbolicResolverDescriptor, position: u64) -> bool
+        requires position < 64
+    {
+        SymbolicResolverDescriptor::clone_from(&mut project_symbol_catalog.symbolic_resolver_descriptors[position], descriptor);
+        project_symbol_catalog.symbolic_resolver_descriptor_count = ((project_symbol_catalog.symbolic_resolver_descriptor_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+// ASCII whitespace trim for rename names — upstream str::trim covers
+// unicode whitespace; module/layout names are ascii in practice, so the
+// port trims the ascii set (named deviation).
+machine catalog_is_space(byte: u8) -> bool {
+    (byte == 32 || byte == 9 || byte == 10 || byte == 13)
+}
+
+// Copies the trimmed window of `source` into `out`; returns the written
+// length (bounded at 256 like every name carrier).
+machine catalog_trim_copy(source: &[u8], out: &mut [u8; 256]) -> u64 {
+    transition { _ -> find_start(source, out, 0) }
+    state find_start(source: &[u8], out: &mut [u8; 256], position: u64) -> u64 {
+        transition position < source.len {
+            true -> space_or_body(source, out, position)
+            false -> (0)
+        }
+    }
+    state space_or_body(source: &[u8], out: &mut [u8; 256], position: u64) -> u64
+        requires position < source.len
+    {
+        transition catalog_is_space(source[position]) {
+            true -> find_start(source, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> find_end(source, out, position, source.len)
+        }
+    }
+    state find_end(source: &[u8], out: &mut [u8; 256], start: u64, end: u64) -> u64 {
+        transition end > start {
+            true -> check_end(source, out, start, end)
+            false -> (0)
+        }
+    }
+    state check_end(source: &[u8], out: &mut [u8; 256], start: u64, end: u64) -> u64 {
+        let last: u64 = ((end as u64 in Saturating) - (1 as u64 in Saturating)) as u64;
+        transition last < source.len && last >= start {
+            true -> space_or_copy(source, out, start, end, last)
+            false -> (0)
+        }
+    }
+    state space_or_copy(source: &[u8], out: &mut [u8; 256], start: u64, end: u64, last: u64) -> u64
+        requires last < source.len && last >= start
+    {
+        transition catalog_is_space(source[last]) {
+            true -> find_end(source, out, start, last)
+            false -> copy_body(source, out, start, end, 0)
+        }
+    }
+    state copy_body(source: &[u8], out: &mut [u8; 256], start: u64, end: u64, offset: u64) -> u64 {
+        let source_position: u64 = ((start as u64 in Wrapping) + (offset as u64 in Wrapping)) as u64;
+        transition source_position < end && offset < 256 {
+            true -> write_byte(source, out, source_position, start, end, offset)
+            false -> (offset)
+        }
+    }
+    state write_byte(source: &[u8], out: &mut [u8; 256], source_position: u64, start: u64, end: u64, offset: u64) -> u64 {
+        transition source_position < source.len && offset < 256 {
+            true -> store_byte(source, out, source_position, start, end, offset)
+            false -> (offset)
+        }
+    }
+    state store_byte(source: &[u8], out: &mut [u8; 256], source_position: u64, start: u64, end: u64, offset: u64) -> u64
+        requires source_position < source.len && offset < 256
+    {
+        out[offset] = source[source_position];
+        transition {
+            _ -> copy_body(source, out, start, end, ((offset as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `rename_module_root_struct_layout`: trimmed empty or identical
+// names are a no-op success, a missing old id is a no-op success, and an
+// existing destination id refuses. The renamed definition keeps the old
+// layout kind, fields, and declared size.
+pub machine ProjectSymbolCatalog::rename_module_root_struct_layout(
+        project_symbol_catalog: &mut ProjectSymbolCatalog,
+        old_module_name: &[u8],
+        new_module_name: &[u8]
+    ) -> bool {
+    let mut trimmed_old: [u8; 256];
+    let mut trimmed_new: [u8; 256];
+    let trimmed_old_len: u64 = catalog_trim_copy(old_module_name, &mut trimmed_old);
+    let trimmed_new_len: u64 = catalog_trim_copy(new_module_name, &mut trimmed_new);
+    transition trimmed_old_len <= 256 && trimmed_new_len <= 256 {
+        true -> gate(project_symbol_catalog, &trimmed_old[0..trimmed_old_len], &trimmed_new[0..trimmed_new_len])
+        false -> (false)
+    }
+    state gate(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_old: &[u8], trimmed_new: &[u8]) -> bool {
+        let skip: bool = trimmed_old.len == 0 || trimmed_new.len == 0 || bytes_equal(trimmed_old, trimmed_new);
+        transition skip {
+            true -> (true)
+            false -> locate_old(project_symbol_catalog, trimmed_old, trimmed_new)
+        }
+    }
+    state locate_old(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_old: &[u8], trimmed_new: &[u8]) -> bool {
+        let old_position: u64 = ProjectSymbolCatalog::find_struct_layout_descriptor_position(project_symbol_catalog, trimmed_old);
+        transition old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128 {
+            true -> conflict_scan(project_symbol_catalog, trimmed_old, trimmed_new, old_position, 0)
+            false -> (true)
+        }
+    }
+    state conflict_scan(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_old: &[u8], trimmed_new: &[u8], old_position: u64, scan_position: u64) -> bool
+        requires old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128;
+    {
+        transition scan_position < project_symbol_catalog.struct_layout_descriptor_count && scan_position < 128 {
+            true -> conflict_probe(project_symbol_catalog, trimmed_old, trimmed_new, old_position, scan_position)
+            false -> prepare(project_symbol_catalog, trimmed_old, trimmed_new, old_position)
+        }
+    }
+    state conflict_probe(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_old: &[u8], trimmed_new: &[u8], old_position: u64, scan_position: u64) -> bool
+        requires scan_position < project_symbol_catalog.struct_layout_descriptor_count && scan_position < 128 && old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128
+    {
+        let taken: bool = bytes_equal(StructLayoutDescriptor::get_struct_layout_id(&project_symbol_catalog.struct_layout_descriptors[scan_position]), trimmed_new);
+        transition taken {
+            true -> (false)
+            false -> conflict_scan(project_symbol_catalog, trimmed_old, trimmed_new, old_position, ((scan_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Read the old definition's shape before removal shifts slots.
+    state prepare(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_old: &[u8], trimmed_new: &[u8], old_position: u64) -> bool
+        requires old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128
+    {
+        let old_definition: &SymbolicStructDefinition = StructLayoutDescriptor::get_struct_layout_definition(&project_symbol_catalog.struct_layout_descriptors[old_position]);
+        let layout_kind: SymbolicLayoutKind = SymbolicStructDefinition::get_layout_kind(old_definition);
+        let has_declared: bool = SymbolicStructDefinition::has_declared_size_in_bytes(StructLayoutDescriptor::get_struct_layout_definition(&project_symbol_catalog.struct_layout_descriptors[old_position]));
+        let declared: u64 = SymbolicStructDefinition::get_declared_size_in_bytes(StructLayoutDescriptor::get_struct_layout_definition(&project_symbol_catalog.struct_layout_descriptors[old_position]));
+        let field_count: u64 = SymbolicStructDefinition::get_field_count(StructLayoutDescriptor::get_struct_layout_definition(&project_symbol_catalog.struct_layout_descriptors[old_position]));
+        let mut renamed_definition: SymbolicStructDefinition = SymbolicStructDefinition::new_with_layout_kind(trimmed_new, layout_kind, &[]);
+        SymbolicStructDefinition::set_declared_size_in_bytes(&mut renamed_definition, has_declared, declared);
+        transition field_count <= 64 {
+            true -> copy_fields(project_symbol_catalog, trimmed_new, old_position, &mut renamed_definition, 0, field_count)
+            false -> copy_fields(project_symbol_catalog, trimmed_new, old_position, &mut renamed_definition, 0, 64)
+        }
+    }
+    state copy_fields(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_new: &[u8], old_position: u64, renamed_definition: &mut SymbolicStructDefinition, field_position: u64, field_count: u64) -> bool
+        requires old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128 && field_position <= field_count
+    {
+        transition field_position < field_count && field_position < 64 {
+            true -> copy_field(project_symbol_catalog, trimmed_new, old_position, renamed_definition, field_position, field_count)
+            false -> apply(project_symbol_catalog, trimmed_new, old_position, renamed_definition)
+        }
+    }
+    state copy_field(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_new: &[u8], old_position: u64, renamed_definition: &mut SymbolicStructDefinition, field_position: u64, field_count: u64) -> bool
+        requires old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128 && field_position < 64 && field_position < field_count
+    {
+        _ = SymbolicStructDefinition::add_field(renamed_definition, SymbolicStructDefinition::get_field(StructLayoutDescriptor::get_struct_layout_definition(&project_symbol_catalog.struct_layout_descriptors[old_position]), field_position));
+        transition {
+            _ -> field_gate(project_symbol_catalog, trimmed_new, old_position, renamed_definition, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, field_count)
+        }
+    }
+    state field_gate(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_new: &[u8], old_position: u64, renamed_definition: &mut SymbolicStructDefinition, field_position: u64, field_count: u64) -> bool
+        requires old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128;
+    {
+        transition field_position <= field_count {
+            true -> copy_fields(project_symbol_catalog, trimmed_new, old_position, renamed_definition, field_position, field_count)
+            false -> apply(project_symbol_catalog, trimmed_new, old_position, renamed_definition)
+        }
+    }
+    state apply(project_symbol_catalog: &mut ProjectSymbolCatalog, trimmed_new: &[u8], old_position: u64, renamed_definition: &SymbolicStructDefinition) -> bool
+        requires old_position < project_symbol_catalog.struct_layout_descriptor_count && old_position < 128
+    {
+        let renamed_descriptor: StructLayoutDescriptor = StructLayoutDescriptor::new(trimmed_new, renamed_definition);
+        _ = ProjectSymbolCatalog::remove_struct_layout_descriptor_at(project_symbol_catalog, old_position);
+        (ProjectSymbolCatalog::insert_struct_layout_descriptor_sorted(project_symbol_catalog, &renamed_descriptor))
+    }
+}
+
+// ============================================================
+// Local resolver-dependency validation — upstream
+// validate_local_resolver_dependencies(_for_struct_layout):
+// per layout descriptor, collect the field→field dependency
+// graph from each field's count/display/offset/active_when
+// resolver references (filtered to fields of the same struct),
+// then refuse on a dependency cycle. Upstream reports the cycle
+// path via DFS; that path was diagnostic-only, so the port runs
+// the equivalent verdict as reachability closure over the same
+// graph — a field on a dependency cycle iff reach[f][f].
+// ============================================================
+
+// The field→field adjacency table — upstream's
+// HashMap<String, Vec<String>> dependencies_by_field_name keyed
+// by the deduped field-name table's positions.
+pub data LocalDependencyMatrix {
+    edges: [[bool; 64]; 64];
+}
+
+machine LocalDependencyMatrix::new() -> LocalDependencyMatrix {
+    LocalDependencyMatrix {}
+}
+
+// Position of `needle` in the name table, or the count sentinel.
+machine catalog_find_name_position(names: &ProjectStringList, needle: &[u8]) -> u64 {
+    transition { _ -> scan(names, needle, 0) }
+    state scan(names: &ProjectStringList, needle: &[u8], position: u64) -> u64 {
+        transition position < ProjectStringList::get_string_count(names) && position < 64 {
+            true -> compare(names, needle, position)
+            false -> (position)
+        }
+    }
+    state compare(names: &ProjectStringList, needle: &[u8], position: u64) -> u64 {
+        let found: bool = bytes_equal(ProjectStringList::get_string(names, position), needle);
+        transition found {
+            true -> (position)
+            false -> scan(names, needle, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+pub machine ProjectSymbolCatalog::validate_local_resolver_dependencies(project_symbol_catalog: &ProjectSymbolCatalog) -> bool {
+    transition { _ -> descriptor_scan(project_symbol_catalog, 0) }
+    state descriptor_scan(project_symbol_catalog: &ProjectSymbolCatalog, descriptor_position: u64) -> bool {
+        transition descriptor_position < project_symbol_catalog.struct_layout_descriptor_count && descriptor_position < 128 {
+            true -> check_descriptor(project_symbol_catalog, descriptor_position)
+            false -> (true)
+        }
+    }
+    state check_descriptor(project_symbol_catalog: &ProjectSymbolCatalog, descriptor_position: u64) -> bool
+        requires descriptor_position < project_symbol_catalog.struct_layout_descriptor_count && descriptor_position < 128
+    {
+        let valid: bool = catalog_validate_layout_dependencies(project_symbol_catalog, StructLayoutDescriptor::get_struct_layout_definition(&project_symbol_catalog.struct_layout_descriptors[descriptor_position]));
+        transition valid {
+            true -> descriptor_scan(project_symbol_catalog, ((descriptor_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+        }
+    }
+}
+
+// Upstream `validate_local_resolver_dependencies_for_struct_layout`
+// folded to bool — Err carries only diagnostic text upstream.
+machine catalog_validate_layout_dependencies(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition
+    ) -> bool {
+    let mut field_names: ProjectStringList = ProjectStringList::empty();
+    let mut dependencies: LocalDependencyMatrix = LocalDependencyMatrix::new();
+    transition {
+        _ -> build_names(project_symbol_catalog, struct_layout_definition, &mut field_names, &mut dependencies, 0)
+    }
+    // Collect the deduped nonempty field-name table.
+    state build_names(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64
+    ) -> bool {
+        transition field_position < SymbolicStructDefinition::get_field_count(struct_layout_definition) && field_position < 64 {
+            true -> name_entry(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position)
+            false -> collect(project_symbol_catalog, struct_layout_definition, field_names, dependencies, 0)
+        }
+    }
+    state name_entry(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64
+    ) -> bool {
+        let field_definition_local: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(struct_layout_definition, field_position);
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(field_definition_local);
+        let add: bool = field_name.len > 0 && !catalog_name_list_contains(field_names, field_name);
+        transition add {
+            true -> store_name(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position)
+            false -> build_names(project_symbol_catalog, struct_layout_definition, field_names, dependencies, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state store_name(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64
+    ) -> bool {
+        let field_definition_local: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(struct_layout_definition, field_position);
+        _ = ProjectStringList::add_string(field_names, SymbolicFieldDefinition::get_field_name(field_definition_local));
+        transition {
+            _ -> build_names(project_symbol_catalog, struct_layout_definition, field_names, dependencies, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Per-field dependency collection — upstream iterates every field,
+    // skips unnamed, and gathers each of its resolver ids' referenced
+    // local fields.
+    state collect(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64
+    ) -> bool {
+        transition field_position < SymbolicStructDefinition::get_field_count(struct_layout_definition) && field_position < 64 {
+            true -> field_row(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position)
+            false -> closure_outer(project_symbol_catalog, field_names, dependencies, 0, 0, 0)
+        }
+    }
+    state field_row(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64
+    ) -> bool {
+        let field_definition_local: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(struct_layout_definition, field_position);
+        let field_name: &[u8] = SymbolicFieldDefinition::get_field_name(field_definition_local);
+        transition field_name.len > 0 {
+            true -> row_lookup(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position)
+            false -> collect(project_symbol_catalog, struct_layout_definition, field_names, dependencies, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state row_lookup(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64
+    ) -> bool {
+        let field_definition_local: &SymbolicFieldDefinition = SymbolicStructDefinition::get_field(struct_layout_definition, field_position);
+        let row: u64 = catalog_find_name_position(field_names, SymbolicFieldDefinition::get_field_name(field_definition_local));
+        transition row < ProjectStringList::get_string_count(field_names) && row < 64 {
+            true -> dep_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 0)
+            false -> collect(project_symbol_catalog, struct_layout_definition, field_names, dependencies, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // The four resolver references per field, in upstream order:
+    // count, display count, offset, active_when.
+    state dep_ref(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64
+    ) -> bool
+        requires row < 64
+    {
+        transition ref_slot {
+            0 -> dep_count(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row)
+            1 -> dep_display(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row)
+            2 -> dep_offset(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row)
+            _ -> dep_active(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row)
+        }
+    }
+    state dep_count(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64
+    ) -> bool
+        requires row < 64
+    {
+        let resolution: SymbolicFieldCountResolution = SymbolicFieldDefinition::get_count_resolution(SymbolicStructDefinition::get_field(struct_layout_definition, field_position));
+        transition SymbolicFieldCountResolution::has_resolver_id(&resolution) {
+            true -> resolve_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 0, SymbolicFieldCountResolution::get_resolver_id(&resolution))
+            false -> dep_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 1)
+        }
+    }
+    state dep_display(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64
+    ) -> bool
+        requires row < 64
+    {
+        let resolution: SymbolicFieldCountResolution = SymbolicFieldDefinition::get_display_count_resolution(SymbolicStructDefinition::get_field(struct_layout_definition, field_position));
+        transition SymbolicFieldCountResolution::has_resolver_id(&resolution) {
+            true -> resolve_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 1, SymbolicFieldCountResolution::get_resolver_id(&resolution))
+            false -> dep_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 2)
+        }
+    }
+    state dep_offset(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64
+    ) -> bool
+        requires row < 64
+    {
+        let resolution: SymbolicFieldOffsetResolution = SymbolicFieldDefinition::get_offset_resolution(SymbolicStructDefinition::get_field(struct_layout_definition, field_position));
+        transition SymbolicFieldOffsetResolution::has_resolver_id(&resolution) {
+            true -> resolve_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 2, SymbolicFieldOffsetResolution::get_resolver_id(&resolution))
+            false -> dep_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 3)
+        }
+    }
+    state dep_active(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64
+    ) -> bool
+        requires row < 64
+    {
+        let resolver_ref_match: SymbolicResolverRefMatch = SymbolicFieldDefinition::get_active_when_resolver(SymbolicStructDefinition::get_field(struct_layout_definition, field_position));
+        transition resolver_ref_match.found {
+            true -> resolve_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, 3, SymbolicResolverRef::get_resolver_id(&resolver_ref_match.resolver_ref))
+            false -> next_field(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position)
+        }
+    }
+    state next_field(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64
+    ) -> bool {
+        transition {
+            _ -> collect(project_symbol_catalog, struct_layout_definition, field_names, dependencies, ((field_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Upstream `collect_local_field_dependencies_from_resolver`: a
+    // resolver id that matches no descriptor contributes nothing.
+    state resolve_ref(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64,
+        resolver_id: &[u8]
+    ) -> bool
+        requires row < 64
+    {
+        let descriptor_position: u64 = ProjectSymbolCatalog::find_symbolic_resolver_descriptor_position(project_symbol_catalog, resolver_id);
+        transition { _ -> resolver_gate(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position) }
+    }
+    state resolver_gate(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64,
+        descriptor_position: u64
+    ) -> bool
+        requires row < 64;
+    {
+        transition descriptor_position < project_symbol_catalog.symbolic_resolver_descriptor_count && descriptor_position < 64 {
+            true -> dep_names(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, 0)
+            false -> dep_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ((ref_slot as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Upstream `retain(|dep| field_names.contains(dep))` + dedup — the
+    // find-name-position lookup keeps only same-struct field names, and
+    // a bool edge is naturally deduped.
+    state dep_names(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64,
+        descriptor_position: u64,
+        dep_position: u64
+    ) -> bool
+        requires row < 64 && descriptor_position < project_symbol_catalog.symbolic_resolver_descriptor_count && descriptor_position < 64
+    {
+        let local_fields: SymbolicResolverLocalFieldList = SymbolicResolverDefinition::referenced_local_fields(SymbolicResolverDescriptor::get_resolver_definition(&project_symbol_catalog.symbolic_resolver_descriptors[descriptor_position]));
+        transition dep_position < SymbolicResolverLocalFieldList::get_field_name_count(&local_fields) && dep_position < 128 {
+            true -> dep_name(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, dep_position)
+            false -> dep_ref(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ((ref_slot as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state dep_name(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64,
+        descriptor_position: u64,
+        dep_position: u64
+    ) -> bool
+        requires row < 64 && descriptor_position < project_symbol_catalog.symbolic_resolver_descriptor_count && descriptor_position < 64
+    {
+        let local_fields: SymbolicResolverLocalFieldList = SymbolicResolverDefinition::referenced_local_fields(SymbolicResolverDescriptor::get_resolver_definition(&project_symbol_catalog.symbolic_resolver_descriptors[descriptor_position]));
+        transition {
+            _ -> dep_name_gate(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, dep_position, &local_fields)
+        }
+    }
+    state dep_name_gate(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64,
+        descriptor_position: u64,
+        dep_position: u64,
+        local_fields: &SymbolicResolverLocalFieldList
+    ) -> bool
+        requires row < 64 && descriptor_position < project_symbol_catalog.symbolic_resolver_descriptor_count && descriptor_position < 64;
+    {
+        transition dep_position < local_fields.field_name_count && dep_position < 128 {
+            true -> dep_name_body(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, dep_position, local_fields)
+            false -> dep_names(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, ((dep_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state dep_name_body(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64,
+        descriptor_position: u64,
+        dep_position: u64,
+        local_fields: &SymbolicResolverLocalFieldList
+    ) -> bool
+        requires row < 64 && descriptor_position < project_symbol_catalog.symbolic_resolver_descriptor_count && descriptor_position < 64 && dep_position < local_fields.field_name_count && dep_position < 128;
+    {
+        let dep_name: &[u8] = SymbolicResolverLocalFieldList::get_field_name(local_fields, dep_position);
+        let column: u64 = catalog_find_name_position(field_names, dep_name);
+        transition column < ProjectStringList::get_string_count(field_names) && column < 64 {
+            true -> mark_edge(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, dep_position, column)
+            false -> dep_names(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, ((dep_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state mark_edge(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        struct_layout_definition: &SymbolicStructDefinition,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        field_position: u64,
+        row: u64,
+        ref_slot: u64,
+        descriptor_position: u64,
+        dep_position: u64,
+        column: u64
+    ) -> bool
+        requires row < 64 && column < 64 && descriptor_position < project_symbol_catalog.symbolic_resolver_descriptor_count && descriptor_position < 64
+    {
+        dependencies.edges[row][column] = true;
+        transition {
+            _ -> dep_names(project_symbol_catalog, struct_layout_definition, field_names, dependencies, field_position, row, ref_slot, descriptor_position, ((dep_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // Reachability closure over the adjacency table — a dependency
+    // cycle exists iff some name reaches itself. Upstream's DFS emits
+    // the same verdict (the reported path text was diagnostic-only).
+    state closure_outer(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        via: u64,
+        source: u64,
+        target: u64
+    ) -> bool {
+        transition via < ProjectStringList::get_string_count(field_names) && via < 64 {
+            true -> closure_middle(project_symbol_catalog, field_names, dependencies, via, source, target)
+            false -> diagonal(project_symbol_catalog, field_names, dependencies, 0)
+        }
+    }
+    state closure_middle(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        via: u64,
+        source: u64,
+        target: u64
+    ) -> bool
+        requires via < 64;
+    {
+        transition source < ProjectStringList::get_string_count(field_names) && source < 64 {
+            true -> closure_inner(project_symbol_catalog, field_names, dependencies, via, source, target)
+            false -> closure_outer(project_symbol_catalog, field_names, dependencies, ((via as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, 0, 0)
+        }
+    }
+    state closure_inner(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        via: u64,
+        source: u64,
+        target: u64
+    ) -> bool
+        requires via < 64 && source < 64
+    {
+        transition target < ProjectStringList::get_string_count(field_names) && target < 64 {
+            true -> closure_mark(project_symbol_catalog, field_names, dependencies, via, source, target)
+            false -> closure_middle(project_symbol_catalog, field_names, dependencies, via, ((source as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, 0)
+        }
+    }
+    state closure_mark(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        via: u64,
+        source: u64,
+        target: u64
+    ) -> bool
+        requires via < 64 && source < 64 && target < 64
+    {
+        transition dependencies.edges[source][via] && dependencies.edges[via][target] {
+            true -> closure_set(project_symbol_catalog, field_names, dependencies, via, source, target)
+            false -> closure_inner(project_symbol_catalog, field_names, dependencies, via, source, ((target as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state closure_set(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        via: u64,
+        source: u64,
+        target: u64
+    ) -> bool
+        requires via < 64 && source < 64 && target < 64
+    {
+        dependencies.edges[source][target] = true;
+        transition {
+            _ -> closure_inner(project_symbol_catalog, field_names, dependencies, via, source, ((target as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state diagonal(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        position: u64
+    ) -> bool {
+        transition position < ProjectStringList::get_string_count(field_names) && position < 64 {
+            true -> check_diagonal(project_symbol_catalog, field_names, dependencies, position)
+            false -> (true)
+        }
+    }
+    state check_diagonal(
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        field_names: &mut ProjectStringList,
+        dependencies: &mut LocalDependencyMatrix,
+        position: u64
+    ) -> bool
+        requires position < 64
+    {
+        transition dependencies.edges[position][position] {
+            true -> (false)
+            false -> diagonal(project_symbol_catalog, field_names, dependencies, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
     }
 }

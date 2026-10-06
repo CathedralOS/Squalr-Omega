@@ -1,0 +1,490 @@
+module src::command_executors::project_items_update_details_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::update_details::project_items_update_details_request::ProjectItemsUpdateDetailsRequest;
+use squalr_engine_api::src::commands::project_items::update_details::project_items_update_details_response::ProjectItemsUpdateDetailsPathChange;
+use squalr_engine_api::src::commands::project_items::update_details::project_items_update_details_response::ProjectItemsUpdateDetailsResponse;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::details::details_field::DetailsFieldSource;
+use squalr_engine_api::src::structures::details::details_field::DetailsValue;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project::ProjectItemLookup;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::details::project_item_details_edit_applier::ProjectItemDetailsEditApplier;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/update_details/
+// project_items_update_details_request_executor.rs — resolves the
+// (source, value) pair from the request, applies it to each named item
+// via `ProjectItemDetailsEditApplier`, then renames on-disk when the
+// "name" property of a non-directory item moved (upstream's
+// `align_project_item_file_name`). The response record is threaded
+// through the loop so path changes accumulate as upstream's Vec push;
+// rename failures retry the unique-path probe up to 1024 attempts
+// (upstream retries only AlreadyExists — the bool carrier can't
+// distinguish the error kind, documented deviation).
+pub data ProjectItemsUpdateDetailsRequestExecutor {}
+
+pub machine ProjectItemsUpdateDetailsRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_update_details_request: &ProjectItemsUpdateDetailsRequest
+) -> ProjectItemsUpdateDetailsResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let paths: &ProjectPathList = ProjectItemsUpdateDetailsRequest::get_project_item_paths(project_items_update_details_request);
+    transition ProjectPathList::get_path_count(paths) == 0 {
+        true -> respond()
+        _ -> resolve_source(engine_unprivileged_state, project_items_update_details_request)
+    }
+
+    // ---- resolve_details_update ----
+    state resolve_source(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest) -> ProjectItemsUpdateDetailsResponse {
+        let source: &DetailsFieldSource = ProjectItemsUpdateDetailsRequest::get_details_field_source(project_items_update_details_request);
+        transition source {
+            DetailsFieldSource::Unknown -> resolve_names(engine_unprivileged_state, project_items_update_details_request)
+            DetailsFieldSource::ProjectItemProperty { property_name, property_name_len } -> resolve_value(engine_unprivileged_state, project_items_update_details_request, DetailsFieldSource::ProjectItemProperty { property_name: property_name, property_name_len: property_name_len })
+            DetailsFieldSource::ProjectItemAddressTarget { property_name, property_name_len } -> resolve_value(engine_unprivileged_state, project_items_update_details_request, DetailsFieldSource::ProjectItemAddressTarget { property_name: property_name, property_name_len: property_name_len })
+            _ -> fail("Unsupported details field source.")
+        }
+    }
+    state resolve_names(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest) -> ProjectItemsUpdateDetailsResponse {
+        let has_property: bool = ProjectItemsUpdateDetailsRequest::has_property_name(project_items_update_details_request);
+        let has_address_target: bool = ProjectItemsUpdateDetailsRequest::has_address_target_property_name(project_items_update_details_request);
+        transition has_property && has_address_target {
+            true -> fail("Project item details update must target either a stored property or an address target property, not both.")
+            _ -> pick(engine_unprivileged_state, project_items_update_details_request, has_property, has_address_target)
+        }
+    }
+    state pick(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, has_property: bool, has_address_target: bool) -> ProjectItemsUpdateDetailsResponse {
+        transition has_property {
+            true -> property_source(engine_unprivileged_state, project_items_update_details_request)
+            _ -> pick_target(engine_unprivileged_state, project_items_update_details_request, has_address_target)
+        }
+    }
+    state property_source(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest) -> ProjectItemsUpdateDetailsResponse {
+        let property_name: &[u8] = ProjectItemsUpdateDetailsRequest::get_property_name(project_items_update_details_request);
+        let mut name_scratch: [u8; 256];
+        let name_len: u64 = copy_256(property_name, &mut name_scratch);
+        transition name_len <= 256 {
+            true -> resolve_value(engine_unprivileged_state, project_items_update_details_request, DetailsFieldSource::ProjectItemProperty { property_name: name_scratch, property_name_len: name_len })
+            _ -> fail("Project item details update property name exceeded 256 bytes.")
+        }
+    }
+    state pick_target(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, has_address_target: bool) -> ProjectItemsUpdateDetailsResponse {
+        transition has_address_target {
+            true -> target_source(engine_unprivileged_state, project_items_update_details_request)
+            _ -> fail("Project item details update target is required.")
+        }
+    }
+    state target_source(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest) -> ProjectItemsUpdateDetailsResponse {
+        let property_name: &[u8] = ProjectItemsUpdateDetailsRequest::get_address_target_property_name(project_items_update_details_request);
+        let mut name_scratch: [u8; 256];
+        let name_len: u64 = copy_256(property_name, &mut name_scratch);
+        transition name_len <= 256 {
+            true -> resolve_value(engine_unprivileged_state, project_items_update_details_request, DetailsFieldSource::ProjectItemAddressTarget { property_name: name_scratch, property_name_len: name_len })
+            _ -> fail("Project item details update property name exceeded 256 bytes.")
+        }
+    }
+    // Upstream prefers a spelled `anonymous_value_string`, else the stored
+    // `details_value` (DetailsValue::Empty when neither was supplied).
+    state resolve_value(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, details_field_source: DetailsFieldSource) -> ProjectItemsUpdateDetailsResponse {
+        transition ProjectItemsUpdateDetailsRequest::has_anonymous_value_string(project_items_update_details_request) {
+            true -> anonymous_value(engine_unprivileged_state, project_items_update_details_request, details_field_source)
+            _ -> stored_route(engine_unprivileged_state, project_items_update_details_request, details_field_source)
+        }
+    }
+    state anonymous_value(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, details_field_source: DetailsFieldSource) -> ProjectItemsUpdateDetailsResponse {
+        let anonymous: &AnonymousValueString = ProjectItemsUpdateDetailsRequest::get_anonymous_value_string(project_items_update_details_request);
+        let cloned: AnonymousValueString = AnonymousValueString::clone(anonymous);
+        transition { _ -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::AnonymousValue { value: cloned }) }
+    }
+    state stored_route(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, details_field_source: DetailsFieldSource) -> ProjectItemsUpdateDetailsResponse {
+        let stored_value: &DetailsValue = ProjectItemsUpdateDetailsRequest::get_details_value(project_items_update_details_request);
+        transition stored_value {
+            DetailsValue::Text { text, text_len } -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::Text { text: text, text_len: text_len })
+            DetailsValue::Boolean { value } -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::Boolean { value: value })
+            DetailsValue::UnsignedInteger { value } -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::UnsignedInteger { value: value })
+            DetailsValue::SignedInteger { value } -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::SignedInteger { value: value })
+            DetailsValue::DisplayFormat { format } -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::DisplayFormat { format: format })
+            DetailsValue::DataValue { value } -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::DataValue { value: value })
+            _ -> opened(engine_unprivileged_state, project_items_update_details_request, details_field_source, DetailsValue::Empty)
+        }
+    }
+
+    // ---- per-path apply loop ----
+    state opened(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, details_field_source: DetailsFieldSource, details_value: DetailsValue) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> directory(engine_unprivileged_state, project_items_update_details_request, details_field_source, details_value)
+            _ -> fail("Cannot update project item details without an opened project.")
+        }
+    }
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, details_field_source: DetailsFieldSource, details_value: DetailsValue) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory_bytes: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory_bytes) {
+            true -> length(engine_unprivileged_state, project_items_update_details_request, details_field_source, details_value, project_info, directory_bytes)
+            _ -> fail("Project directory path could not be read.")
+        }
+    }
+    state length(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, details_field_source: DetailsFieldSource, details_value: DetailsValue, project_info: &ProjectInfo, directory_bytes: [u8; 512]) -> ProjectItemsUpdateDetailsResponse {
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> copied(engine_unprivileged_state, project_items_update_details_request, details_field_source, details_value, directory_bytes, directory_len)
+            _ -> fail("Project directory path exceeded 512 bytes.")
+        }
+    }
+    state copied(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, details_field_source: DetailsFieldSource, details_value: DetailsValue, directory_bytes: [u8; 512], directory_len: u64) -> ProjectItemsUpdateDetailsResponse
+        requires directory_len <= 512;
+    {
+        let mut directory_scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut directory_scratch);
+        let copied_len: u64 = copy_scratch(&directory_bytes[0..directory_len], &mut directory_scratch);
+        let response: ProjectItemsUpdateDetailsResponse = ProjectItemsUpdateDetailsResponse::new();
+        transition {
+            _ -> each(engine_unprivileged_state, project_items_update_details_request, directory_scratch, details_field_source, details_value, response, 0, 0)
+        }
+    }
+    state each(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, mut response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        let paths: &ProjectPathList = ProjectItemsUpdateDetailsRequest::get_project_item_paths(project_items_update_details_request);
+        transition position < ProjectPathList::get_path_count(paths) {
+            true -> resolve(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count)
+            _ -> done_gate(engine_unprivileged_state, response, updated_count)
+        }
+    }
+    state resolve(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        let paths: &ProjectPathList = ProjectItemsUpdateDetailsRequest::get_project_item_paths(project_items_update_details_request);
+        let path: &[u8] = ProjectPathList::get_path(paths, position);
+        let mut resolved: ManifestPathScratch;
+        ManifestPathScratch::new(&mut resolved);
+        let inner3065: &[u8] = ManifestPathScratch::get_bytes(&directory);
+        transition ProjectItemFileMutation::resolve_project_item_path(inner3065, path, &mut resolved) {
+            true -> apply(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count)
+        }
+    }
+    state apply(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        let inner30: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let project_item_ref: ProjectItemRef = ProjectItemRef::new(inner30);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let lookup: ProjectItemLookup = Project::lookup_project_item_index(opened_project, &project_item_ref);
+        transition lookup {
+            ProjectItemLookup::Found { index } -> apply_item(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count)
+        }
+    }
+    state apply_item(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, index);
+        let project_item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        let applied: bool = ProjectItemDetailsEditApplier::apply_update(project_item, &details_field_source, &details_value);
+        transition applied {
+            true -> mark_item(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count)
+        }
+    }
+    state mark_item(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, index);
+        let project_item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        ProjectItem::set_has_unsaved_changes(project_item, true);
+        transition { _ -> align_gate(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved) }
+    }
+    // should_align_file_name: source is ProjectItemProperty "name" and the
+    // item is not a directory.
+    state align_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        transition details_field_source {
+            DetailsFieldSource::ProjectItemProperty { property_name, property_name_len } -> align_name(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, property_name, property_name_len)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state align_name(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, property_name: [u8; 256], property_name_len: u64) -> ProjectItemsUpdateDetailsResponse {
+        let is_name: bool = property_name_len == 4 && property_name[0] == 110 && property_name[1] == 97 && property_name[2] == 109 && property_name[3] == 101;
+        transition is_name {
+            true -> align_type(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state align_type(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        let inner31: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let project_item_ref: ProjectItemRef = ProjectItemRef::new(inner31);
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let lookup: ProjectItemLookup = Project::lookup_project_item_index(opened_project, &project_item_ref);
+        transition lookup {
+            ProjectItemLookup::Found { index } -> align_type_at(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state align_type_at(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, index);
+        let project_item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let inner32: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(inner32);
+        let mut type_equaler: ProjectItemSortOrder = ProjectItemSortOrder {};
+        transition ProjectItemSortOrder::paths_equal(type_equaler, type_id, "directory") {
+            true -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> align(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, 0)
+        }
+    }
+
+    // ---- align_project_item_file_name ----
+    state align(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64) -> ProjectItemsUpdateDetailsResponse {
+        let resolved_len: u64 = ManifestPathScratch::get_bytes(&resolved).len;
+        let inner33: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let name_start: u64 = ProjectItemFileMutation::find_last_separator(inner33);
+        transition name_start <= resolved_len {
+            true -> display(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, attempt, name_start)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state display(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64, name_start: u64) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, index);
+        let project_item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let mut display_name: [u8; 256];
+        let display_len: u64 = ProjectItem::get_field_name(project_item, &mut display_name);
+        transition display_len <= 256 {
+            true -> sanitize(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, attempt, name_start, display_name, display_len)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state sanitize(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64, name_start: u64, display_name: [u8; 256], display_len: u64) -> ProjectItemsUpdateDetailsResponse
+        requires display_len <= 256;
+    {
+        let mut stem: ManifestPathScratch;
+        ManifestPathScratch::new(&mut stem);
+        transition ProjectItemFileMutation::sanitize_file_name_component(&display_name[0..display_len], "project_item", &mut stem) {
+            true -> unique(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, attempt, name_start, stem)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state unique(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64, name_start: u64, stem: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let mut target: ManifestPathScratch;
+        ManifestPathScratch::new(&mut target);
+        transition name_start <= resolved.len {
+            true -> unique_do(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, attempt, name_start, stem, target)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state unique_do(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64, name_start: u64, stem: ManifestPathScratch, mut target: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse
+        requires name_start <= resolved.len;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let resolved_bytes: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let inner3066: &[u8] = ManifestPathScratch::get_bytes(&stem);
+        transition ProjectItemFileMutation::generate_unique_project_item_file_path_allowing(&resolved_bytes[0..name_start], opened_project, inner3066, resolved_bytes, true, &mut target) {
+            true -> unchanged_gate(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, attempt, target)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state unchanged_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64, target: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        let mut path_equaler: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3067: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let inner3068: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition ProjectItemSortOrder::paths_equal(path_equaler, inner3067, inner3068) {
+            true -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> rename(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, attempt, target)
+        }
+    }
+    state rename(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64, target: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        let inner3069: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let inner3070: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition FileSystemUtils::rename_tree_commit(inner3069, inner3070) {
+            true -> retarget(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, target)
+            _ -> retry(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, attempt)
+        }
+    }
+    state retry(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, index: u64, attempt: u64) -> ProjectItemsUpdateDetailsResponse {
+        transition attempt < 1024 {
+            true -> align(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, index, ((attempt as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // `items_mut().remove(source_ref)` then `insert(target_ref, item)`.
+    state retarget(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, target: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let inner34: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let resolved_ref: ProjectItemRef = ProjectItemRef::new(inner34);
+        let mut taken: ProjectItem = ProjectItem::default();
+        transition Project::take_project_item(opened_project, &resolved_ref, &mut taken) {
+            true -> reinsert(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, target, taken)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state reinsert(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, target: ManifestPathScratch, taken: ProjectItem) -> ProjectItemsUpdateDetailsResponse {
+        let inner35: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let target_ref: ProjectItemRef = ProjectItemRef::new(inner35);
+        let pair: ProjectItemPair = ProjectItemPair::new(target_ref, taken);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition Project::insert_project_item(opened_project, &pair) {
+            true -> sort(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, updated_count, resolved, target)
+            _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state sort(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, mut response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64, resolved: ManifestPathScratch, target: ManifestPathScratch) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3071: &[u8] = ManifestPathScratch::get_bytes(&directory);
+        let inner3072: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let inner3073: &[u8] = ManifestPathScratch::get_bytes(&target);
+        _ = ProjectItemSortOrder::rename_project_item_path_in_sort_order(&sort_order, opened_project, inner3071, inner3072, inner3073);
+        let inner36: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let inner37: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let path_change: ProjectItemsUpdateDetailsPathChange = ProjectItemsUpdateDetailsPathChange::new_with(inner36, inner37);
+        _ = ProjectItemsUpdateDetailsResponse::add_path_change(&mut response, path_change);
+        transition { _ -> advance(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, position, ((updated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // ---- tail ----
+    state advance(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_update_details_request: &ProjectItemsUpdateDetailsRequest, directory: ManifestPathScratch, details_field_source: DetailsFieldSource, details_value: DetailsValue, response: ProjectItemsUpdateDetailsResponse, position: u64, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        transition { _ -> each(engine_unprivileged_state, project_items_update_details_request, directory, details_field_source, details_value, response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, updated_count) }
+    }
+    state done_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, mut response: ProjectItemsUpdateDetailsResponse, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        transition updated_count == 0 {
+            true -> seal(response, updated_count)
+            _ -> mark_dirty(engine_unprivileged_state, response, updated_count)
+        }
+    }
+    state mark_dirty(engine_unprivileged_state: &mut EngineUnprivilegedState, response: ProjectItemsUpdateDetailsResponse, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let info: &mut ProjectInfo = Project::borrow_project_info_mut(opened_project);
+        ProjectInfo::set_has_unsaved_changes(info, true);
+        transition { _ -> save_open(engine_unprivileged_state, response, updated_count) }
+    }
+    state save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, response: ProjectItemsUpdateDetailsResponse, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory_scratch: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory_scratch) {
+            true -> save_len(engine_unprivileged_state, response, updated_count, project_info, directory_scratch)
+            _ -> fail("Project directory path could not be read.")
+        }
+    }
+    state save_len(engine_unprivileged_state: &mut EngineUnprivilegedState, response: ProjectItemsUpdateDetailsResponse, updated_count: u64, project_info: &ProjectInfo, directory_scratch: [u8; 512]) -> ProjectItemsUpdateDetailsResponse {
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> save_fd(engine_unprivileged_state, response, updated_count, directory_scratch, directory_len)
+            _ -> fail("Project directory path exceeded 512 bytes.")
+        }
+    }
+    state save_fd(engine_unprivileged_state: &mut EngineUnprivilegedState, response: ProjectItemsUpdateDetailsResponse, updated_count: u64, directory: [u8; 512], directory_len: u64) -> ProjectItemsUpdateDetailsResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> save_do(engine_unprivileged_state, response, updated_count, dir_fd, directory, directory_len)
+            _ -> fail("Failed to save the project after updating project item details.")
+        }
+    }
+    state save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, response: ProjectItemsUpdateDetailsResponse, updated_count: u64, dir_fd: i32, directory: [u8; 512], directory_len: u64) -> ProjectItemsUpdateDetailsResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify_done(engine_unprivileged_state, response, updated_count)
+            _ -> fail("Failed to save the project after updating project item details.")
+        }
+    }
+    state notify_done(engine_unprivileged_state: &mut EngineUnprivilegedState, response: ProjectItemsUpdateDetailsResponse, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> seal(response, updated_count) }
+    }
+    state seal(mut response: ProjectItemsUpdateDetailsResponse, updated_count: u64) -> ProjectItemsUpdateDetailsResponse {
+        ProjectItemsUpdateDetailsResponse::set_success(&mut response, true);
+        ProjectItemsUpdateDetailsResponse::set_updated_project_item_count(&mut response, updated_count);
+        (response)
+    }
+    state respond() -> ProjectItemsUpdateDetailsResponse {
+        let mut response: ProjectItemsUpdateDetailsResponse = ProjectItemsUpdateDetailsResponse::new();
+        ProjectItemsUpdateDetailsResponse::set_success(&mut response, true);
+        (response)
+    }
+    state fail(error: &[u8]) -> ProjectItemsUpdateDetailsResponse {
+        let mut response: ProjectItemsUpdateDetailsResponse = ProjectItemsUpdateDetailsResponse::new();
+        ProjectItemsUpdateDetailsResponse::set_success(&mut response, false);
+        ProjectItemsUpdateDetailsResponse::set_error(&mut response, error);
+        (response)
+    }
+}
+
+machine copy_256(source: &[u8], out: &mut [u8; 256]) -> u64 {
+    transition source.len <= 256 {
+        true -> copy(source, out, source.len, 0)
+        _ -> (source.len)
+    }
+    state copy(source: &[u8], out: &mut [u8; 256], source_len: u64, position: u64) -> u64
+        requires source_len <= 256;
+    {
+        transition position < source_len && position < source.len {
+            true -> put(source, out, source_len, position)
+            _ -> (source_len)
+        }
+    }
+    state put(source: &[u8], out: &mut [u8; 256], source_len: u64, position: u64) -> u64
+        requires position < source.len;
+    {
+        out[position] = source[position];
+        transition { _ -> copy(source, out, source_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine copy_scratch(source: &[u8], out: &mut ManifestPathScratch) -> u64 {
+    transition source.len <= 512 {
+        true -> copy(source, out, source.len, 0)
+        _ -> (source.len)
+    }
+    state copy(source: &[u8], out: &mut ManifestPathScratch, source_len: u64, position: u64) -> u64
+        requires source_len <= 512;
+    {
+        transition position < source_len && position < source.len {
+            true -> put(source, out, source_len, position)
+            _ -> (source_len)
+        }
+    }
+    state put(source: &[u8], out: &mut ManifestPathScratch, source_len: u64, position: u64) -> u64
+        requires position < source.len;
+    {
+        _ = ManifestPathScratch::append(out, source[position]);
+        transition { _ -> copy(source, out, source_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}

@@ -1,0 +1,1082 @@
+module src::services::projects::project_item_preview;
+
+// Port of squalr-engine/src/services/projects/project_item_preview.rs.
+//
+// Refreshes the freeze data-value interpreter / evaluated pointer path fields
+// of opened project items by resolving their runtime targets and dispatching
+// privileged memory reads.
+//
+// Named deviations:
+// - Upstream's `ProjectItemPreviewRefreshSession` caches (read responses keyed
+//   on address+module+layout, pointer evaluations keyed on Pointer) are
+//   request-count optimizations inside one refresh batch; the port drops both
+//   caches — identical display values, more dispatches. Documented deviation.
+// - `find_instruction_set`/`InstructionSet::disassemble_block` are plugin-dyn
+//   surfaces (unported residual): an instruction-typed field still reads the
+//   upstream fallback byte count (16) and produces the empty preview upstream
+//   yields when no instruction set resolves.
+// - `HashSet<PathBuf>` requested-path membership is exact path equality
+//   upstream; the port compares the ref's stored path bytes against each
+//   requested path.
+// - The open item slice `&mut [(ProjectItemRef, ProjectItem)]` is the opened
+//   project's pair table.
+
+use omega::language::core::option;
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::memory::read::memory_read_response::MemoryReadResponse;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use squalr_engine_api::src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::data_values::data_value_preview_formatter::DataValuePreview;
+use squalr_engine_api::src::structures::data_values::data_value_preview_formatter::DataValuePreviewFormatOptions;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::data_value_preview_formatter::DataValuePreviewFormatter;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::memory::address_display;
+use squalr_engine_api::src::structures::memory::pointer::Pointer;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::SymbolicLinkOffset;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::ProjectItemTypeAddress;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::SymbolicStructRefMatch;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::OwnedRuntimePointer;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::ProjectItemAddressTarget;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::RuntimePointerMatch;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_pointer::ProjectItemTypePointer;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinitionParse;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_struct_ref::SymbolicStructRef;
+use squalr_engine_api::src::structures::structs::valued_struct::ValuedStruct;
+use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructField;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_session::src::engine_unprivileged_state::AnonymizeValueOutcome;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_symbol_resolution::MemoryReadDispatchResult;
+use src::services::projects::project_item_symbol_resolution::ProjectItemSymbolResolution;
+use src::services::projects::project_item_symbol_resolution::CountMatch;
+
+pub data ProjectItemPreview {}
+
+// Upstream `build_project_item_preview_read_definition` result carrier — the
+// found flag plus the assembled read definition.
+data PreviewDefinitionMatch {
+    found: bool;
+    read_definition: PreviewReadDefinition;
+}
+
+// Upstream `ProjectItemPreviewReadDefinition` — the layout-key member is
+// dropped with the read cache.
+data PreviewReadDefinition {
+    symbolic_struct_definition: SymbolicStructDefinition;
+    symbolic_field_container_type: ContainerType;
+    preview_was_truncated: bool;
+    is_instruction_preview: bool;
+}
+
+// Upstream `(u64, String)` resolved-target option carrier.
+data ResolvedTarget {
+    found: bool;
+    address: u64;
+    module_name: [u8; 256];
+    module_name_len: u64;
+}
+
+// Upstream `PointerPreviewEvaluation` — `evaluated_path` is the " -> "-joined
+// segment text upstream stores as a String.
+data PointerPreviewEvaluation {
+    resolved_target: ResolvedTarget;
+    evaluated_path: [u8; 4096];
+    evaluated_path_len: u64;
+}
+
+const PROJECT_ITEM_PREVIEW_MAX_FIELD_BYTES: u64 = 16;
+
+// Empty slice backing for `SymbolicStructDefinition::new("", &[])` — the
+// language needs a concrete array to slice.
+
+// Upstream `refresh_project_item_display_values`.
+pub machine ProjectItemPreview::refresh_project_item_display_values(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    opened_project: &mut Project,
+    has_requested_paths: bool,
+    requested_preview_project_item_paths: &ProjectPathList
+)
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition { _ -> each(engine_unprivileged_state, engine_bindings, project_symbol_catalog, opened_project, has_requested_paths, requested_preview_project_item_paths, 0) }
+    state each(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        opened_project: &mut Project,
+        has_requested_paths: bool,
+        requested_preview_project_item_paths: &ProjectPathList,
+        at: u64
+    )
+    {
+        transition at < Project::get_project_items_len(opened_project) && at < 256 {
+            true -> consider(engine_unprivileged_state, engine_bindings, project_symbol_catalog, opened_project, has_requested_paths, requested_preview_project_item_paths, at)
+            _ -> done()
+        }
+    }
+    state consider(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        opened_project: &mut Project,
+        has_requested_paths: bool,
+        requested_preview_project_item_paths: &ProjectPathList,
+        at: u64
+    )
+    requires at < 256;
+    {
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, at);
+        let item_ref: &ProjectItemRef = ProjectItemPair::get_project_item_ref(pair);
+        let item_path: &[u8] = ProjectItemRef::get_project_item_path(item_ref);
+        transition ProjectItemPreview::should_refresh_preview(item_path, has_requested_paths, requested_preview_project_item_paths) {
+            true -> refresh(engine_unprivileged_state, engine_bindings, project_symbol_catalog, opened_project, has_requested_paths, requested_preview_project_item_paths, at)
+            _ -> advance(engine_unprivileged_state, engine_bindings, project_symbol_catalog, opened_project, has_requested_paths, requested_preview_project_item_paths, at)
+        }
+    }
+    state refresh(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        opened_project: &mut Project,
+        has_requested_paths: bool,
+        requested_preview_project_item_paths: &ProjectPathList,
+        at: u64
+    )
+    requires at < 256;
+    {
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, at);
+        let project_item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        ProjectItemPreview::refresh_one(
+            engine_unprivileged_state, engine_bindings, project_symbol_catalog, project_item);
+        transition { _ -> advance(engine_unprivileged_state, engine_bindings, project_symbol_catalog, opened_project, has_requested_paths, requested_preview_project_item_paths, at) }
+    }
+    state advance(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        opened_project: &mut Project,
+        has_requested_paths: bool,
+        requested_preview_project_item_paths: &ProjectPathList,
+        at: u64
+    )
+    requires at < 256;
+    {
+        transition { _ -> each(engine_unprivileged_state, engine_bindings, project_symbol_catalog, opened_project, has_requested_paths, requested_preview_project_item_paths, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state done() { }
+}
+
+// Per-item type dispatch — upstream's address/pointer branches in
+// `refresh_project_item_display_values_with_session`.
+pub machine ProjectItemPreview::refresh_one(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    project_item: &mut ProjectItem
+)
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    transition ProjectItemPreview::type_id_is(item_type_id, "address") {
+        true -> refresh_address(engine_unprivileged_state, engine_bindings, project_symbol_catalog, project_item)
+        _ -> maybe_pointer(engine_unprivileged_state, engine_bindings, project_item, item_type_id)
+    }
+    state refresh_address(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        project_item: &mut ProjectItem
+    )
+    {
+        ProjectItemPreview::refresh_address_project_item_display_value(
+            engine_unprivileged_state, engine_bindings, project_symbol_catalog, project_item);
+        transition { _ -> done() }
+    }
+    state maybe_pointer(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        item_type_id: &[u8]
+    )
+    {
+        transition ProjectItemPreview::type_id_is(item_type_id, "pointer") {
+            true -> refresh_pointer(engine_unprivileged_state, engine_bindings, project_item)
+            _ -> done()
+        }
+    }
+    state refresh_pointer(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem
+    )
+    {
+        ProjectItemPreview::refresh_pointer_project_item_display_value(
+            engine_unprivileged_state, engine_bindings, project_item);
+        transition { _ -> done() }
+    }
+    state done() { }
+}
+
+// Upstream `should_refresh_preview` — no request filter, or exact path hit.
+machine ProjectItemPreview::should_refresh_preview(
+    item_path: &[u8],
+    has_requested_paths: bool,
+    requested_preview_project_item_paths: &ProjectPathList
+) -> bool {
+    transition has_requested_paths {
+        false -> (true)
+        _ -> scan(item_path, requested_preview_project_item_paths, 0)
+    }
+    state scan(item_path: &[u8], requested_preview_project_item_paths: &ProjectPathList, at: u64) -> bool {
+        transition at < ProjectPathList::get_path_count(requested_preview_project_item_paths) && at < 64 {
+            true -> check(item_path, requested_preview_project_item_paths, at)
+            _ -> (false)
+        }
+    }
+    state check(item_path: &[u8], requested_preview_project_item_paths: &ProjectPathList, at: u64) -> bool
+        requires at < 64;
+    {
+        let requested: &[u8] = ProjectPathList::get_path(requested_preview_project_item_paths, at);
+        transition FileSystemUtils::bytes_equal(item_path, requested) {
+            true -> (true)
+            _ -> scan(item_path, requested_preview_project_item_paths, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `refresh_address_project_item_display_value`.
+pub machine ProjectItemPreview::refresh_address_project_item_display_value(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    project_item: &mut ProjectItem
+)
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let address_target: ProjectItemAddressTarget = ProjectItemTypeAddress::get_address_target(project_item);
+    let resolved: ResolvedTarget = ProjectItemPreview::resolve_address_target_for_preview(
+        engine_unprivileged_state, engine_bindings, project_symbol_catalog, &address_target);
+    transition resolved.found {
+        true -> layout(engine_unprivileged_state, engine_bindings, project_item, resolved)
+        _ -> clear(project_item)
+    }
+    state layout(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        resolved: ResolvedTarget
+    )
+    {
+        let layout: SymbolicStructRefMatch = ProjectItemTypeAddress::get_field_symbolic_struct_definition_reference(project_item);
+        transition layout.found {
+            true -> definition(engine_unprivileged_state, engine_bindings, project_item, resolved, layout.symbolic_struct_ref)
+            _ -> clear(project_item)
+        }
+    }
+    state definition(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        resolved: ResolvedTarget,
+        symbolic_struct_ref: SymbolicStructRef
+    )
+    {
+        let namespace: &[u8] = SymbolicStructRef::get_symbolic_struct_namespace(&symbolic_struct_ref);
+        let definition: PreviewDefinitionMatch = ProjectItemPreview::build_project_item_preview_read_definition(
+            engine_unprivileged_state, namespace);
+        transition definition.found {
+            true -> read(engine_unprivileged_state, engine_bindings, project_item, resolved, definition.read_definition)
+            _ -> clear(project_item)
+        }
+    }
+    state read(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        resolved: ResolvedTarget,
+        read_definition: PreviewReadDefinition
+    )
+    {
+        let module_slice: &[u8] = &resolved.module_name[0..resolved.module_name_len];
+        let mut display: [u8; 4096];
+        let display_len: u64 = ProjectItemPreview::read_display_value(
+            engine_unprivileged_state, engine_bindings, resolved.address, module_slice, &read_definition, &mut display);
+        transition display_len <= 4096 {
+            true -> store(project_item, display, display_len)
+            _ -> clear(project_item)
+        }
+    }
+    state store(project_item: &mut ProjectItem, display: [u8; 4096], display_len: u64)
+        requires display_len <= 4096;
+    {
+        ProjectItemTypeAddress::set_field_freeze_data_value_interpreter(project_item, &display[0..display_len]);
+        transition { _ -> done() }
+    }
+    state clear(project_item: &mut ProjectItem) {
+        ProjectItemTypeAddress::set_field_freeze_data_value_interpreter(project_item, "");
+        transition { _ -> done() }
+    }
+    state done() { }
+}
+
+// Upstream `resolve_address_target_for_preview`.
+machine ProjectItemPreview::resolve_address_target_for_preview(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    address_target: &ProjectItemAddressTarget
+) -> ResolvedTarget
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let runtime_pointer: RuntimePointerMatch = ProjectItemSymbolResolution::resolve_address_target_runtime_pointer(
+        project_symbol_catalog, address_target);
+    transition runtime_pointer.found {
+        true -> offsets(engine_unprivileged_state, engine_bindings, runtime_pointer.pointer)
+        _ -> (ResolvedTarget { found: false, address: 0, module_name_len: 0 })
+    }
+    state offsets(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: OwnedRuntimePointer
+    ) -> ResolvedTarget
+    {
+        transition runtime_pointer.offset_count == 0 {
+            true -> direct(runtime_pointer)
+            _ -> evaluate(engine_unprivileged_state, engine_bindings, runtime_pointer)
+        }
+    }
+    state direct(runtime_pointer: OwnedRuntimePointer) -> ResolvedTarget {
+        let mut resolved: ResolvedTarget = ResolvedTarget {
+            found: true,
+            address: runtime_pointer.address,
+            module_name_len: 0,
+        };
+        let module_slice: &[u8] = OwnedRuntimePointer::get_module_name(&runtime_pointer);
+        resolved.module_name_len = ProjectItemPreview::copy_module(&mut resolved.module_name, module_slice);
+        (resolved)
+    }
+    state evaluate(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: OwnedRuntimePointer
+    ) -> ResolvedTarget
+    {
+        let evaluation: PointerPreviewEvaluation = ProjectItemPreview::evaluate_pointer_for_preview(
+            engine_unprivileged_state, engine_bindings, &runtime_pointer);
+        (evaluation.resolved_target)
+    }
+}
+
+// Upstream `refresh_pointer_project_item_display_value`.
+pub machine ProjectItemPreview::refresh_pointer_project_item_display_value(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_item: &mut ProjectItem
+)
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let runtime_pointer: OwnedRuntimePointer = ProjectItemTypePointer::get_field_pointer(project_item);
+    let evaluation: PointerPreviewEvaluation = ProjectItemPreview::evaluate_pointer_for_preview(
+        engine_unprivileged_state, engine_bindings, &runtime_pointer);
+    transition evaluation.evaluated_path_len <= 4096 {
+        true -> store_path(project_item, evaluation)
+        _ -> layout(engine_unprivileged_state, engine_bindings, project_item, evaluation.resolved_target)
+    }
+    state store_path(project_item: &mut ProjectItem, evaluation: PointerPreviewEvaluation)
+        requires evaluation.evaluated_path_len <= 4096;
+    {
+        ProjectItemTypePointer::set_field_evaluated_pointer_path(
+            project_item, &evaluation.evaluated_path[0..evaluation.evaluated_path_len]);
+        transition { _ -> done() }
+    }
+    state layout(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        resolved: ResolvedTarget
+    )
+    {
+        let layout: SymbolicStructRefMatch = ProjectItemTypePointer::get_field_symbolic_struct_definition_reference(project_item);
+        transition layout.found {
+            true -> definition(engine_unprivileged_state, engine_bindings, project_item, resolved, layout.symbolic_struct_ref)
+            _ -> clear(project_item)
+        }
+    }
+    state definition(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        resolved: ResolvedTarget,
+        symbolic_struct_ref: SymbolicStructRef
+    )
+    {
+        let namespace: &[u8] = SymbolicStructRef::get_symbolic_struct_namespace(&symbolic_struct_ref);
+        let definition: PreviewDefinitionMatch = ProjectItemPreview::build_project_item_preview_read_definition(
+            engine_unprivileged_state, namespace);
+        transition definition.found {
+            true -> require_target(engine_unprivileged_state, engine_bindings, project_item, resolved, definition.read_definition)
+            _ -> clear(project_item)
+        }
+    }
+    state require_target(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        resolved: ResolvedTarget,
+        read_definition: PreviewReadDefinition
+    )
+    {
+        transition resolved.found {
+            true -> read(engine_unprivileged_state, engine_bindings, project_item, resolved, read_definition)
+            _ -> clear(project_item)
+        }
+    }
+    state read(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &mut ProjectItem,
+        resolved: ResolvedTarget,
+        read_definition: PreviewReadDefinition
+    )
+    {
+        let module_slice: &[u8] = &resolved.module_name[0..resolved.module_name_len];
+        let mut display: [u8; 4096];
+        let display_len: u64 = ProjectItemPreview::read_display_value(
+            engine_unprivileged_state, engine_bindings, resolved.address, module_slice, &read_definition, &mut display);
+        transition display_len <= 4096 {
+            true -> store(project_item, display, display_len)
+            _ -> clear(project_item)
+        }
+    }
+    state store(project_item: &mut ProjectItem, display: [u8; 4096], display_len: u64)
+        requires display_len <= 4096;
+    {
+        ProjectItemTypePointer::set_field_freeze_data_value_interpreter(project_item, &display[0..display_len]);
+        transition { _ -> done() }
+    }
+    state clear(project_item: &mut ProjectItem) {
+        ProjectItemTypePointer::set_field_freeze_data_value_interpreter(project_item, "");
+        transition { _ -> done() }
+    }
+    state done() { }
+}
+
+// Upstream `build_project_item_preview_read_definition` — plugin instruction
+// sets unported, so an instruction-typed namespace reads the 16-byte upstream
+// fallback and takes the (empty) instruction display arm.
+machine ProjectItemPreview::build_project_item_preview_read_definition(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    symbolic_struct_namespace: &[u8]
+) -> PreviewDefinitionMatch {
+    let instruction: InstructionIdMatch = ProjectItemPreview::normalize_instruction_preview_data_type_id(symbolic_struct_namespace);
+    transition instruction.found {
+        true -> instruction_definition()
+        _ -> struct_definition(engine_unprivileged_state, symbolic_struct_namespace)
+    }
+    state instruction_definition() -> PreviewDefinitionMatch {
+        // u8[FALLBACK_INSTRUCTION_PREVIEW_BYTE_COUNT] anonymous definition.
+        let data_type_ref: DataTypeRef = DataTypeRef::new("u8");
+        let field: SymbolicFieldDefinition = SymbolicFieldDefinition::new(
+            data_type_ref, ContainerType::ArrayFixed { length: PROJECT_ITEM_PREVIEW_MAX_FIELD_BYTES });
+        let fields: [SymbolicFieldDefinition; 1] = [field];
+        let definition: SymbolicStructDefinition = SymbolicStructDefinition::new("", &fields[0..1]);
+        (PreviewDefinitionMatch {
+            found: true,
+            read_definition: PreviewReadDefinition {
+                symbolic_struct_definition: definition,
+                symbolic_field_container_type: ContainerType::None,
+                preview_was_truncated: false,
+                is_instruction_preview: true,
+            },
+        })
+    }
+    state struct_definition(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        symbolic_struct_namespace: &[u8]
+    ) -> PreviewDefinitionMatch {
+        let container_type: ContainerType = ProjectItemPreview::resolve_project_item_container_type(symbolic_struct_namespace);
+        let mut resolved_definition: SymbolicStructDefinition = SymbolicStructDefinition::new_empty("");
+        let resolved: bool = EngineUnprivilegedState::resolve_struct_layout_definition(
+            engine_unprivileged_state, symbolic_struct_namespace, &mut resolved_definition);
+        transition resolved {
+            true -> preview_field(engine_unprivileged_state, symbolic_struct_namespace, resolved_definition, container_type)
+            _ -> absent()
+        }
+    }
+    state preview_field(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        symbolic_struct_namespace: &[u8],
+        resolved_definition: SymbolicStructDefinition,
+        container_type: ContainerType
+    ) -> PreviewDefinitionMatch {
+        let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(symbolic_struct_namespace);
+        transition parsed {
+            SymbolicFieldDefinitionParse::Parsed { value } -> limit(engine_unprivileged_state, symbolic_struct_namespace, resolved_definition, container_type, value)
+            _ -> use_resolved(resolved_definition, container_type)
+        }
+    }
+    state limit(
+        engine_unprivileged_state: &EngineUnprivilegedState,
+        symbolic_struct_namespace: &[u8],
+        resolved_definition: SymbolicStructDefinition,
+        container_type: ContainerType,
+        preview_field_definition: SymbolicFieldDefinition
+    ) -> PreviewDefinitionMatch {
+        let field_container_type: ContainerType = SymbolicFieldDefinition::get_container_type(&preview_field_definition);
+        let preview_container_type: ContainerType = DataValuePreviewFormatter::limit_array_container_type(
+            field_container_type);
+        transition ContainerType::equals(&preview_container_type, &field_container_type) {
+            true -> use_resolved(resolved_definition, container_type)
+            _ -> truncated(resolved_definition, container_type, preview_container_type, preview_field_definition)
+        }
+    }
+    state use_resolved(
+        resolved_definition: SymbolicStructDefinition,
+        container_type: ContainerType
+    ) -> PreviewDefinitionMatch {
+        (PreviewDefinitionMatch {
+            found: true,
+            read_definition: PreviewReadDefinition {
+                symbolic_struct_definition: resolved_definition,
+                symbolic_field_container_type: container_type,
+                preview_was_truncated: false,
+                is_instruction_preview: false,
+            },
+        })
+    }
+    state truncated(
+        resolved_definition: SymbolicStructDefinition,
+        container_type: ContainerType,
+        preview_container_type: ContainerType,
+        preview_field_definition: SymbolicFieldDefinition
+    ) -> PreviewDefinitionMatch {
+        let field: SymbolicFieldDefinition = SymbolicFieldDefinition::new(
+            SymbolicFieldDefinition::get_data_type_ref(&preview_field_definition), preview_container_type);
+        let fields: [SymbolicFieldDefinition; 1] = [field];
+        let definition: SymbolicStructDefinition = SymbolicStructDefinition::new("", &fields[0..1]);
+        (PreviewDefinitionMatch {
+            found: true,
+            read_definition: PreviewReadDefinition {
+                symbolic_struct_definition: definition,
+                symbolic_field_container_type: container_type,
+                preview_was_truncated: true,
+                is_instruction_preview: false,
+            },
+        })
+    }
+    state absent() -> PreviewDefinitionMatch {
+        (PreviewDefinitionMatch {
+            found: false,
+            read_definition: PreviewReadDefinition {
+                symbolic_struct_definition: SymbolicStructDefinition::new_empty(""),
+                symbolic_field_container_type: ContainerType::None,
+                preview_was_truncated: false,
+                is_instruction_preview: false,
+            },
+        })
+    }
+}
+
+// Upstream `resolve_project_item_container_type` — instruction namespaces take
+// `ContainerType::None` (already excluded upstream by the normalize check
+// inside the fn; preserved here), otherwise the parsed container type.
+machine ProjectItemPreview::resolve_project_item_container_type(symbolic_struct_namespace: &[u8]) -> ContainerType {
+    let instruction: InstructionIdMatch = ProjectItemPreview::normalize_instruction_preview_data_type_id(symbolic_struct_namespace);
+    transition instruction.found {
+        true -> (ContainerType::None)
+        _ -> parse(symbolic_struct_namespace)
+    }
+    state parse(symbolic_struct_namespace: &[u8]) -> ContainerType {
+        let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(symbolic_struct_namespace);
+        transition parsed {
+            SymbolicFieldDefinitionParse::Parsed { value } -> of(value)
+            _ -> (ContainerType::None)
+        }
+    }
+    state of(preview_field_definition: SymbolicFieldDefinition) -> ContainerType {
+        (SymbolicFieldDefinition::get_container_type(&preview_field_definition))
+    }
+}
+
+// Upstream `normalize_instruction_preview_data_type_id` =
+// `normalize_instruction_data_type_id`: parse the namespace as a field
+// definition, take its data type id, require the `i_` prefix.
+data InstructionIdMatch {
+    found: bool;
+}
+
+machine ProjectItemPreview::normalize_instruction_preview_data_type_id(symbolic_struct_namespace: &[u8]) -> InstructionIdMatch {
+    let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(symbolic_struct_namespace);
+    transition parsed {
+        SymbolicFieldDefinitionParse::Parsed { value } -> check(value)
+        _ -> (InstructionIdMatch { found: false })
+    }
+    state check(preview_field_definition: SymbolicFieldDefinition) -> InstructionIdMatch {
+        let data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(&preview_field_definition);
+        let data_type_id: &[u8] = DataTypeRef::get_data_type_id(&data_type_ref);
+        transition data_type_id.len >= 2 {
+            true -> prefix(data_type_id)
+            _ -> (InstructionIdMatch { found: false })
+        }
+    }
+    state prefix(data_type_id: &[u8]) -> InstructionIdMatch
+        requires data_type_id.len >= 2;
+    {
+        transition data_type_id[0] == 105 && data_type_id[1] == 95 {
+            true -> (InstructionIdMatch { found: true })
+            _ -> (InstructionIdMatch { found: false })
+        }
+    }
+}
+
+// Upstream `refresh_project_item_display_value_from_memory_read` — the
+// set_display_value closure is inlined as "return the text to store"; the
+// caller writes the field. `out` receives the produced preview text.
+machine ProjectItemPreview::read_display_value(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    address: u64,
+    module_name: &[u8],
+    read_definition: &PreviewReadDefinition,
+    out: &mut [u8; 4096]
+) -> u64
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let response: MemoryReadDispatchResult = ProjectItemSymbolResolution::dispatch_memory_read_request(
+        engine_bindings, address, module_name, &read_definition.symbolic_struct_definition);
+    transition response {
+        MemoryReadDispatchResult::Present { response } -> check_success(engine_unprivileged_state, read_definition, response, out)
+        _ -> (0)
+    }
+    state check_success(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        read_definition: &PreviewReadDefinition,
+        response: MemoryReadResponse,
+        out: &mut [u8; 4096]
+    ) -> u64 {
+        transition MemoryReadResponse::get_success(&response) {
+            true -> first_field(engine_unprivileged_state, read_definition, response, out)
+            _ -> (0)
+        }
+    }
+    state first_field(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        read_definition: &PreviewReadDefinition,
+        response: MemoryReadResponse,
+        out: &mut [u8; 4096]
+    ) -> u64 {
+        let valued_struct: &ValuedStruct = MemoryReadResponse::get_valued_struct(&response);
+        transition ValuedStruct::get_field_count(valued_struct) > 0 {
+            true -> extract(engine_unprivileged_state, read_definition, valued_struct, out)
+            _ -> (0)
+        }
+    }
+    state extract(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        read_definition: &PreviewReadDefinition,
+        valued_struct: &ValuedStruct,
+        out: &mut [u8; 4096]
+    ) -> u64 {
+        let field: ValuedStructField = ValuedStruct::get_field_at(valued_struct, 0);
+        transition ValuedStructField::is_value(&field) {
+            true -> render(engine_unprivileged_state, read_definition, field, out)
+            _ -> (0)
+        }
+    }
+    state render(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        read_definition: &PreviewReadDefinition,
+        field: ValuedStructField,
+        out: &mut [u8; 4096]
+    ) -> u64 {
+        let data_value: DataValue = ValuedStructField::get_data_value(&field);
+        transition read_definition.is_instruction_preview {
+            true -> (0)
+            _ -> anonymize(engine_unprivileged_state, read_definition, data_value, out)
+        }
+    }
+    state anonymize(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        read_definition: &PreviewReadDefinition,
+        data_value: DataValue,
+        out: &mut [u8; 4096]
+    ) -> u64 {
+        let data_type_ref: DataTypeRef = DataValue::get_data_type_ref(&data_value);
+        let default_format: AnonymousValueStringFormat = EngineUnprivilegedState::get_default_anonymous_value_string_format(
+            engine_unprivileged_state, &data_type_ref);
+        let outcome: AnonymizeValueOutcome = EngineUnprivilegedState::anonymize_value(
+            engine_unprivileged_state, &data_value, default_format);
+        transition outcome {
+            AnonymizeValueOutcome::Value { anonymous_value_string } -> format(read_definition, anonymous_value_string, out)
+            _ -> (0)
+        }
+    }
+    state format(
+        read_definition: &PreviewReadDefinition,
+        anonymous_value_string: AnonymousValueString,
+        out: &mut [u8; 4096]
+    ) -> u64 {
+        let format_options: DataValuePreviewFormatOptions = DataValuePreviewFormatOptions::new(4, 96, 96);
+        let preview: DataValuePreview = DataValuePreviewFormatter::format_anonymous_value_preview(
+            &anonymous_value_string,
+            read_definition.symbolic_field_container_type,
+            read_definition.preview_was_truncated,
+            format_options);
+        (DataValuePreview::copy_text(&preview, out))
+    }
+}
+
+// Upstream `evaluate_pointer_for_preview` — session cache dropped; builds the
+// " -> "-joined evaluated path and resolves the terminal (address, module).
+machine ProjectItemPreview::evaluate_pointer_for_preview(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    runtime_pointer: &OwnedRuntimePointer
+) -> PointerPreviewEvaluation
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut evaluation: PointerPreviewEvaluation = PointerPreviewEvaluation {
+        resolved_target: ResolvedTarget { found: false, address: 0, module_name_len: 0 },
+        evaluated_path_len: 0,
+    };
+    let mut root_text: [u8; 512];
+    let root_len: u64 = ProjectItemPreview::root_display_text(runtime_pointer, &mut root_text);
+    transition root_len <= 512 && root_len <= 4096 {
+        true -> seeded(engine_unprivileged_state, engine_bindings, runtime_pointer, evaluation, root_text, root_len)
+        _ -> broken(evaluation)
+    }
+    state seeded(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: &OwnedRuntimePointer,
+        evaluation: PointerPreviewEvaluation,
+        root_text: [u8; 512],
+        root_len: u64
+    ) -> PointerPreviewEvaluation
+        requires root_len <= 512 && root_len <= 4096;
+    {
+        let mut carried: PointerPreviewEvaluation = evaluation;
+        carried.evaluated_path_len = ProjectItemPreview::copy_segment(&mut carried.evaluated_path, 0, &root_text[0..root_len]);
+        transition { _ -> segment(engine_unprivileged_state, engine_bindings, runtime_pointer, carried, OwnedRuntimePointer::get_address(runtime_pointer), OwnedRuntimePointer::get_module_name(runtime_pointer), 0) }
+    }
+    state segment(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: &OwnedRuntimePointer,
+        evaluation: PointerPreviewEvaluation,
+        current_address: u64,
+        current_module_name: &[u8],
+        at: u64
+    ) -> PointerPreviewEvaluation
+    {
+        transition at < runtime_pointer.offset_count && at < 64 {
+            true -> link(engine_unprivileged_state, engine_bindings, runtime_pointer, evaluation, current_address, current_module_name, at)
+            _ -> resolve(engine_unprivileged_state, engine_bindings, evaluation, current_address, current_module_name)
+        }
+    }
+    state link(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: &OwnedRuntimePointer,
+        evaluation: PointerPreviewEvaluation,
+        current_address: u64,
+        current_module_name: &[u8],
+        at: u64
+    ) -> PointerPreviewEvaluation
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        let chain_link: SymbolicPointerChainLink = runtime_pointer.offset_segments[at];
+        let resolved_offset: SymbolicLinkOffset = SymbolicPointerChainLink::as_offset(&chain_link);
+        transition resolved_offset.found {
+            true -> read(engine_unprivileged_state, engine_bindings, runtime_pointer, evaluation, current_address, current_module_name, at, resolved_offset.offset)
+            _ -> bail(evaluation)
+        }
+    }
+    state read(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: &OwnedRuntimePointer,
+        evaluation: PointerPreviewEvaluation,
+        current_address: u64,
+        current_module_name: &[u8],
+        at: u64,
+        pointer_offset: i64
+    ) -> PointerPreviewEvaluation
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        let read: CountMatch = ProjectItemSymbolResolution::read_pointer_value(
+            engine_unprivileged_state, engine_bindings, current_address, current_module_name, OwnedRuntimePointer::get_pointer_size(runtime_pointer));
+        transition read.found {
+            true -> apply(engine_unprivileged_state, engine_bindings, runtime_pointer, evaluation, current_address, at, pointer_offset, read.count)
+            _ -> bail(evaluation)
+        }
+    }
+    state apply(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: &OwnedRuntimePointer,
+        evaluation: PointerPreviewEvaluation,
+        current_address: u64,
+        at: u64,
+        pointer_offset: i64,
+        pointer_value: u64
+    ) -> PointerPreviewEvaluation
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        let applied: Optional<u64> = symbolic_pointer_chain::symbolic_pointer_chain_apply_pointer_offset(pointer_value, pointer_offset);
+        transition applied {
+            Optional::Some { value } -> advance(engine_unprivileged_state, engine_bindings, runtime_pointer, evaluation, at, value)
+            _ -> bail(evaluation)
+        }
+    }
+    state advance(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        runtime_pointer: &OwnedRuntimePointer,
+        evaluation: PointerPreviewEvaluation,
+        at: u64,
+        next_address: u64
+    ) -> PointerPreviewEvaluation
+        requires at < runtime_pointer.offset_count && at < 64;
+    {
+        let mut carried: PointerPreviewEvaluation = evaluation;
+        carried.evaluated_path_len = ProjectItemPreview::append_address_segment(
+            &mut carried.evaluated_path, carried.evaluated_path_len, next_address);
+        transition { _ -> segment(engine_unprivileged_state, engine_bindings, runtime_pointer, carried, next_address, "", ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state resolve(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        evaluation: PointerPreviewEvaluation,
+        current_address: u64,
+        current_module_name: &[u8]
+    ) -> PointerPreviewEvaluation {
+        let mut carried: PointerPreviewEvaluation = evaluation;
+        carried.resolved_target.found = true;
+        carried.resolved_target.address = current_address;
+        carried.resolved_target.module_name_len = ProjectItemPreview::copy_module(&mut carried.resolved_target.module_name, current_module_name);
+        (carried)
+    }
+    state bail(evaluation: PointerPreviewEvaluation) -> PointerPreviewEvaluation {
+        let mut carried: PointerPreviewEvaluation = evaluation;
+        carried.evaluated_path_len = ProjectItemPreview::append_unknown_segment(
+            &mut carried.evaluated_path, carried.evaluated_path_len);
+        carried.resolved_target.found = false;
+        (carried)
+    }
+    state broken(evaluation: PointerPreviewEvaluation) -> PointerPreviewEvaluation {
+        (evaluation)
+    }
+}
+
+// ---- helpers ----
+
+// `0x` + uppercase significant hex digits (upstream `format!("0x{:X}")`).
+machine ProjectItemPreview::format_address_segment(out: &mut [u8; 512], address: u64) -> u64 {
+    out[0] = 48;
+    out[1] = 120;
+    let width: u64 = ProjectItemPreview::hex_width(address);
+    let wrote: u64 = address_display::write_hex_upper_at(out, address, 2, width);
+    ((width as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64
+}
+
+machine ProjectItemPreview::hex_width(value: u64) -> u64 {
+    transition { _ -> measure(value, 0) }
+    state measure(remaining: u64, count: u64) -> u64 {
+        transition remaining > 0 {
+            true -> measure(remaining / 16, ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> finish(count)
+        }
+    }
+    state finish(count: u64) -> u64 {
+        transition count > 0 {
+            true -> (count)
+            _ -> (1)
+        }
+    }
+}
+
+// " -> " + segment append into the evaluated path buffer.
+machine ProjectItemPreview::append_address_segment(out: &mut [u8; 4096], path_len: u64, address: u64) -> u64 {
+    let mut segment: [u8; 512];
+    let segment_len: u64 = ProjectItemPreview::format_address_segment(&mut segment, address);
+    transition segment_len <= 512 {
+        true -> append(out, path_len, segment, segment_len)
+        _ -> (path_len)
+    }
+    state append(out: &mut [u8; 4096], path_len: u64, segment: [u8; 512], segment_len: u64) -> u64
+        requires segment_len <= 512;
+    {
+        let joined: u64 = ProjectItemPreview::append_separator(out, path_len);
+        (ProjectItemPreview::copy_segment(out, joined, &segment[0..segment_len]))
+    }
+}
+
+machine ProjectItemPreview::append_unknown_segment(out: &mut [u8; 4096], path_len: u64) -> u64 {
+    let joined: u64 = ProjectItemPreview::append_separator(out, path_len);
+    (ProjectItemPreview::copy_segment(out, joined, "??"))
+}
+
+machine ProjectItemPreview::append_separator(out: &mut [u8; 4096], path_len: u64) -> u64 {
+    transition path_len < 4092 {
+        true -> write(out, path_len)
+        _ -> (path_len)
+    }
+    state write(out: &mut [u8; 4096], path_len: u64) -> u64
+        requires path_len < 4092;
+    {
+        out[path_len] = 32;
+        out[((path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64] = 45;
+        out[((path_len as u64 in Wrapping) + (2 as u64 in Wrapping)) as u64] = 62;
+        out[((path_len as u64 in Wrapping) + (3 as u64 in Wrapping)) as u64] = 32;
+        (((path_len as u64 in Wrapping) + (4 as u64 in Wrapping)) as u64)
+    }
+}
+
+machine ProjectItemPreview::copy_segment(out: &mut [u8; 4096], path_len: u64, segment: &[u8]) -> u64 {
+    transition { _ -> each(out, path_len, segment, 0) }
+    state each(out: &mut [u8; 4096], path_len: u64, segment: &[u8], at: u64) -> u64 {
+        transition at < segment.len && (((path_len as u64 in Wrapping) + (at as u64 in Wrapping)) as u64 )< 4096 {
+            true -> write(out, path_len, segment, at)
+            _ -> (path_len_clamped(path_len, segment, at))
+        }
+    }
+    state write(out: &mut [u8; 4096], path_len: u64, segment: &[u8], at: u64) -> u64
+        requires at < segment.len && (((path_len as u64 in Wrapping) + (at as u64 in Wrapping)) as u64 )< 4096;
+    {
+        out[((path_len as u64 in Wrapping) + (at as u64 in Wrapping)) as u64] = segment[at];
+        transition { _ -> each(out, path_len, segment, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine ProjectItemPreview::path_len_clamped(path_len: u64, segment: &[u8], at: u64) -> u64 {
+    (((path_len as u64 in Wrapping) + (at as u64 in Wrapping)) as u64)
+}
+
+machine ProjectItemPreview::copy_module(out: &mut [u8; 256], source: &[u8]) -> u64 {
+    transition { _ -> each(out, source, 0) }
+    state each(out: &mut [u8; 256], source: &[u8], at: u64) -> u64 {
+        transition at < source.len && at < 256 {
+            true -> write(out, source, at)
+            _ -> (at)
+        }
+    }
+    state write(out: &mut [u8; 256], source: &[u8], at: u64) -> u64
+        requires at < source.len && at < 256;
+    {
+        out[at] = source[at];
+        transition { _ -> each(out, source, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Root display text for an owned runtime pointer — upstream routes both
+// shapes through Pointer::get_root_display_text: absolute hex when the
+// module is empty, "<module>+0x<offset>" otherwise.
+machine ProjectItemPreview::root_display_text(runtime_pointer: &OwnedRuntimePointer, out: &mut [u8; 512]) -> u64 {
+    let module_slice: &[u8] = OwnedRuntimePointer::get_module_name(runtime_pointer);
+    transition module_slice.len == 0 {
+        true -> absolute(runtime_pointer, out)
+        _ -> relative(runtime_pointer, module_slice, out)
+    }
+    state absolute(runtime_pointer: &OwnedRuntimePointer, out: &mut [u8; 512]) -> u64 {
+        let mut text: [u8; 17];
+        let inner12: u64 = OwnedRuntimePointer::get_address(runtime_pointer);
+        let width: u64 = address_display::format_absolute_address(&mut text, inner12);
+        (ProjectItemPreview::copy_root_text(out, text, width))
+    }
+    state relative(runtime_pointer: &OwnedRuntimePointer, module_slice: &[u8], out: &mut [u8; 512]) -> u64 {
+        let inner3095: u64 = OwnedRuntimePointer::get_address(runtime_pointer);
+        (address_display::format_module_address(out, module_slice, inner3095))
+    }
+}
+
+machine ProjectItemPreview::copy_root_text(out: &mut [u8; 512], text: [u8; 17], width: u64) -> u64 {
+    transition { _ -> each(out, text, 0, width) }
+    state each(out: &mut [u8; 512], text: [u8; 17], at: u64, width: u64) -> u64 {
+        transition at < width && at < 17 && at < 512 {
+            true -> write(out, text, at, width)
+            _ -> (at)
+        }
+    }
+    state write(out: &mut [u8; 512], text: [u8; 17], at: u64, width: u64) -> u64
+        requires at < 17 && at < 512;
+    {
+        out[at] = text[at];
+        transition { _ -> each(out, text, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, width) }
+    }
+}
+
+machine ProjectItemPreview::type_id_is(item_type_id: &[u8], expected: &[u8]) -> bool {
+    transition item_type_id.len == expected.len {
+        true -> probe(item_type_id, expected, 0)
+        _ -> (false)
+    }
+    state probe(item_type_id: &[u8], expected: &[u8], at: u64) -> bool {
+        transition at < item_type_id.len && at < expected.len {
+            true -> byte(item_type_id, expected, at)
+            _ -> (true)
+        }
+    }
+    state byte(item_type_id: &[u8], expected: &[u8], at: u64) -> bool
+        requires at < item_type_id.len && at < expected.len;
+    {
+        transition item_type_id[at] == expected[at] {
+            true -> probe(item_type_id, expected, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}

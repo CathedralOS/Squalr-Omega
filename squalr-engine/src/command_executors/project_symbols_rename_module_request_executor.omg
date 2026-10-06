@@ -1,0 +1,171 @@
+module src::command_executors::project_symbols_rename_module_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_symbols::rename_module::project_symbols_rename_module_request::ProjectSymbolsRenameModuleRequest;
+use squalr_engine_api::src::commands::project_symbols::rename_module::project_symbols_rename_module_response::ProjectSymbolsRenameModuleResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_symbol_claim::ProjectSymbolClaim;
+use squalr_engine_api::src::structures::projects::project_symbol_module::ProjectSymbolModule;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_symbol_name_scope::ProjectSymbolNameScope;
+use src::services::projects::project_symbol_catalog_persistence::ProjectSymbolCatalogPersistence;
+
+// Port of command_executors/project_symbols/rename_module/
+// project_symbols_rename_module_request_executor.rs — refuse renames onto
+// an existing module, retarget the root struct layout, rename the module
+// entry, and rename every claim locator referencing the old module, then
+// save + sync.
+// Deviations:
+// - `find_symbol_module`/`find_symbol_module_mut`/`get_symbol_claims_mut`
+//   respell as find_symbol_module_position + get_symbol_module_mut +
+//   bounded borrow_symbol_claim_mut loop.
+// - upstream's claims-mut loop is a position-scanned borrow loop here
+//   (identical visit order — every claim's locator gets rename_module).
+// - the project directory resolves inside save_and_sync (upstream resolved
+//   it early only to pass it through).
+pub data ProjectSymbolsRenameModuleRequestExecutor {}
+
+machine rename_module_same_name(first: &[u8], second: &[u8]) -> bool {
+    transition first.len == second.len {
+        true -> scan(first, second, 0)
+        _ -> (false)
+    }
+    state scan(first: &[u8], second: &[u8], position: u64) -> bool {
+        transition position < first.len {
+            true -> compare(first, second, position)
+            _ -> (true)
+        }
+    }
+    state compare(first: &[u8], second: &[u8], position: u64) -> bool
+        requires position < first.len;
+    {
+        transition first[position] == second[position] {
+            true -> scan(first, second, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+pub linux_x86_64 machine ProjectSymbolsRenameModuleRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbols_rename_module_request: &ProjectSymbolsRenameModuleRequest
+) -> ProjectSymbolsRenameModuleResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+    transition ProjectManager::get_has_opened_project(project_manager) {
+        true -> trim(engine_unprivileged_state, engine_bindings, project_symbols_rename_module_request)
+        _ -> (refused())
+    }
+    state refused() -> ProjectSymbolsRenameModuleResponse {
+        (ProjectSymbolsRenameModuleResponse::new())
+    }
+    state trim(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_module_request: &ProjectSymbolsRenameModuleRequest) -> ProjectSymbolsRenameModuleResponse {
+        let mut scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let mut old_module_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut old_module_name);
+        let mut new_module_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut new_module_name);
+        let inner3076: &[u8] = ProjectSymbolsRenameModuleRequest::get_module_name(project_symbols_rename_module_request);
+        _ = ProjectSymbolNameScope::trim_copy(&mut scope, inner3076, &mut old_module_name);
+        let inner3077: &[u8] = ProjectSymbolsRenameModuleRequest::get_new_module_name(project_symbols_rename_module_request);
+        _ = ProjectSymbolNameScope::trim_copy(&mut scope, inner3077, &mut new_module_name);
+        transition old_module_name.len > 0 && new_module_name.len > 0 {
+            true -> duplicate_probe(engine_unprivileged_state, engine_bindings, old_module_name, new_module_name)
+            _ -> (refused())
+        }
+    }
+    state duplicate_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, old_module_name: ManifestPathScratch, new_module_name: ManifestPathScratch) -> ProjectSymbolsRenameModuleResponse {
+        let changed: bool = rename_module_same_name(ManifestPathScratch::get_bytes(&old_module_name), ManifestPathScratch::get_bytes(&new_module_name));
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_symbol_catalog: &ProjectSymbolCatalog = Project::get_project_symbol_catalog(opened_project);
+        let inner73: &[u8] = ManifestPathScratch::get_bytes(&new_module_name);
+        let new_position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, inner73);
+        transition !changed && new_position < ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog) && new_position < 64 {
+            true -> (refused())
+            _ -> old_probe(engine_unprivileged_state, engine_bindings, old_module_name, new_module_name)
+        }
+    }
+    state old_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, old_module_name: ManifestPathScratch, new_module_name: ManifestPathScratch) -> ProjectSymbolsRenameModuleResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_symbol_catalog: &ProjectSymbolCatalog = Project::get_project_symbol_catalog(opened_project);
+        let inner74: &[u8] = ManifestPathScratch::get_bytes(&old_module_name);
+        let old_position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, inner74);
+        transition old_position < ProjectSymbolCatalog::get_symbol_module_count(project_symbol_catalog) && old_position < 64 {
+            true -> relayout(engine_unprivileged_state, engine_bindings, old_module_name, new_module_name)
+            _ -> (refused())
+        }
+    }
+    state relayout(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, old_module_name: ManifestPathScratch, new_module_name: ManifestPathScratch) -> ProjectSymbolsRenameModuleResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = Project::borrow_project_symbol_catalog_mut(opened_project);
+        let renamed: bool = ProjectSymbolCatalog::rename_module_root_struct_layout(project_symbol_catalog, ManifestPathScratch::get_bytes(&old_module_name), ManifestPathScratch::get_bytes(&new_module_name));
+        transition renamed {
+            true -> rename_module(engine_unprivileged_state, engine_bindings, old_module_name, new_module_name)
+            _ -> (refused())
+        }
+    }
+    state rename_module(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, old_module_name: ManifestPathScratch, new_module_name: ManifestPathScratch) -> ProjectSymbolsRenameModuleResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = Project::borrow_project_symbol_catalog_mut(opened_project);
+        let inner75: &[u8] = ManifestPathScratch::get_bytes(&old_module_name);
+        let old_position: u64 = ProjectSymbolCatalog::find_symbol_module_position(project_symbol_catalog, inner75);
+        transition old_position < project_symbol_catalog.symbol_module_count && old_position < 64 {
+            true -> apply_rename(project_symbol_catalog, old_position, engine_unprivileged_state, engine_bindings, old_module_name, new_module_name)
+            _ -> (refused())
+        }
+    }
+    state apply_rename(project_symbol_catalog: &mut ProjectSymbolCatalog, old_position: u64, engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, old_module_name: ManifestPathScratch, new_module_name: ManifestPathScratch) -> ProjectSymbolsRenameModuleResponse
+        requires old_position < project_symbol_catalog.symbol_module_count && old_position < 64;
+    {
+        let symbol_module: &mut ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module_mut(project_symbol_catalog, old_position);
+        ProjectSymbolModule::set_module_name(symbol_module, ManifestPathScratch::get_bytes(&new_module_name));
+        transition { _ -> claims(engine_unprivileged_state, engine_bindings, old_module_name, new_module_name, 0) }
+    }
+    state claims(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, old_module_name: ManifestPathScratch, new_module_name: ManifestPathScratch, position: u64) -> ProjectSymbolsRenameModuleResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = Project::borrow_project_symbol_catalog_mut(opened_project);
+        transition position < project_symbol_catalog.symbol_claim_count && position < 128 {
+            true -> claim_at(project_symbol_catalog, engine_unprivileged_state, engine_bindings, old_module_name, new_module_name, position)
+            _ -> save(engine_unprivileged_state, engine_bindings, new_module_name)
+        }
+    }
+    state claim_at(project_symbol_catalog: &mut ProjectSymbolCatalog, engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, old_module_name: ManifestPathScratch, new_module_name: ManifestPathScratch, position: u64) -> ProjectSymbolsRenameModuleResponse
+        requires position < project_symbol_catalog.symbol_claim_count && position < 128;
+    {
+        let claim: &mut ProjectSymbolClaim = ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog, position);
+        ProjectSymbolClaim::rename_module(claim, ManifestPathScratch::get_bytes(&old_module_name), ManifestPathScratch::get_bytes(&new_module_name));
+        transition { _ -> claims(engine_unprivileged_state, engine_bindings, old_module_name, new_module_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state save(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, new_module_name: ManifestPathScratch) -> ProjectSymbolsRenameModuleResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition ProjectSymbolCatalogPersistence::save_and_sync_project_symbol_catalog(engine_bindings, opened_project) {
+            true -> succeed(new_module_name)
+            _ -> (refused())
+        }
+    }
+    state succeed(new_module_name: ManifestPathScratch) -> ProjectSymbolsRenameModuleResponse {
+        let mut response: ProjectSymbolsRenameModuleResponse = ProjectSymbolsRenameModuleResponse::new();
+        ProjectSymbolsRenameModuleResponse::set_success(&mut response, true);
+        ProjectSymbolsRenameModuleResponse::set_module_name(&mut response, ManifestPathScratch::get_bytes(&new_module_name));
+        (response)
+    }
+}

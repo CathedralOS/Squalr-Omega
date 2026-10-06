@@ -1,0 +1,198 @@
+module src::command_executors::project_create_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project::create::project_create_request::ProjectCreateRequest;
+use squalr_engine_api::src::commands::project::create::project_create_response::ProjectCreateResponse;
+use squalr_engine_api::src::structures::processes::process_icon::ProcessIcon;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_manifest::ProjectManifest;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_directory::ProjectItemTypeDirectory;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_projects::src::settings::project_settings_config::ProjectSettingsConfig;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+// Port of command_executors/project/create/project_create_request_executor.rs —
+// path selection (explicit > projects_root + name > unique "New Project"),
+// refuse non-empty existing dirs, mkdir -p, seed the project (info + root
+// directory item), save, notify. Upstream constructs ProjectInfo with the
+// directory path as `project_file_path` (the stored identity is then the
+// bare directory until the first load — kept, it's upstream's exact
+// behavior). Directory fs ops run on the runtime-path seams
+// (path_exists/dir_is_empty/create_dir_all_path/save_at over an opened
+// dirfd).
+pub data ProjectCreateRequestExecutor {}
+
+pub machine ProjectCreateRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_create_request: &ProjectCreateRequest
+) -> ProjectCreateResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition ProjectCreateRequest::has_project_directory_path(project_create_request) {
+        true -> explicit(engine_unprivileged_state, project_create_request)
+        _ -> named(engine_unprivileged_state, project_create_request)
+    }
+
+    state explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, project_create_request: &ProjectCreateRequest) -> ProjectCreateResponse {
+        let path: &[u8] = ProjectCreateRequest::get_project_directory_path(project_create_request);
+        let mut chosen: [u8; 512];
+        let chosen_len: u64 = path.len;
+        transition chosen_len > 0 && chosen_len <= 512 {
+            true -> copy_explicit(engine_unprivileged_state, path, chosen, chosen_len, 0)
+            _ -> refused()
+        }
+    }
+    state copy_explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, path: &[u8], mut chosen: [u8; 512], chosen_len: u64, position: u64) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        transition position < path.len && position < 512 {
+            true -> write_explicit(engine_unprivileged_state, path, chosen, chosen_len, position)
+            _ -> exists(engine_unprivileged_state, chosen, chosen_len)
+        }
+    }
+    state write_explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, path: &[u8], mut chosen: [u8; 512], chosen_len: u64, position: u64) -> ProjectCreateResponse
+        requires chosen_len <= 512 && position < path.len && position < 512;
+    {
+        chosen[position] = path[position];
+        transition { _ -> copy_explicit(engine_unprivileged_state, path, chosen, chosen_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state named(engine_unprivileged_state: &mut EngineUnprivilegedState, project_create_request: &ProjectCreateRequest) -> ProjectCreateResponse {
+        transition ProjectCreateRequest::has_project_name(project_create_request) {
+            true -> join(engine_unprivileged_state, project_create_request)
+            _ -> unique(engine_unprivileged_state)
+        }
+    }
+
+    state join(engine_unprivileged_state: &mut EngineUnprivilegedState, project_create_request: &ProjectCreateRequest) -> ProjectCreateResponse {
+        let mut chosen: [u8; 512];
+        _ = EngineUnprivilegedState::get_or_init_project_settings_config(engine_unprivileged_state);
+        let settings_config: &ProjectSettingsConfig = EngineUnprivilegedState::get_project_settings_config(engine_unprivileged_state);
+        let projects_root: &[u8] = ProjectSettingsConfig::get_projects_root(settings_config);
+        let project_name: &[u8] = ProjectCreateRequest::get_project_name(project_create_request);
+        let chosen_len: u64 = FileSystemUtils::join_path(projects_root, project_name, &mut chosen);
+        transition chosen_len > 0 && chosen_len <= 512 {
+            true -> exists(engine_unprivileged_state, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `FileSystemUtils::create_unique_folder(root, "New Project")`.
+    state unique(engine_unprivileged_state: &mut EngineUnprivilegedState) -> ProjectCreateResponse {
+        let mut chosen: [u8; 512];
+        _ = EngineUnprivilegedState::get_or_init_project_settings_config(engine_unprivileged_state);
+        let settings_config: &ProjectSettingsConfig = EngineUnprivilegedState::get_project_settings_config(engine_unprivileged_state);
+        let projects_root: &[u8] = ProjectSettingsConfig::get_projects_root(settings_config);
+        let chosen_len: u64 = FileSystemUtils::create_unique_folder(projects_root, "New Project", &mut chosen);
+        transition chosen_len > 0 && chosen_len <= 512 {
+            true -> exists(engine_unprivileged_state, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream: exists -> read_dir non-empty refuses; then create_dir_all.
+    state exists(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        transition FileSystemUtils::path_exists(&chosen[0..chosen_len]) {
+            true -> check_empty(engine_unprivileged_state, chosen, chosen_len)
+            _ -> mkdir(engine_unprivileged_state, chosen, chosen_len)
+        }
+    }
+    state check_empty(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        transition FileSystemUtils::dir_is_empty(&chosen[0..chosen_len]) {
+            true -> mkdir(engine_unprivileged_state, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+    state mkdir(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        transition FileSystemUtils::create_dir_all_path(&chosen[0..chosen_len]) {
+            true -> build(engine_unprivileged_state, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `ProjectInfo::new(directory, None, manifest)` +
+    // `ProjectItemRef::new(directory.join(PROJECT_DIR))` +
+    // `HashMap::insert(root, Directory::new_project_item)` +
+    // `Project::new(info, items, root)`.
+    state build(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        let default_icon: ProcessIcon = ProcessIcon::default();
+        let manifest: ProjectManifest = ProjectManifest::default();
+        let mut project_info: ProjectInfo = ProjectInfo::new(&chosen[0..chosen_len], &default_icon, manifest);
+        ProjectInfo::clear_project_icon_rgba(&mut project_info);
+        let mut root_path: [u8; 512];
+        let root_len: u64 = FileSystemUtils::join_path(&chosen[0..chosen_len], "project_items", &mut root_path);
+        transition root_len > 0 && root_len <= 512 {
+            true -> insert_root(engine_unprivileged_state, chosen, chosen_len, project_info, root_path, root_len)
+            _ -> refused()
+        }
+    }
+
+    state insert_root(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, project_info: ProjectInfo, root_path: [u8; 512], root_len: u64) -> ProjectCreateResponse
+        requires chosen_len <= 512 && root_len <= 512;
+    {
+        let project_root_ref: ProjectItemRef = ProjectItemRef::new(&root_path[0..root_len]);
+        let project_root_ref_for_root: ProjectItemRef = ProjectItemRef::clone(&project_root_ref);
+        let root_item: squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem = ProjectItemTypeDirectory::new_project_item(&project_root_ref);
+        let root_pair: ProjectItemPair = ProjectItemPair::new(project_root_ref, root_item);
+        let mut project: Project = Project::new(project_info, project_root_ref_for_root);
+        _ = Project::insert_project_item(&mut project, root_pair);
+        transition { _ -> open_dir(engine_unprivileged_state, chosen, chosen_len, project) }
+    }
+
+    state open_dir(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, mut project: Project) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&chosen[0..chosen_len], 0);
+        transition dir_fd >= 0 {
+            true -> save(engine_unprivileged_state, dir_fd, chosen, chosen_len, project)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `new_project.save_to_path(&directory, true)` — dirfd twin.
+    state save(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, chosen: [u8; 512], chosen_len: u64, mut project: Project) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        let saved: ProjectFileSave = Project::save_at(&mut project, dir_fd, &chosen[0..chosen_len], true);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify(engine_unprivileged_state, chosen, chosen_len, project)
+            _ -> refused()
+        }
+    }
+
+    state notify(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64, project: Project) -> ProjectCreateResponse
+        requires chosen_len <= 512;
+    {
+        EngineUnprivilegedState::notify_project_created(engine_unprivileged_state, Project::get_project_info(&project));
+        let mut response: ProjectCreateResponse = ProjectCreateResponse::new();
+        ProjectCreateResponse::set_success(&mut response, true);
+        ProjectCreateResponse::set_new_project_path(&mut response, &chosen[0..chosen_len]);
+        (response)
+    }
+
+    state refused() -> ProjectCreateResponse {
+        (ProjectCreateResponse::new())
+    }
+}

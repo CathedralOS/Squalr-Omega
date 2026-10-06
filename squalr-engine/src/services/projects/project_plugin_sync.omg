@@ -1,0 +1,460 @@
+module src::services::projects::project_plugin_sync;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::plugins::list::plugin_list_request::PluginListRequest;
+use squalr_engine_api::src::commands::plugins::list::plugin_list_response::PluginListResponse;
+use squalr_engine_api::src::commands::plugins::plugins_command::PluginsCommand;
+use squalr_engine_api::src::commands::plugins::plugins_response::PluginsResponse;
+use squalr_engine_api::src::commands::plugins::set_enabled::plugin_set_enabled_request::PluginSetEnabledRequest;
+use squalr_engine_api::src::commands::plugins::set_enabled::plugin_set_enabled_response::PluginSetEnabledResponse;
+use squalr_engine_api::src::commands::plugins::set_order::plugin_set_order_request::PluginSetOrderRequest;
+use squalr_engine_api::src::commands::plugins::set_order::plugin_set_order_response::PluginSetOrderResponse;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
+use squalr_engine_api::src::plugins::plugin_configuration::PluginConfiguration;
+use squalr_engine_api::src::plugins::plugin_id::PluginId;
+use squalr_engine_api::src::plugins::plugin_metadata::PluginMetadata;
+use squalr_engine_api::src::plugins::plugin_state::PluginState;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+// Port of command_executors/project/project_plugin_sync.rs. Upstream
+// reaches the plugins surface through `send_unprivileged` — a direct
+// engine_bindings dispatch that bypasses the middleware wire and blocks
+// on the channel response. The port dispatches the same privileged
+// commands through the standalone bindings mailbox, which is equally
+// synchronous; the 30s recv_timeout collapses (no async hop exists).
+pub data ProjectPluginSync {}
+
+// Upstream `PluginSnapshot` — the two tables the list response carries.
+pub data PluginSnapshot {
+    plugin_list_response: PluginListResponse;
+}
+
+// Upstream `get_plugin_snapshot` — Option maps to a probe union; the
+// log-errors collapse to the false arm (upstream only logs on lock/recv
+// failure paths that cannot occur in the synchronous dispatch).
+pub machine ProjectPluginSync::get_plugin_snapshot(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings
+) -> PluginSnapshotProbe
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+    let request: PluginListRequest = PluginListRequest::new();
+    let command: PrivilegedCommand = PrivilegedCommand::Plugins { command: PluginsCommand::List { request: request } };
+    _ = StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(
+        engine_bindings,
+        &command,
+        &mut mailbox);
+    transition mailbox {
+        PrivilegedResponseMailbox::Delivered { response } -> domain(response)
+        _ -> (PluginSnapshotProbe::Absent)
+    }
+    state domain(response: PrivilegedCommandResponse) -> PluginSnapshotProbe {
+        transition response {
+            PrivilegedCommandResponse::Plugins { response } -> leaf(response)
+            _ -> (PluginSnapshotProbe::Absent)
+        }
+    }
+    state leaf(response: PluginsResponse) -> PluginSnapshotProbe {
+        transition response {
+            PluginsResponse::List { response } -> fill(response)
+            _ -> (PluginSnapshotProbe::Absent)
+        }
+    }
+    state fill(response: PluginListResponse) -> PluginSnapshotProbe {
+        let mut carried: PluginListResponse = response;
+        let snapshot: PluginSnapshot = PluginSnapshot { plugin_list_response: carried };
+        (PluginSnapshotProbe::Present { snapshot: snapshot })
+    }
+}
+
+pub data PluginSnapshotProbe {
+    case Absent;
+    case Present(snapshot: PluginSnapshot);
+}
+
+pub machine PluginSnapshot::get_plugin_list_response(plugin_snapshot: &PluginSnapshot) -> &PluginListResponse {
+    &plugin_snapshot.plugin_list_response
+}
+
+// Upstream `apply_project_plugin_configuration` — empty/absent
+// configuration applies trivially (returns true without any dispatch).
+// Otherwise: order hop (priority ids when present, default ids when not),
+// then a fresh snapshot and per-plugin enable/disable hops where the
+// configuration's set overrides differ from the plugin's default.
+pub machine ProjectPluginSync::apply_project_plugin_configuration(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    has_plugin_configuration: bool,
+    plugin_configuration: &PluginConfiguration
+) -> bool
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition !has_plugin_configuration || PluginConfiguration::is_empty(plugin_configuration) {
+        true -> (true)
+        _ -> snapshot(engine_bindings, plugin_configuration)
+    }
+    state snapshot(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration
+    ) -> bool {
+        let probe: PluginSnapshotProbe = ProjectPluginSync::get_plugin_snapshot(engine_bindings);
+        transition probe {
+            PluginSnapshotProbe::Present { snapshot } -> order_probe(engine_bindings, plugin_configuration, snapshot)
+            _ -> (false)
+        }
+    }
+    // Upstream: `plugin_configuration.get_priority_plugin_ids()` when
+    // non-empty else `initial_snapshot.default_plugin_ids`.
+    state order_probe(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot
+    ) -> bool {
+        transition PluginConfiguration::get_priority_plugin_id_count(plugin_configuration) > 0 {
+            true -> order_priority(engine_bindings, plugin_configuration, plugin_snapshot)
+            _ -> order_defaults(engine_bindings, plugin_configuration, plugin_snapshot)
+        }
+    }
+    state order_priority(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot
+    ) -> bool {
+        let mut request: PluginSetOrderRequest = PluginSetOrderRequest::new();
+        transition { _ -> fill_priority(engine_bindings, request, plugin_configuration, plugin_snapshot, 0) }
+    }
+    state fill_priority(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        mut request: PluginSetOrderRequest,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64
+    ) -> bool {
+        transition position < PluginConfiguration::get_priority_plugin_id_count(plugin_configuration) && position < 32 {
+            true -> push_priority(engine_bindings, request, plugin_configuration, plugin_snapshot, position)
+            _ -> send_order(engine_bindings, plugin_configuration, request, plugin_snapshot)
+        }
+    }
+    state push_priority(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        mut request: PluginSetOrderRequest,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64
+    ) -> bool
+        requires position < 32;
+    {
+        let inner3141: &PluginId = PluginConfiguration::get_priority_plugin_id(plugin_configuration, position);
+        _ = PluginSetOrderRequest::add_plugin_id(&mut request, inner3141);
+        transition { _ -> fill_priority(engine_bindings, request, plugin_configuration, plugin_snapshot, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state order_defaults(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot
+    ) -> bool {
+        let mut request: PluginSetOrderRequest = PluginSetOrderRequest::new();
+        transition { _ -> fill_defaults(engine_bindings, plugin_configuration, request, plugin_snapshot, 0) }
+    }
+    state fill_defaults(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        mut request: PluginSetOrderRequest,
+        plugin_snapshot: PluginSnapshot,
+        position: u64
+    ) -> bool {
+        let inner3142: &PluginListResponse = PluginSnapshot::get_plugin_list_response(&plugin_snapshot);
+        transition position < PluginListResponse::get_default_plugin_id_count(inner3142) && position < 64 {
+            true -> push_defaults(engine_bindings, plugin_configuration, request, plugin_snapshot, position)
+            _ -> send_order(engine_bindings, plugin_configuration, request, plugin_snapshot)
+        }
+    }
+    state push_defaults(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        mut request: PluginSetOrderRequest,
+        plugin_snapshot: PluginSnapshot,
+        position: u64
+    ) -> bool
+        requires position < 64;
+    {
+        let inner3143: &PluginListResponse = PluginSnapshot::get_plugin_list_response(&plugin_snapshot);
+        let inner3144: &PluginId = PluginListResponse::get_default_plugin_id(inner3143, position);
+        _ = PluginSetOrderRequest::add_plugin_id(&mut request, inner3144);
+        transition { _ -> fill_defaults(engine_bindings, plugin_configuration, request, plugin_snapshot, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state send_order(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        request: PluginSetOrderRequest,
+        plugin_snapshot: PluginSnapshot
+    ) -> bool {
+        let did_update: bool = ProjectPluginSync::dispatch_set_order(engine_bindings, &request);
+        transition did_update {
+            true -> resnapshot(engine_bindings, plugin_configuration)
+            _ -> (false)
+        }
+    }
+    // Upstream re-queries after the order hop before computing enables.
+    // Upstream re-queries after the order hop before computing enables.
+    state resnapshot(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration
+    ) -> bool {
+        let probe: PluginSnapshotProbe = ProjectPluginSync::get_plugin_snapshot(engine_bindings);
+        transition probe {
+            PluginSnapshotProbe::Present { snapshot } -> walk_plugins(engine_bindings, plugin_configuration, snapshot, 0)
+            _ -> (false)
+        }
+    }
+    state walk_plugins(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64
+    ) -> bool {
+        let inner3145: &PluginListResponse = PluginSnapshot::get_plugin_list_response(&plugin_snapshot);
+        transition position < PluginListResponse::get_plugin_count(inner3145) && position < 64 {
+            true -> check_plugin(engine_bindings, plugin_configuration, plugin_snapshot, position)
+            _ -> (true)
+        }
+    }
+    // Upstream per-state rule: enabled-override => true, disabled-
+    // override => false, otherwise the plugin's is_enabled_by_default.
+    // A mismatch against the plugin's live is_enabled dispatches the
+    // set-enabled hop; hop failure aborts the apply.
+    state check_plugin(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64
+    ) -> bool
+        requires position < 64;
+    {
+        let inner18: &PluginListResponse = PluginSnapshot::get_plugin_list_response(&plugin_snapshot);
+        let plugin_state: &PluginState = PluginListResponse::get_plugin(inner18, position);
+        let metadata: &PluginMetadata = PluginState::get_metadata(plugin_state);
+        let plugin_id: &[u8] = PluginMetadata::get_plugin_id(metadata);
+        let mut state_id: PluginId = PluginId::new(plugin_id);
+        let in_enabled: bool = contains_enabled(plugin_configuration, &state_id);
+        let in_disabled: bool = contains_disabled(plugin_configuration, &state_id);
+        transition in_enabled {
+            true -> diff(engine_bindings, plugin_configuration, plugin_snapshot, position, true, state_id)
+            _ -> check_disabled(engine_bindings, plugin_configuration, plugin_snapshot, position, in_enabled, in_disabled, state_id)
+        }
+    }
+    state check_disabled(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64,
+        in_enabled: bool,
+        in_disabled: bool,
+        state_id: PluginId
+    ) -> bool
+        requires position < 64;
+    {
+        transition in_disabled {
+            true -> diff(engine_bindings, plugin_configuration, plugin_snapshot, position, false, state_id)
+            _ -> diff_default(engine_bindings, plugin_configuration, plugin_snapshot, position, state_id)
+        }
+    }
+    state diff_default(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64,
+        state_id: PluginId
+    ) -> bool
+        requires position < 64;
+    {
+        let inner19: &PluginListResponse = PluginSnapshot::get_plugin_list_response(&plugin_snapshot);
+        let plugin_state: &PluginState = PluginListResponse::get_plugin(inner19, position);
+        let metadata: &PluginMetadata = PluginState::get_metadata(plugin_state);
+        let by_default: bool = PluginMetadata::get_is_enabled_by_default(metadata);
+        transition { _ -> diff(engine_bindings, plugin_configuration, plugin_snapshot, position, by_default, state_id) }
+    }
+    state diff(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64,
+        should_enable: bool,
+        state_id: PluginId
+    ) -> bool
+        requires position < 64;
+    {
+        let inner20: &PluginListResponse = PluginSnapshot::get_plugin_list_response(&plugin_snapshot);
+        let plugin_state: &PluginState = PluginListResponse::get_plugin(inner20, position);
+        let is_enabled: bool = PluginState::get_is_enabled(plugin_state);
+        transition is_enabled == should_enable {
+            true -> walk_plugins(engine_bindings, plugin_configuration, plugin_snapshot, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> apply_enabled(engine_bindings, plugin_configuration, plugin_snapshot, position, should_enable, state_id)
+        }
+    }
+    state apply_enabled(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        plugin_configuration: &PluginConfiguration,
+        plugin_snapshot: PluginSnapshot,
+        position: u64,
+        should_enable: bool,
+        state_id: PluginId
+    ) -> bool
+        requires position < 64;
+    {
+        let did_update: bool = ProjectPluginSync::dispatch_set_enabled(engine_bindings, &state_id, should_enable);
+        transition did_update {
+            true -> walk_plugins(engine_bindings, plugin_configuration, plugin_snapshot, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Membership probes over the two override lists (upstream HashSet
+// contains; the port scans the bounded sorted tables).
+machine contains_enabled(plugin_configuration: &PluginConfiguration, plugin_id: &PluginId) -> bool {
+    transition { _ -> scan(plugin_configuration, plugin_id, 0) }
+    state scan(plugin_configuration: &PluginConfiguration, plugin_id: &PluginId, position: u64) -> bool {
+        transition position < PluginConfiguration::get_enabled_plugin_id_count(plugin_configuration) && position < 32 {
+            true -> compare(plugin_configuration, plugin_id, position)
+            _ -> (false)
+        }
+    }
+    state compare(plugin_configuration: &PluginConfiguration, plugin_id: &PluginId, position: u64) -> bool
+        requires position < 32;
+    {
+        let inner3146: &PluginId = PluginConfiguration::get_enabled_plugin_id(plugin_configuration, position);
+        transition PluginId::equals(inner3146, plugin_id) {
+            true -> (true)
+            _ -> scan(plugin_configuration, plugin_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+machine contains_disabled(plugin_configuration: &PluginConfiguration, plugin_id: &PluginId) -> bool {
+    transition { _ -> scan(plugin_configuration, plugin_id, 0) }
+    state scan(plugin_configuration: &PluginConfiguration, plugin_id: &PluginId, position: u64) -> bool {
+        transition position < PluginConfiguration::get_disabled_plugin_id_count(plugin_configuration) && position < 32 {
+            true -> compare(plugin_configuration, plugin_id, position)
+            _ -> (false)
+        }
+    }
+    state compare(plugin_configuration: &PluginConfiguration, plugin_id: &PluginId, position: u64) -> bool
+        requires position < 32;
+    {
+        let inner3147: &PluginId = PluginConfiguration::get_disabled_plugin_id(plugin_configuration, position);
+        transition PluginId::equals(inner3147, plugin_id) {
+            true -> (true)
+            _ -> scan(plugin_configuration, plugin_id, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}
+
+// Upstream `set_plugin_order` — privileged hop through the bindings'
+// mailbox; response did_update is the hop result.
+pub machine ProjectPluginSync::dispatch_set_order(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    request: &PluginSetOrderRequest
+) -> bool
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+    let mut carried: PluginSetOrderRequest = PluginSetOrderRequest::new();
+    _ = clone_set_order_request(&mut carried, request);
+    let command: PrivilegedCommand = PrivilegedCommand::Plugins { command: PluginsCommand::SetOrder { request: carried } };
+    _ = StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(
+        engine_bindings,
+        &command,
+        &mut mailbox);
+    transition mailbox {
+        PrivilegedResponseMailbox::Delivered { response } -> domain(response)
+        _ -> (false)
+    }
+    state domain(response: PrivilegedCommandResponse) -> bool {
+        transition response {
+            PrivilegedCommandResponse::Plugins { response } -> leaf(response)
+            _ -> (false)
+        }
+    }
+    state leaf(response: PluginsResponse) -> bool {
+        transition response {
+            PluginsResponse::SetOrder { response } -> (PluginSetOrderResponse::get_did_update(&response))
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `set_plugin_enabled` — same mailbox shape.
+pub machine ProjectPluginSync::dispatch_set_enabled(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    plugin_id: &PluginId,
+    is_enabled: bool
+) -> bool
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+    let mut request: PluginSetEnabledRequest = PluginSetEnabledRequest::new(is_enabled);
+    PluginSetEnabledRequest::set_plugin_id(&mut request, PluginId::get_plugin_id(plugin_id));
+    let command: PrivilegedCommand = PrivilegedCommand::Plugins { command: PluginsCommand::SetEnabled { request: request } };
+    _ = StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(
+        engine_bindings,
+        &command,
+        &mut mailbox);
+    transition mailbox {
+        PrivilegedResponseMailbox::Delivered { response } -> domain(response)
+        _ -> (false)
+    }
+    state domain(response: PrivilegedCommandResponse) -> bool {
+        transition response {
+            PrivilegedCommandResponse::Plugins { response } -> leaf(response)
+            _ -> (false)
+        }
+    }
+    state leaf(response: PluginsResponse) -> bool {
+        transition response {
+            PluginsResponse::SetEnabled { response } -> (PluginSetEnabledResponse::get_did_update(&response))
+            _ -> (false)
+        }
+    }
+}
+
+// Bounded id-list copy for the set-order request — the request record
+// moves into the command so the caller's copy is cloned field-wise.
+machine clone_set_order_request(carried: &mut PluginSetOrderRequest, request: &PluginSetOrderRequest) -> bool {
+    transition { _ -> walk(carried, request, 0) }
+    state walk(carried: &mut PluginSetOrderRequest, request: &PluginSetOrderRequest, position: u64) -> bool {
+        transition position < PluginSetOrderRequest::get_plugin_id_count(request) && position < 64 {
+            true -> copy(carried, request, position)
+            _ -> (true)
+        }
+    }
+    state copy(carried: &mut PluginSetOrderRequest, request: &PluginSetOrderRequest, position: u64) -> bool
+        requires position < 64;
+    {
+        let inner3148: &PluginId = PluginSetOrderRequest::get_plugin_id(request, position);
+        _ = PluginSetOrderRequest::add_plugin_id(carried, inner3148);
+        transition { _ -> walk(carried, request, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}

@@ -6,6 +6,8 @@ use src::structures::projects::project_items::project_item::ProjectItem;
 use src::structures::projects::project_items::project_item_pair::ProjectItemPair;
 use src::structures::projects::project_items::project_item_ref::ProjectItemRef;
 use src::structures::projects::project_manifest::ProjectManifest;
+use src::structures::projects::project_path_list::ProjectPathList;
+use src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
 
 // Port of structures/projects/project.rs — a full project in memory plus the
 // file-layout constants its serializer uses. Upstream
@@ -128,6 +130,23 @@ pub machine Project::set_project_info(project: &mut Project, project_info: Proje
     project.project_info = project_info;
 }
 
+// Upstream `project.project_info().project_symbol_catalog()` — the composed
+// two-level read in one call.
+pub machine Project::get_project_symbol_catalog(project: &Project) -> &ProjectSymbolCatalog {
+    (ProjectInfo::get_project_symbol_catalog(&project.project_info))
+}
+
+// Upstream `project.project_info_mut().project_symbol_catalog_mut()`.
+pub machine Project::borrow_project_symbol_catalog_mut(project: &mut Project) -> &mut ProjectSymbolCatalog {
+    (ProjectInfo::borrow_project_symbol_catalog_mut(&mut project.project_info))
+}
+
+// Upstream `project.project_info().project_manifest().project_item_sort_order()`.
+pub machine Project::get_project_item_sort_order(project: &Project) -> &ProjectPathList {
+    let manifest: &ProjectManifest = ProjectInfo::get_project_manifest(&project.project_info);
+    (ProjectManifest::get_project_item_sort_order(manifest))
+}
+
 // Upstream `set_project_icon(Option<ProcessIcon>)` — Some carries here,
 // None's clear routes through `clear_project_icon` (Optional is unmatchable
 // in this pin, so the empty arm keeps its own machine — named deviation).
@@ -137,6 +156,64 @@ pub machine Project::set_project_icon(project: &mut Project, project_icon: &Proc
 
 pub machine Project::clear_project_icon(project: &mut Project) {
     ProjectInfo::clear_project_icon_rgba(&mut project.project_info);
+}
+
+// Upstream `HashMap::remove` keyed by ref — the pair's item is cloned
+// out (moves can't leave the table through &mut), then the tail shifts
+// left one slot. ZII-style absence stays as `false`.
+pub machine Project::take_project_item(project: &mut Project, project_item_ref: &ProjectItemRef, out_project_item: &mut ProjectItem) -> bool {
+    let lookup: ProjectItemLookup = Project::lookup_project_item_index(project, project_item_ref);
+    transition lookup {
+        ProjectItemLookup::Found { index } -> take(project, index, out_project_item)
+        _ -> (false)
+    }
+    state take(project: &mut Project, index: u64, out_project_item: &mut ProjectItem) -> bool {
+        transition index < project.project_items_len && index < 256 {
+            true -> copy_out(project, index, out_project_item)
+            false -> (false)
+            _ -> (false)
+        }
+    }
+    state copy_out(project: &mut Project, index: u64, out_project_item: &mut ProjectItem) -> bool
+        requires index < 256;
+    {
+        let taken: ProjectItem = ProjectItem::clone(ProjectItemPair::get_project_item(&project.project_items[index]));
+        ProjectItem::clone_from(out_project_item, &taken);
+        transition { _ -> shift(project, index) }
+    }
+    state shift(project: &mut Project, position: u64) -> bool {
+        let next: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition next < project.project_items_len && position < 255 {
+            true -> shift_one(project, position)
+            _ -> shrink(project)
+        }
+    }
+    state shift_one(project: &mut Project, position: u64) -> bool
+        requires position < 255;
+    {
+        let source_index: u64 = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition source_index < 256 {
+            true -> shift_copy(project, position, source_index)
+            _ -> shrink(project)
+        }
+    }
+    state shift_copy(project: &mut Project, position: u64, source_index: u64) -> bool
+        requires position < 255 && source_index < 256;
+    {
+        let carried: ProjectItemPair = ProjectItemPair::clone(&project.project_items[source_index]);
+        ProjectItemPair::clone_from(&mut project.project_items[position], &carried);
+        transition { _ -> shift(project, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state shrink(project: &mut Project) -> bool {
+        transition project.project_items_len > 0 {
+            true -> shrink_do(project)
+            _ -> (false)
+        }
+    }
+    state shrink_do(project: &mut Project) -> bool {
+        project.project_items_len = ((project.project_items_len as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
 }
 
 // Upstream `get_project_items`/`get_project_items_mut` HashMap exposure —

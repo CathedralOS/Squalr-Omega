@@ -1,0 +1,117 @@
+module src::command_executors::project_symbols_upsert_resolver_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_symbols::upsert_resolver::project_symbols_upsert_resolver_request::ProjectSymbolsUpsertResolverRequest;
+use squalr_engine_api::src::commands::project_symbols::upsert_resolver::project_symbols_upsert_resolver_response::ProjectSymbolsUpsertResolverResponse;
+use squalr_engine_api::src::registries::symbols::symbolic_resolver_descriptor::SymbolicResolverDescriptor;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::structs::symbolic_resolver_definition::SymbolicResolverDefinition;
+use squalr_engine_projects::src::project::serialization::project_file_codec::ProjectFileReader;
+use squalr_engine_projects::src::project::serialization::project_file_codec_types::decode_resolver_definition;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_symbol_name_scope::ProjectSymbolNameScope;
+use src::services::projects::project_symbol_resolver_mutation::ProjectSymbolResolverMutation;
+use src::services::projects::project_symbol_resolver_mutation::ResolverMutationResult;
+use src::services::projects::project_symbol_catalog_persistence::ProjectSymbolCatalogPersistence;
+
+// Port of command_executors/project_symbols/upsert_resolver/
+// project_symbols_upsert_resolver_request_executor.rs — build a
+// SymbolicResolverDescriptor from the request (upstream's
+// `to_resolver_descriptor`), upsert it into the catalog, then save + sync.
+// Deviations:
+// - upstream `serde_json::from_str<SymbolicResolverDefinition>` — there is
+//   no JSON substrate; the port decodes the definition bytes with the
+//   persistence leg's bounded codec (`decode_resolver_definition` over
+//   ProjectFileReader::wrap). The wire field stays
+//   `resolver_definition_json`; its payload is the bounded binary framing
+//   rather than JSON text (same deviation family as the project file
+//   codec — documented).
+// - `to_resolver_descriptor` lives engine-side: the api request type
+//   cannot see the codec surface.
+// - the project directory resolves inside save_and_sync (upstream resolved
+//   it early only to pass it through).
+pub data ProjectSymbolsUpsertResolverRequestExecutor {}
+
+pub linux_x86_64 machine ProjectSymbolsUpsertResolverRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbols_upsert_resolver_request: &ProjectSymbolsUpsertResolverRequest
+) -> ProjectSymbolsUpsertResolverResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+    let mut resolver_id: ManifestPathScratch;
+    ManifestPathScratch::new(&mut resolver_id);
+    let inner3080: &[u8] = ProjectSymbolsUpsertResolverRequest::get_resolver_id(project_symbols_upsert_resolver_request);
+    _ = ProjectSymbolNameScope::trim_copy(&mut scope, inner3080, &mut resolver_id);
+    transition resolver_id.len > 0 {
+        true -> decode(engine_unprivileged_state, engine_bindings, project_symbols_upsert_resolver_request, resolver_id)
+        _ -> (fail(project_symbols_upsert_resolver_request, "Resolver id is required."))
+    }
+    state fail(request: &ProjectSymbolsUpsertResolverRequest, message: &[u8]) -> ProjectSymbolsUpsertResolverResponse {
+        let mut response: ProjectSymbolsUpsertResolverResponse = ProjectSymbolsUpsertResolverResponse::new();
+        ProjectSymbolsUpsertResolverResponse::set_resolver_id(&mut response, ProjectSymbolsUpsertResolverRequest::get_resolver_id(request));
+        ProjectSymbolsUpsertResolverResponse::set_error(&mut response, message);
+        (response)
+    }
+    state decode(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_resolver_request: &ProjectSymbolsUpsertResolverRequest, resolver_id: ManifestPathScratch) -> ProjectSymbolsUpsertResolverResponse {
+        let definition_bytes: &[u8] = ProjectSymbolsUpsertResolverRequest::get_resolver_definition_json(project_symbols_upsert_resolver_request);
+        let mut reader: ProjectFileReader = ProjectFileReader::wrap(definition_bytes, definition_bytes.len);
+        let mut resolver_definition: SymbolicResolverDefinition = SymbolicResolverDefinition::default();
+        transition decode_resolver_definition(&mut reader, &mut resolver_definition) {
+            true -> descriptor(engine_unprivileged_state, engine_bindings, project_symbols_upsert_resolver_request, resolver_id, resolver_definition)
+            _ -> (fail(project_symbols_upsert_resolver_request, "Invalid resolver definition."))
+        }
+    }
+    state descriptor(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_resolver_request: &ProjectSymbolsUpsertResolverRequest, resolver_id: ManifestPathScratch, resolver_definition: SymbolicResolverDefinition) -> ProjectSymbolsUpsertResolverResponse {
+        let inner24: &[u8] = ManifestPathScratch::get_bytes(&resolver_id);
+        let resolver_descriptor: SymbolicResolverDescriptor = SymbolicResolverDescriptor::new(inner24, &resolver_definition);
+        transition { _ -> gate(engine_unprivileged_state, engine_bindings, project_symbols_upsert_resolver_request, resolver_descriptor) }
+    }
+    state gate(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_resolver_request: &ProjectSymbolsUpsertResolverRequest, resolver_descriptor: SymbolicResolverDescriptor) -> ProjectSymbolsUpsertResolverResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> mutate(engine_unprivileged_state, engine_bindings, project_symbols_upsert_resolver_request, resolver_descriptor)
+            _ -> (fail(project_symbols_upsert_resolver_request, "Cannot upsert a symbol resolver without an opened project."))
+        }
+    }
+    state mutate(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_resolver_request: &ProjectSymbolsUpsertResolverRequest, resolver_descriptor: SymbolicResolverDescriptor) -> ProjectSymbolsUpsertResolverResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_info: &mut ProjectInfo = Project::borrow_project_info_mut(opened_project);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = ProjectInfo::borrow_project_symbol_catalog_mut(project_info);
+        let has_original: bool = ProjectSymbolsUpsertResolverRequest::has_original_resolver_id(project_symbols_upsert_resolver_request);
+        let mut mutation: ProjectSymbolResolverMutation = ProjectSymbolResolverMutation {};
+        let inner25: &[u8] = ProjectSymbolsUpsertResolverRequest::get_original_resolver_id(project_symbols_upsert_resolver_request);
+        let result: ResolverMutationResult = ProjectSymbolResolverMutation::upsert_resolver_descriptor(&mut mutation, project_symbol_catalog, has_original, inner25, &resolver_descriptor);
+        transition result {
+            ResolverMutationResult::Succeeded -> save(engine_unprivileged_state, engine_bindings, project_symbols_upsert_resolver_request)
+            _ -> (fail(project_symbols_upsert_resolver_request, "Failed to upsert the symbol resolver."))
+        }
+    }
+    state save(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_resolver_request: &ProjectSymbolsUpsertResolverRequest) -> ProjectSymbolsUpsertResolverResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition ProjectSymbolCatalogPersistence::save_and_sync_project_symbol_catalog(engine_bindings, opened_project) {
+            true -> succeed(project_symbols_upsert_resolver_request)
+            _ -> (fail(project_symbols_upsert_resolver_request, "Failed to save and sync project symbol catalog."))
+        }
+    }
+    state succeed(project_symbols_upsert_resolver_request: &ProjectSymbolsUpsertResolverRequest) -> ProjectSymbolsUpsertResolverResponse {
+        let mut response: ProjectSymbolsUpsertResolverResponse = ProjectSymbolsUpsertResolverResponse::new();
+        ProjectSymbolsUpsertResolverResponse::set_success(&mut response, true);
+        ProjectSymbolsUpsertResolverResponse::set_resolver_id(&mut response, ProjectSymbolsUpsertResolverRequest::get_resolver_id(project_symbols_upsert_resolver_request));
+        (response)
+    }
+}

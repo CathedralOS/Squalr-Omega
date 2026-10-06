@@ -1,0 +1,250 @@
+module src::command_executors::project_items_delete_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::delete::project_items_delete_request::ProjectItemsDeleteRequest;
+use squalr_engine_api::src::commands::project_items::delete::project_items_delete_response::ProjectItemsDeleteResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::project_serialization::ProjectLoad;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/delete/
+// project_items_delete_request_executor.rs — resolve each requested path,
+// refuse protected roots (the project dir itself and project_items/), skip
+// missing paths, remove files/dirs (remove_tree covers both — the is_file/
+// is_dir branch is elided since the twin handles either), reload the
+// project, strip sort-order entries, save, notify. Deviation: upstream
+// normalizes `.`/`..` components before the protected-path compare; the
+// port byte-compares the resolved join — a `..`-containing item path
+// dodges the protected check (documented in the file mutation service).
+pub data ProjectItemsDeleteRequestExecutor {}
+
+pub machine ProjectItemsDeleteRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_delete_request: &ProjectItemsDeleteRequest
+) -> ProjectItemsDeleteResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let paths: &ProjectPathList = ProjectItemsDeleteRequest::get_project_item_paths(project_items_delete_request);
+    transition ProjectPathList::get_path_count(paths) == 0 {
+        true -> empty()
+        _ -> opened(engine_unprivileged_state, project_items_delete_request)
+    }
+
+    state empty() -> ProjectItemsDeleteResponse {
+        let mut response: ProjectItemsDeleteResponse = ProjectItemsDeleteResponse::new();
+        ProjectItemsDeleteResponse::set_success(&mut response, true);
+        (response)
+    }
+
+    state opened(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest) -> ProjectItemsDeleteResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> directory(engine_unprivileged_state, project_items_delete_request)
+            _ -> refused()
+        }
+    }
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest) -> ProjectItemsDeleteResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> measure(engine_unprivileged_state, project_items_delete_request, directory)
+            _ -> refused()
+        }
+    }
+    state measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512]) -> ProjectItemsDeleteResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> items(engine_unprivileged_state, project_items_delete_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+
+    state items(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let mut deleted_paths: ProjectPathList = ProjectPathList::empty();
+        transition { _ -> each(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, 0, 0, true) }
+    }
+
+    state each(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let paths: &ProjectPathList = ProjectItemsDeleteRequest::get_project_item_paths(project_items_delete_request);
+        transition position < ProjectPathList::get_path_count(paths) {
+            true -> resolve_item(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success)
+            _ -> reload_gate(engine_unprivileged_state, directory, directory_len, deleted_paths, deleted_count, operation_success)
+        }
+    }
+
+    state resolve_item(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let paths: &ProjectPathList = ProjectItemsDeleteRequest::get_project_item_paths(project_items_delete_request);
+        let item_path: &[u8] = ProjectPathList::get_path(paths, position);
+        let mut resolved: ManifestPathScratch;
+        ManifestPathScratch::new(&mut resolved);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], item_path, &mut resolved) {
+            true -> protected(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success, resolved)
+            _ -> each(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_count, false)
+        }
+    }
+
+    // `is_protected_project_item_path` — resolved equals the project
+    // directory itself or <dir>/project_items.
+    state protected(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool, resolved: ManifestPathScratch) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let mut path_sort: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let resolved_bytes: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        transition ProjectItemSortOrder::paths_equal(path_sort, resolved_bytes, &directory[0..directory_len]) {
+            true -> each(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_count, false)
+            _ -> protected_root(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success, resolved)
+        }
+    }
+    state protected_root(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool, resolved: ManifestPathScratch) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let mut items_root: ManifestPathScratch;
+        ManifestPathScratch::new(&mut items_root);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        transition ProjectItemSortOrder::join_path(path_joiner, &directory[0..directory_len], "project_items", &mut items_root) {
+            true -> root_compare(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success, resolved, items_root)
+            _ -> exists(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success, resolved)
+        }
+    }
+    state root_compare(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool, resolved: ManifestPathScratch, items_root: ManifestPathScratch) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let mut path_sort: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3024: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        let inner3025: &[u8] = ManifestPathScratch::get_bytes(&items_root);
+        transition ProjectItemSortOrder::paths_equal(path_sort, inner3024, inner3025) {
+            true -> each(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_count, false)
+            _ -> exists(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success, resolved)
+        }
+    }
+
+    state exists(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool, resolved: ManifestPathScratch) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let inner3026: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        transition FileSystemUtils::path_exists(inner3026) {
+            true -> remove(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success, resolved)
+            _ -> each(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_count, operation_success)
+        }
+    }
+    state remove(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool, resolved: ManifestPathScratch) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let inner3027: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        transition FileSystemUtils::remove_tree(inner3027) {
+            true -> record(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, position, deleted_count, operation_success, resolved)
+            _ -> each(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, deleted_count, false)
+        }
+    }
+    state record(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_delete_request: &ProjectItemsDeleteRequest, directory: [u8; 512], directory_len: u64, mut deleted_paths: ProjectPathList, position: u64, deleted_count: u64, operation_success: bool, resolved: ManifestPathScratch) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let inner3028: &[u8] = ManifestPathScratch::get_bytes(&resolved);
+        _ = ProjectPathList::add_path(&mut deleted_paths, inner3028);
+        transition { _ -> each(engine_unprivileged_state, project_items_delete_request, directory, directory_len, deleted_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((deleted_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, operation_success) }
+    }
+
+    state reload_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, deleted_paths: ProjectPathList, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        transition deleted_count > 0 {
+            true -> reload_open(engine_unprivileged_state, directory, directory_len, deleted_paths, deleted_count, operation_success)
+            _ -> respond(operation_success, deleted_count)
+        }
+    }
+    state reload_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, deleted_paths: ProjectPathList, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> reload_read(engine_unprivileged_state, dir_fd, directory, directory_len, deleted_paths, deleted_count, operation_success)
+            _ -> respond(false, deleted_count)
+        }
+    }
+    state reload_read(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, deleted_paths: ProjectPathList, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let loaded: ProjectLoad = Project::load_at(dir_fd, &directory[0..directory_len]);
+        _ = FilesystemHost::close(dir_fd);
+        transition loaded {
+            ProjectLoad::Loaded { project } -> sort(engine_unprivileged_state, directory, directory_len, deleted_paths, deleted_count, operation_success, project)
+            _ -> respond(false, deleted_count)
+        }
+    }
+    state sort(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, deleted_paths: ProjectPathList, deleted_count: u64, operation_success: bool, mut project: Project) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::remove_project_item_paths_from_sort_order(&sort_order, &mut project, &directory[0..directory_len], &deleted_paths);
+        transition { _ -> store(engine_unprivileged_state, directory, directory_len, deleted_count, operation_success, project) }
+    }
+    state store(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, deleted_count: u64, operation_success: bool, project: Project) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::set_opened_project(project_manager, &project);
+        transition { _ -> save_open(engine_unprivileged_state, directory, directory_len, deleted_count, operation_success) }
+    }
+    state save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> save_do(engine_unprivileged_state, dir_fd, directory, directory_len, deleted_count, operation_success)
+            _ -> respond(false, deleted_count)
+        }
+    }
+    state save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify_done(engine_unprivileged_state, deleted_count, operation_success)
+            _ -> respond(false, deleted_count)
+        }
+    }
+    state notify_done(engine_unprivileged_state: &mut EngineUnprivilegedState, deleted_count: u64, operation_success: bool) -> ProjectItemsDeleteResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> respond(operation_success, deleted_count) }
+    }
+    state respond(operation_success: bool, deleted_count: u64) -> ProjectItemsDeleteResponse {
+        let mut response: ProjectItemsDeleteResponse = ProjectItemsDeleteResponse::new();
+        ProjectItemsDeleteResponse::set_success(&mut response, operation_success);
+        ProjectItemsDeleteResponse::set_deleted_project_item_count(&mut response, deleted_count);
+        (response)
+    }
+    state refused() -> ProjectItemsDeleteResponse {
+        (ProjectItemsDeleteResponse::new())
+    }
+}

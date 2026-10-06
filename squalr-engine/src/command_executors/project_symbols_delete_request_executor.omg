@@ -1,0 +1,100 @@
+module src::command_executors::project_symbols_delete_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_symbols::delete::project_symbols_delete_request::ProjectSymbolsDeleteRequest;
+use squalr_engine_api::src::commands::project_symbols::delete::project_symbols_delete_response::ProjectSymbolsDeleteResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_string_list::ProjectStringList;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_symbol_catalog_mutation::ProjectSymbolCatalogMutation;
+use src::services::projects::project_symbol_catalog_mutation::ProjectSymbolsDeleteMutationSummary;
+use src::services::projects::project_symbol_catalog_persistence::ProjectSymbolCatalogPersistence;
+
+// Port of command_executors/project_symbols/delete/
+// project_symbols_delete_request_executor.rs — empty request is an
+// early success(0,0,0); else mutate the catalog, skip the save when
+// nothing matched, persist + broadcast otherwise.
+// Deviations:
+// - the `is_empty` fast path checks the bounded list counts (locator keys,
+//   module names, range count) before opening the catalog — same refusal
+//   surface upstream.
+// - the project directory resolves inside save_and_sync (upstream resolved
+//   it early only to pass it through).
+pub data ProjectSymbolsDeleteRequestExecutor {}
+
+pub linux_x86_64 machine ProjectSymbolsDeleteRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbols_delete_request: &ProjectSymbolsDeleteRequest
+) -> ProjectSymbolsDeleteResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let inner3075: &ProjectStringList = ProjectSymbolsDeleteRequest::get_symbol_locator_keys(project_symbols_delete_request);
+    transition ProjectStringList::get_string_count(inner3075) == 0
+        && ProjectStringList::get_string_count(ProjectSymbolsDeleteRequest::get_module_names(project_symbols_delete_request)) == 0
+        && ProjectSymbolsDeleteRequest::get_module_range_count(project_symbols_delete_request) == 0 {
+        true -> empty_success()
+        _ -> gate(engine_unprivileged_state, engine_bindings, project_symbols_delete_request)
+    }
+    state empty_success() -> ProjectSymbolsDeleteResponse {
+        let mut response: ProjectSymbolsDeleteResponse = ProjectSymbolsDeleteResponse::new();
+        ProjectSymbolsDeleteResponse::set_success(&mut response, true);
+        (response)
+    }
+    state gate(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_delete_request: &ProjectSymbolsDeleteRequest) -> ProjectSymbolsDeleteResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> mutate(engine_unprivileged_state, engine_bindings, project_symbols_delete_request)
+            _ -> (refused())
+        }
+    }
+    state refused() -> ProjectSymbolsDeleteResponse {
+        (ProjectSymbolsDeleteResponse::new())
+    }
+    state mutate(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_delete_request: &ProjectSymbolsDeleteRequest) -> ProjectSymbolsDeleteResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_info: &mut ProjectInfo = Project::borrow_project_info_mut(opened_project);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = ProjectInfo::borrow_project_symbol_catalog_mut(project_info);
+        let mut mutation: ProjectSymbolCatalogMutation = ProjectSymbolCatalogMutation {};
+        let summary: ProjectSymbolsDeleteMutationSummary = ProjectSymbolCatalogMutation::delete_project_symbols(&mut mutation, project_symbol_catalog, project_symbols_delete_request);
+        transition ProjectSymbolsDeleteMutationSummary::did_delete_anything(&summary) {
+            true -> save(engine_unprivileged_state, engine_bindings, summary)
+            _ -> (empty_success())
+        }
+    }
+    state save(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, summary: ProjectSymbolsDeleteMutationSummary) -> ProjectSymbolsDeleteResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition ProjectSymbolCatalogPersistence::save_and_sync_project_symbol_catalog(engine_bindings, opened_project) {
+            true -> fill(summary)
+            _ -> fill_failed(summary)
+        }
+    }
+    state fill(summary: ProjectSymbolsDeleteMutationSummary) -> ProjectSymbolsDeleteResponse {
+        let mut response: ProjectSymbolsDeleteResponse = ProjectSymbolsDeleteResponse::new();
+        ProjectSymbolsDeleteResponse::set_success(&mut response, true);
+        ProjectSymbolsDeleteResponse::set_deleted_symbol_count(&mut response, summary.deleted_symbol_count);
+        ProjectSymbolsDeleteResponse::set_deleted_module_count(&mut response, summary.deleted_module_count);
+        ProjectSymbolsDeleteResponse::set_deleted_module_range_count(&mut response, summary.deleted_module_range_count);
+        (response)
+    }
+    state fill_failed(summary: ProjectSymbolsDeleteMutationSummary) -> ProjectSymbolsDeleteResponse {
+        let mut response: ProjectSymbolsDeleteResponse = ProjectSymbolsDeleteResponse::new();
+        ProjectSymbolsDeleteResponse::set_success(&mut response, false);
+        ProjectSymbolsDeleteResponse::set_deleted_symbol_count(&mut response, summary.deleted_symbol_count);
+        ProjectSymbolsDeleteResponse::set_deleted_module_count(&mut response, summary.deleted_module_count);
+        ProjectSymbolsDeleteResponse::set_deleted_module_range_count(&mut response, summary.deleted_module_range_count);
+        (response)
+    }
+}

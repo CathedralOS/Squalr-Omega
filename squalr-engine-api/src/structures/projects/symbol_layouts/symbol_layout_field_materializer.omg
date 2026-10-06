@@ -1,0 +1,380 @@
+module src::structures::projects::symbol_layouts::symbol_layout_field_materializer;
+
+use omega::language::core::option;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use src::structures::structs::symbolic_field_definition::SymbolicFieldOffsetResolution;
+use src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+
+// Port of structures/projects/symbol_layouts/symbol_layout_field_materializer.rs.
+// Positions a set of fields by absolute offset, fills gaps with
+// unassigned fields and rewrites placed offsets to Sequential (struct)
+// or keeps them sorted (union).
+
+pub data SymbolLayoutPositionedField {
+    offset_in_bytes: u64;
+    size_in_bytes: u64;
+    field_definition: SymbolicFieldDefinition;
+}
+
+pub machine SymbolLayoutPositionedField::new(
+    offset_in_bytes: u64,
+    size_in_bytes: u64,
+    field_definition: SymbolicFieldDefinition
+) -> SymbolLayoutPositionedField {
+    SymbolLayoutPositionedField { offset_in_bytes: offset_in_bytes, size_in_bytes: size_in_bytes, field_definition: field_definition }
+}
+
+pub machine SymbolLayoutPositionedField::get_offset_in_bytes(symbol_layout_positioned_field: &SymbolLayoutPositionedField) -> u64 {
+    symbol_layout_positioned_field.offset_in_bytes
+}
+
+pub machine SymbolLayoutPositionedField::get_size_in_bytes(symbol_layout_positioned_field: &SymbolLayoutPositionedField) -> u64 {
+    symbol_layout_positioned_field.size_in_bytes
+}
+
+pub machine SymbolLayoutPositionedField::get_field_definition(symbol_layout_positioned_field: &SymbolLayoutPositionedField) -> &SymbolicFieldDefinition {
+    &symbol_layout_positioned_field.field_definition
+}
+
+// Bounded positioned-field list (upstream Vec).
+pub data SymbolLayoutPositionedFieldList {
+    fields: [SymbolLayoutPositionedField; 64];
+    field_count: u64;
+}
+
+pub machine SymbolLayoutPositionedFieldList::new() -> SymbolLayoutPositionedFieldList {
+    SymbolLayoutPositionedFieldList { field_count: 0 }
+}
+
+pub machine SymbolLayoutPositionedFieldList::get_field_count(symbol_layout_positioned_field_list: &SymbolLayoutPositionedFieldList) -> u64 {
+    symbol_layout_positioned_field_list.field_count
+}
+
+pub machine SymbolLayoutPositionedFieldList::get_field(symbol_layout_positioned_field_list: &SymbolLayoutPositionedFieldList, position: u64) -> &SymbolLayoutPositionedField
+    requires position < symbol_layout_positioned_field_list.field_count && position < 64;
+{
+    &symbol_layout_positioned_field_list.fields[position]
+}
+
+pub machine SymbolLayoutPositionedFieldList::push(symbol_layout_positioned_field_list: &mut SymbolLayoutPositionedFieldList, field: &SymbolLayoutPositionedField) -> bool {
+    transition symbol_layout_positioned_field_list.field_count < 64 {
+        true -> store(symbol_layout_positioned_field_list, field)
+        _ -> (false)
+    }
+    state store(symbol_layout_positioned_field_list: &mut SymbolLayoutPositionedFieldList, field: &SymbolLayoutPositionedField) -> bool
+        requires symbol_layout_positioned_field_list.field_count < 64;
+    {
+        symbol_layout_positioned_field_list.fields[symbol_layout_positioned_field_list.field_count] = SymbolLayoutPositionedField::clone(field);
+        symbol_layout_positioned_field_list.field_count = ((symbol_layout_positioned_field_list.field_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        (true)
+    }
+}
+
+pub machine SymbolLayoutPositionedField::clone(source: &SymbolLayoutPositionedField) -> SymbolLayoutPositionedField {
+    SymbolLayoutPositionedField {
+        offset_in_bytes: source.offset_in_bytes,
+        size_in_bytes: source.size_in_bytes,
+        field_definition: SymbolicFieldDefinition::clone(&source.field_definition),
+    }
+}
+
+// Upstream `Result<Vec<SymbolicFieldDefinition>, String>` carrier.
+pub data MaterializedFieldList {
+    found: bool;
+    fields: [SymbolicFieldDefinition; 64];
+    field_count: u64;
+}
+
+pub machine MaterializedFieldList::get_field_count(materialized_field_list: &MaterializedFieldList) -> u64 {
+    materialized_field_list.field_count
+}
+
+pub machine MaterializedFieldList::get_field(materialized_field_list: &MaterializedFieldList, position: u64) -> &SymbolicFieldDefinition
+    requires position < materialized_field_list.field_count && position < 64;
+{
+    &materialized_field_list.fields[position]
+}
+
+// Whole-list slice for `new_with_layout_kind`-style consumers.
+pub machine MaterializedFieldList::get_fields(materialized_field_list: &MaterializedFieldList) -> &[SymbolicFieldDefinition]
+    requires materialized_field_list.field_count <= 64;
+{
+    &materialized_field_list.fields[0..materialized_field_list.field_count]
+}
+
+pub data SymbolLayoutFieldMaterializer {}
+
+// Upstream `materialize_positioned_fields` — union: sort only; struct:
+// sort + gap-fill + Sequential rewrite + declared tail fill.
+pub machine SymbolLayoutFieldMaterializer::materialize_positioned_fields(
+    layout_kind: SymbolicLayoutKind,
+    has_declared_size: bool,
+    declared_size_in_bytes: u64,
+    positioned_fields: &mut SymbolLayoutPositionedFieldList
+) -> MaterializedFieldList {
+    SymbolLayoutFieldMaterializer::sort_positioned_fields(positioned_fields);
+    let mut materialized: MaterializedFieldList = MaterializedFieldList { found: true, field_count: 0 };
+    transition SymbolicLayoutKind::is_union(&layout_kind) {
+        true -> union_each(positioned_fields, &mut materialized, 0)
+        _ -> struct_each(positioned_fields, &mut materialized, has_declared_size, declared_size_in_bytes, 0, 0)
+    }
+    state union_each(positioned_fields: &SymbolLayoutPositionedFieldList, materialized: &mut MaterializedFieldList, position: u64) -> MaterializedFieldList {
+        transition position < positioned_fields.field_count && position < 64 && materialized.field_count < 64 {
+            true -> union_field(positioned_fields, materialized, position)
+            _ -> finish(materialized)
+        }
+    }
+    state union_field(positioned_fields: &SymbolLayoutPositionedFieldList, materialized: &mut MaterializedFieldList, position: u64) -> MaterializedFieldList
+        requires position < positioned_fields.field_count && position < 64 && materialized.field_count < 64;
+    {
+        let field_definition: &SymbolicFieldDefinition = SymbolLayoutPositionedField::get_field_definition(&positioned_fields.fields[position]);
+        materialized.fields[materialized.field_count] = SymbolicFieldDefinition::clone(field_definition);
+        materialized.field_count = ((materialized.field_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> union_each(positioned_fields, materialized, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state struct_each(
+        positioned_fields: &SymbolLayoutPositionedFieldList,
+        materialized: &mut MaterializedFieldList,
+        has_declared_size: bool,
+        declared_size_in_bytes: u64,
+        position: u64,
+        next_sequential_offset: u64
+    ) -> MaterializedFieldList {
+        transition position < positioned_fields.field_count && position < 64 {
+            true -> struct_place(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, position, next_sequential_offset)
+            _ -> struct_tail(materialized, has_declared_size, declared_size_in_bytes, next_sequential_offset)
+        }
+    }
+    state struct_place(
+        positioned_fields: &SymbolLayoutPositionedFieldList,
+        materialized: &mut MaterializedFieldList,
+        has_declared_size: bool,
+        declared_size_in_bytes: u64,
+        position: u64,
+        next_sequential_offset: u64
+    ) -> MaterializedFieldList
+        requires position < positioned_fields.field_count && position < 64;
+    {
+        let offset: u64 = positioned_fields.fields[position].offset_in_bytes;
+        transition offset < next_sequential_offset {
+            true -> overlap(materialized)
+            _ -> struct_gap(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, position, next_sequential_offset, offset)
+        }
+    }
+    state overlap(materialized: &mut MaterializedFieldList) -> MaterializedFieldList {
+        materialized.found = false;
+        transition { _ -> finish(materialized) }
+    }
+    state struct_gap(
+        positioned_fields: &SymbolLayoutPositionedFieldList,
+        materialized: &mut MaterializedFieldList,
+        has_declared_size: bool,
+        declared_size_in_bytes: u64,
+        position: u64,
+        next_sequential_offset: u64,
+        offset: u64
+    ) -> MaterializedFieldList
+        requires position < positioned_fields.field_count && position < 64;
+    {
+        transition offset > next_sequential_offset && materialized.field_count < 64 {
+            true -> struct_fill_gap(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, position, next_sequential_offset, offset)
+            _ -> push_gate(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, position, next_sequential_offset, offset)
+        }
+    }
+    state push_gate(
+        positioned_fields: &SymbolLayoutPositionedFieldList,
+        materialized: &mut MaterializedFieldList,
+        has_declared_size: bool,
+        declared_size_in_bytes: u64,
+        position: u64,
+        next_sequential_offset: u64,
+        offset: u64
+    ) -> MaterializedFieldList {
+        transition position < positioned_fields.field_count && position < 64 {
+            true -> struct_push(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, position, next_sequential_offset, offset)
+            _ -> struct_tail(materialized, has_declared_size, declared_size_in_bytes, next_sequential_offset)
+        }
+    }
+    state struct_fill_gap(
+        positioned_fields: &SymbolLayoutPositionedFieldList,
+        materialized: &mut MaterializedFieldList,
+        has_declared_size: bool,
+        declared_size_in_bytes: u64,
+        position: u64,
+        next_sequential_offset: u64,
+        offset: u64
+    ) -> MaterializedFieldList
+        requires position < positioned_fields.field_count && position < 64 && materialized.field_count < 64;
+    {
+        materialized.fields[materialized.field_count] = SymbolicFieldDefinition::new_unassigned(
+            ((offset as u64 in Saturating) - (next_sequential_offset as u64 in Saturating)) as u64);
+        materialized.field_count = ((materialized.field_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> push_gate(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, position, next_sequential_offset, offset) }
+    }
+    state struct_push(
+        positioned_fields: &SymbolLayoutPositionedFieldList,
+        materialized: &mut MaterializedFieldList,
+        has_declared_size: bool,
+        declared_size_in_bytes: u64,
+        position: u64,
+        next_sequential_offset: u64,
+        offset: u64
+    ) -> MaterializedFieldList
+        requires position < positioned_fields.field_count && position < 64;
+    {
+        transition materialized.field_count < 64 {
+            true -> struct_store(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, position, next_sequential_offset, offset)
+            _ -> struct_tail(materialized, has_declared_size, declared_size_in_bytes, next_sequential_offset)
+        }
+    }
+    state struct_store(
+        positioned_fields: &SymbolLayoutPositionedFieldList,
+        materialized: &mut MaterializedFieldList,
+        has_declared_size: bool,
+        declared_size_in_bytes: u64,
+        position: u64,
+        next_sequential_offset: u64,
+        offset: u64
+    ) -> MaterializedFieldList
+        requires position < positioned_fields.field_count && position < 64 && materialized.field_count < 64;
+    {
+        let field_definition: SymbolicFieldDefinition = SymbolicFieldDefinition::clone(
+            SymbolLayoutPositionedField::get_field_definition(&positioned_fields.fields[position]));
+        materialized.fields[materialized.field_count] = SymbolicFieldDefinition::with_offset_resolution(
+            field_definition,
+            SymbolicFieldOffsetResolution::Sequential);
+        materialized.field_count = ((materialized.field_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let next_offset: u64 = ((offset as u64 in Saturating) + (positioned_fields.fields[position].size_in_bytes as u64 in Saturating)) as u64;
+        transition { _ -> struct_each(positioned_fields, materialized, has_declared_size, declared_size_in_bytes, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next_offset) }
+    }
+    state struct_tail(materialized: &mut MaterializedFieldList, has_declared_size: bool, declared_size_in_bytes: u64, next_sequential_offset: u64) -> MaterializedFieldList {
+        transition has_declared_size && declared_size_in_bytes > next_sequential_offset && materialized.field_count < 64 {
+            true -> tail_fill(materialized, declared_size_in_bytes, next_sequential_offset)
+            _ -> finish(materialized)
+        }
+    }
+    state tail_fill(materialized: &mut MaterializedFieldList, declared_size_in_bytes: u64, next_sequential_offset: u64) -> MaterializedFieldList
+        requires materialized.field_count < 64 && declared_size_in_bytes > next_sequential_offset;
+    {
+        materialized.fields[materialized.field_count] = SymbolicFieldDefinition::new_unassigned(
+            ((declared_size_in_bytes as u64 in Saturating) - (next_sequential_offset as u64 in Saturating)) as u64);
+        materialized.field_count = ((materialized.field_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> finish(materialized) }
+    }
+    state finish(materialized: &MaterializedFieldList) -> MaterializedFieldList {
+        let mut copy: MaterializedFieldList = MaterializedFieldList {
+            found: materialized.found,
+            field_count: materialized.field_count,
+        };
+        transition { _ -> emit(materialized, copy, 0) }
+    }
+    state emit(materialized: &MaterializedFieldList, copy: MaterializedFieldList, position: u64) -> MaterializedFieldList {
+        transition position < materialized.field_count && position < 64 {
+            true -> emit_field(materialized, copy, position)
+            _ -> (copy)
+        }
+    }
+    state emit_field(materialized: &MaterializedFieldList, copy: MaterializedFieldList, position: u64) -> MaterializedFieldList
+        requires position < materialized.field_count && position < 64;
+    {
+        let mut carried: MaterializedFieldList = copy;
+        carried.fields[position] = SymbolicFieldDefinition::clone(&materialized.fields[position]);
+        transition { _ -> emit(materialized, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Insertion sort by (offset_in_bytes, field_name) — upstream sort_by.
+pub machine SymbolLayoutFieldMaterializer::sort_positioned_fields(positioned_fields: &mut SymbolLayoutPositionedFieldList) {
+    transition { _ -> outer(positioned_fields, 1) }
+    state outer(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64) {
+        transition cursor < positioned_fields.field_count && cursor < 64 {
+            true -> inner(positioned_fields, cursor, cursor)
+            _ -> done()
+        }
+    }
+    state inner(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64, position: u64)
+        requires position < 64;
+    {
+        transition position > 0 {
+            true -> compare(positioned_fields, cursor, position)
+            _ -> outer(positioned_fields, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state compare(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64, position: u64)
+        requires position > 0 && position < 64;
+    {
+        let before: u64 = ((position as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition { _ -> before_gate(positioned_fields, cursor, position, before) }
+    }
+    state before_gate(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64, position: u64, before: u64) {
+        transition before < 64 && before < positioned_fields.field_count && position < positioned_fields.field_count {
+            true -> swap_check(positioned_fields, cursor, position, before)
+            _ -> outer(positioned_fields, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state swap_check(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64, position: u64, before: u64)
+        requires before < positioned_fields.field_count && position < positioned_fields.field_count && before < 64;
+    {
+        let left_offset: u64 = positioned_fields.fields[before].offset_in_bytes;
+        let right_offset: u64 = positioned_fields.fields[position].offset_in_bytes;
+        transition right_offset < left_offset {
+            true -> swap(positioned_fields, cursor, position, before)
+            _ -> names(positioned_fields, cursor, position, before)
+        }
+    }
+    state names(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64, position: u64, before: u64)
+        requires before < positioned_fields.field_count && position < positioned_fields.field_count && before < 64;
+    {
+        let left_offset: u64 = positioned_fields.fields[before].offset_in_bytes;
+        let right_offset: u64 = positioned_fields.fields[position].offset_in_bytes;
+        transition right_offset == left_offset {
+            true -> name_less(positioned_fields, cursor, position, before)
+            _ -> outer(positioned_fields, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state name_less(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64, position: u64, before: u64)
+        requires before < positioned_fields.field_count && position < positioned_fields.field_count && before < 64;
+    {
+        let left_name: &[u8] = SymbolicFieldDefinition::get_field_name(&positioned_fields.fields[before].field_definition);
+        let right_name: &[u8] = SymbolicFieldDefinition::get_field_name(&positioned_fields.fields[position].field_definition);
+        transition materializer_bytes_less(right_name, left_name) {
+            true -> swap(positioned_fields, cursor, position, before)
+            _ -> outer(positioned_fields, ((cursor as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state swap(positioned_fields: &mut SymbolLayoutPositionedFieldList, cursor: u64, position: u64, before: u64)
+        requires before < positioned_fields.field_count && position < positioned_fields.field_count && before < 64;
+    {
+        let temp: SymbolLayoutPositionedField = SymbolLayoutPositionedField::clone(&positioned_fields.fields[before]);
+        positioned_fields.fields[before] = SymbolLayoutPositionedField::clone(&positioned_fields.fields[position]);
+        positioned_fields.fields[position] = temp;
+        transition { _ -> inner(positioned_fields, cursor, before) }
+    }
+    state done() { }
+}
+
+machine materializer_bytes_less(a: &[u8], b: &[u8]) -> bool {
+    transition { _ -> each(a, b, 0) }
+    state each(a: &[u8], b: &[u8], position: u64) -> bool {
+        transition position < a.len && position < b.len {
+            true -> compare(a, b, position)
+            _ -> (position < b.len && !(position < a.len))
+        }
+    }
+    state compare(a: &[u8], b: &[u8], position: u64) -> bool
+        requires position < a.len && position < b.len;
+    {
+        transition a[position] < b[position] {
+            true -> (true)
+            _ -> decide(a, b, position)
+        }
+    }
+    state decide(a: &[u8], b: &[u8], position: u64) -> bool
+        requires position < a.len && position < b.len;
+    {
+        transition a[position] > b[position] {
+            true -> (false)
+            _ -> each(a, b, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+}

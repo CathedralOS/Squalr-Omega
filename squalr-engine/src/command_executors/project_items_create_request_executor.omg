@@ -1,0 +1,397 @@
+module src::command_executors::project_items_create_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::create::project_items_create_request::ProjectItemsCreateRequest;
+use squalr_engine_api::src::commands::project_items::create::project_items_create_response::ProjectItemsCreateResponse;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::ProjectItemTypeAddress;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::ProjectItemAddressTarget;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::project_serialization::ProjectLoad;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::PointerChainSymbol;
+use squalr_engine_api::src::structures::structs::owned_symbolic_pointer_chain::OwnedSymbolicPointerChain;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/create/
+// project_items_create_request_executor.rs — directory items mkdir +
+// reload + sort-order append; address items sanitize the stem, mint a
+// unique file path, build the ProjectItemTypeAddress item (address target
+// when pointer offsets are supplied, symbolic-struct reference =
+// data_type_id or "u8", freeze interpreter when preview text given),
+// insert the pair, write the placeholder file, append, save, notify.
+pub data ProjectItemsCreateRequestExecutor {}
+
+pub machine ProjectItemsCreateRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_create_request: &ProjectItemsCreateRequest
+) -> ProjectItemsCreateResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition ProjectItemsCreateRequest::get_is_directory(project_items_create_request) {
+        true -> dir_opened(engine_unprivileged_state, project_items_create_request)
+        _ -> addr_opened(engine_unprivileged_state, project_items_create_request)
+    }
+
+    // ---- Directory item -------------------------------------------------
+    state dir_opened(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest) -> ProjectItemsCreateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> dir_directory(engine_unprivileged_state, project_items_create_request)
+            _ -> refused()
+        }
+    }
+    state dir_directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest) -> ProjectItemsCreateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> dir_measure(engine_unprivileged_state, project_items_create_request, directory)
+            _ -> refused()
+        }
+    }
+    state dir_measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512]) -> ProjectItemsCreateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> dir_parent(engine_unprivileged_state, project_items_create_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+    state dir_parent(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let mut parent: ManifestPathScratch;
+        ManifestPathScratch::new(&mut parent);
+        let parent_path: &[u8] = ProjectItemsCreateRequest::get_parent_directory_path(project_items_create_request);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], parent_path, &mut parent) {
+            true -> dir_join(engine_unprivileged_state, project_items_create_request, directory, directory_len, parent)
+            _ -> refused()
+        }
+    }
+    state dir_join(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, parent: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let mut created: ManifestPathScratch;
+        ManifestPathScratch::new(&mut created);
+        let item_name: &[u8] = ProjectItemsCreateRequest::get_project_item_name(project_items_create_request);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3017: &[u8] = ManifestPathScratch::get_bytes(&parent);
+        transition ProjectItemSortOrder::join_path(path_joiner, inner3017, item_name, &mut created) {
+            true -> dir_mkdir(engine_unprivileged_state, project_items_create_request, directory, directory_len, created)
+            _ -> refused()
+        }
+    }
+    state dir_mkdir(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let inner3018: &[u8] = ManifestPathScratch::get_bytes(&created);
+        transition FileSystemUtils::create_dir_all_path(inner3018) {
+            true -> dir_reload_open(engine_unprivileged_state, directory, directory_len, created)
+            _ -> refused()
+        }
+    }
+    state dir_reload_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> dir_reload_read(engine_unprivileged_state, dir_fd, directory, directory_len, created)
+            _ -> refused()
+        }
+    }
+    state dir_reload_read(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let loaded: ProjectLoad = Project::load_at(dir_fd, &directory[0..directory_len]);
+        _ = FilesystemHost::close(dir_fd);
+        transition loaded {
+            ProjectLoad::Loaded { project } -> dir_sort(engine_unprivileged_state, directory, directory_len, created, project)
+            _ -> refused()
+        }
+    }
+    state dir_sort(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project: Project) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let mut appended: ProjectPathList = ProjectPathList::empty();
+        let inner3019: &[u8] = ManifestPathScratch::get_bytes(&created);
+        _ = ProjectPathList::add_path(&mut appended, inner3019);
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::append_project_item_paths_to_sort_order(&sort_order, &mut project, &directory[0..directory_len], &appended);
+        transition { _ -> dir_store(engine_unprivileged_state, directory, directory_len, created, project) }
+    }
+    state dir_store(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, project: Project) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::set_opened_project(project_manager, &project);
+        transition { _ -> dir_save_open(engine_unprivileged_state, directory, directory_len, created) }
+    }
+    state dir_save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> dir_save_do(engine_unprivileged_state, dir_fd, directory, directory_len, created)
+            _ -> refused()
+        }
+    }
+    state dir_save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> dir_notify(engine_unprivileged_state, created)
+            _ -> refused()
+        }
+    }
+    state dir_notify(engine_unprivileged_state: &mut EngineUnprivilegedState, created: ManifestPathScratch) -> ProjectItemsCreateResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> succeed(created) }
+    }
+    state succeed(created: ManifestPathScratch) -> ProjectItemsCreateResponse {
+        let mut response: ProjectItemsCreateResponse = ProjectItemsCreateResponse::new();
+        ProjectItemsCreateResponse::set_success(&mut response, true);
+        ProjectItemsCreateResponse::set_created_project_item_path(&mut response, ManifestPathScratch::get_bytes(&created));
+        (response)
+    }
+    state refused() -> ProjectItemsCreateResponse {
+        (ProjectItemsCreateResponse::new())
+    }
+
+    // ---- Address item ---------------------------------------------------
+    state addr_opened(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest) -> ProjectItemsCreateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> addr_directory(engine_unprivileged_state, project_items_create_request)
+            _ -> refused()
+        }
+    }
+    state addr_directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest) -> ProjectItemsCreateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> addr_measure(engine_unprivileged_state, project_items_create_request, directory)
+            _ -> refused()
+        }
+    }
+    state addr_measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512]) -> ProjectItemsCreateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> addr_parent(engine_unprivileged_state, project_items_create_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+    // `resolve_project_file_parent_directory_path` clamps to the items root.
+    state addr_parent(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let mut parent: ManifestPathScratch;
+        ManifestPathScratch::new(&mut parent);
+        let parent_path: &[u8] = ProjectItemsCreateRequest::get_parent_directory_path(project_items_create_request);
+        transition ProjectItemFileMutation::resolve_project_file_parent_directory_path(&directory[0..directory_len], parent_path, &mut parent) {
+            true -> addr_stem(engine_unprivileged_state, project_items_create_request, directory, directory_len, parent)
+            _ -> refused()
+        }
+    }
+    state addr_stem(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, parent: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let mut stem: ManifestPathScratch;
+        ManifestPathScratch::new(&mut stem);
+        let item_name: &[u8] = ProjectItemsCreateRequest::get_project_item_name(project_items_create_request);
+        transition ProjectItemFileMutation::sanitize_file_name_component(item_name, "project_item", &mut stem) {
+            true -> addr_unique(engine_unprivileged_state, project_items_create_request, directory, directory_len, parent, stem)
+            _ -> refused()
+        }
+    }
+    state addr_unique(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, parent: ManifestPathScratch, stem: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let mut created: ManifestPathScratch;
+        ManifestPathScratch::new(&mut created);
+        let inner3020: &[u8] = ManifestPathScratch::get_bytes(&parent);
+        let inner3021: &[u8] = ManifestPathScratch::get_bytes(&stem);
+        transition ProjectItemFileMutation::generate_unique_project_item_file_path(inner3020, opened_project, inner3021, &mut created) {
+            true -> addr_build(engine_unprivileged_state, project_items_create_request, directory, directory_len, created)
+            _ -> refused()
+        }
+    }
+    // `ProjectItemTypeAddress::new_project_item` + optional address
+    // target / preview interpreter; symbolic-struct reference is the
+    // requested data_type_id ("u8" when absent or blank).
+    state addr_build(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let data_type_ref: DataTypeRef = DataTypeRef::new("u8");
+        let zero_bytes: [u8; 1];
+        zero_bytes[0] = 0;
+        let freeze_value: DataValue = DataValue::new(&data_type_ref, &zero_bytes[0..1]);
+        let item_name: &[u8] = ProjectItemsCreateRequest::get_project_item_name(project_items_create_request);
+        let address: u64 = ProjectItemsCreateRequest::get_address(project_items_create_request);
+        let module_name: &[u8] = ProjectItemsCreateRequest::get_module_name(project_items_create_request);
+        let mut project_item: ProjectItem = ProjectItemTypeAddress::new_project_item(item_name, address, module_name, "", freeze_value);
+        transition { _ -> addr_target(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, module_name) }
+    }
+    state addr_target(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem, module_name: &[u8]) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        transition ProjectItemsCreateRequest::get_pointer_offset_count(project_items_create_request) > 0 {
+            true -> addr_target_set(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, module_name)
+            _ -> addr_dtid(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item)
+        }
+    }
+    state addr_target_set(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem, module_name: &[u8]) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let mut pointer_chain: OwnedSymbolicPointerChain = OwnedSymbolicPointerChain::new(module_name, PointerScanPointerSize::Pointer64);
+        transition { _ -> addr_links(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, pointer_chain, 0) }
+    }
+    state addr_links(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem, mut pointer_chain: OwnedSymbolicPointerChain, link_position: u64) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let count: u64 = ProjectItemsCreateRequest::get_pointer_offset_count(project_items_create_request);
+        transition link_position < count && link_position < 16 {
+            true -> addr_link_kind(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, pointer_chain, link_position)
+            _ -> addr_target_apply(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, pointer_chain)
+        }
+    }
+    // The request element accessor returns `&SymbolicPointerChainLink`;
+    // [copy] payloads re-wrap through the union transition.
+    state addr_link_kind(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem, mut pointer_chain: OwnedSymbolicPointerChain, link_position: u64) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let link: &SymbolicPointerChainLink = ProjectItemsCreateRequest::get_pointer_offset(project_items_create_request, link_position);
+        transition link {
+            SymbolicPointerChainLink::Offset { offset } -> addr_link_offset(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, pointer_chain, link_position, offset)
+            SymbolicPointerChainLink::Symbol { symbol } -> addr_link_symbol(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, pointer_chain, link_position, symbol)
+            _ -> refused()
+        }
+    }
+    state addr_link_offset(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem, mut pointer_chain: OwnedSymbolicPointerChain, link_position: u64, offset: i64) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        _ = OwnedSymbolicPointerChain::add_link(&mut pointer_chain, SymbolicPointerChainLink::Offset { offset: offset });
+        transition { _ -> addr_links(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, pointer_chain, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state addr_link_symbol(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem, mut pointer_chain: OwnedSymbolicPointerChain, link_position: u64, symbol: PointerChainSymbol) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        _ = OwnedSymbolicPointerChain::add_link(&mut pointer_chain, SymbolicPointerChainLink::Symbol { symbol: symbol });
+        transition { _ -> addr_links(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item, pointer_chain, ((link_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state addr_target_apply(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem, pointer_chain: OwnedSymbolicPointerChain) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let address_target: ProjectItemAddressTarget = ProjectItemAddressTarget { pointer_chain: pointer_chain };
+        ProjectItemTypeAddress::set_address_target(&mut project_item, &address_target);
+        transition { _ -> addr_dtid(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item) }
+    }
+    // `data_type_id.unwrap_or("u8")` — empty/whitespace folds to "u8" too
+    // (upstream trims then filters empty).
+    state addr_dtid(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        transition ProjectItemsCreateRequest::has_data_type_id(project_items_create_request) && ProjectItemsCreateRequest::get_data_type_id(project_items_create_request).len > 0 {
+            true -> addr_dtid_set(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item)
+            _ -> addr_dtid_default(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item)
+        }
+    }
+    state addr_dtid_set(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let data_type_id: &[u8] = ProjectItemsCreateRequest::get_data_type_id(project_items_create_request);
+        ProjectItemTypeAddress::set_field_symbolic_struct_definition_reference(&mut project_item, data_type_id);
+        transition { _ -> addr_preview(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item) }
+    }
+    state addr_dtid_default(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        ProjectItemTypeAddress::set_field_symbolic_struct_definition_reference(&mut project_item, "u8");
+        transition { _ -> addr_preview(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item) }
+    }
+    state addr_preview(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        transition ProjectItemsCreateRequest::has_initial_preview_value(project_items_create_request) && ProjectItemsCreateRequest::get_initial_preview_value(project_items_create_request).len > 0 {
+            true -> addr_preview_set(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item)
+            _ -> addr_insert(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item)
+        }
+    }
+    state addr_preview_set(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, mut project_item: ProjectItem) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let preview: &[u8] = ProjectItemsCreateRequest::get_initial_preview_value(project_items_create_request);
+        ProjectItemTypeAddress::set_field_freeze_data_value_interpreter(&mut project_item, preview);
+        transition { _ -> addr_insert(engine_unprivileged_state, project_items_create_request, directory, directory_len, created, project_item) }
+    }
+    state addr_insert(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch, project_item: ProjectItem) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let inner40: &[u8] = ManifestPathScratch::get_bytes(&created);
+        let project_item_ref: ProjectItemRef = ProjectItemRef::new(inner40);
+        let pair: ProjectItemPair = ProjectItemPair::new(project_item_ref, project_item);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition Project::insert_project_item(opened_project, &pair) {
+            true -> addr_placeholder(engine_unprivileged_state, project_items_create_request, directory, directory_len, created)
+            _ -> refused()
+        }
+    }
+    state addr_placeholder(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_create_request: &ProjectItemsCreateRequest, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let inner3022: &[u8] = ManifestPathScratch::get_bytes(&created);
+        transition ProjectItemFileMutation::create_placeholder_file(inner3022) {
+            true -> addr_append(engine_unprivileged_state, directory, directory_len, created)
+            _ -> refused()
+        }
+    }
+    state addr_append(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, created: ManifestPathScratch) -> ProjectItemsCreateResponse
+        requires directory_len <= 512;
+    {
+        let mut appended: ProjectPathList = ProjectPathList::empty();
+        let inner3023: &[u8] = ManifestPathScratch::get_bytes(&created);
+        _ = ProjectPathList::add_path(&mut appended, inner3023);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::append_project_item_paths_to_sort_order(&sort_order, opened_project, &directory[0..directory_len], &appended);
+        transition { _ -> dir_save_open(engine_unprivileged_state, directory, directory_len, created) }
+    }
+}

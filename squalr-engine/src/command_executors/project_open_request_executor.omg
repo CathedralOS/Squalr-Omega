@@ -1,0 +1,170 @@
+module src::command_executors::project_open_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project::open::project_open_request::ProjectOpenRequest;
+use squalr_engine_api::src::commands::project::open::project_open_response::ProjectOpenResponse;
+use squalr_engine_api::src::plugins::plugin_configuration::PluginConfiguration;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::project_serialization::ProjectLoad;
+use squalr_engine_projects::src::settings::project_settings_config::ProjectSettingsConfig;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_plugin_sync::ProjectPluginSync;
+use src::services::projects::project_symbol_sync::ProjectSymbolSync;
+
+// Port of command_executors/project/open/project_open_request_executor.rs —
+// path selection (explicit > projects_root + name; the `open_file_browser`
+// arm is a GUI file dialog upstream — headless-first port refuses it,
+// documented deviation), then load via the dirfd twin `Project::load_at`,
+// store as the opened project, apply plugin configuration + sync the
+// symbol catalog (a failed sync clears the open, matching upstream's
+// failure arm), then watch + notify.
+pub data ProjectOpenRequestExecutor {}
+
+pub machine ProjectOpenRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_open_request: &ProjectOpenRequest
+) -> ProjectOpenResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition ProjectOpenRequest::get_open_file_browser(project_open_request) {
+        true -> refused()
+        _ -> path_select(engine_unprivileged_state, engine_bindings, project_open_request)
+    }
+
+    state path_select(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_open_request: &ProjectOpenRequest) -> ProjectOpenResponse {
+        transition ProjectOpenRequest::has_project_directory_path(project_open_request) {
+            true -> explicit(engine_unprivileged_state, engine_bindings, project_open_request)
+            _ -> join(engine_unprivileged_state, engine_bindings, project_open_request)
+        }
+    }
+
+    state explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_open_request: &ProjectOpenRequest) -> ProjectOpenResponse {
+        let path: &[u8] = ProjectOpenRequest::get_project_directory_path(project_open_request);
+        let mut chosen: [u8; 512];
+        let chosen_len: u64 = path.len;
+        transition chosen_len > 0 && chosen_len <= 512 {
+            true -> copy_explicit(engine_unprivileged_state, engine_bindings, path, chosen, chosen_len, 0)
+            _ -> refused()
+        }
+    }
+    state copy_explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, path: &[u8], mut chosen: [u8; 512], chosen_len: u64, position: u64) -> ProjectOpenResponse
+        requires chosen_len <= 512;
+    {
+        transition position < path.len && position < 512 {
+            true -> write_explicit(engine_unprivileged_state, engine_bindings, path, chosen, chosen_len, position)
+            _ -> load(engine_unprivileged_state, engine_bindings, chosen, chosen_len)
+        }
+    }
+    state write_explicit(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, path: &[u8], mut chosen: [u8; 512], chosen_len: u64, position: u64) -> ProjectOpenResponse
+        requires chosen_len <= 512 && position < path.len && position < 512;
+    {
+        chosen[position] = path[position];
+        transition { _ -> copy_explicit(engine_unprivileged_state, engine_bindings, path, chosen, chosen_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // Upstream `ProjectSettingsConfig::get_projects_root().join(name)` —
+    // empty name still joins (root alone); the loader fails closed when it
+    // cannot open the directory.
+    state join(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_open_request: &ProjectOpenRequest) -> ProjectOpenResponse {
+        let mut chosen: [u8; 512];
+        _ = EngineUnprivilegedState::get_or_init_project_settings_config(engine_unprivileged_state);
+        let settings_config: &ProjectSettingsConfig = EngineUnprivilegedState::get_project_settings_config(engine_unprivileged_state);
+        let projects_root: &[u8] = ProjectSettingsConfig::get_projects_root(settings_config);
+        let project_name: &[u8] = ProjectOpenRequest::get_project_name(project_open_request);
+        let chosen_len: u64 = FileSystemUtils::join_path(projects_root, project_name, &mut chosen);
+        transition chosen_len > 0 && chosen_len <= 512 {
+            true -> load(engine_unprivileged_state, engine_bindings, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    state load(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, chosen: [u8; 512], chosen_len: u64) -> ProjectOpenResponse
+        requires chosen_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&chosen[0..chosen_len], 0);
+        transition dir_fd >= 0 {
+            true -> read(engine_unprivileged_state, engine_bindings, dir_fd, chosen, chosen_len)
+            _ -> refused()
+        }
+    }
+
+    state read(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, dir_fd: i32, chosen: [u8; 512], chosen_len: u64) -> ProjectOpenResponse
+        requires chosen_len <= 512;
+    {
+        let loaded: ProjectLoad = Project::load_at(dir_fd, &chosen[0..chosen_len]);
+        _ = FilesystemHost::close(dir_fd);
+        transition loaded {
+            ProjectLoad::Loaded { project } -> store(engine_unprivileged_state, engine_bindings, chosen, chosen_len, project)
+            _ -> refused()
+        }
+    }
+
+    state store(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, chosen: [u8; 512], chosen_len: u64, mut project: Project) -> ProjectOpenResponse
+        requires chosen_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::set_opened_project(project_manager, &project);
+        transition { _ -> sync(engine_unprivileged_state, engine_bindings, chosen, chosen_len, project) }
+    }
+
+    // Upstream `apply_project_plugin_configuration(...) &&
+    // sync_project_symbol_catalog(...)` — either failing clears the open.
+    state sync(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, chosen: [u8; 512], chosen_len: u64, project: Project) -> ProjectOpenResponse
+        requires chosen_len <= 512;
+    {
+        let project_info: &ProjectInfo = Project::get_project_info(&project);
+        let has_plugin_configuration: bool = ProjectInfo::has_plugin_configuration(project_info);
+        let plugin_configuration: &PluginConfiguration = ProjectInfo::get_plugin_configuration(project_info);
+        transition ProjectPluginSync::apply_project_plugin_configuration(engine_bindings, has_plugin_configuration, plugin_configuration) {
+            true -> sync_symbols(engine_unprivileged_state, engine_bindings, chosen, chosen_len, project)
+            _ -> rollback(engine_unprivileged_state)
+        }
+    }
+
+    state sync_symbols(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, chosen: [u8; 512], chosen_len: u64, project: Project) -> ProjectOpenResponse
+        requires chosen_len <= 512;
+    {
+        let project_info: &ProjectInfo = Project::get_project_info(&project);
+        let catalog: &ProjectSymbolCatalog = ProjectInfo::get_project_symbol_catalog(project_info);
+        transition ProjectSymbolSync::sync_project_symbol_catalog(engine_bindings, catalog) {
+            true -> watch(engine_unprivileged_state, chosen, chosen_len)
+            _ -> rollback(engine_unprivileged_state)
+        }
+    }
+
+    // Upstream `watch_opened_project(opened_project_directory_path)` +
+    // `notify_project_items_changed`.
+    state watch(engine_unprivileged_state: &mut EngineUnprivilegedState, chosen: [u8; 512], chosen_len: u64) -> ProjectOpenResponse
+        requires chosen_len <= 512;
+    {
+        EngineUnprivilegedState::watch_opened_project(engine_unprivileged_state, &chosen[0..chosen_len], true);
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        let mut response: ProjectOpenResponse = ProjectOpenResponse::new();
+        ProjectOpenResponse::set_success(&mut response, true);
+        (response)
+    }
+
+    // Upstream's failure arm clears the just-stored opened project.
+    state rollback(engine_unprivileged_state: &mut EngineUnprivilegedState) -> ProjectOpenResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::clear_opened_project(project_manager);
+        (ProjectOpenResponse::new())
+    }
+
+    state refused() -> ProjectOpenResponse {
+        (ProjectOpenResponse::new())
+    }
+}

@@ -1,0 +1,118 @@
+// Port of squalr-engine/src/services/projects/project_symbol_catalog_persistence.rs.
+//
+// Save-then-sync: persists the opened project (flagging unsaved
+// changes first, as upstream does) and syncs the PRE-SAVE catalog
+// snapshot into the symbol registry. Upstream clones the catalog
+// before save so a failed save still syncs the pre-mutation shape —
+// ProjectSymbolCatalog::clone gives the same snapshot.
+//
+// The project directory rides the stored bytes seam: upstream's
+// caller resolved `get_project_directory()` and passed it down; the
+// port resolves it inside (same record, same bytes) and opens it via
+// `open_at` against an fd for "/" — openat with an absolute or
+// root-relative name resolves the stored bytes without a Path proof.
+// Upstream `log::error!` on failure collapses to a bool return.
+
+module src::services::projects::project_symbol_catalog_persistence;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_symbol_sync::ProjectSymbolSync;
+
+pub data ProjectSymbolCatalogPersistence {}
+
+pub machine ProjectSymbolCatalogPersistence::save_and_sync_project_symbol_catalog(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    opened_project: &mut Project
+) -> bool
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut project_directory: [u8; 512];
+    let resolved: bool = get_project_directory_of(opened_project, &mut project_directory);
+    transition resolved {
+        true -> snapshot(engine_bindings, opened_project, project_directory)
+        _ -> (false)
+    }
+    state snapshot(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        opened_project: &mut Project,
+        project_directory: [u8; 512]
+    ) -> bool {
+        let updated_project_symbol_catalog: ProjectSymbolCatalog =
+            ProjectSymbolCatalog::clone(get_catalog_of(opened_project));
+        set_unsaved(opened_project);
+        transition { _ -> open(engine_bindings, opened_project, project_directory, updated_project_symbol_catalog) }
+    }
+    state open(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        opened_project: &mut Project,
+        project_directory: [u8; 512],
+        updated_project_symbol_catalog: ProjectSymbolCatalog
+    ) -> bool {
+        // The stored directory bytes are plain — `open_at` on a root
+        // fd resolves them as a path under "/" (or absolutely).
+        let root_fd: i32 = FilesystemHost::open("/", 0);
+        transition root_fd >= 0 {
+            true -> open_dir(engine_bindings, opened_project, project_directory, updated_project_symbol_catalog, root_fd)
+            _ -> (false)
+        }
+    }
+    state open_dir(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        opened_project: &mut Project,
+        project_directory: [u8; 512],
+        updated_project_symbol_catalog: ProjectSymbolCatalog,
+        root_fd: i32
+    ) -> bool {
+        let dir_fd: i32 = FilesystemHost::open_at(root_fd, &project_directory[0..512], 0);
+        transition dir_fd >= 0 {
+            true -> save(engine_bindings, opened_project, project_directory, updated_project_symbol_catalog, root_fd, dir_fd)
+            _ -> close_root(root_fd)
+        }
+    }
+    state save(
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        opened_project: &mut Project,
+        project_directory: [u8; 512],
+        updated_project_symbol_catalog: ProjectSymbolCatalog,
+        root_fd: i32,
+        dir_fd: i32
+    ) -> bool {
+        // Upstream `include_snapshot = false`; per-item failures are
+        // non-fatal exactly as upstream's log-and-continue.
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &project_directory[0..512], false);
+        _ = FilesystemHost::close(dir_fd);
+        _ = FilesystemHost::close(root_fd);
+        transition saved {
+            ProjectFileSave::Stored -> (ProjectSymbolSync::sync_project_symbol_catalog(engine_bindings, &updated_project_symbol_catalog))
+            _ -> (false)
+        }
+    }
+    state close_root(root_fd: i32) -> bool {
+        _ = FilesystemHost::close(root_fd);
+        (false)
+    }
+}
+
+machine get_project_directory_of(opened_project: &Project, out_directory: &mut [u8; 512]) -> bool {
+    let inner3160: &ProjectInfo = Project::get_project_info(opened_project);
+    (ProjectInfo::get_project_directory(inner3160, out_directory))
+}
+
+machine get_catalog_of(opened_project: &Project) -> &ProjectSymbolCatalog {
+    (Project::get_project_symbol_catalog(opened_project))
+}
+
+machine set_unsaved(opened_project: &mut Project) {
+    ProjectInfo::set_has_unsaved_changes(Project::borrow_project_info_mut(opened_project), true);
+}

@@ -167,7 +167,7 @@ invokes FilesystemHost;
         true -> open(dfd, project_directory_path)
         _ -> (ProjectInfoLoad::Refused)
     }
-    state open(dfd: i32, project_directory_path: &[u8] in Path) -> ProjectInfoLoad {
+    state open(dfd: i32, project_directory_path: &[u8]) -> ProjectInfoLoad {
         let fd: i32 = FilesystemHost::open_at(dfd, "project.json", 0);
         transition fd >= 0 {
             true -> fill(dfd, fd, project_directory_path)
@@ -224,7 +224,7 @@ invokes FilesystemHost;
             stub.project_symbol_catalog);
         transition { _ -> plugin(project_info, stub) }
     }
-    state plugin(project_info_arg: ProjectInfo, stub: ProjectInfoStub) -> ProjectInfoLoad {
+    state plugin(project_info: ProjectInfo, stub: ProjectInfoStub) -> ProjectInfoLoad {
         let mut carried_info: ProjectInfo = project_info;
         let mut carried_stub: ProjectInfoStub = stub;
         transition carried_stub.has_plugin_configuration {
@@ -232,14 +232,153 @@ invokes FilesystemHost;
             _ -> finish(carried_info)
         }
     }
-    state with_plugin(project_info_arg: ProjectInfo, plugin_configuration: PluginConfiguration) -> ProjectInfoLoad {
+    state with_plugin(project_info: ProjectInfo, plugin_configuration: PluginConfiguration) -> ProjectInfoLoad {
         let mut carried: ProjectInfo = project_info;
         ProjectInfo::set_plugin_configuration(&mut carried, &plugin_configuration);
         transition { _ -> finish(carried) }
     }
-    state finish(project_info_arg: ProjectInfo) -> ProjectInfoLoad {
+    state finish(project_info: ProjectInfo) -> ProjectInfoLoad {
         let mut carried: ProjectInfo = project_info;
         ProjectInfo::set_has_unsaved_changes(&mut carried, false);
+        (ProjectInfoLoad::Loaded { project_info: carried })
+    }
+}
+
+// Dirfd twin of `save_to_path` for callers that arrive holding the
+// project directory open (unprivileged executors reach paths through
+// runtime bytes — `FileSystemUtils::open_path` — not the `in Path`
+// domain). The caller owns `dir_fd`; it is never closed here. Upstream
+// semantics preserved: unchanged fast-path, stub encode, leaf write via
+// `open_at`, `has_unsaved_changes` cleared on success.
+pub linux_x86_64 machine ProjectInfo::save_at(
+    project_info: &mut ProjectInfo,
+    dir_fd: i32,
+    save_even_if_unchanged: bool
+) -> ProjectFileSave
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition save_even_if_unchanged || project_info.has_unsaved_changes {
+        true -> store(project_info, dir_fd)
+        _ -> (ProjectFileSave::Stored)
+    }
+    state store(project_info: &mut ProjectInfo, dir_fd: i32) -> ProjectFileSave {
+        let mut stub: ProjectInfoStub = ProjectInfoStub::new(
+            project_info.has_project_icon_rgba,
+            ProcessIcon::default(),
+            ProjectManifest::clone(&project_info.project_manifest),
+            ProjectSymbolCatalog::clone(&project_info.project_symbol_catalog),
+            project_info.has_plugin_configuration,
+            PluginConfiguration::clone(&project_info.plugin_configuration));
+        ProcessIcon::clone_from(&mut stub.project_icon_rgba, &project_info.project_icon_rgba);
+        let mut writer: ProjectFileWriter = ProjectFileWriter::new();
+        let head_ok: bool = ProjectFileWriter::put_header(&mut writer);
+        let body_ok: bool = encode_info_stub(&mut writer, &stub);
+        transition head_ok && body_ok {
+            true -> create(project_info, dir_fd, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state create(project_info: &mut ProjectInfo, dir_fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
+        let fd: i32 = FilesystemHost::open_at(dir_fd, "project.json", 577);
+        transition fd >= 0 {
+            true -> write(project_info, fd, writer)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state write(project_info: &mut ProjectInfo, fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
+        let mut carried: ProjectFileWriter = writer;
+        let put: i64 = ProjectFileWriter::flush_to_fd(&mut carried, fd);
+        let expected: i64 = ((carried.written as i64 in Wrapping) as i64);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition put == expected && put >= 0 {
+            true -> clean(project_info)
+            _ -> (ProjectFileSave::Refused)
+        }
+    }
+    state clean(project_info: &mut ProjectInfo) -> ProjectFileSave {
+        project_info.has_unsaved_changes = false;
+        (ProjectFileSave::Stored)
+    }
+}
+
+// Dirfd twin of `load_from_path` (see `save_at` for the contract). The
+// caller owns `dir_fd`; downstream decode/build states are reused — they
+// never touch fds. The recorded identity path stays the joined
+// `directory/project.json` bytes upstream stores.
+pub linux_x86_64 machine ProjectInfo::load_at(
+    dir_fd: i32,
+    project_directory_path: &[u8]
+) -> ProjectInfoLoad
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let fd: i32 = FilesystemHost::open_at(dir_fd, "project.json", 0);
+    transition fd >= 0 {
+        true -> fill(fd, project_directory_path)
+        _ -> (ProjectInfoLoad::Refused)
+    }
+    state fill(fd: i32, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut reader: ProjectFileReader = ProjectFileReader::default();
+        let got: i64 = ProjectFileReader::fill_from_fd(&mut reader, fd);
+        let closed: i32 = FilesystemHost::close(fd);
+        transition got > 0 {
+            true -> decode(reader, project_directory_path)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state decode(reader: ProjectFileReader, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut carried: ProjectFileReader = reader;
+        let header_ok: bool = ProjectFileReader::check_header(&mut carried);
+        transition header_ok {
+            true -> stub(carried, project_directory_path)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state stub(reader: ProjectFileReader, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut carried: ProjectFileReader = reader;
+        let mut stub: ProjectInfoStub = ProjectInfoStub::default();
+        let body_ok: bool = decode_info_stub(&mut carried, &mut stub);
+        transition body_ok {
+            true -> build(stub, project_directory_path)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state build(stub: ProjectInfoStub, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let mut info_path: [u8; 512];
+        let info_len: u64 = resolve_project_info_file_path(project_directory_path, &mut info_path);
+        transition info_len <= 512 {
+            true -> build_info(stub, info_path, info_len)
+            _ -> (ProjectInfoLoad::Refused)
+        }
+    }
+    state build_info(stub: ProjectInfoStub, info_path: [u8; 512], info_len: u64) -> ProjectInfoLoad
+        requires info_len <= 512;
+    {
+        let mut project_info: ProjectInfo = ProjectInfo::new_with_symbol_catalog(
+            &info_path[0..info_len],
+            stub.has_project_icon_rgba,
+            &stub.project_icon_rgba,
+            stub.project_manifest,
+            stub.project_symbol_catalog);
+        transition { _ -> plugin(project_info, stub) }
+    }
+    state plugin(project_info: ProjectInfo, stub: ProjectInfoStub) -> ProjectInfoLoad {
+        let mut carried_info: ProjectInfo = project_info;
+        let mut carried_stub: ProjectInfoStub = stub;
+        transition carried_stub.has_plugin_configuration {
+            true -> with_plugin(carried_info, carried_stub.plugin_configuration)
+            _ -> finish(carried_info)
+        }
+    }
+    state with_plugin(project_info: ProjectInfo, plugin_configuration: PluginConfiguration) -> ProjectInfoLoad {
+        let mut carried: ProjectInfo = project_info;
+        ProjectInfo::set_plugin_configuration(&mut carried, &plugin_configuration);
+        transition { _ -> finish(carried) }
+    }
+    state finish(project_info: ProjectInfo) -> ProjectInfoLoad {
+        let mut carried: ProjectInfo = project_info;
+        carried.has_unsaved_changes = false;
         (ProjectInfoLoad::Loaded { project_info: carried })
     }
 }

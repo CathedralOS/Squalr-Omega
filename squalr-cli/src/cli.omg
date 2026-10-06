@@ -1,16 +1,22 @@
 module src::cli;
 
+use squalr_engine_api::src::commands::command_invocation::CommandInvocationSource;
 use squalr_engine_api::src::commands::command_line::command_line_command::CommandLineCommand;
 use squalr_engine_api::src::commands::command_line::command_line_parser::CommandLineParse;
 use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
 use squalr_engine_api::src::commands::command_line::command_line_parser::CommandLineParser;
 use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultsListResponse;
+use squalr_engine_api::src::commands::unprivileged_command::UnprivilegedCommand;
+use squalr_engine_api::src::commands::unprivileged_command_response::UnprivilegedCommandResponse;
+use squalr_engine_api::src::engine::unprivileged_response_mailbox::UnprivilegedResponseMailbox;
 use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
+use squalr_engine::src::command_invocation_wire::CommandInvocationWireModule;
 use squalr_engine::src::squalr_engine::SqualrEngine;
 use omega_language_std::console;
 use omega_language_std::filesystem_host;
 use omega::language::core::wait_wake;
 use src::command_framer::CommandFramer;
+use src::response_handlers::response_handlers::ResponseHandlers;
 
 // Port of cli.rs `Cli::run_loop` for the headless leg: read stdin lines,
 // `exit`/`close`/`quit` (case-insensitive) breaks, each line parses to a
@@ -27,7 +33,7 @@ pub data Cli {
 pub machine Cli::init(cli: &mut Cli) {
     // Upstream cli runs `EngineMode::Standalone` — the unprivileged state
     // owns the invocation-id allocator and the dispatch pipeline rides it.
-    cli.engine.init_standalone();
+    SqualrEngine::init_standalone(&mut cli.engine);
     cli.framer = CommandFramer::new();
 }
 
@@ -106,7 +112,7 @@ machine Cli::dec_places(cli: &mut Cli, value: u64) -> u64 {
     transition { _ -> grow(value, 1, cli) }
     state grow(value: u64, place: u64, cli: &mut Cli) -> u64 {
         transition value >= 10 && place <= 1000000000000000000 {
-            true -> check(cli, value, place, cli)
+            true -> check(value, place, cli)
             false -> (place)
         }
     }
@@ -295,7 +301,29 @@ crashes Trap
     state walk(cli: &mut Cli, command: CommandLineCommand, end_after: bool, count: u64) {
         transition command {
             CommandLineCommand::Privileged { command } -> send(cli, command, end_after, count)
+            CommandLineCommand::Unprivileged { command } -> send_unprivileged(cli, command, end_after, count)
         }
+    }
+
+    // Upstream `Cli::handle_unprivileged_command`: send through the wire's
+    // create->prepare->dispatch->publish pipeline as
+    // `CommandInvocationSource::Cli`, take the delivered response and run
+    // `handle_unprivileged_engine_response` on it.
+    state send_unprivileged(cli: &mut Cli, command: UnprivilegedCommand, end_after: bool, count: u64) {
+        let mut mailbox: UnprivilegedResponseMailbox = UnprivilegedResponseMailbox::default();
+        let sent: bool = CommandInvocationWireModule::send_unprivileged_invocation(&mut cli.engine,
+            CommandInvocationSource::Cli,
+            command,
+            &mut mailbox);
+        transition mailbox {
+            UnprivilegedResponseMailbox::Delivered { response } -> respond(cli, response, end_after, count)
+            _ -> done(cli, end_after)
+        }
+    }
+
+    state respond(cli: &mut Cli, response: UnprivilegedCommandResponse, end_after: bool, count: u64) {
+        ResponseHandlers::handle_unprivileged_engine_response(response);
+        transition { _ -> done(cli, end_after) }
     }
 
     state send(cli: &mut Cli, command: PrivilegedCommand, end_after: bool, count: u64) {
@@ -305,7 +333,7 @@ crashes Trap
         // payload through and the envelope wraps it engine-side. The id
         // allocates on the unprivileged state's fetch_add counter, same as
         // upstream's `create_command_invocation`.
-        let list: ScanResultsListResponse = cli.engine.dispatch_invocation_list(command);
+        let list: ScanResultsListResponse = SqualrEngine::dispatch_invocation_list(&mut cli.engine, command);
         transition { _ -> storing(cli, list, end_after, count) }
     }
 

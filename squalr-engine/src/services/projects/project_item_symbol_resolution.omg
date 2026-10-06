@@ -1,0 +1,766 @@
+// Port of squalr-engine/src/services/projects/project_item_symbol_resolution.rs.
+//
+// Resolves a project item's runtime memory target (address + module) and its
+// symbolic struct layout id, and answers the promotable/memory-viewer/
+// code-viewer questions the GUI asks when rows are edited.
+//
+// Named deviations:
+// - Upstream routes through `engine_execution_context` (dyn) for the
+//   privileged memory read and `get_default_value`. The port takes the dual
+//   unprivileged context `(engine_unprivileged_state, engine_bindings)`:
+//   memory reads dispatch through `dispatch_privileged_command` on the
+//   standalone bindings (upstream's send_unprivileged equivalent), and the
+//   unit-size lookup uses `DataTypeRef::get_unit_size_in_bytes` — upstream's
+//   `get_default_value(...).get_size_in_bytes()` resolves to the same number
+//   for every registered builtin; an unregistered id falls back to 1 byte
+//   here exactly as upstream's `unwrap_or(1)`.
+// - `Pointer` stays the borrowed pointer; `OwnedRuntimePointer` carries the
+//   converted runtime shape. `resolve_pointer_runtime_target` accepts the
+//   owned shape; pointer-typed items convert via `pointer_to_owned_runtime`.
+// - `SymbolicFieldDefinition::from_str` parse failures collapse to the
+//   result union's absent arm — upstream only `.ok()?`s them.
+
+module src::services::projects::project_item_symbol_resolution;
+
+use omega::language::core::option;
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::memory::memory_command::MemoryCommand;
+use squalr_engine_api::src::commands::memory::memory_response::MemoryResponse;
+use squalr_engine_api::src::commands::memory::read::memory_read_request::MemoryReadRequest;
+use squalr_engine_api::src::commands::memory::read::memory_read_response::MemoryReadResponse;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerAddressValue;
+use squalr_engine_api::src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use squalr_engine_api::src::structures::memory::pointer::Pointer;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::SymbolicLinkOffset;
+use squalr_engine_api::src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::ProjectItemTypeAddress;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::SymbolicStructRefMatch;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::AddressTargetMatch;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::OwnedRuntimePointer;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::ProjectItemAddressTarget;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address_target::RuntimePointerMatch;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_pointer::ProjectItemTypePointer;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_symbol_locator::ProjectSymbolLocator;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinitionParse;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_struct_ref::SymbolicStructRef;
+use squalr_engine_api::src::structures::structs::valued_struct::ValuedStruct;
+use squalr_engine_api::src::structures::structs::valued_struct_field::ValuedStructField;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+pub data ProjectItemSymbolResolution {}
+
+// `Option<String>` carrier for the resolved layout namespace.
+pub data StructLayoutMatch {
+    found: bool;
+    layout_id: [u8; 256];
+    layout_id_len: u64;
+}
+
+// `Option<(u64, String)>` carrier for the resolved runtime target.
+pub data RuntimeTargetMatch {
+    found: bool;
+    address: u64;
+    module_name: [u8; 256];
+    module_name_len: u64;
+}
+
+// `Option<ProjectSymbolLocator>` carrier.
+pub data LocatorMatch {
+    found: bool;
+    locator: ProjectSymbolLocator;
+}
+
+// `Option<u64>` carrier for byte counts and pointer values.
+pub data CountMatch {
+    found: bool;
+    count: u64;
+}
+
+// `Option<&'static str>` collapses to a flag — the two promotable ids are
+// compile-time known, so callers re-ask the type ref they already hold.
+pub data TypeIdMatch {
+    found: bool;
+}
+
+// Upstream `is_promotable_project_item`.
+pub machine ProjectItemSymbolResolution::is_promotable_project_item(project_item: &ProjectItem) -> bool {
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    let is_address: bool = ProjectItemSymbolResolution::type_id_is(item_type_id, "address");
+    let is_pointer: bool = ProjectItemSymbolResolution::type_id_is(item_type_id, "pointer");
+    transition is_address || is_pointer {
+        true -> resolvable(project_item, item_type_id)
+        _ -> (false)
+    }
+    state resolvable(project_item: &ProjectItem, item_type_id: &[u8]) -> bool {
+        let resolved: TypeIdMatch = ProjectItemSymbolResolution::resolve_project_item_type_id(project_item);
+        resolved.found
+    }
+}
+
+// Upstream `can_open_project_item_in_memory_viewer`.
+pub machine ProjectItemSymbolResolution::can_open_project_item_in_memory_viewer(project_item: &ProjectItem) -> bool {
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    let is_address: bool = ProjectItemSymbolResolution::type_id_is(item_type_id, "address");
+    let is_pointer: bool = ProjectItemSymbolResolution::type_id_is(item_type_id, "pointer");
+    is_address || is_pointer
+}
+
+// Upstream `should_open_project_item_in_code_viewer` — layout id parses and
+// its data type id starts with "i_" (an instruction-set plugin type).
+pub machine ProjectItemSymbolResolution::should_open_project_item_in_code_viewer(project_item: &ProjectItem) -> bool {
+    let layout: StructLayoutMatch = ProjectItemSymbolResolution::resolve_project_item_struct_layout_id(project_item);
+    transition layout.found {
+        true -> instruction(project_item, layout)
+        _ -> (false)
+    }
+    state instruction(project_item: &ProjectItem, layout: StructLayoutMatch) -> bool {
+        let layout_slice: &[u8] = &layout.layout_id[0..layout.layout_id_len];
+        let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(layout_slice);
+        transition parsed {
+            SymbolicFieldDefinitionParse::Parsed { value } -> normalize(value)
+            _ -> (false)
+        }
+    }
+    state normalize(field_definition: SymbolicFieldDefinition) -> bool {
+        let data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(&field_definition);
+        let data_type_id: &[u8] = DataTypeRef::get_data_type_id(&data_type_ref);
+        ProjectItemSymbolResolution::type_id_is(&data_type_id[0..2], "i_") && data_type_id.len > 2
+    }
+}
+
+// Upstream `resolve_project_item_struct_layout_id` — the catalog parameter
+// is unused upstream (reserved for future symbol-root resolution); the port
+// drops it like upstream's `_project_symbol_catalog`.
+pub machine ProjectItemSymbolResolution::resolve_project_item_struct_layout_id(project_item: &ProjectItem) -> StructLayoutMatch {
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    transition ProjectItemSymbolResolution::type_id_is(item_type_id, "address") {
+        true -> address_layout(project_item)
+        _ -> pointer_layout(project_item, item_type_id)
+    }
+    state address_layout(project_item: &ProjectItem) -> StructLayoutMatch {
+        let resolved: SymbolicStructRefMatch = ProjectItemTypeAddress::get_field_symbolic_struct_definition_reference(project_item);
+        transition resolved.found {
+            true -> copy_namespace(&resolved.symbolic_struct_ref)
+            _ -> absent()
+        }
+    }
+    state copy_namespace(symbolic_struct_ref: &SymbolicStructRef) -> StructLayoutMatch {
+        let namespace: &[u8] = SymbolicStructRef::get_symbolic_struct_namespace(symbolic_struct_ref);
+        let mut layout_id: [u8; 256];
+        let written: u64 = ProjectItemSymbolResolution::copy_256(&mut layout_id, namespace);
+        (StructLayoutMatch { found: true, layout_id: layout_id, layout_id_len: written })
+    }
+    state pointer_layout(project_item: &ProjectItem, item_type_id: &[u8]) -> StructLayoutMatch {
+        transition ProjectItemSymbolResolution::type_id_is(item_type_id, "pointer") {
+            true -> from_pointer(project_item)
+            _ -> absent()
+        }
+    }
+    state from_pointer(project_item: &ProjectItem) -> StructLayoutMatch {
+        let resolved: SymbolicStructRefMatch = ProjectItemTypePointer::get_field_symbolic_struct_definition_reference(project_item);
+        transition resolved.found {
+            true -> copy_pointer_namespace(&resolved.symbolic_struct_ref)
+            _ -> absent()
+        }
+    }
+    state copy_pointer_namespace(symbolic_struct_ref: &SymbolicStructRef) -> StructLayoutMatch {
+        let namespace: &[u8] = SymbolicStructRef::get_symbolic_struct_namespace(symbolic_struct_ref);
+        let mut layout_id: [u8; 256];
+        let written: u64 = ProjectItemSymbolResolution::copy_256(&mut layout_id, namespace);
+        (StructLayoutMatch { found: true, layout_id: layout_id, layout_id_len: written })
+    }
+    state absent() -> StructLayoutMatch {
+        let mut layout_id: [u8; 256];
+        (StructLayoutMatch { found: false, layout_id: layout_id, layout_id_len: 0 })
+    }
+}
+
+// Upstream `resolve_project_item_runtime_value_target` —
+// `project_symbol_catalog` rides as a flag+value pair.
+pub machine ProjectItemSymbolResolution::resolve_project_item_runtime_value_target(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    has_catalog: bool,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    project_item: &ProjectItem
+) -> RuntimeTargetMatch
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    transition ProjectItemSymbolResolution::type_id_is(item_type_id, "address") {
+        true -> address_target(engine_unprivileged_state, engine_bindings, has_catalog, project_symbol_catalog, project_item)
+        _ -> pointer_target(engine_unprivileged_state, engine_bindings, project_item, item_type_id)
+    }
+    state address_target(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        has_catalog: bool,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        project_item: &ProjectItem
+    ) -> RuntimeTargetMatch
+    {
+        let address_target: ProjectItemAddressTarget = ProjectItemTypeAddress::get_address_target(project_item);
+        ProjectItemSymbolResolution::resolve_address_target_runtime_target_with_optional_catalog(
+            engine_unprivileged_state,
+            engine_bindings,
+            has_catalog,
+            project_symbol_catalog,
+            &address_target)
+    }
+    state pointer_target(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &ProjectItem,
+        item_type_id: &[u8]
+    ) -> RuntimeTargetMatch
+    {
+        transition ProjectItemSymbolResolution::type_id_is(item_type_id, "pointer") {
+            true -> from_pointer(engine_unprivileged_state, engine_bindings, project_item)
+            _ -> absent()
+        }
+    }
+    state from_pointer(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &ProjectItem
+    ) -> RuntimeTargetMatch
+    {
+        let pointer: OwnedRuntimePointer = ProjectItemTypePointer::get_field_pointer(project_item);
+        ProjectItemSymbolResolution::resolve_pointer_runtime_target(engine_unprivileged_state, engine_bindings, &pointer)
+    }
+    state absent() -> RuntimeTargetMatch {
+        let mut module_name: [u8; 256];
+        (RuntimeTargetMatch { found: false, address: 0, module_name: module_name, module_name_len: 0 })
+    }
+}
+
+// Upstream `resolve_project_item_runtime_value_byte_count`. The unit-size
+// hop is `DataTypeRef::get_unit_size_in_bytes` (see header deviation).
+pub machine ProjectItemSymbolResolution::resolve_project_item_runtime_value_byte_count(project_item: &ProjectItem) -> CountMatch {
+    let layout: StructLayoutMatch = ProjectItemSymbolResolution::resolve_project_item_struct_layout_id(project_item);
+    transition layout.found {
+        true -> parse_layout(layout)
+        _ -> (CountMatch { found: false, count: 0 })
+    }
+    state parse_layout(layout: StructLayoutMatch) -> CountMatch {
+        let layout_slice: &[u8] = &layout.layout_id[0..layout.layout_id_len];
+        let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(layout_slice);
+        transition parsed {
+            SymbolicFieldDefinitionParse::Parsed { value } -> unit_size(value)
+            _ -> (CountMatch { found: false, count: 0 })
+        }
+    }
+    state unit_size(field_definition: SymbolicFieldDefinition) -> CountMatch {
+        let data_type_ref: DataTypeRef = SymbolicFieldDefinition::get_data_type_ref(&field_definition);
+        let mut unit_size: u64 = DataTypeRef::get_unit_size_in_bytes(&data_type_ref);
+        transition unit_size >= 1 {
+            true -> total(field_definition, unit_size)
+            _ -> total(field_definition, 1)
+        }
+    }
+    state total(field_definition: SymbolicFieldDefinition, unit_size: u64) -> CountMatch {
+        let container_type: ContainerType = SymbolicFieldDefinition::get_container_type(&field_definition);
+        (CountMatch { found: true, count: ContainerType::get_total_size_in_bytes(&container_type, unit_size) })
+    }
+}
+
+// Upstream `resolve_project_item_type_id` — the &str collapses to found.
+pub machine ProjectItemSymbolResolution::resolve_project_item_type_id(project_item: &ProjectItem) -> TypeIdMatch {
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    let is_address: bool = ProjectItemSymbolResolution::type_id_is(item_type_id, "address");
+    let is_pointer: bool = ProjectItemSymbolResolution::type_id_is(item_type_id, "pointer");
+    (TypeIdMatch { found: is_address || is_pointer })
+}
+
+// Upstream `resolve_project_item_locator`.
+pub machine ProjectItemSymbolResolution::resolve_project_item_locator(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    project_item: &ProjectItem
+) -> LocatorMatch
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+    let item_type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+    transition ProjectItemSymbolResolution::type_id_is(item_type_id, "address") {
+        true -> address_locator(engine_unprivileged_state, engine_bindings, project_symbol_catalog, project_item)
+        _ -> pointer_locator(engine_unprivileged_state, engine_bindings, project_item, item_type_id)
+    }
+    state address_locator(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_symbol_catalog: &ProjectSymbolCatalog,
+        project_item: &ProjectItem
+    ) -> LocatorMatch
+    {
+        let address_target: ProjectItemAddressTarget = ProjectItemTypeAddress::get_address_target(project_item);
+        let target: RuntimeTargetMatch = ProjectItemSymbolResolution::resolve_address_target_runtime_target(
+            engine_unprivileged_state,
+            engine_bindings,
+            project_symbol_catalog,
+            &address_target);
+        transition target.found {
+            true -> located(target)
+            _ -> absent()
+        }
+    }
+    state located(target: RuntimeTargetMatch) -> LocatorMatch {
+        let module_slice: &[u8] = &target.module_name[0..target.module_name_len];
+        (LocatorMatch { found: true, locator: ProjectItemSymbolResolution::build_locator(target.address, module_slice) })
+    }
+    state pointer_locator(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &ProjectItem,
+        item_type_id: &[u8]
+    ) -> LocatorMatch
+    {
+        transition ProjectItemSymbolResolution::type_id_is(item_type_id, "pointer") {
+            true -> from_pointer(engine_unprivileged_state, engine_bindings, project_item)
+            _ -> absent()
+        }
+    }
+    state from_pointer(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        project_item: &ProjectItem
+    ) -> LocatorMatch
+    {
+        let pointer: OwnedRuntimePointer = ProjectItemTypePointer::get_field_pointer(project_item);
+        let target: RuntimeTargetMatch = ProjectItemSymbolResolution::resolve_pointer_runtime_target(engine_unprivileged_state, engine_bindings, &pointer);
+        transition target.found {
+            true -> located(target)
+            _ -> absent()
+        }
+    }
+    state absent() -> LocatorMatch {
+        (LocatorMatch { found: false, locator: ProjectSymbolLocator::default() })
+    }
+}
+
+// Upstream `resolve_address_target_runtime_target` (catalog required).
+pub machine ProjectItemSymbolResolution::resolve_address_target_runtime_target(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    address_target: &ProjectItemAddressTarget
+) -> RuntimeTargetMatch
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    ProjectItemSymbolResolution::resolve_address_target_runtime_target_with_optional_catalog(
+        engine_unprivileged_state,
+        engine_bindings,
+        true,
+        project_symbol_catalog,
+        address_target)
+}
+
+// Upstream `resolve_address_target_runtime_target_with_optional_catalog`.
+pub machine ProjectItemSymbolResolution::resolve_address_target_runtime_target_with_optional_catalog(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    has_catalog: bool,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    address_target: &ProjectItemAddressTarget
+) -> RuntimeTargetMatch
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let runtime_pointer: RuntimePointerMatch = ProjectItemSymbolResolution::resolve_address_target_runtime_pointer_with_optional_catalog(
+        has_catalog,
+        project_symbol_catalog,
+        address_target);
+    transition runtime_pointer.found {
+        true -> offsets(runtime_pointer, engine_unprivileged_state, engine_bindings)
+        _ -> absent()
+    }
+    state offsets(
+        runtime_pointer: RuntimePointerMatch,
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings
+    ) -> RuntimeTargetMatch
+    {
+        transition runtime_pointer.pointer.offset_count == 0 {
+            true -> direct(runtime_pointer)
+            _ -> walk(runtime_pointer, engine_unprivileged_state, engine_bindings)
+        }
+    }
+    state direct(runtime_pointer: RuntimePointerMatch) -> RuntimeTargetMatch {
+        let module_slice: &[u8] = OwnedRuntimePointer::get_module_name(&runtime_pointer.pointer);
+        let mut module_name: [u8; 256];
+        let written: u64 = ProjectItemSymbolResolution::copy_256(&mut module_name, module_slice);
+        (RuntimeTargetMatch { found: true, address: OwnedRuntimePointer::get_address(&runtime_pointer.pointer), module_name: module_name, module_name_len: written })
+    }
+    state walk(
+        runtime_pointer: RuntimePointerMatch,
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings
+    ) -> RuntimeTargetMatch
+    {
+        ProjectItemSymbolResolution::resolve_pointer_runtime_target(engine_unprivileged_state, engine_bindings, &runtime_pointer.pointer)
+    }
+    state absent() -> RuntimeTargetMatch {
+        let mut module_name: [u8; 256];
+        (RuntimeTargetMatch { found: false, address: 0, module_name: module_name, module_name_len: 0 })
+    }
+}
+
+// Upstream `resolve_address_target_runtime_pointer` (catalog required).
+pub machine ProjectItemSymbolResolution::resolve_address_target_runtime_pointer(
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    address_target: &ProjectItemAddressTarget
+) -> RuntimePointerMatch {
+    ProjectItemAddressTarget::to_runtime_pointer_resolving_symbols(address_target, project_symbol_catalog)
+}
+
+// Upstream `resolve_address_target_runtime_pointer_with_optional_catalog`.
+pub machine ProjectItemSymbolResolution::resolve_address_target_runtime_pointer_with_optional_catalog(
+    has_catalog: bool,
+    project_symbol_catalog: &ProjectSymbolCatalog,
+    address_target: &ProjectItemAddressTarget
+) -> RuntimePointerMatch {
+    transition has_catalog {
+        true -> with_catalog(project_symbol_catalog, address_target)
+        _ -> without_catalog(address_target)
+    }
+    state with_catalog(project_symbol_catalog: &ProjectSymbolCatalog, address_target: &ProjectItemAddressTarget) -> RuntimePointerMatch {
+        ProjectItemAddressTarget::to_runtime_pointer_resolving_symbols(address_target, project_symbol_catalog)
+    }
+    state without_catalog(address_target: &ProjectItemAddressTarget) -> RuntimePointerMatch {
+        ProjectItemAddressTarget::to_runtime_pointer(address_target)
+    }
+}
+
+// Upstream `resolve_pointer_runtime_target` — walks offset segments, one
+// memory read per link, module name cleared after the first hop.
+pub machine ProjectItemSymbolResolution::resolve_pointer_runtime_target(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    pointer: &OwnedRuntimePointer
+) -> RuntimeTargetMatch
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut current_address: u64 = OwnedRuntimePointer::get_address(pointer);
+    let mut current_module_name: [u8; 256];
+    let module_slice: &[u8] = OwnedRuntimePointer::get_module_name(pointer);
+    let mut current_module_name_len: u64 = ProjectItemSymbolResolution::copy_256(&mut current_module_name, module_slice);
+    transition { _ -> segment(engine_unprivileged_state, engine_bindings, pointer, 0, current_address, current_module_name, current_module_name_len) }
+    state segment(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        pointer: &OwnedRuntimePointer,
+        at: u64,
+        current_address: u64,
+        current_module_name: [u8; 256],
+        current_module_name_len: u64
+    ) -> RuntimeTargetMatch
+    {
+        transition at < pointer.offset_count && at < 64 {
+            true -> link(engine_unprivileged_state, engine_bindings, pointer, at, current_address, current_module_name, current_module_name_len)
+            _ -> done(current_address, current_module_name, current_module_name_len)
+        }
+    }
+    state link(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        pointer: &OwnedRuntimePointer,
+        at: u64,
+        current_address: u64,
+        current_module_name: [u8; 256],
+        current_module_name_len: u64
+    ) -> RuntimeTargetMatch
+        requires at < pointer.offset_count && at < 64;
+    {
+        let link: SymbolicPointerChainLink = pointer.offset_segments[at];
+        let resolved: SymbolicLinkOffset = SymbolicPointerChainLink::as_offset(&link);
+        transition resolved.found {
+            true -> read_value(engine_unprivileged_state, engine_bindings, pointer, at, current_address, current_module_name, current_module_name_len, resolved.offset)
+            _ -> absent(current_module_name, current_module_name_len)
+        }
+    }
+    state read_value(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        pointer: &OwnedRuntimePointer,
+        at: u64,
+        current_address: u64,
+        current_module_name: [u8; 256],
+        current_module_name_len: u64,
+        pointer_offset: i64
+    ) -> RuntimeTargetMatch
+    {
+        let module_slice: &[u8] = &current_module_name[0..current_module_name_len];
+        let pointer_value: CountMatch = ProjectItemSymbolResolution::read_pointer_value(
+            engine_unprivileged_state,
+            engine_bindings,
+            current_address,
+            module_slice,
+            OwnedRuntimePointer::get_pointer_size(pointer));
+        transition pointer_value.found {
+            true -> apply(engine_unprivileged_state, engine_bindings, pointer, at, current_module_name, pointer_value.count, pointer_offset)
+            _ -> absent(current_module_name, current_module_name_len)
+        }
+    }
+    state apply(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        pointer: &OwnedRuntimePointer,
+        at: u64,
+        current_module_name: [u8; 256],
+        pointer_value: u64,
+        pointer_offset: i64
+    ) -> RuntimeTargetMatch
+        requires at < pointer.offset_count && at < 64;
+    {
+        let adjusted: Optional<u64> = symbolic_pointer_chain_apply_pointer_offset(pointer_value, pointer_offset);
+        transition adjusted {
+            Optional::Some { value } -> cleared(engine_unprivileged_state, engine_bindings, pointer, at, value, current_module_name)
+            _ -> absent(current_module_name, 0)
+        }
+    }
+    state cleared(
+        engine_unprivileged_state: &mut EngineUnprivilegedState,
+        engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+        pointer: &OwnedRuntimePointer,
+        at: u64,
+        next_address: u64,
+        current_module_name: [u8; 256]
+    ) -> RuntimeTargetMatch
+        requires at < pointer.offset_count && at < 64;
+    {
+        // Upstream `current_module_name.clear()` — the module only anchors
+        // the first read; subsequent hops are absolute.
+        let mut empty_module: [u8; 256];
+        transition { _ -> segment(engine_unprivileged_state, engine_bindings, pointer, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, next_address, empty_module, 0) }
+    }
+    state absent(current_module_name: [u8; 256], current_module_name_len: u64) -> RuntimeTargetMatch {
+        (RuntimeTargetMatch { found: false, address: 0, module_name: current_module_name, module_name_len: current_module_name_len })
+    }
+    state done(current_address: u64, current_module_name: [u8; 256], current_module_name_len: u64) -> RuntimeTargetMatch {
+        (RuntimeTargetMatch { found: true, address: current_address, module_name: current_module_name, module_name_len: current_module_name_len })
+    }
+}
+
+// Upstream `build_locator` — empty module name means an absolute locator.
+pub machine ProjectItemSymbolResolution::build_locator(address: u64, module_name: &[u8]) -> ProjectSymbolLocator {
+    transition module_name.len == 0 {
+        true -> (ProjectSymbolLocator::new_absolute_address(address))
+        _ -> (ProjectSymbolLocator::new_module_offset(module_name, address))
+    }
+}
+
+// Upstream `read_pointer_value` — anonymous one-field struct over the
+// pointer size's data type, one privileged read, first field's data value.
+pub machine ProjectItemSymbolResolution::read_pointer_value(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    address: u64,
+    module_name: &[u8],
+    pointer_size: PointerScanPointerSize
+) -> CountMatch
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let data_type_ref: DataTypeRef = PointerScanPointerSize::to_data_type_ref(&pointer_size);
+    let field: SymbolicFieldDefinition = SymbolicFieldDefinition::new(data_type_ref, ContainerType::None);
+    let fields: [SymbolicFieldDefinition; 1] = [field];
+    let definition: SymbolicStructDefinition = SymbolicStructDefinition::new("", &fields[0..1]);
+    let response: MemoryReadDispatchResult = ProjectItemSymbolResolution::dispatch_memory_read_request(
+        engine_bindings,
+        address,
+        module_name,
+        &definition);
+    transition response {
+        MemoryReadDispatchResult::Present { response } -> read_field(response, pointer_size)
+        _ -> (CountMatch { found: false, count: 0 })
+    }
+    state read_field(memory_read_response: MemoryReadResponse, pointer_size: PointerScanPointerSize) -> CountMatch {
+        transition MemoryReadResponse::get_success(&memory_read_response) {
+            true -> first_field(memory_read_response, pointer_size)
+            _ -> (CountMatch { found: false, count: 0 })
+        }
+    }
+    state first_field(memory_read_response: MemoryReadResponse, pointer_size: PointerScanPointerSize) -> CountMatch {
+        let valued_struct: &ValuedStruct = MemoryReadResponse::get_valued_struct(&memory_read_response);
+        transition ValuedStruct::get_field_count(valued_struct) > 0 {
+            true -> extract(valued_struct, pointer_size)
+            _ -> (CountMatch { found: false, count: 0 })
+        }
+    }
+    state extract(valued_struct: &ValuedStruct, pointer_size: PointerScanPointerSize) -> CountMatch {
+        let field: ValuedStructField = ValuedStruct::get_field_at(valued_struct, 0);
+        transition ValuedStructField::is_value(&field) {
+            true -> read_value(field, pointer_size)
+            _ -> (CountMatch { found: false, count: 0 })
+        }
+    }
+    state read_value(field: ValuedStructField, pointer_size: PointerScanPointerSize) -> CountMatch {
+        let data_value: DataValue = ValuedStructField::get_data_value(&field);
+        let read: PointerAddressValue = PointerScanPointerSize::read_address_value(pointer_size, &data_value);
+        transition read.found {
+            true -> (CountMatch { found: true, count: read.value })
+            _ -> (CountMatch { found: false, count: 0 })
+        }
+    }
+}
+
+// Upstream `dispatch_memory_read_request` — mailbox hop through the
+// standalone bindings (same synchronous shape as the write dispatch).
+pub machine ProjectItemSymbolResolution::dispatch_memory_read_request(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    address: u64,
+    module_name: &[u8],
+    symbolic_struct_definition: &SymbolicStructDefinition
+) -> MemoryReadDispatchResult
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let inner23: SymbolicStructDefinition = SymbolicStructDefinition::clone(symbolic_struct_definition);
+    let request: MemoryReadRequest = MemoryReadRequest::new(address, module_name, inner23, true);
+    let command: PrivilegedCommand = PrivilegedCommand::Memory { command: MemoryCommand::Read { request: request } };
+    let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+    _ = StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(engine_bindings, &command, &mut mailbox);
+    transition mailbox {
+        PrivilegedResponseMailbox::Delivered { response } -> domain(response)
+        _ -> (MemoryReadDispatchResult::Absent)
+    }
+    state domain(response: PrivilegedCommandResponse) -> MemoryReadDispatchResult {
+        transition response {
+            PrivilegedCommandResponse::Memory { response } -> leaf(response)
+            _ -> (MemoryReadDispatchResult::Absent)
+        }
+    }
+    state leaf(response: MemoryResponse) -> MemoryReadDispatchResult {
+        transition response {
+            MemoryResponse::Read { response } -> (MemoryReadDispatchResult::Present { response: response })
+            _ -> (MemoryReadDispatchResult::Absent)
+        }
+    }
+}
+
+// Result union for the read hop — mirrors MemoryWriteDispatchResult.
+pub data MemoryReadDispatchResult {
+    case Absent;
+    case Present(response: MemoryReadResponse);
+}
+
+// Pointer-to-owned conversion — the pointer item's borrowed `Pointer`
+// becomes the owned runtime shape the resolver walks.
+pub machine ProjectItemSymbolResolution::pointer_to_owned_runtime(pointer: &Pointer) -> OwnedRuntimePointer {
+    let mut owned: OwnedRuntimePointer = OwnedRuntimePointer::default();
+    owned.address = Pointer::get_address(pointer);
+    let module_slice: &[u8] = Pointer::get_module_name(pointer);
+    let written: u64 = ProjectItemSymbolResolution::copy_256(&mut owned.module_name, module_slice);
+    owned.module_name_len = written;
+    OwnedRuntimePointer::set_pointer_size(&mut owned, Pointer::get_pointer_size(pointer));
+    let segments: &[SymbolicPointerChainLink] = Pointer::get_offset_segments(pointer);
+    transition { _ -> copy_segments(pointer, segments, 0, owned) }
+    state copy_segments(pointer: &Pointer, segments: &[SymbolicPointerChainLink], at: u64, owned: OwnedRuntimePointer) -> OwnedRuntimePointer {
+        transition at < pointer.offset_count && at < 64 && at < segments.len {
+            true -> copy_segment(pointer, segments, at, owned)
+            _ -> finish(owned, at)
+        }
+    }
+    state copy_segment(pointer: &Pointer, segments: &[SymbolicPointerChainLink], at: u64, owned: OwnedRuntimePointer) -> OwnedRuntimePointer
+        requires at < pointer.offset_count && at < 64 && at < segments.len;
+    {
+        let mut carried: OwnedRuntimePointer = owned;
+        carried.offset_segments[at] = segments[at];
+        transition { _ -> copy_segments(pointer, segments, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, carried) }
+    }
+    state finish(owned: OwnedRuntimePointer, at: u64) -> OwnedRuntimePointer {
+        let mut carried: OwnedRuntimePointer = owned;
+        carried.offset_count = at;
+        carried
+    }
+}
+
+// Bounded copy into a [u8;256] field.
+machine ProjectItemSymbolResolution::copy_256(out: &mut [u8; 256], source: &[u8]) -> u64 {
+    transition { _ -> copy(out, source, 0) }
+    state copy(out: &mut [u8; 256], source: &[u8], at: u64) -> u64 {
+        transition at < source.len && at < 256 {
+            true -> byte(out, source, at)
+            _ -> (at)
+        }
+    }
+    state byte(out: &mut [u8; 256], source: &[u8], at: u64) -> u64
+        requires at < source.len && at < 256;
+    {
+        out[at] = source[at];
+        transition { _ -> copy(out, source, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Type-id equality on bounded byte slices.
+machine ProjectItemSymbolResolution::type_id_is(item_type_id: &[u8], expected: &[u8]) -> bool {
+    transition item_type_id.len == expected.len {
+        true -> probe(item_type_id, expected, 0)
+        _ -> (false)
+    }
+    state probe(item_type_id: &[u8], expected: &[u8], at: u64) -> bool {
+        transition at < item_type_id.len && at < expected.len {
+            true -> byte(item_type_id, expected, at)
+            _ -> (true)
+        }
+    }
+    state byte(item_type_id: &[u8], expected: &[u8], at: u64) -> bool
+        requires at < item_type_id.len && at < expected.len;
+    {
+        transition item_type_id[at] == expected[at] {
+            true -> probe(item_type_id, expected, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}

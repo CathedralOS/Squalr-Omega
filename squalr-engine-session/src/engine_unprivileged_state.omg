@@ -1,5 +1,6 @@
 module src::engine_unprivileged_state;
 
+use omega_language_std::filesystem_host;
 use squalr_engine_api::src::commands::command_invocation::CommandInvocation;
 use squalr_engine_api::src::commands::command_invocation::CommandInvocationOutcome;
 use squalr_engine_api::src::commands::command_invocation::CommandInvocationDecision;
@@ -26,6 +27,7 @@ use squalr_engine_api::src::structures::scanning::constraints::anonymous_scan_co
 use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_builder::ScanConstraintBuild;
 use squalr_engine_api::src::structures::scanning::constraints::scan_constraint_builder::ScanConstraintBuilder;
 use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_projects::src::settings::project_settings_config::ProjectSettingsConfig;
 use src::event_subscribers::event_subscriber_table::EventSubscriberTable;
 use src::logging::log_dispatcher::LogDispatcher;
 use squalr_engine_api::src::events::logging::log_level::LogLevel;
@@ -135,6 +137,10 @@ pub data EngineUnprivilegedState {
     project_manager: ProjectManager;
     plugin_registry: PluginRegistry;
     privileged_registry_cache: PrivilegedRegistryCache;
+    // Upstream `ProjectSettingsConfig` OnceLock — per-state field + lazy
+    // flag; `get_or_init_project_settings_config` is the init edge.
+    project_settings_config: ProjectSettingsConfig;
+    has_project_settings_config: bool;
     // Upstream `HashMap<String, VirtualSnapshot>` — bounded 8-slot tables.
     virtual_snapshot_keys: [[u8; 64]; 8];
     virtual_snapshot_key_lens: [u64; 8];
@@ -161,6 +167,8 @@ pub machine EngineUnprivilegedState::new_with_options(
         project_manager: ProjectManager::new(),
         plugin_registry: PluginRegistry::new(),
         privileged_registry_cache: PrivilegedRegistryCache::new(),
+        project_settings_config: ProjectSettingsConfig::default(),
+        has_project_settings_config: false,
         virtual_snapshot_count: 0,
     };
     EngineUnprivilegedState::seed_virtual_snapshot_keys(&mut state);
@@ -181,6 +189,8 @@ pub machine EngineUnprivilegedState::init(engine_unprivileged_state: &mut Engine
     engine_unprivileged_state.project_manager = ProjectManager::new();
     engine_unprivileged_state.plugin_registry = PluginRegistry::new();
     engine_unprivileged_state.privileged_registry_cache = PrivilegedRegistryCache::new();
+    engine_unprivileged_state.project_settings_config = ProjectSettingsConfig::default();
+    engine_unprivileged_state.has_project_settings_config = false;
     engine_unprivileged_state.virtual_snapshot_count = 0;
     EngineUnprivilegedState::seed_virtual_snapshot_keys(engine_unprivileged_state);
 }
@@ -319,6 +329,59 @@ pub machine EngineUnprivilegedState::is_registered_data_type_ref(
     data_type_ref: &DataTypeRef
 ) -> bool {
     PrivilegedRegistryCache::is_registered_data_type_ref(&engine_unprivileged_state.privileged_registry_cache, data_type_ref)
+}
+
+// Upstream `get_default_value` — the registered descriptor's unit size
+// sizes a zeroed `DataValue` on the same type ref (upstream returns the
+// data type's own default instance; unit-typed defaults are all-zero).
+// `out` filled only on true.
+pub machine EngineUnprivilegedState::get_default_value(
+    engine_unprivileged_state: &EngineUnprivilegedState,
+    data_type_ref: &DataTypeRef,
+    out_value: &mut DataValue
+) -> bool {
+    let mut descriptor: DataTypeDescriptor = DataTypeDescriptor::default();
+    transition PrivilegedRegistryCache::find_data_type_descriptor(&engine_unprivileged_state.privileged_registry_cache, DataTypeRef::get_data_type_id(data_type_ref), &mut descriptor) {
+        true -> sized(engine_unprivileged_state, data_type_ref, &descriptor, out_value)
+        _ -> (false)
+    }
+    state sized(engine_unprivileged_state: &EngineUnprivilegedState, data_type_ref: &DataTypeRef, descriptor: &DataTypeDescriptor, out_value: &mut DataValue) -> bool {
+        let unit_size: u64 = DataTypeDescriptor::get_unit_size_in_bytes(descriptor);
+        transition unit_size <= 512 {
+            true -> fill(engine_unprivileged_state, data_type_ref, unit_size, out_value)
+            _ -> (false)
+        }
+    }
+    state fill(engine_unprivileged_state: &EngineUnprivilegedState, data_type_ref: &DataTypeRef, unit_size: u64, out_value: &mut DataValue) -> bool
+        requires unit_size <= 512;
+    {
+        let mut zeroes: [u8; 512];
+        let _zeroed: u64 = zero_fill(&mut zeroes, unit_size);
+        let filled: DataValue = DataValue::new(data_type_ref, &zeroes[0..unit_size]);
+        DataValue::clone_from(out_value, &filled);
+        (true)
+    }
+}
+
+machine zero_fill(out: &mut [u8; 512], len: u64) -> u64 {
+    transition len <= 512 {
+        true -> scan(out, len, 0)
+        _ -> (0)
+    }
+    state scan(out: &mut [u8; 512], len: u64, position: u64) -> u64
+        requires len <= 512;
+    {
+        transition position < len && position < 512 {
+            true -> put(out, len, position)
+            _ -> (len)
+        }
+    }
+    state put(out: &mut [u8; 512], len: u64, position: u64) -> u64
+        requires position < 512;
+    {
+        out[position] = 0;
+        transition { _ -> scan(out, len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
 }
 
 pub machine EngineUnprivilegedState::get_default_anonymous_value_string_format(
@@ -567,7 +630,7 @@ pub machine EngineUnprivilegedState::deanonymize_value_string(
         // An over-long producer payload cannot happen upstream (the buffer is
         // the type ceiling); refusing keeps the bound honest at the slice.
         transition count <= 4096 {
-            true -> wrap(engine_unprivileged_state, data_type_ref, &out_bytes, count)
+            true -> wrap(engine_unprivileged_state, data_type_ref, out_bytes, count)
             _ -> refuse(engine_unprivileged_state, data_type_ref)
         }
     }
@@ -811,7 +874,8 @@ pub machine EngineUnprivilegedState::read_scalar_integer_value(
     state finish_le(engine_unprivileged_state: &EngineUnprivilegedState, data_value: &DataValue, size: u64, value: u64) -> ScalarIntegerReadOutcome {
         // Sign-extend when the type is signed and the top bit is set.
         let sign_bit: u64 = 128;
-        transition DataValue::get_data_type_ref(data_value).is_signed() && size > 0 && size < 8
+        let data_type_ref: DataTypeRef = DataValue::get_data_type_ref(data_value);
+        transition DataTypeRef::is_signed(&data_type_ref) && size > 0 && size < 8
             && (value >> ((size * 8) - 1)) & 1 == 1 {
             true -> negative(engine_unprivileged_state, value, size)
             false -> positive(engine_unprivileged_state, value, size)
@@ -819,7 +883,8 @@ pub machine EngineUnprivilegedState::read_scalar_integer_value(
         }
     }
     state finish_be(engine_unprivileged_state: &EngineUnprivilegedState, data_value: &DataValue, size: u64, value: u64) -> ScalarIntegerReadOutcome {
-        transition DataValue::get_data_type_ref(data_value).is_signed() && size > 0 && size < 8
+        let data_type_ref: DataTypeRef = DataValue::get_data_type_ref(data_value);
+        transition DataTypeRef::is_signed(&data_type_ref) && size > 0 && size < 8
             && (value >> ((size * 8) - 1)) & 1 == 1 {
             true -> negative(engine_unprivileged_state, value, size)
             false -> positive(engine_unprivileged_state, value, size)
@@ -1637,6 +1702,42 @@ pub machine EngineUnprivilegedState::notify_project_deleted(engine_unprivileged_
 
 pub machine EngineUnprivilegedState::notify_project_closed(engine_unprivileged_state: &mut EngineUnprivilegedState) {
     ProjectManager::notify_project_closed(&engine_unprivileged_state.project_manager, &mut engine_unprivileged_state.event_subscribers);
+}
+
+// Upstream `ProjectSettingsConfig::get_instance()` — the OnceLock lazy
+// edge: first access materializes the config from the default path
+// (fs-bound) and flips the flag; subsequent calls are reads.
+pub linux_x86_64 machine EngineUnprivilegedState::get_or_init_project_settings_config(
+    engine_unprivileged_state: &mut EngineUnprivilegedState
+) -> bool
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    transition engine_unprivileged_state.has_project_settings_config {
+        true -> (true)
+        _ -> build(engine_unprivileged_state)
+    }
+    state build(engine_unprivileged_state: &mut EngineUnprivilegedState) -> bool {
+        engine_unprivileged_state.project_settings_config = ProjectSettingsConfig::get_or_init_default();
+        engine_unprivileged_state.has_project_settings_config = true;
+        (true)
+    }
+}
+
+// Upstream `ProjectSettingsConfig::get_projects_root()` — callers needing
+// the root read it off the initialized field; the lazy edge is
+// `get_or_init_project_settings_config` and every fs executor already
+// names the FilesystemHost boundary it implies.
+pub machine EngineUnprivilegedState::get_project_settings_config(
+    engine_unprivileged_state: &EngineUnprivilegedState
+) -> &ProjectSettingsConfig {
+    &engine_unprivileged_state.project_settings_config
+}
+
+pub machine EngineUnprivilegedState::borrow_project_settings_config_mut(
+    engine_unprivileged_state: &mut EngineUnprivilegedState
+) -> &mut ProjectSettingsConfig {
+    &mut engine_unprivileged_state.project_settings_config
 }
 
 pub machine EngineUnprivilegedState::watch_projects_root(engine_unprivileged_state: &mut EngineUnprivilegedState, root_path: &[u8]) {

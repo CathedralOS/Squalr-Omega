@@ -1,0 +1,125 @@
+module src::command_executors::project_items_promote_symbol_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::promote_symbol::project_items_promote_symbol_request::ProjectItemsPromoteSymbolRequest;
+use squalr_engine_api::src::commands::project_items::promote_symbol::project_items_promote_symbol_response::ProjectItemsPromoteSymbolConflict;
+use squalr_engine_api::src::commands::project_items::promote_symbol::project_items_promote_symbol_response::ProjectItemsPromoteSymbolResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_symbol_promotion::ProjectItemSymbolPromotion;
+use src::services::projects::project_item_symbol_promotion::ProjectItemSymbolPromotionChangeSet;
+use src::services::projects::project_symbol_catalog_persistence::ProjectSymbolCatalogPersistence;
+
+// Port of command_executors/project_items/promote_symbol/
+// project_items_promote_symbol_request_executor.rs — opened-process
+// gate, apply the promotion (catalog claims + sort-order entries +
+// placeholder files handled by the service), sync the catalog upstream,
+// save, notify.
+pub data ProjectItemsPromoteSymbolRequestExecutor {}
+
+pub machine ProjectItemsPromoteSymbolRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_promote_symbol_request: &ProjectItemsPromoteSymbolRequest
+) -> ProjectItemsPromoteSymbolResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition ProjectItemSymbolPromotion::query_has_opened_process(engine_bindings) {
+        true -> opened(engine_unprivileged_state, engine_bindings, project_items_promote_symbol_request)
+        _ -> refused()
+    }
+
+    state opened(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_promote_symbol_request: &ProjectItemsPromoteSymbolRequest) -> ProjectItemsPromoteSymbolResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> directory(engine_unprivileged_state, engine_bindings, project_items_promote_symbol_request)
+            _ -> refused()
+        }
+    }
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_promote_symbol_request: &ProjectItemsPromoteSymbolRequest) -> ProjectItemsPromoteSymbolResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> measure(engine_unprivileged_state, engine_bindings, project_items_promote_symbol_request, directory)
+            _ -> refused()
+        }
+    }
+    state measure(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_promote_symbol_request: &ProjectItemsPromoteSymbolRequest, directory: [u8; 512]) -> ProjectItemsPromoteSymbolResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> apply(engine_unprivileged_state, engine_bindings, project_items_promote_symbol_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+
+    state apply(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_promote_symbol_request: &ProjectItemsPromoteSymbolRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsPromoteSymbolResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let paths: &ProjectPathList = ProjectItemsPromoteSymbolRequest::get_project_item_paths(project_items_promote_symbol_request);
+        let overwrite: bool = ProjectItemsPromoteSymbolRequest::get_overwrite_conflicting_symbols(project_items_promote_symbol_request);
+        let change_set: ProjectItemSymbolPromotionChangeSet = ProjectItemSymbolPromotion::apply_project_item_symbol_promotion(engine_unprivileged_state, engine_bindings, opened_project, &directory[0..directory_len], paths, overwrite);
+        transition { _ -> respond(engine_unprivileged_state, engine_bindings, change_set) }
+    }
+
+    // Upstream `should_save_project` gates catalog sync + save + notify.
+    state respond(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, change_set: ProjectItemSymbolPromotionChangeSet) -> ProjectItemsPromoteSymbolResponse {
+        transition change_set.should_save_project {
+            true -> sync(engine_unprivileged_state, engine_bindings, change_set)
+            _ -> fill(change_set)
+        }
+    }
+    state sync(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, change_set: ProjectItemSymbolPromotionChangeSet) -> ProjectItemsPromoteSymbolResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        _ = ProjectSymbolCatalogPersistence::save_and_sync_project_symbol_catalog(engine_bindings, opened_project);
+        transition { _ -> fill(change_set) }
+    }
+
+    state fill(change_set: ProjectItemSymbolPromotionChangeSet) -> ProjectItemsPromoteSymbolResponse {
+        let mut response: ProjectItemsPromoteSymbolResponse = ProjectItemsPromoteSymbolResponse::new();
+        ProjectItemsPromoteSymbolResponse::set_success(&mut response, true);
+        ProjectItemsPromoteSymbolResponse::set_promoted_symbol_count(&mut response, change_set.promoted_symbol_count);
+        ProjectItemsPromoteSymbolResponse::set_reused_symbol_count(&mut response, change_set.reused_symbol_count);
+        transition { _ -> conflicts(response, &change_set, 0) }
+    }
+    // Change-set conflicts carry the engine-side duplicate of the
+    // response's conflict record; fields are copied field-wise.
+    state conflicts(mut response: ProjectItemsPromoteSymbolResponse, change_set: &ProjectItemSymbolPromotionChangeSet, position: u64) -> ProjectItemsPromoteSymbolResponse {
+        transition position < change_set.conflicts.count && position < 16 {
+            true -> conflict_one(response, change_set, position)
+            _ -> (response)
+        }
+    }
+    state conflict_one(mut response: ProjectItemsPromoteSymbolResponse, change_set: &ProjectItemSymbolPromotionChangeSet, position: u64) -> ProjectItemsPromoteSymbolResponse
+        requires position < 16;
+    {
+        let conflict: &ProjectItemsPromoteSymbolConflict = &change_set.conflicts.conflicts[position];
+        let carried: ProjectItemsPromoteSymbolConflict = ProjectItemsPromoteSymbolConflict::clone(conflict);
+        _ = ProjectItemsPromoteSymbolResponse::add_conflict(&mut response, carried);
+        transition { _ -> conflicts(response, change_set, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state refused() -> ProjectItemsPromoteSymbolResponse {
+        (ProjectItemsPromoteSymbolResponse::new())
+    }
+}

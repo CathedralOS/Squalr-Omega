@@ -708,3 +708,115 @@ pub machine symbolic_pointer_chain_apply_pointer_offset(address: u64, pointer_of
         (Optional::Some { value: ((address as u64 in Wrapping) - (delta as u64 in Wrapping)) as u64 })
     }
 }
+
+// Upstream `PartialEq` on the link union — offset payload equality for
+// `Offset`, name bytes + len for `Symbol`.
+pub machine SymbolicPointerChainLink::links_equal(left: &SymbolicPointerChainLink, right: &SymbolicPointerChainLink) -> bool {
+    transition left {
+        SymbolicPointerChainLink::Offset { offset } -> offset_side(left, right, offset)
+        _ -> symbol_side(left, right)
+    }
+    state offset_side(left: &SymbolicPointerChainLink, right: &SymbolicPointerChainLink, left_offset: i64) -> bool {
+        transition right {
+            SymbolicPointerChainLink::Offset { offset } -> (left_offset == offset)
+            _ -> (false)
+        }
+    }
+    state symbol_side(left: &SymbolicPointerChainLink, right: &SymbolicPointerChainLink) -> bool {
+        transition right {
+            SymbolicPointerChainLink::Symbol { symbol } -> right_symbol_case(left, right, symbol)
+            _ -> (false)
+        }
+    }
+    state right_symbol_case(left: &SymbolicPointerChainLink, right: &SymbolicPointerChainLink, right_symbol: PointerChainSymbol) -> bool {
+        transition left {
+            SymbolicPointerChainLink::Symbol { symbol } -> compare_names(symbol, right_symbol)
+            _ -> (false)
+        }
+    }
+    state compare_names(left_symbol: PointerChainSymbol, right_symbol: PointerChainSymbol) -> bool {
+        transition left_symbol.symbol_name_len == right_symbol.symbol_name_len && left_symbol.symbol_name_len <= 256 {
+            true -> name_byte(left_symbol, right_symbol, 0)
+            _ -> (false)
+        }
+    }
+    state name_byte(left_symbol: PointerChainSymbol, right_symbol: PointerChainSymbol, position: u64) -> bool {
+        transition position < left_symbol.symbol_name_len && left_symbol.symbol_name_len <= 256 {
+            true -> name_probe(left_symbol, right_symbol, position)
+            _ -> (true)
+        }
+    }
+    state name_probe(left_symbol: PointerChainSymbol, right_symbol: PointerChainSymbol, position: u64) -> bool
+        requires position < left_symbol.symbol_name_len && left_symbol.symbol_name_len <= 256;
+    {
+        transition position < 256 && left_symbol.symbol_name[position] == right_symbol.symbol_name[position] {
+            true -> name_byte(left_symbol, right_symbol, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `SymbolicPointerChainLink::parse_text_list` — comma-split
+// per-link `from_str`; the serde_json array spellings upstream tries
+// first are deferred with the codec deviation (no JSON substrate).
+pub machine symbolic_pointer_chain_parse_text_list(text: &[u8], out: &mut [SymbolicPointerChainLink; 64]) -> u64 {
+    transition { _ -> scan(text, out, 0, 0, 0) }
+    state scan(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], segment_start: u64, position: u64, written: u64) -> u64 {
+        transition position < text.len {
+            true -> at(text, out, segment_start, position, written)
+            false -> emit(text, out, segment_start, position, written)
+        }
+    }
+    state at(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], segment_start: u64, position: u64, written: u64) -> u64 {
+        transition text[position] == 44 {
+            true -> emit(text, out, segment_start, position, written)
+            false -> scan(text, out, segment_start, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, written)
+        }
+    }
+    state emit(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], segment_start: u64, position: u64, written: u64) -> u64 {
+        transition segment_start < position && position <= text.len {
+            true -> parse(text, out, segment_start, position, written)
+            false -> next(text, out, position, written)
+        }
+    }
+    state parse(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], segment_start: u64, position: u64, written: u64) -> u64 {
+        let parsed: SymbolicLinkParse = SymbolicPointerChainLink::from_str(&text[segment_start..position]);
+        transition parsed.found {
+            true -> store(text, out, segment_start, position, written, parsed)
+            false -> next(text, out, position, written)
+        }
+    }
+    state store(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], segment_start: u64, position: u64, written: u64, parsed: SymbolicLinkParse) -> u64 {
+        transition written < 64 && parsed.is_symbol {
+            true -> store_symbol(text, out, segment_start, position, written, parsed)
+            _ -> store_offset_route(text, out, position, written, parsed)
+        }
+    }
+    state store_symbol(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], segment_start: u64, position: u64, written: u64, parsed: SymbolicLinkParse) -> u64
+        requires written < 64;
+    {
+        let built: SymbolicLinkBuild = SymbolicPointerChainLink::new_symbol(&text[segment_start..position]);
+        transition built.found {
+            true -> keep(text, out, position, written, built.link)
+            _ -> next(text, out, position, written)
+        }
+    }
+    state store_offset_route(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], position: u64, written: u64, parsed: SymbolicLinkParse) -> u64 {
+        transition written < 64 && parsed.is_symbol == false {
+            true -> keep(text, out, position, written, SymbolicPointerChainLink::new_offset(parsed.offset))
+            _ -> next(text, out, position, written)
+        }
+    }
+    state keep(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], position: u64, written: u64, link: SymbolicPointerChainLink) -> u64
+        requires written < 64;
+    {
+        out[written] = link;
+        transition { _ -> next(text, out, position, ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state next(text: &[u8], out: &mut [SymbolicPointerChainLink; 64], position: u64, written: u64) -> u64 {
+        transition position >= text.len {
+            true -> (written)
+            _ -> scan(text, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, written)
+        }
+    }
+}

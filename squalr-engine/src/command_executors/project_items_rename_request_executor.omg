@@ -1,0 +1,696 @@
+module src::command_executors::project_items_rename_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::rename::project_items_rename_request::ProjectItemsRenameRequest;
+use squalr_engine_api::src::commands::project_items::rename::project_items_rename_response::ProjectItemsRenameResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project::ProjectItemLookup;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_directory::ProjectItemTypeDirectory;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/rename/
+// project_items_rename_request_executor.rs — trimmed non-empty new name,
+// resolve the source item (must be in the table), mint the unique target
+// (directory: last-component `_N` candidates; file: sanitized stem via
+// `generate_unique_project_item_file_path_allowing` with the source as
+// the allowed-existing path), `fs::rename` (rename_tree_commit), retarget
+// the table entry and sort order, set the display name (dir items get
+// the target's file name), dirty flags, save, notify.
+pub data ProjectItemsRenameRequestExecutor {}
+
+pub machine ProjectItemsRenameRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_rename_request: &ProjectItemsRenameRequest
+) -> ProjectItemsRenameResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+    transition ProjectManager::get_has_opened_project(project_manager) {
+        true -> directory(engine_unprivileged_state, project_items_rename_request)
+        _ -> refused()
+    }
+
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest) -> ProjectItemsRenameResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> measure(engine_unprivileged_state, project_items_rename_request, directory)
+            _ -> refused()
+        }
+    }
+    state measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512]) -> ProjectItemsRenameResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> trim_start(engine_unprivileged_state, project_items_rename_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `project_item_name.trim()` — ASCII whitespace scan (9/10/13/32)
+    // bounding the trimmed span [name_lo, name_hi).
+    state trim_start(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        transition { _ -> trim_lo(engine_unprivileged_state, project_items_rename_request, directory, directory_len, 0) }
+    }
+    state trim_lo(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        transition position < name.len {
+            true -> trim_lo_byte(engine_unprivileged_state, project_items_rename_request, directory, directory_len, position)
+            _ -> refused()
+        }
+    }
+    state trim_lo_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        transition position < name.len {
+            true -> trim_lo_val(engine_unprivileged_state, project_items_rename_request, directory, directory_len, position)
+            _ -> refused()
+        }
+    }
+    state trim_lo_val(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        let value: u8 = name[position];
+        let is_space: bool = value == 9 || value == 10 || value == 13 || value == 32;
+        transition is_space {
+            true -> trim_lo(engine_unprivileged_state, project_items_rename_request, directory, directory_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> trim_hi(engine_unprivileged_state, project_items_rename_request, directory, directory_len, position, name.len)
+        }
+    }
+    state trim_hi(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, hi_position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        transition hi_position > name_lo {
+            true -> trim_hi_byte(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, hi_position)
+            _ -> refused()
+        }
+    }
+    state trim_hi_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, hi_position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        let back_index: u64 = ((hi_position as u64 in Wrapping) - (1 as u64 in Wrapping)) as u64;
+        transition back_index < name.len {
+            true -> trim_hi_probe(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, hi_position, back_index)
+            _ -> refused()
+        }
+    }
+    state trim_hi_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, hi_position: u64, back_index: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        transition back_index < name.len {
+            true -> trim_hi_val(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, hi_position, back_index)
+            _ -> refused()
+        }
+    }
+    state trim_hi_val(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, hi_position: u64, back_index: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        let value: u8 = name[back_index];
+        let is_space: bool = value == 9 || value == 10 || value == 13 || value == 32;
+        transition is_space {
+            true -> trim_hi(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, back_index)
+            _ -> trimmed(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, hi_position)
+        }
+    }
+    // Copy the trimmed span into a scratch — downstream path/name work
+    // flows through bounded carriers.
+    state trimmed(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, name_hi: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut trimmed_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut trimmed_name);
+        transition { _ -> trim_copy(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, name_hi, trimmed_name, name_lo) }
+    }
+    state trim_copy(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, name_hi: u64, mut trimmed_name: ManifestPathScratch, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        transition position < name_hi && position < name.len {
+            true -> trim_copy_byte(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, name_hi, trimmed_name, position)
+            _ -> resolve_source(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name)
+        }
+    }
+    state trim_copy_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, name_hi: u64, mut trimmed_name: ManifestPathScratch, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name: &[u8] = ProjectItemsRenameRequest::get_project_item_name(project_items_rename_request);
+        transition position < name.len {
+            true -> trim_copy_put(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, name_hi, trimmed_name, position, name[position])
+            _ -> resolve_source(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name)
+        }
+    }
+    state trim_copy_put(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, name_lo: u64, name_hi: u64, mut trimmed_name: ManifestPathScratch, position: u64, byte_value: u8) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        _ = ManifestPathScratch::append(&mut trimmed_name, byte_value);
+        transition { _ -> trim_copy(engine_unprivileged_state, project_items_rename_request, directory, directory_len, name_lo, name_hi, trimmed_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state resolve_source(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut source: ManifestPathScratch;
+        ManifestPathScratch::new(&mut source);
+        let item_path: &[u8] = ProjectItemsRenameRequest::get_project_item_path(project_items_rename_request);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], item_path, &mut source) {
+            true -> lookup_item(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source)
+            _ -> refused()
+        }
+    }
+    state lookup_item(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let inner55: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let source_ref: ProjectItemRef = ProjectItemRef::new(inner55);
+        let found: ProjectItemLookup = Project::lookup_project_item_index(opened_project, &source_ref);
+        transition found {
+            ProjectItemLookup::Found { index } -> item_kind(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, index)
+            _ -> refused()
+        }
+    }
+    // `build_target_project_item_path` — directories mint name
+    // candidates; files sanitize + unique file path, both allowing the
+    // source itself as the pre-existing path.
+    state item_kind(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, index: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened_project, index);
+        let item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(item);
+        let mut path_equaler: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let is_dir: bool = ProjectItemSortOrder::paths_equal(path_equaler, ProjectItemTypeRef::get_project_item_type_id(item_type), ProjectItemTypeDirectory::get_project_item_type_id());
+        transition is_dir {
+            true -> dir_last_sep(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source)
+            _ -> file_parent(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source)
+        }
+    }
+
+    // ---- Directory target: join(parent, <name>[_N]) allowing source ----
+    state dir_last_sep(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let name_start: u64 = ProjectItemFileMutation::find_last_separator(source_bytes);
+        transition name_start <= source_bytes.len {
+            true -> dir_name_start(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, name_start)
+            _ -> refused()
+        }
+    }
+    // Upstream takes `Path::new(name).file_name()` — the requested name's
+    // own last component, fallback "project_directory".
+    state dir_name_start(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name_bytes: &[u8] = ManifestPathScratch::get_bytes(&trimmed_name);
+        let req_name_start: u64 = ProjectItemFileMutation::find_last_separator(name_bytes);
+        transition req_name_start <= name_bytes.len {
+            true -> dir_fallback(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, req_name_start)
+            _ -> refused()
+        }
+    }
+    state dir_fallback(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, req_name_start: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name_bytes: &[u8] = ManifestPathScratch::get_bytes(&trimmed_name);
+        transition req_name_start < name_bytes.len {
+            true -> dir_name(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, req_name_start)
+            _ -> dir_name_empty(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start)
+        }
+    }
+    state dir_name(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, req_name_start: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name_bytes: &[u8] = ManifestPathScratch::get_bytes(&trimmed_name);
+        let mut leaf: ManifestPathScratch;
+        ManifestPathScratch::new(&mut leaf);
+        transition { _ -> dir_leaf(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, req_name_start) }
+    }
+    state dir_leaf(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, mut leaf: ManifestPathScratch, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name_bytes: &[u8] = ManifestPathScratch::get_bytes(&trimmed_name);
+        transition position < name_bytes.len {
+            true -> dir_leaf_byte(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, position)
+            _ -> dir_sequence(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, 0)
+        }
+    }
+    state dir_leaf_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, mut leaf: ManifestPathScratch, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let name_bytes: &[u8] = ManifestPathScratch::get_bytes(&trimmed_name);
+        transition position < name_bytes.len {
+            true -> dir_leaf_put(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, position, name_bytes[position])
+            _ -> dir_sequence(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, 0)
+        }
+    }
+    state dir_leaf_put(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, mut leaf: ManifestPathScratch, position: u64, byte_value: u8) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        _ = ManifestPathScratch::append(&mut leaf, byte_value);
+        transition { _ -> dir_leaf(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state dir_name_empty(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut leaf: ManifestPathScratch;
+        ManifestPathScratch::new(&mut leaf);
+        let mut path_copier: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::copy_into(path_copier, "project_directory", &mut leaf);
+        transition { _ -> dir_sequence(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, 0) }
+    }
+
+    // Candidate = parent + leaf(_N) — `source_name_start` splits the
+    // parent off the source path.
+    state dir_sequence(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        transition sequence <= 999 {
+            true -> dir_candidate(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence)
+            _ -> refused()
+        }
+    }
+    state dir_candidate(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut candidate_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut candidate_name);
+        let mut path_copier: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3051: &[u8] = ManifestPathScratch::get_bytes(&leaf);
+        _ = ProjectItemSortOrder::copy_into(path_copier, inner3051, &mut candidate_name);
+        transition sequence > 0 {
+            true -> dir_suffix(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, sequence, 1)
+            _ -> dir_join(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence)
+        }
+    }
+    state dir_suffix(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64, mut candidate_name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut next_magnitude: u64 = ((magnitude as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64;
+        transition magnitude == 1 && candidate_name.len < 512 {
+            true -> dir_underscore(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, magnitude)
+            _ -> dir_grow(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, magnitude, next_magnitude)
+        }
+    }
+    state dir_underscore(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64, mut candidate_name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+        requires candidate_name.len < 512;
+    {
+        candidate_name.bytes[candidate_name.len] = 95;
+        candidate_name.len = ((candidate_name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> dir_grow(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, magnitude, magnitude) }
+    }
+    state dir_grow(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64, mut candidate_name: ManifestPathScratch, value: u64, magnitude: u64, next_magnitude: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        transition next_magnitude <= value && next_magnitude <= 999 {
+            true -> dir_suffix(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, next_magnitude)
+            _ -> dir_digit(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, magnitude)
+        }
+    }
+    state dir_digit(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64, mut candidate_name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        transition magnitude > 0 {
+            true -> dir_digit_byte(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, magnitude)
+            _ -> dir_join(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence)
+        }
+    }
+    state dir_digit_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64, mut candidate_name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let digit: u64 = ((value as u64 in Wrapping) / (magnitude as u64 in Wrapping)) as u64;
+        let rem: u64 = ((digit as u64 in Wrapping) % (10 as u64 in Wrapping)) as u64;
+        let byte_value: u8 = ((rem as u64 in Wrapping) + (48 as u64 in Wrapping)) as u8;
+        transition candidate_name.len < 512 {
+            true -> dir_digit_put(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, magnitude, byte_value)
+            _ -> dir_join(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence)
+        }
+    }
+    state dir_digit_put(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, leaf: ManifestPathScratch, sequence: u64, mut candidate_name: ManifestPathScratch, value: u64, magnitude: u64, byte_value: u8) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+        requires candidate_name.len < 512;
+    {
+        candidate_name.bytes[candidate_name.len] = byte_value;
+        candidate_name.len = ((candidate_name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> dir_digit(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, leaf, sequence, candidate_name, value, ((magnitude as u64 in Wrapping) / (10 as u64 in Wrapping)) as u64) }
+    }
+
+    // parent = source[..source_name_start]; candidate = parent + name.
+    state dir_join(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, candidate_name: ManifestPathScratch, sequence: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition source_name_start <= source_bytes.len {
+            true -> dir_join_do(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence)
+            _ -> refused()
+        }
+    }
+    state dir_join_do(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, candidate_name: ManifestPathScratch, sequence: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let mut target: ManifestPathScratch;
+        ManifestPathScratch::new(&mut target);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        transition source_name_start <= source_bytes.len {
+            true -> dir_join_sub(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence, target)
+            _ -> refused()
+        }
+    }
+    state dir_join_sub(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, candidate_name: ManifestPathScratch, sequence: u64, mut target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        transition source_name_start <= source_bytes.len {
+            true -> dir_join_do2(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence, target, source_bytes)
+            _ -> refused()
+        }
+    }
+    state dir_join_do2(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, candidate_name: ManifestPathScratch, sequence: u64, mut target: ManifestPathScratch, source_bytes: &[u8]) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+        requires source_name_start <= source_bytes.len;
+    {
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3052: &[u8] = ManifestPathScratch::get_bytes(&candidate_name);
+        transition ProjectItemSortOrder::join_path(path_joiner, &source_bytes[0..source_name_start], inner3052, &mut target) {
+            true -> dir_probe(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence, target)
+            _ -> refused()
+        }
+    }
+    // Allowed-existing = the source itself.
+    state dir_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, candidate_name: ManifestPathScratch, sequence: u64, target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut path_equaler: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3053: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let inner3054: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition ProjectItemSortOrder::paths_equal(path_equaler, inner3053, inner3054) {
+            true -> rename_gate(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, target, true)
+            _ -> dir_probe_exists(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, sequence, target)
+        }
+    }
+    state dir_probe_exists(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, candidate_name: ManifestPathScratch, sequence: u64, target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let inner3055: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition FileSystemUtils::path_exists(inner3055) {
+            true -> dir_sequence(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, candidate_name, ((sequence as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> rename_gate(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, target, true)
+        }
+    }
+
+    // ---- File target: sanitized stem + unique file path ----
+    state file_parent(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let name_start: u64 = ProjectItemFileMutation::find_last_separator(source_bytes);
+        transition name_start <= source_bytes.len {
+            true -> file_stem(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, name_start)
+            _ -> refused()
+        }
+    }
+    state file_stem(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut stem: ManifestPathScratch;
+        ManifestPathScratch::new(&mut stem);
+        let inner3056: &[u8] = ManifestPathScratch::get_bytes(&trimmed_name);
+        transition ProjectItemFileMutation::sanitize_file_name_component(inner3056, "project_item", &mut stem) {
+            true -> file_unique(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, stem)
+            _ -> refused()
+        }
+    }
+    state file_unique(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, stem: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let mut target: ManifestPathScratch;
+        ManifestPathScratch::new(&mut target);
+        transition source_name_start <= source_bytes.len {
+            true -> file_unique_do(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, source_name_start, stem, target, source_bytes)
+            _ -> refused()
+        }
+    }
+    state file_unique_do(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, source_name_start: u64, stem: ManifestPathScratch, mut target: ManifestPathScratch, source_bytes: &[u8]) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+        requires source_name_start <= source_bytes.len;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let inner3057: &[u8] = ManifestPathScratch::get_bytes(&stem);
+        let inner3058: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition ProjectItemFileMutation::generate_unique_project_item_file_path_allowing(&source_bytes[0..source_name_start], opened_project, inner3057, inner3058, true, &mut target) {
+            true -> rename_gate(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, target, false)
+            _ -> refused()
+        }
+    }
+
+    // ---- Shared: rename + retarget + display name + save ----
+    state rename_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, target: ManifestPathScratch, is_dir: bool) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut path_equaler: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3059: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let inner3060: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition ProjectItemSortOrder::paths_equal(path_equaler, inner3059, inner3060) {
+            true -> display(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target, is_dir)
+            _ -> do_rename(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, target, is_dir)
+        }
+    }
+    state do_rename(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, target: ManifestPathScratch, is_dir: bool) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let inner3061: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let inner3062: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition FileSystemUtils::rename_tree_commit(inner3061, inner3062) {
+            true -> retarget(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, target, is_dir)
+            _ -> refused()
+        }
+    }
+    // `items_mut().remove(source_ref)` then `insert(target_ref, item)`.
+    state retarget(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, target: ManifestPathScratch, is_dir: bool) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let inner56: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let source_ref: ProjectItemRef = ProjectItemRef::new(inner56);
+        let mut taken: ProjectItem = ProjectItem::default();
+        transition Project::take_project_item(opened_project, &source_ref, &mut taken) {
+            true -> reinsert(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, target, is_dir, taken)
+            _ -> refused()
+        }
+    }
+    state reinsert(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, target: ManifestPathScratch, is_dir: bool, taken: ProjectItem) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let inner57: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let target_ref: ProjectItemRef = ProjectItemRef::new(inner57);
+        let pair: ProjectItemPair = ProjectItemPair::new(target_ref, taken);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition Project::insert_project_item(opened_project, &pair) {
+            true -> sort(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, source, target, is_dir)
+            _ -> refused()
+        }
+    }
+    state sort(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, source: ManifestPathScratch, target: ManifestPathScratch, is_dir: bool) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3063: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let inner3064: &[u8] = ManifestPathScratch::get_bytes(&target);
+        _ = ProjectItemSortOrder::rename_project_item_path_in_sort_order(&sort_order, opened_project, &directory[0..directory_len], inner3063, inner3064);
+        transition { _ -> display(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target, is_dir) }
+    }
+
+    // `set_field_name` — directory items display the target's file name;
+    // files display the requested name. The leaf bytes are copied into a
+    // scratch first so the single apply state is name-source agnostic.
+    state display(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch, is_dir: bool) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        transition is_dir {
+            true -> leaf_sep(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target)
+            _ -> apply(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target)
+        }
+    }
+    state leaf_sep(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let target_bytes: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let name_start: u64 = ProjectItemFileMutation::find_last_separator(target_bytes);
+        transition name_start <= target_bytes.len {
+            true -> leaf_copy(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target, name_start)
+            _ -> refused()
+        }
+    }
+    state leaf_copy(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch, name_start: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let mut leaf_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut leaf_name);
+        transition { _ -> leaf_loop(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target, leaf_name, name_start) }
+    }
+    state leaf_loop(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch, mut leaf_name: ManifestPathScratch, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let target_bytes: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition position < target_bytes.len {
+            true -> leaf_byte(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target, leaf_name, position)
+            _ -> apply_leaf(engine_unprivileged_state, project_items_rename_request, directory, directory_len, target, leaf_name)
+        }
+    }
+    state leaf_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch, mut leaf_name: ManifestPathScratch, position: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let target_bytes: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition position < target_bytes.len {
+            true -> leaf_put(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target, leaf_name, position, target_bytes[position])
+            _ -> apply_leaf(engine_unprivileged_state, project_items_rename_request, directory, directory_len, target, leaf_name)
+        }
+    }
+    state leaf_put(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch, mut leaf_name: ManifestPathScratch, position: u64, byte_value: u8) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        _ = ManifestPathScratch::append(&mut leaf_name, byte_value);
+        transition { _ -> leaf_loop(engine_unprivileged_state, project_items_rename_request, directory, directory_len, trimmed_name, target, leaf_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state apply(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let inner58: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let target_ref: ProjectItemRef = ProjectItemRef::new(inner58);
+        let found: ProjectItemLookup = Project::lookup_project_item_index(opened_project, &target_ref);
+        transition found {
+            ProjectItemLookup::Found { index } -> set_name(engine_unprivileged_state, directory, directory_len, trimmed_name, target, index)
+            _ -> refused()
+        }
+    }
+    state apply_leaf(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_rename_request: &ProjectItemsRenameRequest, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch, leaf_name: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let inner59: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let target_ref: ProjectItemRef = ProjectItemRef::new(inner59);
+        let found: ProjectItemLookup = Project::lookup_project_item_index(opened_project, &target_ref);
+        transition found {
+            ProjectItemLookup::Found { index } -> set_name_leaf(engine_unprivileged_state, directory, directory_len, leaf_name, target, index)
+            _ -> refused()
+        }
+    }
+    state set_name(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, trimmed_name: ManifestPathScratch, target: ManifestPathScratch, index: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, index);
+        let item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        ProjectItem::set_field_name(item, ManifestPathScratch::get_bytes(&trimmed_name));
+        ProjectItem::set_has_unsaved_changes(item, true);
+        transition { _ -> mark_dirty(engine_unprivileged_state, directory, directory_len, target) }
+    }
+    state set_name_leaf(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, leaf_name: ManifestPathScratch, target: ManifestPathScratch, index: u64) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let pair: &mut ProjectItemPair = Project::borrow_project_item_pair_mut(opened_project, index);
+        let item: &mut ProjectItem = ProjectItemPair::borrow_project_item_mut(pair);
+        ProjectItem::set_field_name(item, ManifestPathScratch::get_bytes(&leaf_name));
+        ProjectItem::set_has_unsaved_changes(item, true);
+        transition { _ -> mark_dirty(engine_unprivileged_state, directory, directory_len, target) }
+    }
+    // Upstream also sets `project_info_mut().set_has_unsaved_changes(true)`.
+    state mark_dirty(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let info: &mut ProjectInfo = Project::borrow_project_info_mut(opened_project);
+        ProjectInfo::set_has_unsaved_changes(info, true);
+        transition { _ -> save_open(engine_unprivileged_state, directory, directory_len, target) }
+    }
+
+    state save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> save_do(engine_unprivileged_state, dir_fd, directory, directory_len, target)
+            _ -> refused()
+        }
+    }
+    state save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, target: ManifestPathScratch) -> ProjectItemsRenameResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify_done(engine_unprivileged_state, target)
+            _ -> refused()
+        }
+    }
+    state notify_done(engine_unprivileged_state: &mut EngineUnprivilegedState, target: ManifestPathScratch) -> ProjectItemsRenameResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> respond(target) }
+    }
+    state respond(target: ManifestPathScratch) -> ProjectItemsRenameResponse {
+        let mut response: ProjectItemsRenameResponse = ProjectItemsRenameResponse::new();
+        ProjectItemsRenameResponse::set_success(&mut response, true);
+        ProjectItemsRenameResponse::set_renamed_project_item_path(&mut response, ManifestPathScratch::get_bytes(&target));
+        (response)
+    }
+    state refused() -> ProjectItemsRenameResponse {
+        (ProjectItemsRenameResponse::new())
+    }
+}

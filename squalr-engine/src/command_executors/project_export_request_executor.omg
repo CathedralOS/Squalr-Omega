@@ -1,0 +1,241 @@
+module src::command_executors::project_export_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project::export::project_export_request::ProjectExportRequest;
+use squalr_engine_api::src::commands::project::export::project_export_response::ProjectExportResponse;
+use squalr_engine_api::src::plugins::plugin_configuration::PluginConfiguration;
+use squalr_engine_api::src::structures::processes::process_icon::ProcessIcon;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_manifest::ProjectManifest;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_file_codec::ProjectFileWriter;
+use squalr_engine_projects::src::project::serialization::project_file_codec_item::encode_project_item;
+use squalr_engine_projects::src::project::serialization::project_file_codec_types::encode_info_stub;
+use squalr_engine_projects::src::project::serialization::project_info_serialization::ProjectInfoStub;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+// Port of command_executors/project/export/project_export_request_executor.rs —
+// serialize the OPENED project to `<dir>/export/<name>.json`. Upstream
+// writes `serde_json::to_writer(file, &project)`; there is no JSON
+// substrate in the port, so the export stream is the project codec's own
+// framing (header + info stub + item count + per-item ref path + item
+// record) — documented deviation, same location and naming.
+// `open_export_folder` is a GUI shell-op upstream; headless-first port
+// records the flag and does not open a file browser.
+pub data ProjectExportRequestExecutor {}
+
+pub machine ProjectExportRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_export_request: &ProjectExportRequest
+) -> ProjectExportResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+    transition ProjectManager::get_has_opened_project(project_manager) {
+        true -> directory(engine_unprivileged_state)
+        _ -> refused()
+    }
+
+    // Upstream `project_info.get_project_directory()` — copy into a
+    // 512-byte scratch with the measured length.
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState) -> ProjectExportResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened);
+        let mut dir: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut dir) {
+            true -> name(engine_unprivileged_state, dir)
+            _ -> refused()
+        }
+    }
+
+    // Upstream `export/<name>.json` — the project name plus a ".json"
+    // suffix (byte concat, no separator) under `<dir>/export`.
+    state name(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512]) -> ProjectExportResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened);
+        let dir_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        let project_name: &[u8] = Project::get_name(opened);
+        let mut file_name: [u8; 512];
+        let name_len: u64 = project_name.len;
+        transition dir_len <= 512 && name_len > 0 && name_len <= 507 {
+            true -> copy_name(engine_unprivileged_state, dir, dir_len, project_name, file_name, 0)
+            _ -> refused()
+        }
+    }
+    state copy_name(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, project_name: &[u8], mut file_name: [u8; 512], position: u64) -> ProjectExportResponse
+        requires dir_len <= 512;
+    {
+        transition position < project_name.len && position < 512 {
+            true -> write_name(engine_unprivileged_state, dir, dir_len, project_name, file_name, position)
+            _ -> tail(engine_unprivileged_state, dir, dir_len, file_name, project_name.len)
+        }
+    }
+    state write_name(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, project_name: &[u8], mut file_name: [u8; 512], position: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && position < project_name.len && position < 512;
+    {
+        file_name[position] = project_name[position];
+        transition { _ -> copy_name(engine_unprivileged_state, dir, dir_len, project_name, file_name, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // Append ".json" — positions dir_len..dir_len+4 written literally.
+    state tail(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, mut file_name: [u8; 512], at: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && at <= 512;
+    {
+        transition at < 512 {
+            true -> tail_0(engine_unprivileged_state, dir, dir_len, file_name, at)
+            _ -> refused()
+        }
+    }
+    state tail_0(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, mut file_name: [u8; 512], at: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && at < 512;
+    {
+        file_name[at] = 46;
+        transition (((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 )< 512 {
+            true -> tail_1(engine_unprivileged_state, dir, dir_len, file_name, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> refused()
+        }
+    }
+    state tail_1(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, mut file_name: [u8; 512], at: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && at < 512;
+    {
+        file_name[at] = 106;
+        transition (((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 )< 512 {
+            true -> tail_2(engine_unprivileged_state, dir, dir_len, file_name, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> refused()
+        }
+    }
+    state tail_2(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, mut file_name: [u8; 512], at: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && at < 512;
+    {
+        file_name[at] = 115;
+        transition (((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 )< 512 {
+            true -> tail_3(engine_unprivileged_state, dir, dir_len, file_name, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> refused()
+        }
+    }
+    state tail_3(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, mut file_name: [u8; 512], at: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && at < 512;
+    {
+        file_name[at] = 111;
+        transition (((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64 )< 512 {
+            true -> tail_4(engine_unprivileged_state, dir, dir_len, file_name, ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> refused()
+        }
+    }
+    state tail_4(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, mut file_name: [u8; 512], at: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && at < 512;
+    {
+        file_name[at] = 110;
+        let file_len: u64 = ((at as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> mkdir(engine_unprivileged_state, dir, dir_len, file_name, file_len) }
+    }
+
+    // Upstream `fs::create_dir(export_path)` best-effort, then create the
+    // file with write|create|truncate — dirfd twin: open `<dir>/export`
+    // then `open_at(export_fd, "<name>.json", 577)`.
+    state mkdir(engine_unprivileged_state: &mut EngineUnprivilegedState, dir: [u8; 512], dir_len: u64, file_name: [u8; 512], file_len: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && file_len <= 512;
+    {
+        let mut export_dir: [u8; 512];
+        let export_len: u64 = FileSystemUtils::join_path(&dir[0..dir_len], "export", &mut export_dir);
+        transition export_len > 0 && export_len <= 512 {
+            true -> mkdir_do(engine_unprivileged_state, dir_len, file_name, file_len, export_dir, export_len)
+            _ -> refused()
+        }
+    }
+    state mkdir_do(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_len: u64, file_name: [u8; 512], file_len: u64, export_dir: [u8; 512], export_len: u64) -> ProjectExportResponse
+        requires dir_len <= 512 && file_len <= 512 && export_len <= 512;
+    {
+        _ = FileSystemUtils::create_dir_all_path(&export_dir[0..export_len]);
+        let export_fd: i32 = FileSystemUtils::open_path(&export_dir[0..export_len], 0);
+        transition export_fd >= 0 {
+            true -> create_file(engine_unprivileged_state, export_fd, file_name, file_len)
+            _ -> refused()
+        }
+    }
+    state create_file(engine_unprivileged_state: &mut EngineUnprivilegedState, export_fd: i32, file_name: [u8; 512], file_len: u64) -> ProjectExportResponse
+        requires file_len <= 512;
+    {
+        let fd: i32 = FilesystemHost::open_at(export_fd, &file_name[0..file_len], 577);
+        _ = FilesystemHost::close(export_fd);
+        transition fd >= 0 {
+            true -> encode(engine_unprivileged_state, fd)
+            _ -> refused()
+        }
+    }
+
+    // Header + info stub + item count + per-pair (ref path + item record).
+    state encode(engine_unprivileged_state: &mut EngineUnprivilegedState, fd: i32) -> ProjectExportResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened);
+        let mut stub: ProjectInfoStub = ProjectInfoStub::new(
+            project_info.has_project_icon_rgba,
+            ProcessIcon::default(),
+            ProjectManifest::clone(&project_info.project_manifest),
+            ProjectSymbolCatalog::clone(&project_info.project_symbol_catalog),
+            project_info.has_plugin_configuration,
+            PluginConfiguration::clone(&project_info.plugin_configuration));
+        ProcessIcon::clone_from(&mut stub.project_icon_rgba, &project_info.project_icon_rgba);
+        let mut writer: ProjectFileWriter = ProjectFileWriter::new();
+        _ = ProjectFileWriter::put_header(&mut writer);
+        _ = encode_info_stub(&mut writer, &stub);
+        let item_count: u64 = Project::get_project_items_len(opened);
+        _ = ProjectFileWriter::put_u64(&mut writer, item_count);
+        transition { _ -> items(engine_unprivileged_state, fd, writer, 0, item_count) }
+    }
+
+    state items(engine_unprivileged_state: &mut EngineUnprivilegedState, fd: i32, mut writer: ProjectFileWriter, index: u64, item_count: u64) -> ProjectExportResponse {
+        transition index < item_count {
+            true -> item(engine_unprivileged_state, fd, writer, index, item_count)
+            _ -> flush(engine_unprivileged_state, fd, writer)
+        }
+    }
+    state item(engine_unprivileged_state: &mut EngineUnprivilegedState, fd: i32, mut writer: ProjectFileWriter, index: u64, item_count: u64) -> ProjectExportResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened: &Project = ProjectManager::get_opened_project(project_manager);
+        let pair: &ProjectItemPair = Project::get_project_item_pair(opened, index);
+        let item_ref: &ProjectItemRef = ProjectItemPair::get_project_item_ref(pair);
+        let item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let inner3009: &[u8] = ProjectItemRef::get_project_item_path(item_ref);
+        _ = ProjectFileWriter::put_bytes(&mut writer, inner3009);
+        _ = encode_project_item(&mut writer, item);
+        transition { _ -> items(engine_unprivileged_state, fd, writer, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, item_count) }
+    }
+
+    state flush(engine_unprivileged_state: &mut EngineUnprivilegedState, fd: i32, mut writer: ProjectFileWriter) -> ProjectExportResponse {
+        let put: i64 = ProjectFileWriter::flush_to_fd(&mut writer, fd);
+        let expected: i64 = ((writer.written as i64 in Wrapping) as i64);
+        let failed: bool = ProjectFileWriter::has_failed(&writer);
+        _ = FilesystemHost::close(fd);
+        transition put == expected && put >= 0 && !failed {
+            true -> (export_done())
+            _ -> refused()
+        }
+    }
+    state export_done() -> ProjectExportResponse {
+        let mut response: ProjectExportResponse = ProjectExportResponse::new();
+        ProjectExportResponse::set_success(&mut response, true);
+        (response)
+    }
+
+    state refused() -> ProjectExportResponse {
+        (ProjectExportResponse::new())
+    }
+}

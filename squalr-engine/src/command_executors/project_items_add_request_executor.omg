@@ -1,0 +1,474 @@
+module src::command_executors::project_items_add_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::commands::project_items::add::project_items_add_request::ProjectItemsAddRequest;
+use squalr_engine_api::src::commands::project_items::add::project_items_add_response::ProjectItemsAddResponse;
+use squalr_engine_api::src::commands::scan_results::delete::scan_results_delete_request::ScanResultRefList;
+use squalr_engine_api::src::commands::scan_results::refresh::scan_results_refresh_request::ScanResultsRefreshRequest;
+use squalr_engine_api::src::commands::scan_results::refresh::scan_results_refresh_response::ScanResultsRefreshResponse;
+use squalr_engine_api::src::commands::scan_results::list::scan_results_list_response::ScanResultPage;
+use squalr_engine_api::src::commands::scan_results::scan_results_command::ScanResultsCommand;
+use squalr_engine_api::src::commands::scan_results::scan_results_response::ScanResultsResponse;
+use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
+use squalr_engine_api::src::structures::data_types::data_type_ref::DataTypeRef;
+use squalr_engine_api::src::structures::data_values::container_type::ContainerType;
+use squalr_engine_api::src::structures::data_values::data_value::DataValue;
+use squalr_engine_api::src::structures::memory::address_display;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project::ProjectItemLookup;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_address::ProjectItemTypeAddress;
+use squalr_engine_api::src::structures::projects::project_items::built_in_types::project_item_type_directory::ProjectItemTypeDirectory;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::scan_results::scan_result::ScanResult;
+use squalr_engine_api::src::structures::scan_results::scan_result_ref::ScanResultRef;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/add/
+// project_items_add_request_executor.rs — refresh the request's scan-result
+// refs through a synchronous privileged hop, mint an "address" project item
+// per refreshed result under the resolved target directory, create the
+// placeholder files, fold the new paths into the sort order, save, and
+// notify.
+//
+// Deviations (recorded here, matching the package comment conventions):
+// - upstream's mpsc channel + recv_timeout(5s) collapses to the
+//   synchronous dispatch + mailbox take every unprivileged executor uses.
+// - upstream's `Vec<PathBuf>` added-file list is bounded [64] ProjectPathList
+//   (one per scan result; the request itself caps at 64 refs).
+// - my ScanResult carries no recently_read_value / display_values, so
+//   `resolve_scan_result_array_length` degenerates to none and
+//   value_size_in_bytes = unit_size: the field definition spelling is
+//   always the scalar `data_type_ref` text — upstream behavior for a
+//   non-multi-byte result. The display-leg lands with the display-values
+//   leg; named in the verdict.
+// - upstream error strings collapse to success=false (the response
+//   carrier has no error field — same shape as upstream's own
+//   ProjectItemsAddResponse).
+pub data ProjectItemsAddRequestExecutor {}
+
+machine add_fail() -> ProjectItemsAddResponse {
+    let mut response: ProjectItemsAddResponse = ProjectItemsAddResponse::new();
+    ProjectItemsAddResponse::set_success(&mut response, false);
+    ProjectItemsAddResponse::set_added_project_item_count(&mut response, 0);
+    response
+}
+
+machine add_ok(added_project_item_count: u64) -> ProjectItemsAddResponse {
+    let mut response: ProjectItemsAddResponse = ProjectItemsAddResponse::new();
+    ProjectItemsAddResponse::set_success(&mut response, true);
+    ProjectItemsAddResponse::set_added_project_item_count(&mut response, added_project_item_count);
+    response
+}
+
+machine add_copy_256(source: &[u8], out: &mut [u8; 256]) -> u64 {
+    transition source.len <= 256 {
+        true -> scan(source, out, 0)
+        _ -> (0)
+    }
+    state scan(source: &[u8], out: &mut [u8; 256], position: u64) -> u64 {
+        transition position < source.len && position < 256 {
+            true -> put(source, out, position)
+            _ -> (position)
+        }
+    }
+    state put(source: &[u8], out: &mut [u8; 256], position: u64) -> u64
+        requires position < source.len && position < 256;
+    {
+        out[position] = source[position];
+        transition { _ -> scan(source, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+// Significant hex digit count for `0x{:X}` spelling (1..16).
+machine add_hex_width(value: u64) -> u64 {
+    transition { _ -> measure(value, 0) }
+    state measure(remaining: u64, count: u64) -> u64 {
+        transition remaining > 0 {
+            true -> measure(remaining / 16, ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> finish(count)
+        }
+    }
+    state finish(count: u64) -> u64 {
+        transition count > 0 {
+            true -> (count)
+            _ -> (1)
+        }
+    }
+}
+
+// `0x<uppercase-hex>` into out[0..]; returns length written.
+machine add_write_hex_address(out: &mut [u8; 512], address: u64) -> u64 {
+    transition 2 <= 512 {
+        true -> prefix(out, address)
+        _ -> (0)
+    }
+    state prefix(out: &mut [u8; 512], address: u64) -> u64 {
+        out[0] = 48;
+        out[1] = 120;
+        transition { _ -> digits(out, address) }
+    }
+    state digits(out: &mut [u8; 512], address: u64) -> u64 {
+        let width: u64 = add_hex_width(address);
+        transition { _ -> (address_display::write_hex_upper_at(out, address, 2, width)) }
+    }
+}
+
+pub linux_x86_64 machine ProjectItemsAddRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_add_request: &ProjectItemsAddRequest
+) -> ProjectItemsAddResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    transition ProjectItemsAddRequest::get_scan_result_ref_count(project_items_add_request) == 0 {
+        true -> (add_ok(0))
+        _ -> refresh_build(engine_unprivileged_state, engine_bindings, project_items_add_request)
+    }
+
+    // request_scan_results: refs -> refresh request -> privileged hop -> page.
+    state refresh_build(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest) -> ProjectItemsAddResponse {
+        let mut refs: ScanResultRefList = ScanResultRefList::empty();
+        transition { _ -> refs_at(engine_unprivileged_state, engine_bindings, project_items_add_request, refs, 0) }
+    }
+    state refs_at(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, refs: ScanResultRefList, position: u64) -> ProjectItemsAddResponse {
+        transition position < ProjectItemsAddRequest::get_scan_result_ref_count(project_items_add_request) && position < 64 {
+            true -> refs_take(engine_unprivileged_state, engine_bindings, project_items_add_request, refs, position)
+            _ -> refresh_dispatch(engine_unprivileged_state, engine_bindings, project_items_add_request, refs)
+        }
+    }
+    state refs_take(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, refs: ScanResultRefList, position: u64) -> ProjectItemsAddResponse {
+        transition position < 64 {
+            true -> refs_push(engine_unprivileged_state, engine_bindings, project_items_add_request, refs, position)
+            _ -> refresh_dispatch(engine_unprivileged_state, engine_bindings, project_items_add_request, refs)
+        }
+    }
+    state refs_push(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, refs: ScanResultRefList, position: u64) -> ProjectItemsAddResponse
+        requires position < 64;
+    {
+        let inner65: &ScanResultRef = ProjectItemsAddRequest::get_scan_result_ref(project_items_add_request, position);
+        let scan_result_ref: ScanResultRef = ScanResultRef::clone(inner65);
+        let mut carried: ScanResultRefList = refs;
+        _ = ScanResultRefList::push(&mut carried, &scan_result_ref);
+        transition { _ -> refs_at(engine_unprivileged_state, engine_bindings, project_items_add_request, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state refresh_dispatch(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, refs: ScanResultRefList) -> ProjectItemsAddResponse {
+        let refresh_request: ScanResultsRefreshRequest = ScanResultsRefreshRequest::new(&refs);
+        let scan_results_command: ScanResultsCommand = ScanResultsCommand::Refresh { request: refresh_request };
+        let command: PrivilegedCommand = PrivilegedCommand::ScanResults { command: scan_results_command };
+        let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+        transition StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(engine_bindings, &command, &mut mailbox) {
+            true -> refresh_take(engine_unprivileged_state, engine_bindings, project_items_add_request, mailbox)
+            _ -> (add_fail())
+        }
+    }
+    state refresh_take(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, mailbox: PrivilegedResponseMailbox) -> ProjectItemsAddResponse {
+        let taken: PrivilegedResponseMailbox = PrivilegedResponseMailbox::take(mailbox);
+        transition taken {
+            PrivilegedResponseMailbox::Delivered { response } -> refresh_decode(engine_unprivileged_state, engine_bindings, project_items_add_request, response)
+            _ -> (add_fail())
+        }
+    }
+    state refresh_decode(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, response: PrivilegedCommandResponse) -> ProjectItemsAddResponse {
+        transition response {
+            PrivilegedCommandResponse::ScanResults { response } -> decode_domain(engine_unprivileged_state, engine_bindings, project_items_add_request, response)
+            _ -> (add_fail())
+        }
+    }
+    state decode_domain(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, response: ScanResultsResponse) -> ProjectItemsAddResponse {
+        transition response {
+            ScanResultsResponse::Refresh { response } -> opened_gate(engine_unprivileged_state, engine_bindings, project_items_add_request, response.scan_results)
+            _ -> (add_fail())
+        }
+    }
+
+    // opened project + directory gate.
+    state opened_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage) -> ProjectItemsAddResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> directory(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results)
+            _ -> (add_fail())
+        }
+    }
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage) -> ProjectItemsAddResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> directory_len(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory)
+            _ -> (add_fail())
+        }
+    }
+    state directory_len(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512]) -> ProjectItemsAddResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> root_item(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len)
+            _ -> (add_fail())
+        }
+    }
+
+    // add_scan_results_to_project: ensure the project-root dir item exists,
+    // resolve the selected directory, then map each result to an item.
+    state root_item(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64) -> ProjectItemsAddResponse
+        requires directory_len <= 512;
+    {
+        let mut project_item_sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let mut project_root: ManifestPathScratch;
+        ManifestPathScratch::new(&mut project_root);
+        let inner3011: &[u8] = Project::get_project_directory_name();
+        _ = ProjectItemSortOrder::join_path(&project_item_sort_order, &directory[0..directory_len], inner3011, &mut project_root);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let inner66: &[u8] = ManifestPathScratch::get_bytes(&project_root);
+        let root_ref: ProjectItemRef = ProjectItemRef::new(inner66);
+        let lookup: ProjectItemLookup = Project::lookup_project_item_index(opened_project, &root_ref);
+        transition lookup {
+            ProjectItemLookup::Found { index } -> selected_dir(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len)
+            _ -> root_insert(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, project_root)
+        }
+    }
+    state root_insert(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, project_root: ManifestPathScratch) -> ProjectItemsAddResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let inner67: &[u8] = ManifestPathScratch::get_bytes(&project_root);
+        let root_ref: ProjectItemRef = ProjectItemRef::new(inner67);
+        let root_item: ProjectItem = ProjectItemTypeDirectory::new_project_item(&root_ref);
+        let pair: ProjectItemPair = ProjectItemPair::new(root_ref, root_item);
+        _ = Project::insert_project_item(opened_project, pair);
+        transition { _ -> selected_dir(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len) }
+    }
+    state selected_dir(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64) -> ProjectItemsAddResponse {
+        let target: &[u8] = ProjectItemsAddRequest::get_target_directory_path(project_items_add_request);
+        let has_target: bool = ProjectItemsAddRequest::has_target_directory_path(project_items_add_request);
+        let mut target_scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut target_scratch);
+        _ = ManifestPathScratch::copy_slice(&mut target_scratch, target);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let mut selected: ManifestPathScratch;
+        ManifestPathScratch::new(&mut selected);
+        let inner3012: &[u8] = ManifestPathScratch::get_bytes(&target_scratch);
+        transition ProjectItemFileMutation::resolve_selected_directory_path(&directory[0..directory_len], inner3012, has_target, opened_project, &mut selected) {
+            true -> add_at(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, ProjectPathList::empty(), 0)
+            _ -> (add_fail())
+        }
+    }
+
+    // Per-result map: skip unsupported data types like upstream's warn+continue.
+    state add_at(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64) -> ProjectItemsAddResponse {
+        transition position < ScanResultPage::get_count(&scan_results) && position < 64 {
+            true -> add_take(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position)
+            _ -> placeholders(engine_unprivileged_state, engine_bindings, scan_results, directory, directory_len, added)
+        }
+    }
+    state add_take(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64) -> ProjectItemsAddResponse {
+        let scan_result: ScanResult = ScanResultPage::get(&scan_results, position);
+        let data_type_ref: DataTypeRef = ScanResult::get_data_type_ref(&scan_result);
+        let mut default_value: DataValue = DataValue::default();
+        transition EngineUnprivilegedState::get_default_value(engine_unprivileged_state, &data_type_ref, &mut default_value) {
+            true -> stem(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value)
+            _ -> add_at(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // build_project_item_file_stem: module -> "<san>_0x<off hex>", else "address_0x<addr hex>".
+    state stem(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue) -> ProjectItemsAddResponse {
+        transition ScanResult::is_module(&scan_result) {
+            true -> stem_module(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value)
+            _ -> stem_address(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value)
+        }
+    }
+    state stem_module(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue) -> ProjectItemsAddResponse {
+        let mut module_name: [u8; 256];
+        let module_name_len: u64 = ScanResult::get_module_name(&scan_result, &mut module_name);
+        let mut sanitized: ManifestPathScratch;
+        ManifestPathScratch::new(&mut sanitized);
+        _ = ProjectItemFileMutation::sanitize_file_name_component(&module_name[0..module_name_len], "module", &mut sanitized);
+        let stem_scratch: ManifestPathScratch = sanitized;
+        transition { _ -> stem_module_hex(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, stem_scratch) }
+    }
+    state stem_module_hex(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, stem_scratch: ManifestPathScratch) -> ProjectItemsAddResponse {
+        let mut hex_bytes: [u8; 512];
+        // "_0x" + offset hex — literal upstream "_{:X}" join.
+        let inner68: u64 = ScanResult::get_module_offset(&scan_result);
+        let hex_len: u64 = add_write_hex_address(&mut hex_bytes, inner68);
+        let mut carried: ManifestPathScratch = stem_scratch;
+        _ = ManifestPathScratch::append(&mut carried, 95);
+        transition { _ -> stem_module_append(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, carried, hex_bytes, hex_len, 0) }
+    }
+    state stem_module_append(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, stem_scratch: ManifestPathScratch, hex_bytes: [u8; 512], hex_len: u64, hex_position: u64) -> ProjectItemsAddResponse {
+        // Skip the leading "0x" — upstream writes "_0x<hex>", the writer
+        // already emitted "0x<hex>"; copy from index 1 (the 'x')? Upstream
+        // is "<san>_0x<off>": append "_0x" + hex digits — reuse hex_bytes[1..] (x + digits).
+        transition hex_position < hex_len && hex_position < 512 {
+            true -> stem_module_byte(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, stem_scratch, hex_bytes, hex_len, hex_position)
+            _ -> unique(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, stem_scratch)
+        }
+    }
+    state stem_module_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, stem_scratch: ManifestPathScratch, hex_bytes: [u8; 512], hex_len: u64, hex_position: u64) -> ProjectItemsAddResponse
+        requires hex_position < 512;
+    {
+        let mut carried: ManifestPathScratch = stem_scratch;
+        _ = ManifestPathScratch::append(&mut carried, hex_bytes[hex_position]);
+        transition { _ -> stem_module_append(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, carried, hex_bytes, hex_len, ((hex_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state stem_address(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue) -> ProjectItemsAddResponse {
+        let mut project_item_sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let mut stem_scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut stem_scratch);
+        _ = ProjectItemSortOrder::copy_into(&project_item_sort_order, "address", &mut stem_scratch);
+        let mut hex_bytes: [u8; 512];
+        let inner69: u64 = ScanResult::get_address(&scan_result);
+        let hex_len: u64 = add_write_hex_address(&mut hex_bytes, inner69);
+        transition { _ -> stem_module_hex_named(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, stem_scratch, hex_bytes, hex_len, 0) }
+    }
+    state stem_module_hex_named(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, stem_scratch: ManifestPathScratch, hex_bytes: [u8; 512], hex_len: u64, hex_position: u64) -> ProjectItemsAddResponse {
+        transition hex_position < hex_len && hex_position < 512 {
+            true -> stem_address_byte(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, stem_scratch, hex_bytes, hex_len, hex_position)
+            _ -> unique(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, stem_scratch)
+        }
+    }
+    state stem_address_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, stem_scratch: ManifestPathScratch, hex_bytes: [u8; 512], hex_len: u64, hex_position: u64) -> ProjectItemsAddResponse
+        requires hex_position < 512;
+    {
+        let mut carried: ManifestPathScratch = stem_scratch;
+        _ = ManifestPathScratch::append(&mut carried, hex_bytes[hex_position]);
+        transition { _ -> stem_module_hex_named(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, carried, hex_bytes, hex_len, ((hex_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state unique(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, stem_scratch: ManifestPathScratch) -> ProjectItemsAddResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let mut unique_path: ManifestPathScratch;
+        ManifestPathScratch::new(&mut unique_path);
+        let inner3013: &[u8] = ManifestPathScratch::get_bytes(&selected);
+        let inner3014: &[u8] = ManifestPathScratch::get_bytes(&stem_scratch);
+        transition ProjectItemFileMutation::generate_unique_project_item_file_path(inner3013, opened_project, inner3014, &mut unique_path) {
+            true -> item_name(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, unique_path)
+            _ -> add_at(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    // build_project_item_name: module -> format_module_address, else 0x<hex>.
+    state item_name(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, unique_path: ManifestPathScratch) -> ProjectItemsAddResponse {
+        transition ScanResult::is_module(&scan_result) {
+            true -> name_module(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, unique_path)
+            _ -> name_address(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, unique_path)
+        }
+    }
+    state name_module(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, unique_path: ManifestPathScratch) -> ProjectItemsAddResponse {
+        let mut module_name: [u8; 256];
+        let module_name_len: u64 = ScanResult::get_module_name(&scan_result, &mut module_name);
+        let mut name_bytes: [u8; 512];
+        let inner70: u64 = ScanResult::get_module_offset(&scan_result);
+        let name_len: u64 = address_display::format_module_address(&mut name_bytes, &module_name[0..module_name_len], inner70);
+        transition { _ -> item_make(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, unique_path, name_bytes, name_len) }
+    }
+    state name_address(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, unique_path: ManifestPathScratch) -> ProjectItemsAddResponse {
+        let mut name_bytes: [u8; 512];
+        let inner71: u64 = ScanResult::get_address(&scan_result);
+        let name_len: u64 = add_write_hex_address(&mut name_bytes, inner71);
+        transition { _ -> item_make(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, default_value, unique_path, name_bytes, name_len) }
+    }
+    state item_make(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, default_value: DataValue, unique_path: ManifestPathScratch, name_bytes: [u8; 512], name_len: u64) -> ProjectItemsAddResponse {
+        let mut module_name: [u8; 256];
+        let module_name_len: u64 = ScanResult::get_module_name(&scan_result, &mut module_name);
+        let mut item: ProjectItem = ProjectItemTypeAddress::new_project_item(
+            &name_bytes[0..name_len],
+            ScanResult::get_module_offset(&scan_result),
+            &module_name[0..module_name_len],
+            "",
+            default_value);
+        // build_symbolic_field_definition_string: scalar data_type_ref
+        // spelling (deviation — see header).
+        let data_type_ref: DataTypeRef = ScanResult::get_data_type_ref(&scan_result);
+        let mut spelling: [u8; 512];
+        let mut ref_scratch: ManifestPathScratch;
+        ManifestPathScratch::new(&mut ref_scratch);
+        let inner3015: &[u8] = DataTypeRef::get_data_type_id(&data_type_ref);
+        _ = ManifestPathScratch::copy_slice(&mut ref_scratch, inner3015);
+        _ = ManifestPathScratch::copy_into(&ref_scratch, &mut spelling);
+        transition { _ -> item_sfd(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, scan_result, unique_path, item, spelling) }
+    }
+    state item_sfd(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, scan_result: ScanResult, unique_path: ManifestPathScratch, item: ProjectItem, spelling: [u8; 512]) -> ProjectItemsAddResponse {
+        let mut carried: ProjectItem = item;
+        ProjectItemTypeAddress::set_field_symbolic_struct_definition_reference(&mut carried, &spelling[0..DataTypeRef::get_data_type_id_len(&ScanResult::get_data_type_ref(&scan_result))]);
+        let inner72: &[u8] = ManifestPathScratch::get_bytes(&unique_path);
+        let project_item_ref: ProjectItemRef = ProjectItemRef::new(inner72);
+        let pair: ProjectItemPair = ProjectItemPair::new(project_item_ref, carried);
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        _ = Project::insert_project_item(opened_project, pair);
+        transition { _ -> added_push(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, added, position, unique_path) }
+    }
+    state added_push(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_items_add_request: &ProjectItemsAddRequest, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, selected: ManifestPathScratch, added: ProjectPathList, position: u64, unique_path: ManifestPathScratch) -> ProjectItemsAddResponse {
+        let mut carried: ProjectPathList = added;
+        let inner3016: &[u8] = ManifestPathScratch::get_bytes(&unique_path);
+        _ = ProjectPathList::add_path(&mut carried, inner3016);
+        transition { _ -> add_at(engine_unprivileged_state, engine_bindings, project_items_add_request, scan_results, directory, directory_len, selected, carried, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // create_placeholder_files -> append sort order -> save -> notify.
+    state placeholders(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, scan_results: ScanResultPage, directory: [u8; 512], directory_len: u64, added: ProjectPathList) -> ProjectItemsAddResponse {
+        transition ProjectPathList::get_path_count(&added) == 0 {
+            true -> (add_ok(0))
+            _ -> placeholders_create(engine_unprivileged_state, engine_bindings, directory, directory_len, added)
+        }
+    }
+    state placeholders_create(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, directory: [u8; 512], directory_len: u64, added: ProjectPathList) -> ProjectItemsAddResponse {
+        transition ProjectItemFileMutation::create_placeholder_files(&added) {
+            true -> sort(engine_unprivileged_state, engine_bindings, directory, directory_len, added)
+            _ -> (add_fail())
+        }
+    }
+    state sort(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, directory: [u8; 512], directory_len: u64, added: ProjectPathList) -> ProjectItemsAddResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let mut project_item_sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::append_project_items_to_sort_order(&project_item_sort_order, opened_project, &directory[0..directory_len], &added);
+        transition { _ -> save_open(engine_unprivileged_state, engine_bindings, directory, directory_len, added) }
+    }
+    state save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, directory: [u8; 512], directory_len: u64, added: ProjectPathList) -> ProjectItemsAddResponse {
+        let directory_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition directory_fd >= 0 {
+            true -> save_do(engine_unprivileged_state, engine_bindings, directory, directory_len, added, directory_fd)
+            _ -> (add_fail())
+        }
+    }
+    state save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, directory: [u8; 512], directory_len: u64, added: ProjectPathList, directory_fd: i32) -> ProjectItemsAddResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let save_result: ProjectFileSave = Project::save_at(opened_project, directory_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(directory_fd);
+        transition save_result {
+            ProjectFileSave::Stored -> notify(engine_unprivileged_state, added)
+            _ -> (add_fail())
+        }
+    }
+    state notify(engine_unprivileged_state: &mut EngineUnprivilegedState, added: ProjectPathList) -> ProjectItemsAddResponse {
+        _ = EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> (add_ok(ProjectPathList::get_path_count(&added))) }
+    }
+}

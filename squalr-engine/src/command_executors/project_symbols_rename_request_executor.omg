@@ -1,0 +1,177 @@
+module src::command_executors::project_symbols_rename_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_symbols::rename::project_symbols_rename_request::ProjectSymbolsRenameRequest;
+use squalr_engine_api::src::commands::project_symbols::rename::project_symbols_rename_response::ProjectSymbolsRenameResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectModuleFieldMatch;
+use squalr_engine_api::src::structures::projects::project_symbol_claim::ProjectSymbolClaim;
+use squalr_engine_api::src::structures::projects::project_symbol_locator::ProjectSymbolLocator;
+use squalr_engine_api::src::structures::projects::project_symbol_module::ProjectSymbolModule;
+use squalr_engine_api::src::structures::projects::project_symbol_module_field::ProjectSymbolModuleField;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_symbol_name_scope::ProjectSymbolNameScope;
+use src::services::projects::project_symbol_catalog_persistence::ProjectSymbolCatalogPersistence;
+
+// Port of command_executors/project_symbols/rename/
+// project_symbols_rename_request_executor.rs — rename a claim or a module
+// field, deduplicating the display name inside the name scope, then
+// save + sync.
+// Deviations:
+// - `find_symbol_claim_mut`/`find_module_field_mut` respell as immutable
+//   position finds followed by borrow_*_mut element writes (same dedup
+//   scope — the dedup runs on the immutable catalog before the write).
+// - the project directory resolves inside save_and_sync (upstream resolved
+//   it early only to pass it through).
+pub data ProjectSymbolsRenameRequestExecutor {}
+
+pub linux_x86_64 machine ProjectSymbolsRenameRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbols_rename_request: &ProjectSymbolsRenameRequest
+) -> ProjectSymbolsRenameResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+    transition ProjectManager::get_has_opened_project(project_manager) {
+        true -> trim(engine_unprivileged_state, engine_bindings, project_symbols_rename_request)
+        _ -> (refused())
+    }
+    state refused() -> ProjectSymbolsRenameResponse {
+        (ProjectSymbolsRenameResponse::new())
+    }
+    state trim(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest) -> ProjectSymbolsRenameResponse {
+        let mut scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let mut display_name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut display_name);
+        let inner3078: &[u8] = ProjectSymbolsRenameRequest::get_display_name(project_symbols_rename_request);
+        _ = ProjectSymbolNameScope::trim_copy(&mut scope, inner3078, &mut display_name);
+        transition display_name.len > 0 {
+            true -> claim_probe(engine_unprivileged_state, engine_bindings, project_symbols_rename_request, display_name)
+            _ -> (refused())
+        }
+    }
+    state claim_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch) -> ProjectSymbolsRenameResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_symbol_catalog: &ProjectSymbolCatalog = Project::get_project_symbol_catalog(opened_project);
+        let inner48: &[u8] = ProjectSymbolsRenameRequest::get_symbol_locator_key(project_symbols_rename_request);
+        let claim_position: u64 = ProjectSymbolCatalog::find_symbol_claim_position(project_symbol_catalog, inner48);
+        transition claim_position < ProjectSymbolCatalog::get_symbol_claim_count(project_symbol_catalog) && claim_position < 128 {
+            true -> claim_rename(engine_unprivileged_state, engine_bindings, project_symbols_rename_request, display_name, claim_position)
+            _ -> field_probe(engine_unprivileged_state, engine_bindings, project_symbols_rename_request, display_name)
+        }
+    }
+    state claim_rename(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch, claim_position: u64) -> ProjectSymbolsRenameResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_symbol_catalog: &ProjectSymbolCatalog = Project::get_project_symbol_catalog(opened_project);
+        let claim: &ProjectSymbolClaim = ProjectSymbolCatalog::get_symbol_claim(project_symbol_catalog, claim_position);
+        let locator: &ProjectSymbolLocator = ProjectSymbolClaim::get_locator(claim);
+        let mut scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let mut deduplicated: ManifestPathScratch;
+        ManifestPathScratch::new(&mut deduplicated);
+        let resolved: bool = ProjectSymbolNameScope::deduplicate_display_name(&mut scope, project_symbol_catalog, locator, ManifestPathScratch::get_bytes(&display_name), ProjectSymbolsRenameRequest::get_symbol_locator_key(project_symbols_rename_request), true, &mut deduplicated);
+        transition resolved {
+            true -> claim_apply(engine_unprivileged_state, engine_bindings, project_symbols_rename_request, deduplicated, claim_position)
+            _ -> (refused())
+        }
+    }
+    state claim_apply(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch, claim_position: u64) -> ProjectSymbolsRenameResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = Project::borrow_project_symbol_catalog_mut(opened_project);
+        transition claim_position < project_symbol_catalog.symbol_claim_count && claim_position < 128 {
+            true -> claim_write(project_symbol_catalog, engine_unprivileged_state, engine_bindings, project_symbols_rename_request, display_name, claim_position)
+            _ -> (refused())
+        }
+    }
+    state claim_write(project_symbol_catalog: &mut ProjectSymbolCatalog, engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch, claim_position: u64) -> ProjectSymbolsRenameResponse
+        requires claim_position < project_symbol_catalog.symbol_claim_count && claim_position < 128;
+    {
+        let claim: &mut ProjectSymbolClaim = ProjectSymbolCatalog::borrow_symbol_claim_mut(project_symbol_catalog, claim_position);
+        ProjectSymbolClaim::set_display_name(claim, ManifestPathScratch::get_bytes(&display_name));
+        transition { _ -> save(engine_unprivileged_state, engine_bindings, project_symbols_rename_request) }
+    }
+    state field_probe(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch) -> ProjectSymbolsRenameResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_symbol_catalog: &ProjectSymbolCatalog = Project::get_project_symbol_catalog(opened_project);
+        let inner49: &[u8] = ProjectSymbolsRenameRequest::get_symbol_locator_key(project_symbols_rename_request);
+        let matched: ProjectModuleFieldMatch = ProjectSymbolCatalog::find_module_field(project_symbol_catalog, inner49);
+        transition matched.found && matched.module_position < project_symbol_catalog.symbol_module_count && matched.module_position < 64 {
+            true -> field_rename(engine_unprivileged_state, engine_bindings, project_symbols_rename_request, display_name, matched)
+            _ -> (refused())
+        }
+    }
+    state field_rename(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch, matched: ProjectModuleFieldMatch) -> ProjectSymbolsRenameResponse
+        requires matched.module_position < 64;
+    {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_symbol_catalog: &ProjectSymbolCatalog = Project::get_project_symbol_catalog(opened_project);
+        let symbol_module: &ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module(project_symbol_catalog, matched.module_position);
+        let module_field: &ProjectSymbolModuleField = ProjectSymbolModule::get_field(symbol_module, matched.field_position);
+        let inner50: &[u8] = ProjectSymbolModule::get_module_name(symbol_module);
+        let inner51: u64 = ProjectSymbolModuleField::get_offset(module_field);
+        let locator: ProjectSymbolLocator = ProjectSymbolLocator::new_module_offset(inner50, inner51);
+        let mut scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+        let mut deduplicated: ManifestPathScratch;
+        ManifestPathScratch::new(&mut deduplicated);
+        let resolved: bool = ProjectSymbolNameScope::deduplicate_display_name(&mut scope, project_symbol_catalog, &locator, ManifestPathScratch::get_bytes(&display_name), ProjectSymbolsRenameRequest::get_symbol_locator_key(project_symbols_rename_request), true, &mut deduplicated);
+        transition resolved {
+            true -> field_apply(engine_unprivileged_state, engine_bindings, project_symbols_rename_request, deduplicated, matched)
+            _ -> (refused())
+        }
+    }
+    state field_apply(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch, matched: ProjectModuleFieldMatch) -> ProjectSymbolsRenameResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = Project::borrow_project_symbol_catalog_mut(opened_project);
+        transition matched.module_position < project_symbol_catalog.symbol_module_count && matched.module_position < 64 {
+            true -> field_write(project_symbol_catalog, engine_unprivileged_state, engine_bindings, project_symbols_rename_request, display_name, matched)
+            _ -> (refused())
+        }
+    }
+    state field_write(project_symbol_catalog: &mut ProjectSymbolCatalog, engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch, matched: ProjectModuleFieldMatch) -> ProjectSymbolsRenameResponse
+        requires matched.module_position < project_symbol_catalog.symbol_module_count && matched.module_position < 64;
+    {
+        let symbol_module: &mut ProjectSymbolModule = ProjectSymbolCatalog::get_symbol_module_mut(project_symbol_catalog, matched.module_position);
+        transition matched.field_position < symbol_module.field_count && matched.field_position < 64 {
+            true -> field_write_inner(symbol_module, engine_unprivileged_state, engine_bindings, project_symbols_rename_request, display_name, matched.field_position)
+            _ -> (refused())
+        }
+    }
+    state field_write_inner(symbol_module: &mut ProjectSymbolModule, engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest, display_name: ManifestPathScratch, field_position: u64) -> ProjectSymbolsRenameResponse
+        requires field_position < symbol_module.field_count && field_position < 64;
+    {
+        let module_field: &mut ProjectSymbolModuleField = ProjectSymbolModule::get_field_mut(symbol_module, field_position);
+        ProjectSymbolModuleField::set_display_name(module_field, ManifestPathScratch::get_bytes(&display_name));
+        transition { _ -> save(engine_unprivileged_state, engine_bindings, project_symbols_rename_request) }
+    }
+    state save(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_rename_request: &ProjectSymbolsRenameRequest) -> ProjectSymbolsRenameResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition ProjectSymbolCatalogPersistence::save_and_sync_project_symbol_catalog(engine_bindings, opened_project) {
+            true -> succeed(project_symbols_rename_request)
+            _ -> (refused())
+        }
+    }
+    state succeed(project_symbols_rename_request: &ProjectSymbolsRenameRequest) -> ProjectSymbolsRenameResponse {
+        let mut response: ProjectSymbolsRenameResponse = ProjectSymbolsRenameResponse::new();
+        ProjectSymbolsRenameResponse::set_success(&mut response, true);
+        ProjectSymbolsRenameResponse::set_symbol_locator_key(&mut response, ProjectSymbolsRenameRequest::get_symbol_locator_key(project_symbols_rename_request));
+        (response)
+    }
+}

@@ -1,0 +1,532 @@
+module src::command_executors::project_items_duplicate_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_items::duplicate::project_items_duplicate_request::ProjectItemsDuplicateRequest;
+use squalr_engine_api::src::commands::project_items::duplicate::project_items_duplicate_response::ProjectItemsDuplicateResponse;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_path_list::ProjectPathList;
+use squalr_engine_api::src::utils::file_system::file_system_utils::FileSystemUtils;
+use squalr_engine_projects::src::project::serialization::project_serialization;
+use squalr_engine_projects::src::project::serialization::project_serialization::ProjectLoad;
+use squalr_engine_projects::src::project::serialization::serializable_project_file::ProjectFileSave;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_file_mutation::ProjectItemFileMutation;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_item_sort_order::ProjectItemSortOrder;
+
+// Port of command_executors/project_items/duplicate/
+// project_items_duplicate_request_executor.rs — resolve the target dir
+// (clamped to <dir>/project_items), create it, then per item: refuse the
+// items root itself, require existence, mint a unique
+// `<stem>[_N]<ext>` candidate under the target, and tree-copy
+// (`rename_tree` — copy without delete; upstream's read+write snapshot
+// has the same post state). Reload, append sort-order entries, save,
+// notify.
+pub data ProjectItemsDuplicateRequestExecutor {}
+
+pub machine ProjectItemsDuplicateRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_items_duplicate_request: &ProjectItemsDuplicateRequest
+) -> ProjectItemsDuplicateResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let paths: &ProjectPathList = ProjectItemsDuplicateRequest::get_project_item_paths(project_items_duplicate_request);
+    transition ProjectPathList::get_path_count(paths) == 0 {
+        true -> empty()
+        _ -> opened(engine_unprivileged_state, project_items_duplicate_request)
+    }
+
+    state empty() -> ProjectItemsDuplicateResponse {
+        let mut response: ProjectItemsDuplicateResponse = ProjectItemsDuplicateResponse::new();
+        ProjectItemsDuplicateResponse::set_success(&mut response, true);
+        (response)
+    }
+
+    state opened(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest) -> ProjectItemsDuplicateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> directory(engine_unprivileged_state, project_items_duplicate_request)
+            _ -> refused()
+        }
+    }
+    state directory(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest) -> ProjectItemsDuplicateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let mut directory: [u8; 512];
+        transition ProjectInfo::get_project_directory(project_info, &mut directory) {
+            true -> measure(engine_unprivileged_state, project_items_duplicate_request, directory)
+            _ -> refused()
+        }
+    }
+    state measure(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512]) -> ProjectItemsDuplicateResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        let opened_project: &Project = ProjectManager::get_opened_project(project_manager);
+        let project_info: &ProjectInfo = Project::get_project_info(opened_project);
+        let directory_len: u64 = ProjectInfo::get_project_directory_len(project_info);
+        transition directory_len <= 512 {
+            true -> root(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len)
+            _ -> refused()
+        }
+    }
+    state root(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let mut items_root: ManifestPathScratch;
+        ManifestPathScratch::new(&mut items_root);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::join_path(path_joiner, &directory[0..directory_len], "project_items", &mut items_root);
+        transition { _ -> resolve_target(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root) }
+    }
+    state resolve_target(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let mut target: ManifestPathScratch;
+        ManifestPathScratch::new(&mut target);
+        let target_path: &[u8] = ProjectItemsDuplicateRequest::get_target_directory_path(project_items_duplicate_request);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], target_path, &mut target) {
+            true -> clamp_target(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target)
+            _ -> refused()
+        }
+    }
+    // Upstream `starts_with(project_root)` — otherwise clamp to the root.
+    state clamp_target(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let mut path_starter: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3029: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let inner3030: &[u8] = ManifestPathScratch::get_bytes(&items_root);
+        transition ProjectItemSortOrder::path_starts_with(path_starter, inner3029, inner3030) {
+            true -> mkdir_target(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target)
+            _ -> clamp_copy(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root)
+        }
+    }
+    state clamp_copy(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let mut target: ManifestPathScratch;
+        ManifestPathScratch::new(&mut target);
+        let mut path_copier: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3031: &[u8] = ManifestPathScratch::get_bytes(&items_root);
+        _ = ProjectItemSortOrder::copy_into(path_copier, inner3031, &mut target);
+        transition { _ -> mkdir_target(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target) }
+    }
+    state mkdir_target(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let inner3032: &[u8] = ManifestPathScratch::get_bytes(&target);
+        transition FileSystemUtils::create_dir_all_path(inner3032) {
+            true -> items(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target)
+            _ -> refused()
+        }
+    }
+
+    state items(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let mut duplicated_paths: ProjectPathList = ProjectPathList::empty();
+        transition { _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, 0, 0, true) }
+    }
+    state each(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let paths: &ProjectPathList = ProjectItemsDuplicateRequest::get_project_item_paths(project_items_duplicate_request);
+        transition position < ProjectPathList::get_path_count(paths) {
+            true -> resolve_source(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success)
+            _ -> reload_gate(engine_unprivileged_state, directory, directory_len, duplicated_paths, duplicated_count, operation_success)
+        }
+    }
+    state resolve_source(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let paths: &ProjectPathList = ProjectItemsDuplicateRequest::get_project_item_paths(project_items_duplicate_request);
+        let item_path: &[u8] = ProjectPathList::get_path(paths, position);
+        let mut source: ManifestPathScratch;
+        ManifestPathScratch::new(&mut source);
+        transition ProjectItemFileMutation::resolve_project_item_path(&directory[0..directory_len], item_path, &mut source) {
+            true -> root_guard(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    // Upstream refuses the items root itself.
+    state root_guard(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let mut path_equaler: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3033: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let inner3034: &[u8] = ManifestPathScratch::get_bytes(&items_root);
+        transition ProjectItemSortOrder::paths_equal(path_equaler, inner3033, inner3034) {
+            true -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+            _ -> source_exists(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source)
+        }
+    }
+    state source_exists(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let inner3035: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition FileSystemUtils::path_exists(inner3035) {
+            true -> source_kind(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    state source_kind(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let is_dir: bool = FileSystemUtils::is_dir_path(ManifestPathScratch::get_bytes(&source));
+        let inner45: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let name_start: u64 = ProjectItemFileMutation::find_last_separator(inner45);
+        transition { _ -> name_parts(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start) }
+    }
+    // name_start bounds the file-name slice; the last '.' after it is the
+    // extension (extension includes the dot, per upstream format!("{}_{}.{}")).
+    state name_parts(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition name_start <= source_bytes.len && name_start <= 512 {
+            true -> dot_scan(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, name_start, 0)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    // Scan for the last '.' in the name, tracked in `last_dot` (0 = none
+    // found yet); `stem_end` resolves to last_dot or the name end.
+    state dot_scan(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, scan_position: u64, last_dot: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition scan_position < source_bytes.len {
+            true -> dot_check(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, scan_position, last_dot)
+            _ -> dot_done(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, last_dot)
+        }
+    }
+    state dot_check(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, scan_position: u64, last_dot: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition scan_position < source_bytes.len {
+            true -> dot_byte(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, scan_position, last_dot)
+            _ -> dot_done(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, last_dot)
+        }
+    }
+    state dot_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, scan_position: u64, last_dot: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition source_bytes[scan_position] == 46 {
+            true -> dot_scan(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, ((scan_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((scan_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> dot_scan(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, ((scan_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, last_dot)
+        }
+    }
+    state dot_done(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, last_dot: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition last_dot > 0 && last_dot <= source_bytes.len {
+            true -> candidate_init(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, last_dot)
+            _ -> candidate_init(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, source_bytes.len)
+        }
+    }
+    // `stem_end` is the last dot (extension boundary) or the name end.
+    state candidate_init(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition stem_end <= source_bytes.len {
+            true -> candidate_loop(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, 0)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    state candidate_loop(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        transition sequence <= 999 {
+            true -> candidate_build(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    // Compose `stem[_N]<ext>` under the target and probe path_exists.
+    state candidate_build(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let mut name: ManifestPathScratch;
+        ManifestPathScratch::new(&mut name);
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition stem_end <= source_bytes.len {
+            true -> copy_stem(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    state copy_stem(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition name_start <= stem_end && stem_end <= source_bytes.len {
+            true -> stem_loop(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, name_start)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    state stem_loop(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, copy_position: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition copy_position < stem_end && copy_position < source_bytes.len {
+            true -> stem_byte(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, copy_position)
+            _ -> suffix_gate(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name)
+        }
+    }
+    state stem_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, copy_position: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        _ = ManifestPathScratch::append(&mut name, source_bytes[copy_position]);
+        transition { _ -> stem_loop(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, ((copy_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    // Directories append `_N` to the whole name; files split stem/ext.
+    state suffix_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        transition sequence > 0 {
+            true -> suffix_emit(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, sequence, 1)
+            _ -> ext_copy(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name)
+        }
+    }
+    // `_` + decimal(sequence) — magnitude-first bounded emit.
+    state suffix_emit(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let mut next_magnitude: u64 = ((magnitude as u64 in Wrapping) * (10 as u64 in Wrapping)) as u64;
+        transition magnitude == 1 && name.len < 512 {
+            true -> underscore(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, magnitude)
+            _ -> suffix_grow(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, magnitude, next_magnitude)
+        }
+    }
+    state underscore(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+        requires name.len < 512;
+    {
+        name.bytes[name.len] = 95;
+        name.len = ((name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> suffix_grow(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, magnitude, magnitude) }
+    }
+    state suffix_grow(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, value: u64, magnitude: u64, next_magnitude: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        transition next_magnitude <= value && next_magnitude <= 999 {
+            true -> suffix_emit(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, next_magnitude)
+            _ -> suffix_digit(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, magnitude)
+        }
+    }
+    state suffix_digit(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        transition magnitude > 0 {
+            true -> digit_byte(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, magnitude)
+            _ -> ext_copy(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name)
+        }
+    }
+    state digit_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, value: u64, magnitude: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let digit: u64 = ((value as u64 in Wrapping) / (magnitude as u64 in Wrapping)) as u64;
+        let rem: u64 = ((digit as u64 in Wrapping) % (10 as u64 in Wrapping)) as u64;
+        let byte_value: u8 = ((rem as u64 in Wrapping) + (48 as u64 in Wrapping)) as u8;
+        transition name.len < 512 {
+            true -> digit_put(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, magnitude, byte_value)
+            _ -> ext_copy(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name)
+        }
+    }
+    state digit_put(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, value: u64, magnitude: u64, byte_value: u8) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+        requires name.len < 512;
+    {
+        name.bytes[name.len] = byte_value;
+        name.len = ((name.len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> suffix_digit(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, value, ((magnitude as u64 in Wrapping) / (10 as u64 in Wrapping)) as u64) }
+    }
+
+    // Files append `<dot..end>` (extension incl. dot); directories have
+    // stem_end == name end so this copies nothing.
+    state ext_copy(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        transition is_dir {
+            true -> join_candidate(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name)
+            _ -> ext_loop(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, stem_end)
+        }
+    }
+    state ext_loop(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, copy_position: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        transition copy_position < source_bytes.len {
+            true -> ext_byte(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, copy_position)
+            _ -> join_candidate(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name)
+        }
+    }
+    state ext_byte(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, mut name: ManifestPathScratch, copy_position: u64) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let source_bytes: &[u8] = ManifestPathScratch::get_bytes(&source);
+        _ = ManifestPathScratch::append(&mut name, source_bytes[copy_position]);
+        transition { _ -> ext_loop(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, name, ((copy_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+
+    state join_candidate(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, name: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let mut candidate: ManifestPathScratch;
+        ManifestPathScratch::new(&mut candidate);
+        let mut path_joiner: ProjectItemSortOrder = ProjectItemSortOrder {};
+        let inner3036: &[u8] = ManifestPathScratch::get_bytes(&target);
+        let inner3037: &[u8] = ManifestPathScratch::get_bytes(&name);
+        transition ProjectItemSortOrder::join_path(path_joiner, inner3036, inner3037, &mut candidate) {
+            true -> candidate_exists(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, sequence, candidate)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    state candidate_exists(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, name_start: u64, stem_end: u64, sequence: u64, candidate: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+        requires name_start <= 512;
+    {
+        let inner3038: &[u8] = ManifestPathScratch::get_bytes(&candidate);
+        transition FileSystemUtils::path_exists(inner3038) {
+            true -> candidate_loop(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, name_start, stem_end, ((sequence as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> copy_tree(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, source, is_dir, candidate)
+        }
+    }
+    // `duplicate_project_item_from_snapshot` — `rename_tree` copies the
+    // tree without removing the source (upstream's snapshot+replay post
+    // state).
+    state copy_tree(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, source: ManifestPathScratch, is_dir: bool, candidate: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let inner3039: &[u8] = ManifestPathScratch::get_bytes(&source);
+        let inner3040: &[u8] = ManifestPathScratch::get_bytes(&candidate);
+        transition FileSystemUtils::rename_tree(inner3039, inner3040) {
+            true -> record(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, position, duplicated_count, operation_success, candidate)
+            _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, duplicated_count, false)
+        }
+    }
+    state record(engine_unprivileged_state: &mut EngineUnprivilegedState, project_items_duplicate_request: &ProjectItemsDuplicateRequest, directory: [u8; 512], directory_len: u64, items_root: ManifestPathScratch, target: ManifestPathScratch, mut duplicated_paths: ProjectPathList, position: u64, duplicated_count: u64, operation_success: bool, candidate: ManifestPathScratch) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let inner3041: &[u8] = ManifestPathScratch::get_bytes(&candidate);
+        _ = ProjectPathList::add_path(&mut duplicated_paths, inner3041);
+        transition { _ -> each(engine_unprivileged_state, project_items_duplicate_request, directory, directory_len, items_root, target, duplicated_paths, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, ((duplicated_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, operation_success) }
+    }
+
+    state reload_gate(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        transition duplicated_count > 0 {
+            true -> reload_open(engine_unprivileged_state, directory, directory_len, duplicated_paths, duplicated_count, operation_success)
+            _ -> respond(operation_success, duplicated_paths, duplicated_count)
+        }
+    }
+    state reload_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> reload_read(engine_unprivileged_state, dir_fd, directory, directory_len, duplicated_paths, duplicated_count, operation_success)
+            _ -> respond_fail(duplicated_paths, duplicated_count)
+        }
+    }
+    state reload_read(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let loaded: ProjectLoad = Project::load_at(dir_fd, &directory[0..directory_len]);
+        _ = FilesystemHost::close(dir_fd);
+        transition loaded {
+            ProjectLoad::Loaded { project } -> sort(engine_unprivileged_state, directory, directory_len, duplicated_paths, duplicated_count, operation_success, project)
+            _ -> respond_fail(duplicated_paths, duplicated_count)
+        }
+    }
+    state sort(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool, mut project: Project) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let mut sort_order: ProjectItemSortOrder = ProjectItemSortOrder {};
+        _ = ProjectItemSortOrder::append_project_item_paths_to_sort_order(&sort_order, &mut project, &directory[0..directory_len], &duplicated_paths);
+        transition { _ -> store(engine_unprivileged_state, directory, directory_len, duplicated_paths, duplicated_count, operation_success, project) }
+    }
+    state store(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool, project: Project) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        ProjectManager::set_opened_project(project_manager, &project);
+        transition { _ -> save_open(engine_unprivileged_state, directory, directory_len, duplicated_paths, duplicated_count, operation_success) }
+    }
+    state save_open(engine_unprivileged_state: &mut EngineUnprivilegedState, directory: [u8; 512], directory_len: u64, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let dir_fd: i32 = FileSystemUtils::open_path(&directory[0..directory_len], 0);
+        transition dir_fd >= 0 {
+            true -> save_do(engine_unprivileged_state, dir_fd, directory, directory_len, duplicated_paths, duplicated_count, operation_success)
+            _ -> respond_fail(duplicated_paths, duplicated_count)
+        }
+    }
+    state save_do(engine_unprivileged_state: &mut EngineUnprivilegedState, dir_fd: i32, directory: [u8; 512], directory_len: u64, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse
+        requires directory_len <= 512;
+    {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let saved: ProjectFileSave = Project::save_at(opened_project, dir_fd, &directory[0..directory_len], false);
+        _ = FilesystemHost::close(dir_fd);
+        transition saved {
+            ProjectFileSave::Stored -> notify_done(engine_unprivileged_state, duplicated_paths, duplicated_count, operation_success)
+            _ -> respond_fail(duplicated_paths, duplicated_count)
+        }
+    }
+    state notify_done(engine_unprivileged_state: &mut EngineUnprivilegedState, duplicated_paths: ProjectPathList, duplicated_count: u64, operation_success: bool) -> ProjectItemsDuplicateResponse {
+        EngineUnprivilegedState::notify_project_items_changed(engine_unprivileged_state);
+        transition { _ -> respond(operation_success, duplicated_paths, duplicated_count) }
+    }
+    state respond(operation_success: bool, duplicated_paths: ProjectPathList, duplicated_count: u64) -> ProjectItemsDuplicateResponse {
+        let mut response: ProjectItemsDuplicateResponse = ProjectItemsDuplicateResponse::new();
+        ProjectItemsDuplicateResponse::set_success(&mut response, operation_success);
+        ProjectItemsDuplicateResponse::set_duplicated_project_item_paths(&mut response, duplicated_paths);
+        ProjectItemsDuplicateResponse::set_duplicated_project_item_count(&mut response, duplicated_count);
+        (response)
+    }
+    state respond_fail(duplicated_paths: ProjectPathList, duplicated_count: u64) -> ProjectItemsDuplicateResponse {
+        let mut response: ProjectItemsDuplicateResponse = ProjectItemsDuplicateResponse::new();
+        ProjectItemsDuplicateResponse::set_duplicated_project_item_paths(&mut response, duplicated_paths);
+        ProjectItemsDuplicateResponse::set_duplicated_project_item_count(&mut response, duplicated_count);
+        (response)
+    }
+    state refused() -> ProjectItemsDuplicateResponse {
+        (ProjectItemsDuplicateResponse::new())
+    }
+}

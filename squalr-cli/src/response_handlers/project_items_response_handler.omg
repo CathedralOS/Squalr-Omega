@@ -1,0 +1,237 @@
+module src::response_handlers::project_items_response_handler;
+
+use omega_language_std::console;
+use squalr_engine_api::src::commands::project_items::project_items_response::ProjectItemsResponse;
+use squalr_engine_api::src::commands::project_items::list::project_items_list_response::ProjectItemsListResponse;
+use squalr_engine_api::src::commands::project_items::promote_symbol::project_items_promote_symbol_response::ProjectItemsPromoteSymbolResponse;
+use squalr_engine_api::src::commands::project_items::strip_symbol::project_items_strip_symbol_response::ProjectItemsStripSymbolResponse;
+use squalr_engine_api::src::commands::project_items::update_details::project_items_update_details_response::ProjectItemsUpdateDetailsResponse;
+use squalr_engine_api::src::commands::project_items::write_value::project_items_write_value_response::ProjectItemsWriteValueResponse;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
+use squalr_engine_api::src::structures::projects::project_items::project_item_pair::ProjectItemPair;
+use squalr_engine_api::src::structures::projects::project_items::project_item_ref::ProjectItemRef;
+use squalr_engine_api::src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use squalr_engine_api::src::structures::projects::project_string_list::ProjectStringList;
+use src::cli_print::CliPrint;
+
+// Port of response_handlers/project_items/mod.rs — upstream's log::info!
+// and log::warn! lines print to the console here (the headless cli's log
+// surface). The debug-level "unhandled" arms print nothing, same as a
+// default-level upstream run.
+pub data ProjectItemsResponseHandler {}
+
+pub machine ProjectItemsResponseHandler::handle(response: ProjectItemsResponse)
+reaches Console
+{
+    transition response {
+        ProjectItemsResponse::List { response } -> list(&response)
+        ProjectItemsResponse::PromoteSymbol { response } -> promote(&response)
+        ProjectItemsResponse::WriteValue { response } -> write_value(&response)
+        ProjectItemsResponse::StripSymbol { response } -> strip(&response)
+        ProjectItemsResponse::UpdateDetails { response } -> update_details(&response)
+        _ -> done()
+    }
+
+    // `project: <name>, project item count: <n>` then one
+    // `path: <path>, name: <name>, type: <type-id>` per item pair.
+    state list(response: &ProjectItemsListResponse) {
+        CliPrint::write_text("project: ");
+        transition ProjectItemsListResponse::has_opened_project_info(response) {
+            true -> list_name(response)
+            _ -> list_no_project(response)
+        }
+    }
+    state list_name(response: &ProjectItemsListResponse) {
+        let opened_project_info: &ProjectInfo = ProjectItemsListResponse::get_opened_project_info(response);
+        let name: &[u8] = ProjectInfo::get_name(opened_project_info);
+        Console::write(name);
+        transition { _ -> list_count(response) }
+    }
+    state list_no_project(response: &ProjectItemsListResponse) {
+        Console::write("(no project)");
+        transition { _ -> list_count(response) }
+    }
+    state list_count(response: &ProjectItemsListResponse) {
+        let count: u64 = ProjectItemsListResponse::get_opened_project_item_count(response);
+        Console::write(", project item count: ");
+        CliPrint::write_dec(count);
+        Console::write_byte(10);
+        transition { _ -> list_item_at(response, 0, count) }
+    }
+    state list_item_at(response: &ProjectItemsListResponse, position: u64, count: u64) {
+        transition position < count {
+            true -> list_item(response, position, count)
+            false -> done()
+        }
+    }
+    state list_item(response: &ProjectItemsListResponse, position: u64, count: u64) {
+        let pair: &ProjectItemPair = ProjectItemsListResponse::get_opened_project_item(response, position);
+        let project_item_ref: &ProjectItemRef = ProjectItemPair::get_project_item_ref(pair);
+        let project_item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let path: &[u8] = ProjectItemRef::get_project_item_path(project_item_ref);
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        Console::write("path: ");
+        Console::write(path);
+        Console::write(", name: ");
+        transition { _ -> list_item_name(response, project_item, pair, position, count) }
+    }
+    state list_item_name(response: &ProjectItemsListResponse, project_item: &ProjectItem, pair: &ProjectItemPair, position: u64, count: u64) {
+        let mut name_out: [u8; 256];
+        let name_len: u64 = ProjectItem::get_field_name(project_item, &mut name_out);
+        transition name_len <= 256 {
+            true -> list_item_name_write(response, project_item, pair, name_out, name_len, position, count)
+            _ -> done()
+        }
+    }
+    state list_item_name_write(response: &ProjectItemsListResponse, project_item: &ProjectItem, pair: &ProjectItemPair, name_out: [u8; 256], name_len: u64, position: u64, count: u64)
+        requires name_len <= 256;
+    {
+        Console::write(&name_out[0..name_len]);
+        transition { _ -> list_item_type(response, pair, position, count) }
+    }
+    state list_item_type(response: &ProjectItemsListResponse, pair: &ProjectItemPair, position: u64, count: u64) {
+        let project_item: &ProjectItem = ProjectItemPair::get_project_item(pair);
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        Console::write(", type: ");
+        Console::write(type_id);
+        Console::write_byte(10);
+        transition { _ -> list_item_at(response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, count) }
+    }
+
+    // Upstream: !success && !status_message.is_empty() -> warn the status
+    // message and return; otherwise the counts line with keys joined ", ".
+    state promote(response: &ProjectItemsPromoteSymbolResponse) {
+        let success: bool = ProjectItemsPromoteSymbolResponse::get_success(response);
+        let status_message: &[u8] = ProjectItemsPromoteSymbolResponse::get_status_message(response);
+        transition !success && status_message.len > 0 {
+            true -> promote_warn(response, status_message)
+            _ -> promote_counts(response)
+        }
+    }
+    state promote_warn(response: &ProjectItemsPromoteSymbolResponse, status_message: &[u8]) {
+        Console::write_line(status_message);
+    }
+    state promote_counts(response: &ProjectItemsPromoteSymbolResponse) {
+        let promoted: u64 = ProjectItemsPromoteSymbolResponse::get_promoted_symbol_count(response);
+        let reused: u64 = ProjectItemsPromoteSymbolResponse::get_reused_symbol_count(response);
+        let conflicts: u64 = ProjectItemsPromoteSymbolResponse::get_conflict_count(response);
+        Console::write("promoted ");
+        CliPrint::write_dec(promoted);
+        Console::write(" symbol(s), reused ");
+        CliPrint::write_dec(reused);
+        Console::write(" existing symbol(s), conflicts ");
+        CliPrint::write_dec(conflicts);
+        Console::write(": ");
+        transition { _ -> promote_keys(response, 0) }
+    }
+    state promote_keys(response: &ProjectItemsPromoteSymbolResponse, position: u64) {
+        let keys: &ProjectStringList = ProjectItemsPromoteSymbolResponse::get_promoted_symbol_locator_keys(response);
+        let count: u64 = ProjectStringList::get_string_count(keys);
+        transition position < count {
+            true -> promote_key(response, keys, position, count)
+            false -> promote_keys_done()
+        }
+    }
+    state promote_key(response: &ProjectItemsPromoteSymbolResponse, keys: &ProjectStringList, position: u64, count: u64) {
+        transition position > 0 {
+            true -> promote_key_comma(response, keys, position, count)
+            false -> promote_key_write(response, keys, position, count)
+        }
+    }
+    state promote_key_comma(response: &ProjectItemsPromoteSymbolResponse, keys: &ProjectStringList, position: u64, count: u64) {
+        Console::write(", ");
+        transition { _ -> promote_key_write(response, keys, position, count) }
+    }
+    state promote_key_write(response: &ProjectItemsPromoteSymbolResponse, keys: &ProjectStringList, position: u64, count: u64) {
+        let key: &[u8] = ProjectStringList::get_string(keys, position);
+        Console::write(key);
+        transition { _ -> promote_keys(response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state promote_keys_done() {
+        Console::write_byte(10);
+    }
+
+    // success -> "project item value write succeeded." ; error -> the
+    // error text ; else -> "project item value write failed."
+    state write_value(response: &ProjectItemsWriteValueResponse) {
+        let success: bool = ProjectItemsWriteValueResponse::get_success(response);
+        transition success {
+            true -> write_value_ok()
+            _ -> write_value_error(response)
+        }
+    }
+    state write_value_ok() {
+        Console::write_line("project item value write succeeded.");
+    }
+    state write_value_error(response: &ProjectItemsWriteValueResponse) {
+        transition ProjectItemsWriteValueResponse::has_error(response) {
+            true -> write_value_error_text(response)
+            _ -> write_value_failed()
+        }
+    }
+    state write_value_error_text(response: &ProjectItemsWriteValueResponse) {
+        let error: &[u8] = ProjectItemsWriteValueResponse::get_error(response);
+        Console::write_line(error);
+    }
+    state write_value_failed() {
+        Console::write_line("project item value write failed.");
+    }
+
+    state strip(response: &ProjectItemsStripSymbolResponse) {
+        let success: bool = ProjectItemsStripSymbolResponse::get_success(response);
+        transition success {
+            true -> strip_count(response)
+            _ -> strip_error(response)
+        }
+    }
+    state strip_count(response: &ProjectItemsStripSymbolResponse) {
+        let stripped: u64 = ProjectItemsStripSymbolResponse::get_stripped_project_item_count(response);
+        Console::write("stripped symbol information from ");
+        CliPrint::write_dec(stripped);
+        Console::write_line(" project item(s).");
+    }
+    state strip_error(response: &ProjectItemsStripSymbolResponse) {
+        transition ProjectItemsStripSymbolResponse::has_error(response) {
+            true -> strip_error_text(response)
+            _ -> strip_failed()
+        }
+    }
+    state strip_error_text(response: &ProjectItemsStripSymbolResponse) {
+        let error: &[u8] = ProjectItemsStripSymbolResponse::get_error(response);
+        Console::write_line(error);
+    }
+    state strip_failed() {
+        Console::write_line("project item strip-symbol command failed.");
+    }
+
+    state update_details(response: &ProjectItemsUpdateDetailsResponse) {
+        let success: bool = ProjectItemsUpdateDetailsResponse::get_success(response);
+        transition success {
+            true -> update_details_count(response)
+            _ -> update_details_error(response)
+        }
+    }
+    state update_details_count(response: &ProjectItemsUpdateDetailsResponse) {
+        let updated: u64 = ProjectItemsUpdateDetailsResponse::get_updated_project_item_count(response);
+        Console::write("updated details on ");
+        CliPrint::write_dec(updated);
+        Console::write_line(" project item(s).");
+    }
+    state update_details_error(response: &ProjectItemsUpdateDetailsResponse) {
+        transition ProjectItemsUpdateDetailsResponse::has_error(response) {
+            true -> update_details_error_text(response)
+            _ -> update_details_failed()
+        }
+    }
+    state update_details_error_text(response: &ProjectItemsUpdateDetailsResponse) {
+        let error: &[u8] = ProjectItemsUpdateDetailsResponse::get_error(response);
+        Console::write_line(error);
+    }
+    state update_details_failed() {
+        Console::write_line("project item update-details command failed.");
+    }
+    state done() { }
+}

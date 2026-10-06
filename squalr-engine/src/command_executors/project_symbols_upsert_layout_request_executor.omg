@@ -1,0 +1,240 @@
+module src::command_executors::project_symbols_upsert_layout_request_executor;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::project_symbols::upsert_layout::project_symbols_upsert_layout_request::ProjectSymbolsUpsertLayoutRequest;
+use squalr_engine_api::src::commands::project_symbols::upsert_layout::project_symbols_upsert_layout_response::ProjectSymbolsUpsertLayoutResponse;
+use squalr_engine_api::src::registries::symbols::struct_layout_descriptor::StructLayoutDescriptor;
+use squalr_engine_api::src::structures::projects::project::Project;
+use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use squalr_engine_api::src::structures::projects::project_string_list::ProjectStringList;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_field_definition::SymbolicFieldDefinitionParse;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicStructDefinition;
+use squalr_engine_api::src::structures::structs::symbolic_struct_definition::SymbolicLayoutKind;
+use squalr_engine_session::src::engine_unprivileged_state::EngineUnprivilegedState;
+use squalr_engine_session::src::projects::project_manager::ProjectManager;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+use src::services::projects::project_item_sort_order::ManifestPathScratch;
+use src::services::projects::project_symbol_layout_mutation::ProjectSymbolLayoutMutation;
+use src::services::projects::project_symbol_layout_mutation::LayoutMutationResult;
+use src::services::projects::project_symbol_name_scope::ProjectSymbolNameScope;
+use src::services::projects::project_symbol_catalog_persistence::ProjectSymbolCatalogPersistence;
+
+// Port of command_executors/project_symbols/upsert_layout/
+// project_symbols_upsert_layout_request_executor.rs — build a
+// StructLayoutDescriptor from the request fields (upstream's
+// `to_struct_layout_descriptor`), upsert it into the catalog, then
+// save + sync.
+// Deviations:
+// - `to_struct_layout_descriptor` lives engine-side: the api request type
+//   cannot see the registries/structs parse surface it needs — upstream
+//   naming kept on the private helpers.
+// - field definitions bound at 64 entries (catalog descriptor bound); a
+//   65th entry refuses the descriptor build like an upstream parse Err.
+// - the project directory resolves inside save_and_sync (upstream resolved
+//   it early only to pass it through).
+data LayoutKindParse {
+    case Parsed(kind: SymbolicLayoutKind);
+    case Refused;
+}
+
+machine upsert_layout_lowered_byte(value: u8) -> u8 {
+    transition value >= 65 && value <= 90 {
+        true -> (((value as u8 in Wrapping) + (32 as u8 in Wrapping)) as u8)
+        _ -> (value)
+    }
+}
+
+machine upsert_layout_kind_equals(text: &[u8], start: u64, end: u64, spelling: &[u8]) -> bool
+    requires start <= end && end <= text.len;
+{
+    let span: &[u8] = &text[start..end];
+    transition span.len == spelling.len {
+        true -> scan(span, spelling, 0)
+        _ -> (false)
+    }
+    state scan(span: &[u8], spelling: &[u8], position: u64) -> bool {
+        transition position < span.len && position < spelling.len {
+            true -> compare(span, spelling, position)
+            _ -> (true)
+        }
+    }
+    state compare(span: &[u8], spelling: &[u8], position: u64) -> bool
+        requires position < span.len && position < spelling.len;
+    {
+        transition upsert_layout_lowered_byte(span[position]) == spelling[position] {
+            true -> scan(span, spelling, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+}
+
+// Upstream `parse_layout_kind`: trim + lowercase; "" or "struct" -> Struct,
+// "union" -> Union, otherwise refused.
+machine upsert_layout_parse_kind(text: &[u8]) -> LayoutKindParse {
+    let mut start: u64 = 0;
+    let mut end: u64 = text.len;
+    transition { _ -> left(text, 0) }
+    state left(text: &[u8], position: u64) -> LayoutKindParse {
+        transition position < text.len {
+            true -> left_byte(text, position)
+            _ -> right(text, text.len)
+        }
+    }
+    state left_byte(text: &[u8], position: u64) -> LayoutKindParse
+        requires position < text.len;
+    {
+        transition text[position] == 32 || text[position] == 9 {
+            true -> left(text, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> right(text, position)
+        }
+    }
+    state right(text: &[u8], start: u64) -> LayoutKindParse {
+        let mut end: u64 = text.len;
+        transition { _ -> right_probe(text, start, text.len) }
+    }
+    state right_probe(text: &[u8], start: u64, end: u64) -> LayoutKindParse {
+            transition end > start {
+                true -> right_byte(text, start, end)
+                _ -> pick(text, start, end)
+            }
+        }
+    state right_byte(text: &[u8], start: u64, end: u64) -> LayoutKindParse
+        requires end > start && end <= text.len;
+    {
+        transition text[end - 1] == 32 || text[end - 1] == 9 {
+            true -> right_probe(text, start, end - 1)
+            _ -> pick(text, start, end)
+        }
+    }
+    state pick(text: &[u8], start: u64, end: u64) -> LayoutKindParse
+        requires start <= end && end <= text.len;
+    {
+        transition upsert_layout_kind_equals(text, start, end, "struct") {
+            true -> (LayoutKindParse::Parsed { kind: SymbolicLayoutKind::Struct })
+            _ -> pick_union(text, start, end)
+        }
+    }
+    state pick_union(text: &[u8], start: u64, end: u64) -> LayoutKindParse
+        requires start <= end && end <= text.len;
+    {
+        transition upsert_layout_kind_equals(text, start, end, "union") {
+            true -> (LayoutKindParse::Parsed { kind: SymbolicLayoutKind::Union })
+            _ -> (LayoutKindParse::Refused)
+        }
+    }
+}
+
+pub data ProjectSymbolsUpsertLayoutRequestExecutor {}
+
+pub linux_x86_64 machine ProjectSymbolsUpsertLayoutRequestExecutor::execute(
+    engine_unprivileged_state: &mut EngineUnprivilegedState,
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest
+) -> ProjectSymbolsUpsertLayoutResponse
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut scope: ProjectSymbolNameScope = ProjectSymbolNameScope {};
+    let mut layout_id: ManifestPathScratch;
+    ManifestPathScratch::new(&mut layout_id);
+    let inner3079: &[u8] = ProjectSymbolsUpsertLayoutRequest::get_struct_layout_id(project_symbols_upsert_layout_request);
+    _ = ProjectSymbolNameScope::trim_copy(&mut scope, inner3079, &mut layout_id);
+    transition layout_id.len > 0 {
+        true -> kind(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id)
+        _ -> (fail(project_symbols_upsert_layout_request, "Symbol layout id is required."))
+    }
+    state fail(request: &ProjectSymbolsUpsertLayoutRequest, message: &[u8]) -> ProjectSymbolsUpsertLayoutResponse {
+        let mut response: ProjectSymbolsUpsertLayoutResponse = ProjectSymbolsUpsertLayoutResponse::new();
+        ProjectSymbolsUpsertLayoutResponse::set_struct_layout_id(&mut response, ProjectSymbolsUpsertLayoutRequest::get_struct_layout_id(request));
+        ProjectSymbolsUpsertLayoutResponse::set_error(&mut response, message);
+        (response)
+    }
+    state kind(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, layout_id: ManifestPathScratch) -> ProjectSymbolsUpsertLayoutResponse {
+        let inner60: &[u8] = ProjectSymbolsUpsertLayoutRequest::get_layout_kind(project_symbols_upsert_layout_request);
+        let parsed: LayoutKindParse = upsert_layout_parse_kind(inner60);
+        transition parsed {
+            LayoutKindParse::Parsed { kind } -> fields(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id, kind)
+            _ -> (fail(project_symbols_upsert_layout_request, "Unsupported symbol layout kind."))
+        }
+    }
+    // Collect the bounded field array from the request's
+    // ProjectStringList — SFD::from_str per entry.
+    state fields(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, layout_id: ManifestPathScratch, kind: SymbolicLayoutKind) -> ProjectSymbolsUpsertLayoutResponse {
+        let mut fields: [SymbolicFieldDefinition; 64];
+        transition { _ -> field_at(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id, kind, fields, 0) }
+    }
+    state field_at(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, layout_id: ManifestPathScratch, kind: SymbolicLayoutKind, fields: [SymbolicFieldDefinition; 64], position: u64) -> ProjectSymbolsUpsertLayoutResponse {
+        let definitions: &ProjectStringList = ProjectSymbolsUpsertLayoutRequest::get_field_definitions(project_symbols_upsert_layout_request);
+        transition position < ProjectStringList::get_string_count(definitions) && position < 64 {
+            true -> field_parse(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id, kind, fields, position)
+            _ -> descriptor(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id, kind, fields, position)
+        }
+    }
+    state field_parse(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, layout_id: ManifestPathScratch, kind: SymbolicLayoutKind, mut fields: [SymbolicFieldDefinition; 64], position: u64) -> ProjectSymbolsUpsertLayoutResponse
+        requires position < 64;
+    {
+        let definitions: &ProjectStringList = ProjectSymbolsUpsertLayoutRequest::get_field_definitions(project_symbols_upsert_layout_request);
+        let inner61: &[u8] = ProjectStringList::get_string(definitions, position);
+        let parsed: SymbolicFieldDefinitionParse = SymbolicFieldDefinition::from_str(inner61);
+        transition parsed {
+            SymbolicFieldDefinitionParse::Parsed { value } -> field_store(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id, kind, fields, position, value)
+            _ -> (fail(project_symbols_upsert_layout_request, "Invalid field definition."))
+        }
+    }
+    state field_store(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, layout_id: ManifestPathScratch, kind: SymbolicLayoutKind, mut fields: [SymbolicFieldDefinition; 64], position: u64, value: SymbolicFieldDefinition) -> ProjectSymbolsUpsertLayoutResponse
+        requires position < 64;
+    {
+        fields[position] = value;
+        transition { _ -> field_at(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id, kind, fields, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state descriptor(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, layout_id: ManifestPathScratch, kind: SymbolicLayoutKind, fields: [SymbolicFieldDefinition; 64], field_count: u64) -> ProjectSymbolsUpsertLayoutResponse {
+        let mut definition: SymbolicStructDefinition = SymbolicStructDefinition::new_with_layout_kind(ManifestPathScratch::get_bytes(&layout_id), kind, &fields[0..field_count]);
+        let has_size: bool = ProjectSymbolsUpsertLayoutRequest::has_size_in_bytes(project_symbols_upsert_layout_request);
+        SymbolicStructDefinition::set_declared_size_in_bytes(&mut definition, has_size, ProjectSymbolsUpsertLayoutRequest::get_size_in_bytes(project_symbols_upsert_layout_request));
+        let inner62: &[u8] = ManifestPathScratch::get_bytes(&layout_id);
+        let struct_layout_descriptor: StructLayoutDescriptor = StructLayoutDescriptor::new(inner62, &definition);
+        transition { _ -> gate(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, layout_id, struct_layout_descriptor) }
+    }
+    state gate(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, layout_id: ManifestPathScratch, struct_layout_descriptor: StructLayoutDescriptor) -> ProjectSymbolsUpsertLayoutResponse {
+        let project_manager: &ProjectManager = EngineUnprivilegedState::get_project_manager(engine_unprivileged_state);
+        transition ProjectManager::get_has_opened_project(project_manager) {
+            true -> mutate(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request, struct_layout_descriptor)
+            _ -> (fail(project_symbols_upsert_layout_request, "Cannot upsert symbol layout without an opened project."))
+        }
+    }
+    state mutate(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest, struct_layout_descriptor: StructLayoutDescriptor) -> ProjectSymbolsUpsertLayoutResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        let project_info: &mut ProjectInfo = Project::borrow_project_info_mut(opened_project);
+        let project_symbol_catalog: &mut ProjectSymbolCatalog = ProjectInfo::borrow_project_symbol_catalog_mut(project_info);
+        let has_original: bool = ProjectSymbolsUpsertLayoutRequest::has_original_struct_layout_id(project_symbols_upsert_layout_request);
+        let mut mutation: ProjectSymbolLayoutMutation = ProjectSymbolLayoutMutation {};
+        let inner63: &[u8] = ProjectSymbolsUpsertLayoutRequest::get_original_struct_layout_id(project_symbols_upsert_layout_request);
+        let result: LayoutMutationResult = ProjectSymbolLayoutMutation::upsert_struct_layout_descriptor(&mut mutation, project_symbol_catalog, has_original, inner63, &struct_layout_descriptor);
+        transition result {
+            LayoutMutationResult::Succeeded { summary } -> save(engine_unprivileged_state, engine_bindings, project_symbols_upsert_layout_request)
+            _ -> (fail(project_symbols_upsert_layout_request, "Failed to upsert the symbol layout."))
+        }
+    }
+    state save(engine_unprivileged_state: &mut EngineUnprivilegedState, engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings, project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest) -> ProjectSymbolsUpsertLayoutResponse {
+        let project_manager: &mut ProjectManager = EngineUnprivilegedState::borrow_project_manager_mut(engine_unprivileged_state);
+        let opened_project: &mut Project = ProjectManager::borrow_opened_project_mut(project_manager);
+        transition ProjectSymbolCatalogPersistence::save_and_sync_project_symbol_catalog(engine_bindings, opened_project) {
+            true -> succeed(project_symbols_upsert_layout_request)
+            _ -> (fail(project_symbols_upsert_layout_request, "Failed to save and sync project symbol catalog."))
+        }
+    }
+    state succeed(project_symbols_upsert_layout_request: &ProjectSymbolsUpsertLayoutRequest) -> ProjectSymbolsUpsertLayoutResponse {
+        let mut response: ProjectSymbolsUpsertLayoutResponse = ProjectSymbolsUpsertLayoutResponse::new();
+        ProjectSymbolsUpsertLayoutResponse::set_success(&mut response, true);
+        ProjectSymbolsUpsertLayoutResponse::set_struct_layout_id(&mut response, ProjectSymbolsUpsertLayoutRequest::get_struct_layout_id(project_symbols_upsert_layout_request));
+        (response)
+    }
+}

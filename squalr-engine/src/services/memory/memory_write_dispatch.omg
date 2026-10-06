@@ -1,0 +1,61 @@
+// Port of squalr-engine/src/services/memory/memory_write_dispatch.rs.
+//
+// Upstream sends `MemoryWriteRequest::to_engine_command` (a privileged
+// command) through `engine_bindings.dispatch_privileged_command` and
+// blocks on the channel result; the port dispatches the same command
+// through the standalone bindings mailbox (equally synchronous — the
+// timeout collapses). Result<String> failure modes (lock/poison/timeout)
+// collapse to the probe union's Absent arm — upstream only logs them.
+
+module src::services::memory::memory_write_dispatch;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::memory::memory_command::MemoryCommand;
+use squalr_engine_api::src::commands::memory::memory_response::MemoryResponse;
+use squalr_engine_api::src::commands::memory::write::memory_write_request::MemoryWriteRequest;
+use squalr_engine_api::src::commands::memory::write::memory_write_response::MemoryWriteResponse;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+pub data MemoryWriteDispatch {}
+
+pub data MemoryWriteDispatchResult {
+    case Absent;
+    case Present(response: MemoryWriteResponse);
+}
+
+pub machine MemoryWriteDispatch::dispatch_memory_write_request(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    memory_write_request: &MemoryWriteRequest
+) -> MemoryWriteDispatchResult
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+    let inner0: MemoryWriteRequest = MemoryWriteRequest::clone(memory_write_request);
+    let command: PrivilegedCommand = PrivilegedCommand::Memory { command: MemoryCommand::Write { request: inner0 } };
+    _ = StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(engine_bindings, &command, &mut mailbox);
+    transition mailbox {
+        PrivilegedResponseMailbox::Delivered { response } -> domain(response)
+        _ -> (MemoryWriteDispatchResult::Absent)
+    }
+    state domain(response: PrivilegedCommandResponse) -> MemoryWriteDispatchResult {
+        transition response {
+            PrivilegedCommandResponse::Memory { response } -> leaf(response)
+            _ -> (MemoryWriteDispatchResult::Absent)
+        }
+    }
+    state leaf(response: MemoryResponse) -> MemoryWriteDispatchResult {
+        transition response {
+            MemoryResponse::Write { response } -> (MemoryWriteDispatchResult::Present { response: response })
+            _ -> (MemoryWriteDispatchResult::Absent)
+        }
+    }
+}

@@ -1,6 +1,9 @@
 module src::plugins::plugin_configuration;
 
 use src::plugins::plugin_id::PluginId;
+use src::plugins::plugin_metadata::PluginMetadata;
+use src::plugins::plugin_state::PluginState;
+use src::commands::plugins::list::plugin_list_response::PluginListResponse;
 
 // Port of plugins/plugin_configuration.rs — the per-project enabled/
 // disabled/priority plugin-id lists persisted in ProjectInfo. Upstream's
@@ -473,6 +476,214 @@ pub machine plugin_id_less(left: &PluginId, right: &PluginId) -> bool {
         transition next_position < left_bytes.len && next_position < right_bytes.len {
             true -> compare_bytes(left_bytes, right_bytes, next_position)
             false -> (left_bytes.len < right_bytes.len)
+        }
+    }
+}
+
+// Upstream `from_plugin_states` — folds the current plugin states plus
+// the default ordering into a project configuration: enabled ids where
+// (not enabled-by-default and currently enabled), disabled ids where
+// (enabled-by-default and currently disabled), and the current order as
+// priority when it differs from the default order. Empty result is the
+// upstream None — the probe union carries it.
+pub machine PluginConfiguration::from_plugin_states(
+    plugin_list_response: &PluginListResponse
+) -> PluginConfigurationProbe {
+    let mut configuration: PluginConfiguration = PluginConfiguration::new();
+    transition { _ -> fold(configuration, plugin_list_response, 0) }
+    state fold(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse,
+        position: u64
+    ) -> PluginConfigurationProbe {
+        transition position < PluginListResponse::get_plugin_count(plugin_list_response) && position < 64 {
+            true -> bucket(configuration, plugin_list_response, position)
+            _ -> order(configuration, plugin_list_response)
+        }
+    }
+    state bucket(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse,
+        position: u64
+    ) -> PluginConfigurationProbe
+        requires position < 64;
+    {
+        let plugin_state: &PluginState = PluginListResponse::get_plugin(plugin_list_response, position);
+        let metadata: &PluginMetadata = PluginState::get_metadata(plugin_state);
+        let plugin_id: &[u8] = PluginMetadata::get_plugin_id(metadata);
+        let mut state_id: PluginId = PluginId::new(plugin_id);
+        let by_default: bool = PluginMetadata::get_is_enabled_by_default(metadata);
+        let is_enabled: bool = PluginState::get_is_enabled(plugin_state);
+        transition !by_default && is_enabled {
+            true -> add_enabled(configuration, plugin_list_response, position, state_id)
+            _ -> maybe_disabled(configuration, plugin_list_response, position, state_id, by_default, is_enabled)
+        }
+    }
+    state add_enabled(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse,
+        position: u64,
+        state_id: PluginId
+    ) -> PluginConfigurationProbe
+        requires position < 64;
+    {
+        _ = PluginConfiguration::add_enabled_plugin_id(&mut configuration, &state_id);
+        transition { _ -> fold(configuration, plugin_list_response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state maybe_disabled(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse,
+        position: u64,
+        state_id: PluginId,
+        by_default: bool,
+        is_enabled: bool
+    ) -> PluginConfigurationProbe
+        requires position < 64;
+    {
+        transition by_default && !is_enabled {
+            true -> add_disabled(configuration, plugin_list_response, position, state_id)
+            _ -> fold(configuration, plugin_list_response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state add_disabled(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse,
+        position: u64,
+        state_id: PluginId
+    ) -> PluginConfigurationProbe
+        requires position < 64;
+    {
+        _ = PluginConfiguration::add_disabled_plugin_id(&mut configuration, &state_id);
+        transition { _ -> fold(configuration, plugin_list_response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    // Upstream `priority_plugin_ids = current if current != defaults
+    // else []` — compare the ordered current ids to the default list.
+    state order(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse
+    ) -> PluginConfigurationProbe {
+        let differs: bool = plugin_order_differs(plugin_list_response);
+        transition differs {
+            true -> fill_order(configuration, plugin_list_response, 0)
+            _ -> probe(configuration)
+        }
+    }
+    state fill_order(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse,
+        position: u64
+    ) -> PluginConfigurationProbe {
+        transition position < PluginListResponse::get_plugin_count(plugin_list_response) && position < 64 {
+            true -> push_order(configuration, plugin_list_response, position)
+            _ -> probe(configuration)
+        }
+    }
+    state push_order(
+        mut configuration: PluginConfiguration,
+        plugin_list_response: &PluginListResponse,
+        position: u64
+    ) -> PluginConfigurationProbe
+        requires position < 64;
+    {
+        let plugin_state: &PluginState = PluginListResponse::get_plugin(plugin_list_response, position);
+        let metadata: &PluginMetadata = PluginState::get_metadata(plugin_state);
+        let mut state_id: PluginId = PluginId::new(PluginMetadata::get_plugin_id(metadata));
+        _ = PluginConfiguration::add_priority_plugin_id(&mut configuration, &state_id);
+        transition { _ -> fill_order(configuration, plugin_list_response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state probe(configuration: PluginConfiguration) -> PluginConfigurationProbe {
+        let mut carried: PluginConfiguration = configuration;
+        transition PluginConfiguration::is_empty(&carried) {
+            true -> (PluginConfigurationProbe::Absent)
+            _ -> (PluginConfigurationProbe::Present { configuration: carried })
+        }
+    }
+}
+
+pub data PluginConfigurationProbe {
+    case Absent;
+    case Present(configuration: PluginConfiguration);
+}
+
+// Ordered current-ids-vs-default-ids compare — upstream
+// `current_plugin_ids == default_plugin_ids`.
+machine plugin_order_differs(plugin_list_response: &PluginListResponse) -> bool {
+    transition PluginListResponse::get_plugin_count(plugin_list_response) == PluginListResponse::get_default_plugin_id_count(plugin_list_response) {
+        true -> walk(plugin_list_response, 0)
+        _ -> (true)
+    }
+    state walk(plugin_list_response: &PluginListResponse, position: u64) -> bool {
+        transition position < PluginListResponse::get_plugin_count(plugin_list_response) && position < 64 {
+            true -> compare(plugin_list_response, position)
+            _ -> (false)
+        }
+    }
+    state compare(plugin_list_response: &PluginListResponse, position: u64) -> bool
+        requires position < 64;
+    {
+        let plugin_state: &PluginState = PluginListResponse::get_plugin(plugin_list_response, position);
+        let metadata: &PluginMetadata = PluginState::get_metadata(plugin_state);
+        let current_id: &[u8] = PluginMetadata::get_plugin_id(metadata);
+        let mut state_id: PluginId = PluginId::new(current_id);
+        let default_id: &PluginId = PluginListResponse::get_default_plugin_id(plugin_list_response, position);
+        transition PluginId::equals(&state_id, default_id) {
+            true -> walk(plugin_list_response, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (true)
+        }
+    }
+}
+
+// Content equality on the three id lists — upstream PartialEq.
+pub machine PluginConfiguration::equals(
+    plugin_configuration: &PluginConfiguration,
+    other: &PluginConfiguration
+) -> bool {
+    transition plugin_configuration.enabled_plugin_id_count == other.enabled_plugin_id_count
+        && plugin_configuration.disabled_plugin_id_count == other.disabled_plugin_id_count
+        && plugin_configuration.priority_plugin_id_count == other.priority_plugin_id_count {
+        true -> walk_enabled(plugin_configuration, other, 0)
+        _ -> (false)
+    }
+    state walk_enabled(plugin_configuration: &PluginConfiguration, other: &PluginConfiguration, position: u64) -> bool {
+        transition position < plugin_configuration.enabled_plugin_id_count && position < 32 {
+            true -> compare_enabled(plugin_configuration, other, position)
+            _ -> walk_disabled(plugin_configuration, other, 0)
+        }
+    }
+    state compare_enabled(plugin_configuration: &PluginConfiguration, other: &PluginConfiguration, position: u64) -> bool
+        requires position < 32;
+    {
+        transition PluginId::equals(&plugin_configuration.enabled_plugin_ids[position], &other.enabled_plugin_ids[position]) {
+            true -> walk_enabled(plugin_configuration, other, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state walk_disabled(plugin_configuration: &PluginConfiguration, other: &PluginConfiguration, position: u64) -> bool {
+        transition position < plugin_configuration.disabled_plugin_id_count && position < 32 {
+            true -> compare_disabled(plugin_configuration, other, position)
+            _ -> walk_priority(plugin_configuration, other, 0)
+        }
+    }
+    state compare_disabled(plugin_configuration: &PluginConfiguration, other: &PluginConfiguration, position: u64) -> bool
+        requires position < 32;
+    {
+        transition PluginId::equals(&plugin_configuration.disabled_plugin_ids[position], &other.disabled_plugin_ids[position]) {
+            true -> walk_disabled(plugin_configuration, other, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
+        }
+    }
+    state walk_priority(plugin_configuration: &PluginConfiguration, other: &PluginConfiguration, position: u64) -> bool {
+        transition position < plugin_configuration.priority_plugin_id_count && position < 32 {
+            true -> compare_priority(plugin_configuration, other, position)
+            _ -> (true)
+        }
+    }
+    state compare_priority(plugin_configuration: &PluginConfiguration, other: &PluginConfiguration, position: u64) -> bool
+        requires position < 32;
+    {
+        transition PluginId::equals(&plugin_configuration.priority_plugin_ids[position], &other.priority_plugin_ids[position]) {
+            true -> walk_priority(plugin_configuration, other, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (false)
         }
     }
 }

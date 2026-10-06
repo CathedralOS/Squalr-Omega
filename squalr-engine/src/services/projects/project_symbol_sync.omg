@@ -1,0 +1,60 @@
+// Port of squalr-engine/src/command_executors/project/project_symbol_sync.rs.
+//
+// Upstream ships the catalog through the bindings' unprivileged channel
+// via `send_unprivileged` — a direct engine_bindings dispatch that
+// bypasses the middleware wire and blocks on the channel response — and
+// the port routes the same privileged Registry command through the
+// standalone bindings mailbox, which is equally synchronous. The 1s
+// recv_timeout becomes a single mailbox probe; there is no async hop to
+// time out. Executors run under the dual (state, bindings) context, so
+// the hop takes the bindings record directly.
+
+module src::services::projects::project_symbol_sync;
+
+use omega::language::core::wait_wake;
+use omega_language_std::filesystem_host;
+use squalr_engine_api::src::commands::privileged_command::PrivilegedCommand;
+use squalr_engine_api::src::commands::privileged_command_response::PrivilegedCommandResponse;
+use squalr_engine_api::src::commands::registry::registry_command::RegistryCommand;
+use squalr_engine_api::src::commands::registry::registry_response::RegistryResponse;
+use squalr_engine_api::src::commands::registry::set_project_symbols::registry_set_project_symbols_request::RegistrySetProjectSymbolsRequest;
+use squalr_engine_api::src::commands::registry::set_project_symbols::registry_set_project_symbols_response::RegistrySetProjectSymbolsResponse;
+use squalr_engine_api::src::engine::privileged_response_mailbox::PrivilegedResponseMailbox;
+use squalr_engine_api::src::structures::projects::project_symbol_catalog::ProjectSymbolCatalog;
+use src::engine_bindings::standalone_engine_api_unprivileged_bindings::StandaloneEngineApiUnprivilegedBindings;
+
+pub data ProjectSymbolSync {}
+
+pub machine ProjectSymbolSync::sync_project_symbol_catalog(
+    engine_bindings: &mut StandaloneEngineApiUnprivilegedBindings,
+    project_symbol_catalog: &ProjectSymbolCatalog
+) -> bool
+reaches WaitWake
+reaches FilesystemHost
+invokes WaitWake;
+invokes FilesystemHost;
+crashes Abort
+crashes Trap
+{
+    let mut mailbox: PrivilegedResponseMailbox = PrivilegedResponseMailbox::default();
+    let cloned_catalog: ProjectSymbolCatalog = ProjectSymbolCatalog::clone(project_symbol_catalog);
+    let request: RegistrySetProjectSymbolsRequest = RegistrySetProjectSymbolsRequest::new(cloned_catalog);
+    let command: PrivilegedCommand = PrivilegedCommand::Registry { command: RegistryCommand::SetProjectSymbols { registry_set_project_symbols_request: request } };
+    _ = StandaloneEngineApiUnprivilegedBindings::dispatch_privileged_command(engine_bindings, &command, &mut mailbox);
+    transition mailbox {
+        PrivilegedResponseMailbox::Delivered { response } -> domain(response)
+        _ -> (false)
+    }
+    state domain(response: PrivilegedCommandResponse) -> bool {
+        transition response {
+            PrivilegedCommandResponse::Registry { response } -> leaf(response)
+            _ -> (false)
+        }
+    }
+    state leaf(response: RegistryResponse) -> bool {
+        transition response {
+            RegistryResponse::SetProjectSymbols { registry_set_project_symbols_response } -> (RegistrySetProjectSymbolsResponse::get_success(&registry_set_project_symbols_response))
+            _ -> (false)
+        }
+    }
+}

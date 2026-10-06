@@ -1,0 +1,589 @@
+// Upstream `squalr-engine-api/src/structures/projects/project_items/details/project_item_details_edit_applier.rs`
+// — translates a resolved (DetailsFieldSource, DetailsValue) pair into a
+// project item field update. `Result<bool, String>` collapses to a bool
+// here: every executor caller treats Err like Ok(false) (warn + continue),
+// and no error text was threaded to the response upstream anyway.
+
+module src::structures::projects::project_items::details::project_item_details_edit_applier;
+
+use omega::language::core::option;
+use src::structures::data_types::data_type_ref::DataTypeRef;
+use src::structures::data_values::anonymous_value_string::AnonymousValueString;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormat;
+use src::structures::data_values::anonymous_value_string_format::AnonymousValueStringFormatParse;
+use src::structures::data_values::data_value::DataValue;
+use src::structures::details::details_field::DetailsFieldSource;
+use src::structures::details::details_field::DetailsValue;
+use src::structures::memory::symbolic_pointer_chain::SymbolicPointerChainLink;
+use src::structures::memory::symbolic_pointer_chain::symbolic_pointer_chain_parse_text_list;
+use src::structures::data_values::pointer_scan_pointer_size::PointerScanPointerSize;
+use src::structures::projects::project_items::built_in_types::project_item_type_address::ProjectItemTypeAddress;
+use src::structures::projects::project_items::built_in_types::project_item_type_address_target::OwnedRuntimePointer;
+use src::structures::projects::project_items::built_in_types::project_item_type_address_target::ProjectItemAddressTarget;
+use src::structures::projects::project_items::built_in_types::project_item_type_pointer::ProjectItemTypePointer;
+use src::structures::projects::project_items::project_item::ProjectItem;
+use src::structures::projects::project_items::project_item_type_ref::ProjectItemTypeRef;
+use src::structures::structs::valued_struct::ValuedStruct;
+use src::structures::structs::valued_struct_field::ValuedStructFieldData;
+
+pub data ProjectItemDetailsEditApplier {
+}
+
+// Byte-slice equality — private; `bytes_equal` helpers elsewhere are
+// module-private too.
+machine details_applier_equal(left: &[u8], right: &[u8]) -> bool {
+    transition left.len == right.len {
+        true -> scan(left, right, 0)
+        _ -> (false)
+    }
+    state scan(left: &[u8], right: &[u8], position: u64) -> bool {
+        transition position < left.len && position < right.len {
+            true -> at(left, right, position)
+            false -> (true)
+        }
+    }
+    state at(left: &[u8], right: &[u8], position: u64) -> bool
+        requires position < left.len && position < right.len;
+    {
+        transition left[position] == right[position] {
+            true -> scan(left, right, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> (false)
+        }
+    }
+}
+
+// Decimal emit — u64 and i64 spell into the caller's 512 scratch. Private
+// copies of the resolver's decimal writers; the field-data text path needs
+// them on this file's side.
+machine details_applier_write_u64(value: u64, out: &mut [u8; 512], written: u64) -> u64 {
+    let mut digits: [u8; 20];
+    let digit_count: u64 = details_applier_u64_digits(value, &mut digits, 0);
+    transition { _ -> emit_gate(digits, digit_count, out, written, 0) }
+    state emit_gate(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64) -> u64 {
+        transition digit_count <= 20 && written <= 512 && digit_count <= 512 - written {
+            true -> emit_u64(digits, digit_count, out, written, position)
+            _ -> (written)
+        }
+    }
+    state emit_u64(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64) -> u64
+        requires digit_count <= 20 && written <= 512;
+    {
+        transition position < digit_count && written < 512 {
+            true -> put_u64(digits, digit_count, out, written, position)
+            _ -> (written)
+        }
+    }
+    state put_u64(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64) -> u64
+        requires digit_count <= 20 && written <= 512 && position < digit_count && written < 512;
+    {
+        let index: u64 = ((digit_count as u64 in Wrapping) - (((1 as u64 in Wrapping) + (position as u64 in Wrapping)))) as u64;
+        transition index < 20 {
+            true -> store_u64(digits, digit_count, out, written, position, index)
+            _ -> (written)
+        }
+    }
+    state store_u64(digits: [u8; 20], digit_count: u64, out: &mut [u8; 512], written: u64, position: u64, index: u64) -> u64
+        requires index < 20 && written < 512 && position < digit_count;
+    {
+        let next_written: u64 = ((written as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        out[written] = digits[index];
+        transition { _ -> emit_gate(digits, digit_count, out, next_written, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+}
+
+machine details_applier_u64_digits(value: u64, digits: &mut [u8; 20], count: u64) -> u64 {
+    transition count < 20 {
+        true -> digit(value, digits, count)
+        _ -> (count)
+    }
+    state digit(value: u64, digits: &mut [u8; 20], count: u64) -> u64
+        requires count < 20;
+    {
+        digits[count] = ((value % 10) as u8) + 48;
+        transition value >= 10 {
+            true -> details_applier_u64_digits_callee(value / 10, digits, ((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            _ -> (((count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        }
+    }
+    state details_applier_u64_digits_callee(value: u64, digits: &mut [u8; 20], count: u64) -> u64 {
+        transition count < 20 {
+            true -> digit(value, digits, count)
+            _ -> (count)
+        }
+    }
+}
+
+// Upstream `details_value_to_text` — renders the value into 512 scratch.
+// DataValue bytes copy through verbatim (upstream does a lossy utf8 decode).
+pub machine details_applier_value_text(details_value: &DetailsValue, out: &mut [u8; 512]) -> u64 {
+    transition details_value {
+        DetailsValue::Text { text, text_len } -> from_text(text, text_len, out)
+        DetailsValue::DataValue { value } -> from_data(value, out)
+        DetailsValue::AnonymousValue { value } -> from_anonymous(value, out)
+        DetailsValue::DisplayFormat { format } -> from_spelling(AnonymousValueStringFormat::spelling(format), out)
+        DetailsValue::Boolean { value } -> from_bool(value, out)
+        DetailsValue::UnsignedInteger { value } -> from_u64(value, out)
+        DetailsValue::SignedInteger { value } -> from_i64(value, out)
+        DetailsValue::Empty -> (0)
+        _ -> (0)
+    }
+    state from_text(text: [u8; 512], text_len: u64, out: &mut [u8; 512]) -> u64 {
+        transition text_len <= 512 {
+            true -> copy_loop(&text, text_len, out, 0)
+            _ -> (0)
+        }
+    }
+    state copy_loop(text: &[u8; 512], text_len: u64, out: &mut [u8; 512], position: u64) -> u64
+        requires text_len <= 512;
+    {
+        transition position < text_len && position < 512 {
+            true -> copy_put(text, text_len, out, position)
+            _ -> (text_len)
+        }
+    }
+    state copy_put(text: &[u8; 512], text_len: u64, out: &mut [u8; 512], position: u64) -> u64
+        requires text_len <= 512 && position < text_len && position < 512;
+    {
+        out[position] = text[position];
+        transition { _ -> copy_loop(text, text_len, out, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state from_data(value: &DataValue, out: &mut [u8; 512]) -> u64 {
+        let bytes: &[u8] = DataValue::get_value_bytes(value);
+        transition bytes.len <= 512 {
+            true -> copy_bytes(bytes, out, bytes.len, 0)
+            _ -> (0)
+        }
+    }
+    state copy_bytes(bytes: &[u8], out: &mut [u8; 512], text_len: u64, position: u64) -> u64 {
+        transition position < text_len && position < 512 && position < bytes.len {
+            true -> copy_byte(bytes, out, text_len, position)
+            _ -> (text_len)
+        }
+    }
+    state copy_byte(bytes: &[u8], out: &mut [u8; 512], text_len: u64, position: u64) -> u64
+        requires position < bytes.len && position < 512;
+    {
+        out[position] = bytes[position];
+        transition { _ -> copy_bytes(bytes, out, text_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state from_anonymous(value: &AnonymousValueString, out: &mut [u8; 512]) -> u64 {
+        let text_len: u64 = AnonymousValueString::get_anonymous_value_string_len(value);
+        transition text_len <= 512 {
+            true -> copy_anonymous(value, out, text_len, 0, text_len)
+            _ -> (0)
+        }
+    }
+    state copy_anonymous(value: &AnonymousValueString, out: &mut [u8; 512], text_len: u64, position: u64, value_len: u64) -> u64 {
+        transition position < text_len && position < 512 && position < value_len {
+            true -> anonymous_byte(value, out, text_len, position, value_len)
+            _ -> (text_len)
+        }
+    }
+    state anonymous_byte(value: &AnonymousValueString, out: &mut [u8; 512], text_len: u64, position: u64, value_len: u64) -> u64
+        requires position < value_len && position < 512;
+    {
+        out[position] = AnonymousValueString::get_anonymous_value_string_byte(value, position);
+        transition { _ -> copy_anonymous(value, out, text_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64, value_len) }
+    }
+    state from_spelling(spelling: &[u8], out: &mut [u8; 512]) -> u64 {
+        transition spelling.len <= 512 {
+            true -> spell_copy(spelling, out, spelling.len, 0)
+            _ -> (0)
+        }
+    }
+    state spell_copy(spelling: &[u8], out: &mut [u8; 512], text_len: u64, position: u64) -> u64
+        requires text_len <= 512;
+    {
+        transition position < text_len && position < spelling.len {
+            true -> spell_byte(spelling, out, text_len, position)
+            _ -> (text_len)
+        }
+    }
+    state spell_byte(spelling: &[u8], out: &mut [u8; 512], text_len: u64, position: u64) -> u64
+        requires position < spelling.len && text_len <= 512;
+    {
+        out[position] = spelling[position];
+        transition { _ -> spell_copy(spelling, out, text_len, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+    }
+    state from_bool(value: bool, out: &mut [u8; 512]) -> u64 {
+        transition value {
+            true -> emit_true(out)
+            _ -> emit_false(out)
+        }
+    }
+    state emit_true(out: &mut [u8; 512]) -> u64 {
+        out[0] = 116;
+        out[1] = 114;
+        out[2] = 117;
+        out[3] = 101;
+        (4)
+    }
+    state emit_false(out: &mut [u8; 512]) -> u64 {
+        out[0] = 102;
+        out[1] = 97;
+        out[2] = 108;
+        out[3] = 115;
+        out[4] = 101;
+        (5)
+    }
+    state from_u64(value: u64, out: &mut [u8; 512]) -> u64 {
+        details_applier_write_u64(value, out, 0)
+    }
+    state from_i64(value: i64, out: &mut [u8; 512]) -> u64 {
+        transition value < 0 {
+            true -> sign(out, value)
+            _ -> details_applier_write_u64(value as u64, out, 0)
+        }
+    }
+    state sign(out: &mut [u8; 512], value: i64) -> u64 {
+        out[0] = 45;
+        transition value < 0 {
+            true -> body(out, value)
+            _ -> (1)
+        }
+    }
+    state body(out: &mut [u8; 512], value: i64) -> u64 {
+        let magnitude: u64 = ((0 as u64 in Wrapping) - (value as u64 in Wrapping)) as u64;
+        transition { _ -> details_applier_write_u64(magnitude, out, 1) }
+    }
+}
+
+// Upstream `details_value_to_display_format` — DisplayFormat arm verbatim,
+// anything else reparses its text. found:false covers upstream's Err.
+machine details_applier_display_format(details_value: &DetailsValue) -> AnonymousValueStringFormatParse {
+    transition details_value {
+        DetailsValue::DisplayFormat { format } -> direct(format)
+        _ -> parse(details_value)
+    }
+    state direct(format: AnonymousValueStringFormat) -> AnonymousValueStringFormatParse {
+        (AnonymousValueStringFormatParse::Parsed { value: format })
+    }
+    state parse(details_value: &DetailsValue) -> AnonymousValueStringFormatParse {
+        let mut text: [u8; 512];
+        let text_len: u64 = details_applier_value_text(details_value, &mut text);
+        transition text_len <= 512 {
+            true -> parsed(text, text_len)
+            _ -> (AnonymousValueStringFormatParse::Refused)
+        }
+    }
+    state parsed(text: [u8; 512], text_len: u64) -> AnonymousValueStringFormatParse
+        requires text_len <= 512;
+    {
+        (AnonymousValueStringFormat::from_str_window(text, 0, text_len))
+    }
+}
+
+// Upstream `details_value_to_pointer_offsets` — nonempty parsed link list
+// or refusal (upstream Err on empty).
+machine details_applier_pointer_offsets(details_value: &DetailsValue, out: &mut [SymbolicPointerChainLink; 64]) -> u64 {
+    let mut text: [u8; 512];
+    let text_len: u64 = details_applier_value_text(details_value, &mut text);
+    transition text_len <= 512 {
+        true -> parse(text, text_len, out)
+        _ -> (0)
+    }
+    state parse(text: [u8; 512], text_len: u64, out: &mut [SymbolicPointerChainLink; 64]) -> u64
+        requires text_len <= 512;
+    {
+        let count: u64 = symbolic_pointer_chain_parse_text_list(&text[0..text_len], out);
+        transition count > 0 {
+            true -> (count)
+            _ -> (0)
+        }
+    }
+}
+
+// Upstream `details_value_to_field_data` — every arm renders to utf8 text
+// (upstream wraps all non-DataValue arms through
+// DataTypeStringUtf8::get_value_from_primitive_string — the established
+// spelling here is `DataTypeRef::new("string_utf8")` per project_item.omg).
+machine details_applier_field_data(details_value: &DetailsValue) -> ValuedStructFieldData {
+    transition details_value {
+        DetailsValue::DataValue { value } -> arm_data(value)
+        _ -> arm_text(details_value)
+    }
+    state arm_data(value: &DataValue) -> ValuedStructFieldData {
+        (ValuedStructFieldData::Value { value: DataValue::clone(value) })
+    }
+    state arm_text(details_value: &DetailsValue) -> ValuedStructFieldData {
+        let mut text: [u8; 512];
+        let text_len: u64 = details_applier_value_text(details_value, &mut text);
+        transition text_len <= 512 {
+            true -> build(details_value, text, text_len)
+            _ -> build_empty(details_value)
+        }
+    }
+    state build(details_value: &DetailsValue, text: [u8; 512], text_len: u64) -> ValuedStructFieldData
+        requires text_len <= 512;
+    {
+        let data_type_ref: DataTypeRef = DataTypeRef::new("string_utf8");
+        let value: DataValue = DataValue::new(&data_type_ref, &text[0..text_len]);
+        (ValuedStructFieldData::Value { value: value })
+    }
+    state build_empty(details_value: &DetailsValue) -> ValuedStructFieldData {
+        let data_type_ref: DataTypeRef = DataTypeRef::new("string_utf8");
+        let value: DataValue = DataValue::new(&data_type_ref, "");
+        (ValuedStructFieldData::Value { value: value })
+    }
+}
+
+// Upstream `apply_project_item_property` — the ordered property/type
+// dispatch. Directory "name" is refused; the five recognized built-in
+// spellings route to their typed setters; anything else lands in the
+// property bag as text field data.
+pub machine ProjectItemDetailsEditApplier::apply_project_item_property(
+    project_item: &mut ProjectItem,
+    property_name: &[u8],
+    details_value: &DetailsValue
+) -> bool {
+    transition {
+        _ -> directory_guard(project_item, property_name, details_value)
+    }
+    state directory_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        let name_target: bool = details_applier_equal(property_name, "name") && details_applier_equal(type_id, "directory");
+        transition name_target {
+            true -> (false)
+            _ -> module_guard(project_item, property_name, details_value)
+        }
+    }
+    state module_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        let target: bool = details_applier_equal(type_id, "address") && details_applier_equal(property_name, "module");
+        transition target {
+            true -> module_apply(project_item, property_name, details_value)
+            _ -> pointer_size_guard(project_item, property_name, details_value)
+        }
+    }
+    state module_apply(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let mut text: [u8; 512];
+        let text_len: u64 = details_applier_value_text(details_value, &mut text);
+        transition text_len <= 512 {
+            true -> module_store(project_item, text, text_len)
+            _ -> (false)
+        }
+    }
+    state module_store(project_item: &mut ProjectItem, text: [u8; 512], text_len: u64) -> bool
+        requires text_len <= 512;
+    {
+        ProjectItemTypeAddress::set_field_module(project_item, &text[0..text_len]);
+        (true)
+    }
+    state pointer_size_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        let target: bool = details_applier_equal(type_id, "pointer") && details_applier_equal(property_name, "pointer_size");
+        transition target {
+            true -> pointer_size_apply(project_item, property_name, details_value)
+            _ -> pointer_offsets_guard(project_item, property_name, details_value)
+        }
+    }
+    state pointer_size_apply(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let mut text: [u8; 512];
+        let text_len: u64 = details_applier_value_text(details_value, &mut text);
+        transition text_len <= 512 {
+            true -> pointer_size_parse(project_item, text, text_len)
+            _ -> (false)
+        }
+    }
+    state pointer_size_parse(project_item: &mut ProjectItem, text: [u8; 512], text_len: u64) -> bool
+        requires text_len <= 512;
+    {
+        let parsed: Optional<PointerScanPointerSize> = PointerScanPointerSize::from_str(&text[0..text_len]);
+        transition parsed {
+            Optional::Some { value } -> pointer_size_store(project_item, value)
+            _ -> (false)
+        }
+    }
+    state pointer_size_store(project_item: &mut ProjectItem, pointer_size: PointerScanPointerSize) -> bool {
+        ProjectItemTypePointer::set_field_pointer_size(project_item, pointer_size);
+        (true)
+    }
+    state pointer_offsets_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        let target: bool = details_applier_equal(type_id, "pointer") && details_applier_equal(property_name, "pointer_offsets");
+        transition target {
+            true -> pointer_offsets_apply(project_item, property_name, details_value)
+            _ -> address_format_guard(project_item, property_name, details_value)
+        }
+    }
+    state pointer_offsets_apply(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let mut segments: [SymbolicPointerChainLink; 64];
+        let count: u64 = details_applier_pointer_offsets(details_value, &mut segments);
+        transition count > 0 && count <= 64 {
+            true -> pointer_offsets_store(project_item, segments, count)
+            _ -> (false)
+        }
+    }
+    state pointer_offsets_store(project_item: &mut ProjectItem, segments: [SymbolicPointerChainLink; 64], count: u64) -> bool
+        requires count <= 64;
+    {
+        let mut pointer: OwnedRuntimePointer = ProjectItemTypePointer::get_field_pointer(project_item);
+        OwnedRuntimePointer::set_offset_segments(&mut pointer, &segments[0..count]);
+        ProjectItemTypePointer::set_field_pointer_chain_segments(project_item, &pointer);
+        (true)
+    }
+    state address_format_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        let target: bool = details_applier_equal(type_id, "address") && details_applier_equal(property_name, "freeze_display_format");
+        transition target {
+            true -> address_format_apply(project_item, property_name, details_value)
+            _ -> pointer_format_guard(project_item, property_name, details_value)
+        }
+    }
+    state address_format_apply(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let parse: AnonymousValueStringFormatParse = details_applier_display_format(details_value);
+        transition parse {
+            AnonymousValueStringFormatParse::Parsed { value } -> address_format_store(project_item, value)
+            _ -> (false)
+        }
+    }
+    state address_format_store(project_item: &mut ProjectItem, format: AnonymousValueStringFormat) -> bool {
+        ProjectItemTypeAddress::set_field_freeze_display_format(project_item, format);
+        (true)
+    }
+    state pointer_format_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        let target: bool = details_applier_equal(type_id, "pointer") && details_applier_equal(property_name, "freeze_display_format");
+        transition target {
+            true -> pointer_format_apply(project_item, property_name, details_value)
+            _ -> property_bag(project_item, property_name, details_value)
+        }
+    }
+    state pointer_format_apply(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let parse: AnonymousValueStringFormatParse = details_applier_display_format(details_value);
+        transition parse {
+            AnonymousValueStringFormatParse::Parsed { value } -> pointer_format_store(project_item, value)
+            _ -> (false)
+        }
+    }
+    state pointer_format_store(project_item: &mut ProjectItem, format: AnonymousValueStringFormat) -> bool {
+        ProjectItemTypePointer::set_field_freeze_display_format(project_item, format);
+        (true)
+    }
+    state property_bag(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let field_data: ValuedStructFieldData = details_applier_field_data(details_value);
+        ValuedStruct::set_field_data(ProjectItem::borrow_properties_mut(project_item), property_name, &field_data, false);
+        (true)
+    }
+}
+
+// Upstream `apply_address_target_property` — address items only; only
+// "pointer_size" and "pointer_offsets" are settable on the target.
+pub machine ProjectItemDetailsEditApplier::apply_address_target_property(
+    project_item: &mut ProjectItem,
+    property_name: &[u8],
+    details_value: &DetailsValue
+) -> bool {
+    transition {
+        _ -> type_guard(project_item, property_name, details_value)
+    }
+    state type_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        let item_type: &ProjectItemTypeRef = ProjectItem::get_item_type(project_item);
+        let type_id: &[u8] = ProjectItemTypeRef::get_project_item_type_id(item_type);
+        transition details_applier_equal(type_id, "address") {
+            true -> size_guard(project_item, property_name, details_value)
+            _ -> (false)
+        }
+    }
+    state size_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        transition details_applier_equal(property_name, "pointer_size") {
+            true -> size_apply(project_item, details_value)
+            _ -> offsets_guard(project_item, property_name, details_value)
+        }
+    }
+    state size_apply(project_item: &mut ProjectItem, details_value: &DetailsValue) -> bool {
+        let mut text: [u8; 512];
+        let text_len: u64 = details_applier_value_text(details_value, &mut text);
+        transition text_len <= 512 {
+            true -> size_parse(project_item, text, text_len)
+            _ -> (false)
+        }
+    }
+    state size_parse(project_item: &mut ProjectItem, text: [u8; 512], text_len: u64) -> bool
+        requires text_len <= 512;
+    {
+        let parsed: Optional<PointerScanPointerSize> = PointerScanPointerSize::from_str(&text[0..text_len]);
+        transition parsed {
+            Optional::Some { value } -> size_store(project_item, value)
+            _ -> (false)
+        }
+    }
+    state size_store(project_item: &mut ProjectItem, pointer_size: PointerScanPointerSize) -> bool {
+        let mut address_target: ProjectItemAddressTarget = ProjectItemTypeAddress::get_address_target(project_item);
+        ProjectItemAddressTarget::set_pointer_size(&mut address_target, pointer_size);
+        ProjectItemTypeAddress::set_address_target(project_item, &address_target);
+        (true)
+    }
+    state offsets_guard(project_item: &mut ProjectItem, property_name: &[u8], details_value: &DetailsValue) -> bool {
+        transition details_applier_equal(property_name, "pointer_offsets") {
+            true -> offsets_apply(project_item, details_value)
+            _ -> (false)
+        }
+    }
+    // Upstream `ensure_minimum_pointer_offsets` — an empty parsed list
+    // upstream reaches here only through a nonempty Err guard, but the
+    // direct `set_pointer_offsets` path pads to one Offset(0).
+    state offsets_apply(project_item: &mut ProjectItem, details_value: &DetailsValue) -> bool {
+        let mut segments: [SymbolicPointerChainLink; 64];
+        let count: u64 = details_applier_pointer_offsets(details_value, &mut segments);
+        transition count > 0 && count <= 64 {
+            true -> offsets_store(project_item, segments, count)
+            _ -> offsets_minimum(project_item)
+        }
+    }
+    state offsets_minimum(project_item: &mut ProjectItem) -> bool {
+        let mut segments: [SymbolicPointerChainLink; 64];
+        segments[0] = SymbolicPointerChainLink::new_offset(0);
+        transition { _ -> offsets_store(project_item, segments, 1) }
+    }
+    state offsets_store(project_item: &mut ProjectItem, segments: [SymbolicPointerChainLink; 64], count: u64) -> bool
+        requires count <= 64;
+    {
+        let mut address_target: ProjectItemAddressTarget = ProjectItemTypeAddress::get_address_target(project_item);
+        ProjectItemAddressTarget::set_pointer_offsets(&mut address_target, &segments[0..count]);
+        ProjectItemTypeAddress::set_address_target(project_item, &address_target);
+        (true)
+    }
+}
+
+// Upstream `apply_update` — the two-arm source dispatch; runtime-value and
+// unknown sources report false.
+pub machine ProjectItemDetailsEditApplier::apply_update(
+    project_item: &mut ProjectItem,
+    details_field_source: &DetailsFieldSource,
+    details_value: &DetailsValue
+) -> bool {
+    transition details_field_source {
+        DetailsFieldSource::ProjectItemProperty { property_name, property_name_len } -> property_arm(project_item, property_name, property_name_len, details_value)
+        DetailsFieldSource::ProjectItemAddressTarget { property_name, property_name_len } -> target_arm(project_item, property_name, property_name_len, details_value)
+        _ -> (false)
+    }
+    state property_arm(project_item: &mut ProjectItem, property_name: [u8; 256], property_name_len: u64, details_value: &DetailsValue) -> bool {
+        transition property_name_len <= 256 {
+            true -> property_apply(project_item, property_name, property_name_len, details_value)
+            _ -> (false)
+        }
+    }
+    state property_apply(project_item: &mut ProjectItem, property_name: [u8; 256], property_name_len: u64, details_value: &DetailsValue) -> bool
+        requires property_name_len <= 256;
+    {
+        ProjectItemDetailsEditApplier::apply_project_item_property(project_item, &property_name[0..property_name_len], details_value)
+    }
+    state target_arm(project_item: &mut ProjectItem, property_name: [u8; 256], property_name_len: u64, details_value: &DetailsValue) -> bool {
+        transition property_name_len <= 256 {
+            true -> target_apply(project_item, property_name, property_name_len, details_value)
+            _ -> (false)
+        }
+    }
+    state target_apply(project_item: &mut ProjectItem, property_name: [u8; 256], property_name_len: u64, details_value: &DetailsValue) -> bool
+        requires property_name_len <= 256;
+    {
+        ProjectItemDetailsEditApplier::apply_address_target_property(project_item, &property_name[0..property_name_len], details_value)
+    }
+}
