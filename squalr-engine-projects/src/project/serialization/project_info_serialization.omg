@@ -179,68 +179,9 @@ invokes FilesystemHost;
         (ProjectInfoLoad::Refused)
     }
     state fill(dfd: i32, fd: i32, project_directory_path: &[u8]) -> ProjectInfoLoad {
-        let mut reader: ProjectFileReader = ProjectFileReader::default();
-        let got: i64 = ProjectFileReader::fill_from_fd(&mut reader, fd);
-        let closed: i32 = FilesystemHost::close(fd);
+        let load: ProjectInfoLoad = ProjectInfo::load_tail(fd, project_directory_path);
         let closed_dir: i32 = FilesystemHost::close(dfd);
-        transition got > 0 {
-            true -> decode(reader, project_directory_path)
-            _ -> (ProjectInfoLoad::Refused)
-        }
-    }
-    state decode(reader: ProjectFileReader, project_directory_path: &[u8]) -> ProjectInfoLoad {
-        let mut carried: ProjectFileReader = reader;
-        let header_ok: bool = ProjectFileReader::check_header(&mut carried);
-        transition header_ok {
-            true -> stub(carried, project_directory_path)
-            _ -> (ProjectInfoLoad::Refused)
-        }
-    }
-    state stub(reader: ProjectFileReader, project_directory_path: &[u8]) -> ProjectInfoLoad {
-        let mut carried: ProjectFileReader = reader;
-        let mut stub: ProjectInfoStub = ProjectInfoStub::default();
-        let body_ok: bool = decode_info_stub(&mut carried, &mut stub);
-        transition body_ok {
-            true -> build(stub, project_directory_path)
-            _ -> (ProjectInfoLoad::Refused)
-        }
-    }
-    state build(stub: ProjectInfoStub, project_directory_path: &[u8]) -> ProjectInfoLoad {
-        let mut info_path: [u8; 512];
-        let info_len: u64 = resolve_project_info_file_path(project_directory_path, &mut info_path);
-        transition info_len <= 512 {
-            true -> build_info(stub, info_path, info_len)
-            _ -> (ProjectInfoLoad::Refused)
-        }
-    }
-    state build_info(stub: ProjectInfoStub, info_path: [u8; 512], info_len: u64) -> ProjectInfoLoad
-        requires info_len <= 512;
-    {
-        let mut project_info: ProjectInfo = ProjectInfo::new_with_symbol_catalog(
-            &info_path[0..info_len],
-            stub.has_project_icon_rgba,
-            &stub.project_icon_rgba,
-            stub.project_manifest,
-            stub.project_symbol_catalog);
-        transition { _ -> plugin(project_info, stub) }
-    }
-    state plugin(project_info: ProjectInfo, stub: ProjectInfoStub) -> ProjectInfoLoad {
-        let mut carried_info: ProjectInfo = project_info;
-        let mut carried_stub: ProjectInfoStub = stub;
-        transition carried_stub.has_plugin_configuration {
-            true -> with_plugin(carried_info, carried_stub.plugin_configuration)
-            _ -> finish(carried_info)
-        }
-    }
-    state with_plugin(project_info: ProjectInfo, plugin_configuration: PluginConfiguration) -> ProjectInfoLoad {
-        let mut carried: ProjectInfo = project_info;
-        ProjectInfo::set_plugin_configuration(&mut carried, &plugin_configuration);
-        transition { _ -> finish(carried) }
-    }
-    state finish(project_info: ProjectInfo) -> ProjectInfoLoad {
-        let mut carried: ProjectInfo = project_info;
-        ProjectInfo::set_has_unsaved_changes(&mut carried, false);
-        (ProjectInfoLoad::Loaded { project_info: carried })
+        transition { _ -> (load) }
     }
 }
 
@@ -303,8 +244,8 @@ invokes FilesystemHost;
 }
 
 // Dirfd twin of `load_from_path` (see `save_at` for the contract). The
-// caller owns `dir_fd`; downstream decode/build states are reused — they
-// never touch fds. The recorded identity path stays the joined
+// caller owns `dir_fd`; downstream decode/build states run in `load_tail`
+// — they never touch dirfds. The recorded identity path stays the joined
 // `directory/project.json` bytes upstream stores.
 pub linux_x86_64 machine ProjectInfo::load_at(
     dir_fd: i32,
@@ -315,17 +256,31 @@ invokes FilesystemHost;
 {
     let fd: i32 = FilesystemHost::open_at(dir_fd, "project.json", 0);
     transition fd >= 0 {
-        true -> fill(fd, project_directory_path)
+        true -> delegate(fd, project_directory_path)
         _ -> (ProjectInfoLoad::Refused)
     }
-    state fill(fd: i32, project_directory_path: &[u8]) -> ProjectInfoLoad {
-        let mut reader: ProjectFileReader = ProjectFileReader::default();
-        let got: i64 = ProjectFileReader::fill_from_fd(&mut reader, fd);
-        let closed: i32 = FilesystemHost::close(fd);
-        transition got > 0 {
-            true -> decode(reader, project_directory_path)
-            _ -> (ProjectInfoLoad::Refused)
-        }
+    state delegate(fd: i32, project_directory_path: &[u8]) -> ProjectInfoLoad {
+        let load: ProjectInfoLoad = ProjectInfo::load_tail(fd, project_directory_path);
+        transition { _ -> (load) }
+    }
+}
+
+// Shared fd -> load tail for `load_from_path` and `load_at`: fill, decode,
+// stub/build, optional plugin attach, and the unsaved-changes finish. The
+// fd is always closed here; dirfd custody stays with the entry machine.
+pub linux_x86_64 machine ProjectInfo::load_tail(
+    fd: i32,
+    project_directory_path: &[u8]
+) -> ProjectInfoLoad
+reaches FilesystemHost
+invokes FilesystemHost;
+{
+    let mut reader: ProjectFileReader = ProjectFileReader::default();
+    let got: i64 = ProjectFileReader::fill_from_fd(&mut reader, fd);
+    let closed: i32 = FilesystemHost::close(fd);
+    transition got > 0 {
+        true -> decode(reader, project_directory_path)
+        _ -> (ProjectInfoLoad::Refused)
     }
     state decode(reader: ProjectFileReader, project_directory_path: &[u8]) -> ProjectInfoLoad {
         let mut carried: ProjectFileReader = reader;
@@ -378,7 +333,7 @@ invokes FilesystemHost;
     }
     state finish(project_info: ProjectInfo) -> ProjectInfoLoad {
         let mut carried: ProjectInfo = project_info;
-        carried.has_unsaved_changes = false;
+        ProjectInfo::set_has_unsaved_changes(&mut carried, false);
         (ProjectInfoLoad::Loaded { project_info: carried })
     }
 }
