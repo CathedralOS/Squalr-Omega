@@ -38,3 +38,9 @@ types entirely; boundaries are reached through trait-level calls
 `tools/binding-trait-call-dodge/README.md`. With no `Binding` member in
 the entry closure the trigger cannot fire and `dispatch_parsed_list` /
 `dispatch_list` / `extract` compile unchanged.
+
+## Vector scanner periodic↔staggered restated skeleton
+
+`squalr-engine-scanning/src/scanners/vector/scanner_vector_overlapping_bytewise_periodic.omg` (768 lines) and `scanner_vector_overlapping_bytewise_staggered.omg` (884 lines) restate ~196 lines of near-verbatim scanner scaffolding: snapshot/window iteration, lane-group stepping, tail `remainder_bytes` reload, and per-result encode calls. The interiors are genuinely different scan semantics — periodic ORs per-lane byte equality against the first `Xity` pattern bytes; staggered ANDs per-byte equality across `data_type_size` at each lane (both spellings mirror upstream `ScannerVectorOverlappingBytewisePeriodic`/`...Staggered`, which are likewise near-mirrors upstream).
+
+Foldable mechanically (shared skeleton helper, per-variant compare core), but only worth it if the port is allowed to consolidate what upstream keeps as two parallel implementations. Should the shared scaffolding collapse into one machine family, or stay a deliberate per-variant mirror of the Rust sources?
