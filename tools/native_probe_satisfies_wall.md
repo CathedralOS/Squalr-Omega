@@ -56,3 +56,20 @@ Requires an upstream fix to the int-family `satisfies` decls in
 `source/library` float_impl (or whatever registers their boundary
 requirement names). Until then every squalr package transitively needing
 `float_mod_*` fails `omega update` package checking.
+
+## Root cause narrowed (omega @ a869ec6980d, fresh binary)
+
+The wall is not "decls missing" — it is overload disambiguation in
+`satisfies` resolution. Every float→int boundary operator name in
+source/library/core/float_operations.omg is declared THREE times —
+plain, `in Trapping`, and `in Saturating` — and the machine-side
+`satisfies I8::from_f32` cannot carry a context qualifier
+(`satisfies ... in Trapping` is a parse error: `in` is not accepted
+after the requirement path). Resolution requires an exact requirement
+name; the three-way same-name overload fails for every int family.
+Scratch repro: six `linux_x86_64 machine ... satisfies I{8,16,32,64}/
+U{8,64}::from_f32` decls — all six fail identically. Unambiguous names
+(F32::from_f64, F32::from_i8, Float::*) resolve fine under the same
+compiler. The gap is checker-side: satisfies resolution needs
+context-aware matching (impl machine `in Trapping` → the `in Trapping`
+decl) or the decls need distinct names.
