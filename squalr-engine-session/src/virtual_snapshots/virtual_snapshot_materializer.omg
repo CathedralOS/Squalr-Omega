@@ -105,57 +105,58 @@ pub machine VirtualSnapshotMaterializer::new() -> VirtualSnapshotMaterializer {
 
 // `begin` copies the snapshot's query list — upstream captures the Vec
 // for the spawned thread; the driver needs the same owned snapshot.
-pub machine VirtualSnapshotMaterializer::begin(&mut self, virtual_snapshot: &VirtualSnapshot) -> bool {
-    self.result_count = 0;
-    self.current_query_index = 0;
-    self.pointer_walk_active = false;
-    self.in_flight_reset();
-    self.cache_count = 0;
-    self.eval_cache_count = 0;
-    transition { _ -> fill(virtual_snapshot, 0) }
-    state fill(&mut self, virtual_snapshot: &VirtualSnapshot, position: u64) -> bool {
-        transition position < virtual_snapshot.get_query_count() && position < 16 {
-            true -> fill_one(virtual_snapshot, position)
-            false -> finish(virtual_snapshot)
+pub machine VirtualSnapshotMaterializer::begin(this: &mut VirtualSnapshotMaterializer, virtual_snapshot: &VirtualSnapshot) -> bool {
+    this.result_count = 0;
+    this.current_query_index = 0;
+    this.pointer_walk_active = false;
+    VirtualSnapshotMaterializer::in_flight_reset(&mut this);
+    this.cache_count = 0;
+    this.eval_cache_count = 0;
+    transition { _ -> fill(this, virtual_snapshot, 0) }
+    state fill(this: &mut VirtualSnapshotMaterializer, virtual_snapshot: &VirtualSnapshot, position: u64) -> bool {
+        let hoist1: u64 = VirtualSnapshot::get_query_count(&virtual_snapshot);
+        transition position < hoist1 && position < 16 {
+            true -> fill_one(this, virtual_snapshot, position)
+            false -> finish(this, virtual_snapshot)
         }
     }
-    state fill_one(&mut self, virtual_snapshot: &VirtualSnapshot, position: u64) -> bool
+    state fill_one(this: &mut VirtualSnapshotMaterializer, virtual_snapshot: &VirtualSnapshot, position: u64) -> bool
         requires position < 16;
     {
-        _ = virtual_snapshot.copy_query(position, &mut self.queries[position]);
-        transition { _ -> fill(virtual_snapshot, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+        _ = VirtualSnapshot::copy_query(&virtual_snapshot, position, &mut this.queries[position]);
+        transition { _ -> fill(this, virtual_snapshot, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
-    state finish(&mut self, virtual_snapshot: &VirtualSnapshot) -> bool {
-        self.query_count = virtual_snapshot.get_query_count();
-        transition self.query_count > 16 {
-            true -> clamp()
+    state finish(this: &mut VirtualSnapshotMaterializer, virtual_snapshot: &VirtualSnapshot) -> bool {
+        this.query_count = VirtualSnapshot::get_query_count(&virtual_snapshot);
+        transition this.query_count > 16 {
+            true -> clamp(this)
             false -> (true)
         }
     }
-    state clamp(&mut self) -> bool {
-        self.query_count = 16;
+    state clamp(this: &mut VirtualSnapshotMaterializer) -> bool {
+        this.query_count = 16;
         (true)
     }
 }
 
-pub machine VirtualSnapshotMaterializer::get_result_count(&self) -> u64 {
-    self.result_count
+pub machine VirtualSnapshotMaterializer::get_result_count(this: &VirtualSnapshotMaterializer) -> u64 {
+    this.result_count
 }
 
-pub machine VirtualSnapshotMaterializer::get_result_ids(&self) -> &[[u8; 128]; 16] {
-    (&self.result_ids)
+pub machine VirtualSnapshotMaterializer::get_result_ids(this: &VirtualSnapshotMaterializer) -> &[[u8; 128]; 16] {
+    (&this.result_ids)
 }
 
-pub machine VirtualSnapshotMaterializer::get_result_id_lens(&self) -> &[u64; 16] {
-    (&self.result_id_lens)
+pub machine VirtualSnapshotMaterializer::get_result_id_lens(this: &VirtualSnapshotMaterializer) -> &[u64; 16] {
+    (&this.result_id_lens)
 }
 
-pub machine VirtualSnapshotMaterializer::get_results(&self) -> &[VirtualSnapshotQueryResult; 16] {
-    (&self.results)
+pub machine VirtualSnapshotMaterializer::get_results(this: &VirtualSnapshotMaterializer) -> &[VirtualSnapshotQueryResult; 16] {
+    (&this.results)
 }
 
-pub machine VirtualSnapshotMaterializer::get_is_finished(&self) -> bool {
-    transition self.current_query_index >= self.query_count && !self.pointer_walk_active {
+pub machine VirtualSnapshotMaterializer::get_is_finished(this: &VirtualSnapshotMaterializer) -> bool {
+    transition this.current_query_index >= this.query_count && !this.pointer_walk_active {
         true -> (true)
         false -> (false)
         _ -> (false)
@@ -164,504 +165,513 @@ pub machine VirtualSnapshotMaterializer::get_is_finished(&self) -> bool {
 
 // The pump — emits the next memory read needed to materialize, or false
 // when the refresh is complete.
-pub machine VirtualSnapshotMaterializer::pump_next_request(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
-    transition self.pointer_walk_active && self.current_query_index < 16 {
-        true -> pump_walk(registry, out_request)
-        false -> advance(registry, out_request)
+pub machine VirtualSnapshotMaterializer::pump_next_request(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
+    transition this.pointer_walk_active && this.current_query_index < 16 {
+        true -> pump_walk(this, registry, out_request)
+        false -> advance(this, registry, out_request)
         _ -> (false)
     }
     // Mid pointer-walk: the next hop is a pointer-width read at the
     // current address/module — the walk bails on a `Symbol` link.
-    state pump_walk(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state pump_walk(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        transition self.pointer.get_has_unresolvable_link() && self.pointer.get_unresolvable_link_index() == self.next_link_index {
-            true -> bail_walk(registry, out_request)
-            false -> walk_step(registry, out_request)
+        let hoist3: u64 = StoredPointer::get_unresolvable_link_index(&this.pointer);
+        let hoist2: bool = StoredPointer::get_has_unresolvable_link(&this.pointer);
+        transition hoist2 && hoist3 == this.next_link_index {
+            true -> bail_walk(this, registry, out_request)
+            false -> walk_step(this, registry, out_request)
         }
     }
-    state walk_step(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state walk_step(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        transition self.next_link_index < self.pointer.get_offset_count() && self.current_query_index < 16 {
-            true -> emit_hop(registry, out_request)
-            false -> emit_final(registry, out_request)
+        let hoist4: u64 = StoredPointer::get_offset_count(&this.pointer);
+        transition this.next_link_index < hoist4 && this.current_query_index < 16 {
+            true -> emit_hop(this, registry, out_request)
+            false -> emit_final(this, registry, out_request)
         }
     }
-    state emit_hop(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state emit_hop(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
         let mut pointer_struct: SymbolicStructDefinition = SymbolicStructDefinition::empty();
-        transition self.pointer_size_definition(registry, &mut pointer_struct) {
-            true -> emit_hop_read(registry, &pointer_struct, out_request)
-            false -> bail_walk(registry, out_request)
+        let hoist5: bool = VirtualSnapshotMaterializer::pointer_size_definition(&this, registry, &mut pointer_struct);
+        transition hoist5 {
+            true -> emit_hop_read(this, registry, &pointer_struct, out_request)
+            false -> bail_walk(this, registry, out_request)
         }
     }
-    state emit_hop_read(&mut self, registry: &PrivilegedRegistryCache, pointer_struct: &SymbolicStructDefinition, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state emit_hop_read(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, pointer_struct: &SymbolicStructDefinition, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        transition self.current_module_name_len <= 512 {
-            true -> emit_hop_bounded(pointer_struct, out_request)
-            false -> bail_walk(registry, out_request)
+        transition this.current_module_name_len <= 512 {
+            true -> emit_hop_bounded(this, pointer_struct, out_request)
+            false -> bail_walk(this, registry, out_request)
         }
     }
-    state emit_hop_bounded(&mut self, pointer_struct: &SymbolicStructDefinition, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state emit_hop_bounded(this: &mut VirtualSnapshotMaterializer, pointer_struct: &SymbolicStructDefinition, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        let current_name: &[u8] = slice_512(&self.current_module_name, self.current_module_name_len);
-        let request: MemoryReadRequest = MemoryReadRequest::new(self.current_address, current_name, pointer_struct.clone(), false);
-        out_request.clone_from(&request);
-        self.has_pending_request = true;
-        self.pending_is_final_read = false;
+        let current_name: &[u8] = slice_512(&this.current_module_name, this.current_module_name_len);
+        let request: MemoryReadRequest = MemoryReadRequest::new(this.current_address, current_name, SymbolicStructDefinition::clone(&pointer_struct), false);
+        MemoryReadRequest::clone_from(&mut out_request, &request);
+        this.has_pending_request = true;
+        this.pending_is_final_read = false;
         (true)
     }
     // All hops applied — the resolved target gets the query's struct read.
-    state emit_final(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state emit_final(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        self.resolved_address = self.current_address;
-        _ = copy_slice(&self.current_module_name, self.current_module_name_len, &mut self.resolved_module_name, &mut self.resolved_module_name_len);
-        transition self.resolved_module_name_len <= 512 {
-            true -> emit_final_bounded(registry, out_request)
+        this.resolved_address = this.current_address;
+        _ = copy_slice(&this.current_module_name, this.current_module_name_len, &mut this.resolved_module_name, &mut this.resolved_module_name_len);
+        transition this.resolved_module_name_len <= 512 {
+            true -> emit_final_bounded(this, registry, out_request)
             false -> (false)
         }
     }
-    state emit_final_bounded(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state emit_final_bounded(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
         let mut query_struct: SymbolicStructDefinition = SymbolicStructDefinition::empty();
-        self.queries[self.current_query_index].get_symbolic_struct_definition(&mut query_struct);
-        let resolved_name: &[u8] = slice_512(&self.resolved_module_name, self.resolved_module_name_len);
-        let request: MemoryReadRequest = MemoryReadRequest::new(self.resolved_address, resolved_name, query_struct, false);
-        out_request.clone_from(&request);
-        self.has_pending_request = true;
-        self.pending_is_final_read = true;
+        VirtualSnapshotQuery::get_symbolic_struct_definition(&this.queries[this.current_query_index], &mut query_struct);
+        let resolved_name: &[u8] = slice_512(&this.resolved_module_name, this.resolved_module_name_len);
+        let request: MemoryReadRequest = MemoryReadRequest::new(this.resolved_address, resolved_name, query_struct, false);
+        MemoryReadRequest::clone_from(&mut out_request, &request);
+        this.has_pending_request = true;
+        this.pending_is_final_read = true;
         (true)
     }
     // `??` — upstream bails the evaluation with an unresolved target.
-    state bail_walk(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
-        _ = self.append_path_segment("??");
-        transition { _ -> finish_walk_failed(registry, out_request) }
+    state bail_walk(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
+        _ = VirtualSnapshotMaterializer::append_path_segment(&mut this, "??");
+        transition { _ -> finish_walk_failed(this, registry, out_request) }
     }
-    state finish_walk_failed(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
-        _ = self.store_eval_cache(0, false);
-        let position: u64 = self.current_query_index;
+    state finish_walk_failed(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
+        _ = VirtualSnapshotMaterializer::store_eval_cache(&mut this, 0, false);
+        let position: u64 = this.current_query_index;
         transition position < 16 {
-            true -> finish_failed_result(position)
-            false -> advance_finished(position, registry, out_request)
+            true -> finish_failed_result(this, position)
+            false -> advance_finished(this, position, registry, out_request)
         }
     }
-    state finish_failed_result(&mut self, position: u64) -> bool
+    state finish_failed_result(this: &mut VirtualSnapshotMaterializer, position: u64) -> bool
         requires position < 16;
     {
-        let path_slice: &[u8] = slice_512(&self.evaluated_path, self.evaluated_path_len);
-        _ = result_set_evaluated_path(&mut self.results[position], path_slice);
-        _ = self.store_result_id(position);
-        self.pointer_walk_active = false;
-        self.has_pending_request = false;
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        let path_slice: &[u8] = slice_512(&this.evaluated_path, this.evaluated_path_len);
+        _ = result_set_evaluated_path(&mut this.results[position], path_slice);
+        _ = VirtualSnapshotMaterializer::store_result_id(&mut this, position);
+        this.pointer_walk_active = false;
+        this.has_pending_request = false;
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (false)
     }
-    state advance_finished(&mut self, position: u64, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
-        self.pointer_walk_active = false;
-        self.has_pending_request = false;
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> advance(registry, out_request) }
+    state advance_finished(this: &mut VirtualSnapshotMaterializer, position: u64, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
+        this.pointer_walk_active = false;
+        this.has_pending_request = false;
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> advance(this, registry, out_request) }
     }
-    state advance(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
-        transition self.current_query_index < self.query_count {
-            true -> route(registry, out_request)
+    state advance(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
+        transition this.current_query_index < this.query_count {
+            true -> route(this, registry, out_request)
             false -> (false)
         }
     }
-    state route(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
-        transition self.current_query_index < 16 {
-            true -> route_kind(registry, out_request)
+    state route(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool {
+        transition this.current_query_index < 16 {
+            true -> route_kind(this, registry, out_request)
             false -> (false)
         }
     }
-    state route_kind(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state route_kind(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        transition self.queries[self.current_query_index].get_is_address() {
-            true -> address_query(registry, out_request)
-            false -> pointer_query(registry, out_request)
+        let hoist6: bool = VirtualSnapshotQuery::get_is_address(&this.queries[this.current_query_index]);
+        transition hoist6 {
+            true -> address_query(this, registry, out_request)
+            false -> pointer_query(this, registry, out_request)
         }
     }
-    state address_query(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state address_query(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        let query_address: u64 = self.queries[self.current_query_index].get_address();
+        let query_address: u64 = VirtualSnapshotQuery::get_address(&this.queries[this.current_query_index]);
         let mut module_name: [u8; 512];
         let mut module_name_len: u64 = 0;
-        self.queries[self.current_query_index].copy_module_name(&mut module_name, &mut module_name_len);
-        transition { _ -> cache_probe(registry, out_request, query_address, module_name, module_name_len, 0) }
+        VirtualSnapshotQuery::copy_module_name(&this.queries[this.current_query_index], &mut module_name, &mut module_name_len);
+        transition { _ -> cache_probe(this, registry, out_request, query_address, module_name, module_name_len, 0) }
     }
     // Read cache probe — on a hit the stored response fills the result
     // and the pump advances without emitting a request.
-    state cache_probe(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64) -> bool
-        requires self.current_query_index < 16;
+    state cache_probe(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64) -> bool
+        requires this.current_query_index < 16;
     {
-        transition cache_position < self.cache_count && cache_position < 16 {
-            true -> cache_compare(registry, out_request, query_address, module_name, module_name_len, cache_position)
-            false -> emit_address_read(out_request, query_address, module_name, module_name_len)
+        transition cache_position < this.cache_count && cache_position < 16 {
+            true -> cache_compare(this, registry, out_request, query_address, module_name, module_name_len, cache_position)
+            false -> emit_address_read(this, out_request, query_address, module_name, module_name_len)
         }
     }
-    state cache_compare(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64) -> bool
-        requires cache_position < 16 && self.current_query_index < 16;
+    state cache_compare(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64) -> bool
+        requires cache_position < 16 && this.current_query_index < 16;
     {
-        transition self.cached_addresses[cache_position] == query_address && self.cached_module_name_lens[cache_position] == module_name_len {
-            true -> cache_bytes(registry, out_request, query_address, module_name, module_name_len, cache_position, 0)
-            false -> cache_probe(registry, out_request, query_address, module_name, module_name_len, ((cache_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        transition this.cached_addresses[cache_position] == query_address && this.cached_module_name_lens[cache_position] == module_name_len {
+            true -> cache_bytes(this, registry, out_request, query_address, module_name, module_name_len, cache_position, 0)
+            false -> cache_probe(this, registry, out_request, query_address, module_name, module_name_len, ((cache_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
         }
     }
-    state cache_bytes(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64, index: u64) -> bool
-        requires cache_position < 16 && self.current_query_index < 16;
+    state cache_bytes(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64, index: u64) -> bool
+        requires cache_position < 16 && this.current_query_index < 16;
     {
         transition index < module_name_len && index < 512 {
-            true -> cache_char(registry, out_request, query_address, module_name, module_name_len, cache_position, index)
-            false -> serve_cached(registry, out_request, query_address, module_name, module_name_len, cache_position)
+            true -> cache_char(this, registry, out_request, query_address, module_name, module_name_len, cache_position, index)
+            false -> serve_cached(this, registry, out_request, query_address, module_name, module_name_len, cache_position)
         }
     }
-    state cache_char(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64, index: u64) -> bool
-        requires cache_position < 16 && index < module_name_len && index < 512 && self.current_query_index < 16;
+    state cache_char(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64, index: u64) -> bool
+        requires cache_position < 16 && index < module_name_len && index < 512 && this.current_query_index < 16;
     {
-        transition self.cached_module_names[cache_position][index] == module_name[index] {
-            true -> cache_bytes(registry, out_request, query_address, module_name, module_name_len, cache_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
-            false -> cache_probe(registry, out_request, query_address, module_name, module_name_len, ((cache_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        transition this.cached_module_names[cache_position][index] == module_name[index] {
+            true -> cache_bytes(this, registry, out_request, query_address, module_name, module_name_len, cache_position, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+            false -> cache_probe(this, registry, out_request, query_address, module_name, module_name_len, ((cache_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
         }
     }
-    state serve_cached(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64) -> bool
+    state serve_cached(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64, cache_position: u64) -> bool
         requires cache_position < 16;
     {
-        let cached_response: MemoryReadResponse = self.cached_responses[cache_position].clone();
-        let position: u64 = self.current_query_index;
+        let cached_response: MemoryReadResponse = MemoryReadResponse::clone(&this.cached_responses[cache_position]);
+        let position: u64 = this.current_query_index;
         transition position < 16 {
-            true -> serve_cached_result(position, &cached_response, query_address, module_name, module_name_len, registry, out_request)
-            false -> advance(registry, out_request)
+            true -> serve_cached_result(this, position, &cached_response, query_address, module_name, module_name_len, registry, out_request)
+            false -> advance(this, registry, out_request)
         }
     }
-    state serve_cached_result(&mut self, position: u64, cached_response: &MemoryReadResponse, query_address: u64, module_name: &[u8; 512], module_name_len: u64, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+    state serve_cached_result(this: &mut VirtualSnapshotMaterializer, position: u64, cached_response: &MemoryReadResponse, query_address: u64, module_name: &[u8; 512], module_name_len: u64, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
         requires position < 16;
     {
-        self.results[position].set_memory_read_response(cached_response);
-        self.results[position].set_resolved_address(query_address);
+        VirtualSnapshotQueryResult::set_memory_read_response(&mut this.results[position], cached_response);
+        VirtualSnapshotQueryResult::set_resolved_address(&mut this.results[position], query_address);
         let module_name_slice: &[u8] = slice_512(module_name, module_name_len);
-        _ = result_set_module_name(&mut self.results[position], module_name_slice);
+        _ = result_set_module_name(&mut this.results[position], module_name_slice);
         
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> advance(registry, out_request) }
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> advance(this, registry, out_request) }
     }
-    state emit_address_read(&mut self, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64) -> bool
-        requires self.current_query_index < 16;
+    state emit_address_read(this: &mut VirtualSnapshotMaterializer, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64) -> bool
+        requires this.current_query_index < 16;
     {
         transition module_name_len <= 512 {
-            true -> emit_address_bounded(out_request, query_address, module_name, module_name_len)
+            true -> emit_address_bounded(this, out_request, query_address, module_name, module_name_len)
             false -> (false)
         }
     }
-    state emit_address_bounded(&mut self, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64) -> bool
-        requires self.current_query_index < 16;
+    state emit_address_bounded(this: &mut VirtualSnapshotMaterializer, out_request: &mut MemoryReadRequest, query_address: u64, module_name: &[u8; 512], module_name_len: u64) -> bool
+        requires this.current_query_index < 16;
     {
         let mut query_struct: SymbolicStructDefinition = SymbolicStructDefinition::empty();
-        self.queries[self.current_query_index].get_symbolic_struct_definition(&mut query_struct);
+        VirtualSnapshotQuery::get_symbolic_struct_definition(&this.queries[this.current_query_index], &mut query_struct);
         let module_name_slice: &[u8] = slice_512(module_name, module_name_len);
         let request: MemoryReadRequest = MemoryReadRequest::new(query_address, module_name_slice, query_struct, false);
-        out_request.clone_from(&request);
-        self.has_pending_request = true;
-        self.pending_is_final_read = true;
-        self.pending_was_cached_insert = true;
-        _ = copy_slice(module_name, module_name_len, &mut self.pending_module_name, &mut self.pending_module_name_len);
+        MemoryReadRequest::clone_from(&mut out_request, &request);
+        this.has_pending_request = true;
+        this.pending_is_final_read = true;
+        this.pending_was_cached_insert = true;
+        _ = copy_slice(module_name, module_name_len, &mut this.pending_module_name, &mut this.pending_module_name_len);
         (true)
     }
-    state pointer_query(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state pointer_query(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        _ = query_copy_pointer(&self.queries[self.current_query_index], &mut self.pointer);
+        _ = query_copy_pointer(&this.queries[this.current_query_index], &mut this.pointer);
         // Seed the evaluated path with the root display text — upstream
         // pushes `pointer.get_root_display_text()` first (module + hex root).
-        self.evaluated_path_len = 0;
-        transition { _ -> seed_root(registry, out_request) }
+        this.evaluated_path_len = 0;
+        transition { _ -> seed_root(this, registry, out_request) }
     }
-    state seed_root(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
-        requires self.current_query_index < 16;
+    state seed_root(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest) -> bool
+        requires this.current_query_index < 16;
     {
-        _ = self.append_path_segment(self.pointer.get_module_name());
-        _ = self.append_hex_prefix();
-        _ = self.append_hex_u64(self.pointer.get_address());
-        transition { _ -> eval_probe(registry, out_request, 0) }
+        _ = VirtualSnapshotMaterializer::append_path_segment(&mut this, StoredPointer::get_module_name(&this.pointer));
+        _ = VirtualSnapshotMaterializer::append_hex_prefix(&mut this);
+        _ = VirtualSnapshotMaterializer::append_hex_u64(&mut this, StoredPointer::get_address(&this.pointer));
+        transition { _ -> eval_probe(this, registry, out_request, 0) }
     }
-    state eval_probe(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
-        requires self.current_query_index < 16;
+    state eval_probe(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
+        requires this.current_query_index < 16;
     {
-        transition cache_position < self.eval_cache_count && cache_position < 16 {
-            true -> eval_compare(registry, out_request, cache_position)
-            false -> start_walk()
+        transition cache_position < this.eval_cache_count && cache_position < 16 {
+            true -> eval_compare(this, registry, out_request, cache_position)
+            false -> start_walk(this)
         }
     }
-    state eval_compare(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
-        requires cache_position < 16 && self.current_query_index < 16;
+    state eval_compare(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
+        requires cache_position < 16 && this.current_query_index < 16;
     {
-        transition self.cached_eval_pointers[cache_position].equals(&self.pointer) {
-            true -> serve_eval(registry, out_request, cache_position)
-            false -> eval_probe(registry, out_request, ((cache_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        let hoist7: bool = StoredPointer::equals(&this.cached_eval_pointers[cache_position], &this.pointer);
+        transition hoist7 {
+            true -> serve_eval(this, registry, out_request, cache_position)
+            false -> eval_probe(this, registry, out_request, ((cache_position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
         }
     }
     // Cached eval — a resolved target goes straight to the final read; a
     // cached failure completes the query with an empty result.
-    state serve_eval(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
-        requires cache_position < 16 && self.current_query_index < 16;
+    state serve_eval(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
+        requires cache_position < 16 && this.current_query_index < 16;
     {
-        transition self.cached_eval_has_address[cache_position] {
-            true -> eval_read(registry, out_request, cache_position)
-            false -> eval_miss(registry, out_request, cache_position)
+        transition this.cached_eval_has_address[cache_position] {
+            true -> eval_read(this, registry, out_request, cache_position)
+            false -> eval_miss(this, registry, out_request, cache_position)
         }
     }
-    state eval_read(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
-        requires cache_position < 16 && self.current_query_index < 16;
+    state eval_read(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
+        requires cache_position < 16 && this.current_query_index < 16;
     {
-        self.resolved_address = self.cached_eval_addresses[cache_position];
-        _ = copy_slice(&self.cached_eval_module_names[cache_position], self.cached_eval_module_name_lens[cache_position], &mut self.resolved_module_name, &mut self.resolved_module_name_len);
-        _ = copy_slice(&self.cached_eval_paths[cache_position], self.cached_eval_path_lens[cache_position], &mut self.evaluated_path, &mut self.evaluated_path_len);
-        transition { _ -> emit_final(registry, out_request) }
+        this.resolved_address = this.cached_eval_addresses[cache_position];
+        _ = copy_slice(&this.cached_eval_module_names[cache_position], this.cached_eval_module_name_lens[cache_position], &mut this.resolved_module_name, &mut this.resolved_module_name_len);
+        _ = copy_slice(&this.cached_eval_paths[cache_position], this.cached_eval_path_lens[cache_position], &mut this.evaluated_path, &mut this.evaluated_path_len);
+        transition { _ -> emit_final(this, registry, out_request) }
     }
-    state eval_miss(&mut self, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
+    state eval_miss(this: &mut VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_request: &mut MemoryReadRequest, cache_position: u64) -> bool
         requires cache_position < 16;
     {
-        let position: u64 = self.current_query_index;
-        _ = copy_slice(&self.cached_eval_paths[cache_position], self.cached_eval_path_lens[cache_position], &mut self.evaluated_path, &mut self.evaluated_path_len);
+        let position: u64 = this.current_query_index;
+        _ = copy_slice(&this.cached_eval_paths[cache_position], this.cached_eval_path_lens[cache_position], &mut this.evaluated_path, &mut this.evaluated_path_len);
         transition position < 16 {
-            true -> eval_miss_result(position)
-            false -> advance_finished(position, registry, out_request)
+            true -> eval_miss_result(this, position)
+            false -> advance_finished(this, position, registry, out_request)
         }
     }
-    state eval_miss_result(&mut self, position: u64) -> bool
+    state eval_miss_result(this: &mut VirtualSnapshotMaterializer, position: u64) -> bool
         requires position < 16;
     {
-        let path_slice: &[u8] = slice_512(&self.evaluated_path, self.evaluated_path_len);
-        _ = result_set_evaluated_path(&mut self.results[position], path_slice);
+        let path_slice: &[u8] = slice_512(&this.evaluated_path, this.evaluated_path_len);
+        _ = result_set_evaluated_path(&mut this.results[position], path_slice);
         
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (false)
     }
-    state start_walk(&mut self) -> bool {
-        self.pointer_walk_active = true;
-        self.pointer_walk_had_first_hop = false;
-        self.current_address = self.pointer.get_address();
-        self.pointer.copy_module_name(&mut self.current_module_name, &mut self.current_module_name_len);
-        self.next_link_index = 0;
+    state start_walk(this: &mut VirtualSnapshotMaterializer) -> bool {
+        this.pointer_walk_active = true;
+        this.pointer_walk_had_first_hop = false;
+        this.current_address = StoredPointer::get_address(&this.pointer);
+        StoredPointer::copy_module_name(&this.pointer, &mut this.current_module_name, &mut this.current_module_name_len);
+        this.next_link_index = 0;
         (false)
     }
 
 }
 
-machine VirtualSnapshotMaterializer::in_flight_reset(&mut self) {
-    self.has_pending_request = false;
-    self.pending_is_final_read = false;
-    self.pending_was_cached_insert = false;
+machine VirtualSnapshotMaterializer::in_flight_reset(this: &mut VirtualSnapshotMaterializer) {
+    this.has_pending_request = false;
+    this.pending_is_final_read = false;
+    this.pending_was_cached_insert = false;
 }
 
 // `accept_response` — the composition root feeds each dispatched
 // response back; hop responses drive the next offset, final responses
 // complete the query's result.
-pub machine VirtualSnapshotMaterializer::accept_response(&mut self, response: &MemoryReadResponse) {
-    self.has_pending_request = false;
-    transition self.pending_is_final_read {
-        true -> complete_query(response)
-        false -> apply_hop(response)
-        _ -> complete_query(response)
+pub machine VirtualSnapshotMaterializer::accept_response(this: &mut VirtualSnapshotMaterializer, response: &MemoryReadResponse) {
+    this.has_pending_request = false;
+    transition this.pending_is_final_read {
+        true -> complete_query(this, response)
+        false -> apply_hop(this, response)
+        _ -> complete_query(this, response)
     }
-    state complete_query(&mut self, response: &MemoryReadResponse) {
-        let position: u64 = self.current_query_index;
+    state complete_query(this: &mut VirtualSnapshotMaterializer, response: &MemoryReadResponse) {
+        let position: u64 = this.current_query_index;
         transition position < 16 {
-            true -> route_kind(position, response)
-            false -> done()
+            true -> route_kind(this, position, response)
+            false -> done(this)
         }
     }
-    state route_kind(&mut self, position: u64, response: &MemoryReadResponse)
+    state route_kind(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        transition self.pointer_walk_active {
-            true -> complete_pointer(position, response)
-            false -> complete_address(position, response)
+        transition this.pointer_walk_active {
+            true -> complete_pointer(this, position, response)
+            false -> complete_address(this, position, response)
         }
     }
-    state complete_address(&mut self, position: u64, response: &MemoryReadResponse)
+    state complete_address(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        transition response.get_success() {
-            true -> fill_address_result(position, response)
-            false -> fill_failed_result(position, response)
+        let hoist8: bool = MemoryReadResponse::get_success(&response);
+        transition hoist8 {
+            true -> fill_address_result(this, position, response)
+            false -> fill_failed_result(this, position, response)
         }
     }
-    state fill_address_result(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_address_result(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        self.results[position].set_memory_read_response(response);
-        self.results[position].set_resolved_address(response.get_address());
-        transition self.pending_module_name_len <= 512 {
-            true -> fill_address_module(position, response)
-            false -> fill_address_finish(position, response)
+        VirtualSnapshotQueryResult::set_memory_read_response(&mut this.results[position], response);
+        VirtualSnapshotQueryResult::set_resolved_address(&mut this.results[position], MemoryReadResponse::get_address(response));
+        transition this.pending_module_name_len <= 512 {
+            true -> fill_address_module(this, position, response)
+            false -> fill_address_finish(this, position, response)
         }
     }
-    state fill_address_module(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_address_module(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        let pending_name: &[u8] = slice_512(&self.pending_module_name, self.pending_module_name_len);
-        _ = result_set_module_name(&mut self.results[position], pending_name);
-        transition { _ -> fill_address_finish(position, response) }
+        let pending_name: &[u8] = slice_512(&this.pending_module_name, this.pending_module_name_len);
+        _ = result_set_module_name(&mut this.results[position], pending_name);
+        transition { _ -> fill_address_finish(this, position, response) }
     }
-    state fill_address_finish(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_address_finish(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
         
-        _ = self.store_read_cache(response);
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> done() }
+        _ = VirtualSnapshotMaterializer::store_read_cache(&mut this, response);
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> done(this) }
     }
-    state fill_failed_result(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_failed_result(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
         
-        _ = self.store_read_cache(response);
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> done() }
+        _ = VirtualSnapshotMaterializer::store_read_cache(&mut this, response);
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> done(this) }
     }
-    state complete_pointer(&mut self, position: u64, response: &MemoryReadResponse)
+    state complete_pointer(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        transition response.get_success() {
-            true -> fill_pointer_result(position, response)
-            false -> fill_pointer_failed(position, response)
+        let hoist9: bool = MemoryReadResponse::get_success(&response);
+        transition hoist9 {
+            true -> fill_pointer_result(this, position, response)
+            false -> fill_pointer_failed(this, position, response)
         }
     }
-    state fill_pointer_result(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_pointer_result(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        self.results[position].set_memory_read_response(response);
-        self.results[position].set_resolved_address(self.resolved_address);
-        transition self.resolved_module_name_len <= 512 {
-            true -> fill_pointer_module(position, response)
-            false -> fill_pointer_path(position, response)
+        VirtualSnapshotQueryResult::set_memory_read_response(&mut this.results[position], response);
+        VirtualSnapshotQueryResult::set_resolved_address(&mut this.results[position], this.resolved_address);
+        transition this.resolved_module_name_len <= 512 {
+            true -> fill_pointer_module(this, position, response)
+            false -> fill_pointer_path(this, position, response)
         }
     }
-    state fill_pointer_module(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_pointer_module(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        let resolved_name: &[u8] = slice_512(&self.resolved_module_name, self.resolved_module_name_len);
-        _ = result_set_module_name(&mut self.results[position], resolved_name);
-        transition { _ -> fill_pointer_path(position, response) }
+        let resolved_name: &[u8] = slice_512(&this.resolved_module_name, this.resolved_module_name_len);
+        _ = result_set_module_name(&mut this.results[position], resolved_name);
+        transition { _ -> fill_pointer_path(this, position, response) }
     }
-    state fill_pointer_path(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_pointer_path(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        let path_slice: &[u8] = slice_512(&self.evaluated_path, self.evaluated_path_len);
-        _ = result_set_evaluated_path(&mut self.results[position], path_slice);
+        let path_slice: &[u8] = slice_512(&this.evaluated_path, this.evaluated_path_len);
+        _ = result_set_evaluated_path(&mut this.results[position], path_slice);
         
-        _ = self.store_eval_cache(self.resolved_address, true);
-        _ = self.store_read_cache(response);
-        self.pointer_walk_active = false;
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> done() }
+        _ = VirtualSnapshotMaterializer::store_eval_cache(&mut this, this.resolved_address, true);
+        _ = VirtualSnapshotMaterializer::store_read_cache(&mut this, response);
+        this.pointer_walk_active = false;
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> done(this) }
     }
-    state fill_pointer_failed(&mut self, position: u64, response: &MemoryReadResponse)
+    state fill_pointer_failed(this: &mut VirtualSnapshotMaterializer, position: u64, response: &MemoryReadResponse)
         requires position < 16;
     {
-        let path_slice: &[u8] = slice_512(&self.evaluated_path, self.evaluated_path_len);
-        _ = result_set_evaluated_path(&mut self.results[position], path_slice);
+        let path_slice: &[u8] = slice_512(&this.evaluated_path, this.evaluated_path_len);
+        _ = result_set_evaluated_path(&mut this.results[position], path_slice);
         
-        _ = self.store_eval_cache(self.resolved_address, true);
-        _ = self.store_read_cache(response);
-        self.pointer_walk_active = false;
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> done() }
+        _ = VirtualSnapshotMaterializer::store_eval_cache(&mut this, this.resolved_address, true);
+        _ = VirtualSnapshotMaterializer::store_read_cache(&mut this, response);
+        this.pointer_walk_active = false;
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> done(this) }
     }
     // A hop response: extract the pointer value from the first field's
     // bytes (pointer-width little/big endian), apply the offset, and
     // advance. A failed read or overflow bails with `??`.
-    state apply_hop(&mut self, response: &MemoryReadResponse) {
-        transition response.get_success() {
-            true -> read_value(response)
-            false -> bail()
+    state apply_hop(this: &mut VirtualSnapshotMaterializer, response: &MemoryReadResponse) {
+        let hoist10: bool = MemoryReadResponse::get_success(&response);
+        transition hoist10 {
+            true -> read_value(this, response)
+            false -> bail(this)
         }
     }
-    state read_value(&mut self, response: &MemoryReadResponse) {
-        let valued_struct: &ValuedStruct = response.get_valued_struct();
-        let field: ValuedStructField = valued_struct.get_field_at(0);
-        let data_value: DataValue = field.get_data_value();
-        let bytes: &[u8] = data_value.get_value_bytes();
-        let pointer_endian: Endian = self.get_pointer_endian();
-        let value: u64 = assemble_pointer_value(bytes, self.pointer.get_pointer_size(), pointer_endian);
-        let offset: i64 = self.pointer.get_offset(self.next_link_index);
-        transition { _ -> apply_offset(value, offset) }
+    state read_value(this: &mut VirtualSnapshotMaterializer, response: &MemoryReadResponse) {
+        let valued_struct: &ValuedStruct = MemoryReadResponse::get_valued_struct(&response);
+        let field: ValuedStructField = ValuedStruct::get_field_at(&valued_struct, 0);
+        let data_value: DataValue = ValuedStructField::get_data_value(&field);
+        let bytes: &[u8] = DataValue::get_value_bytes(&data_value);
+        let pointer_endian: Endian = VirtualSnapshotMaterializer::get_pointer_endian(&this);
+        let value: u64 = assemble_pointer_value(bytes, StoredPointer::get_pointer_size(&this.pointer), pointer_endian);
+        let offset: i64 = StoredPointer::get_offset(&this.pointer, this.next_link_index);
+        transition { _ -> apply_offset(this, value, offset) }
     }
-    state apply_offset(&mut self, value: u64, offset: i64) {
+    state apply_offset(this: &mut VirtualSnapshotMaterializer, value: u64, offset: i64) {
         transition offset >= 0 {
-            true -> add_offset(value, offset)
-            false -> sub_offset(value, offset)
+            true -> add_offset(this, value, offset)
+            false -> sub_offset(this, value, offset)
         }
     }
-    state add_offset(&mut self, value: u64, offset: i64)
+    state add_offset(this: &mut VirtualSnapshotMaterializer, value: u64, offset: i64)
         requires offset >= 0;
     {
         // `apply_pointer_offset` — checked_add for non-negative offsets:
         // overflow refuses rather than wrapping.
         let offset_magnitude: u64 = offset as u64;
         transition offset_magnitude <= (18446744073709551615 - value) {
-            true -> apply_add(value, offset)
-            false -> bail()
+            true -> apply_add(this, value, offset)
+            false -> bail(this)
         }
     }
-    state sub_offset(&mut self, value: u64, offset: i64) {
+    state sub_offset(this: &mut VirtualSnapshotMaterializer, value: u64, offset: i64) {
         // Negative offset — the u64 magnitude is the wrapping negation of
         // the two's-complement cast.
         let magnitude: u64 = ((0 - (offset as u64 in Wrapping)) as u64 in Wrapping) as u64;
         transition value >= magnitude {
-            true -> apply_sub(value, offset)
-            false -> bail()
+            true -> apply_sub(this, value, offset)
+            false -> bail(this)
         }
     }
-    state apply_add(&mut self, value: u64, offset: i64)
+    state apply_add(this: &mut VirtualSnapshotMaterializer, value: u64, offset: i64)
         requires offset >= 0;
     {
-        self.current_address = ((value as u64 in Wrapping) + ((offset as u64 in Wrapping) as u64 in Wrapping)) as u64;
-        transition { _ -> after_hop() }
+        this.current_address = ((value as u64 in Wrapping) + ((offset as u64 in Wrapping) as u64 in Wrapping)) as u64;
+        transition { _ -> after_hop(this) }
     }
-    state apply_sub(&mut self, value: u64, offset: i64)
+    state apply_sub(this: &mut VirtualSnapshotMaterializer, value: u64, offset: i64)
         requires offset < 0;
     {
         let magnitude: u64 = ((0 - (offset as u64 in Wrapping)) as u64 in Wrapping) as u64;
-        self.current_address = ((value as u64 in Wrapping) - (magnitude as u64 in Wrapping)) as u64;
-        transition { _ -> after_hop() }
+        this.current_address = ((value as u64 in Wrapping) - (magnitude as u64 in Wrapping)) as u64;
+        transition { _ -> after_hop(this) }
     }
-    state after_hop(&mut self) {
+    state after_hop(this: &mut VirtualSnapshotMaterializer) {
         // Upstream clears the module once the first offset applies.
-        self.current_module_name_len = 0;
-        self.pointer_walk_had_first_hop = true;
-        self.next_link_index = ((self.next_link_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        _ = self.append_path_segment("0x..");
-        transition { _ -> done() }
+        this.current_module_name_len = 0;
+        this.pointer_walk_had_first_hop = true;
+        this.next_link_index = ((this.next_link_index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        _ = VirtualSnapshotMaterializer::append_path_segment(&mut this, "0x..");
+        transition { _ -> done(this) }
     }
-    state bail(&mut self) {
-        _ = self.append_path_segment("??");
-        _ = self.store_eval_cache(0, false);
-        let position: u64 = self.current_query_index;
+    state bail(this: &mut VirtualSnapshotMaterializer) {
+        _ = VirtualSnapshotMaterializer::append_path_segment(&mut this, "??");
+        _ = VirtualSnapshotMaterializer::store_eval_cache(&mut this, 0, false);
+        let position: u64 = this.current_query_index;
         transition position < 16 {
-            true -> bail_result(position)
-            false -> done()
+            true -> bail_result(this, position)
+            false -> done(this)
         }
     }
-    state bail_result(&mut self, position: u64)
+    state bail_result(this: &mut VirtualSnapshotMaterializer, position: u64)
         requires position < 16;
     {
-        let path_slice: &[u8] = slice_512(&self.evaluated_path, self.evaluated_path_len);
-        _ = result_set_evaluated_path(&mut self.results[position], path_slice);
+        let path_slice: &[u8] = slice_512(&this.evaluated_path, this.evaluated_path_len);
+        _ = result_set_evaluated_path(&mut this.results[position], path_slice);
         
-        self.pointer_walk_active = false;
-        self.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> done() }
+        this.pointer_walk_active = false;
+        this.current_query_index = ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> done(this) }
     }
-    state done(&mut self) {
+    state done(this: &mut VirtualSnapshotMaterializer) {
     }
 }
 
@@ -734,53 +744,56 @@ machine assemble_pointer_value(bytes: &[u8], pointer_size: u64, endian: Endian) 
 }
 
 // Insert into the read cache — keyed by (response address, module).
-machine VirtualSnapshotMaterializer::store_read_cache(&mut self, response: &MemoryReadResponse) -> bool {
-    transition self.cache_count < 16 {
-        true -> store(response)
+machine VirtualSnapshotMaterializer::store_read_cache(this: &mut VirtualSnapshotMaterializer, response: &MemoryReadResponse) -> bool {
+    transition this.cache_count < 16 {
+        true -> store(this, response)
         false -> (false)
         _ -> (false)
     }
-    state store(&mut self, response: &MemoryReadResponse) -> bool {
-        let slot: u64 = self.cache_count;
-        self.cached_addresses[slot] = response.get_address();
-        self.cached_responses[slot].clone_from(response);
-        transition self.pending_was_cached_insert {
-            true -> store_module(slot)
-            false -> store_empty_module(slot)
+    state store(this: &mut VirtualSnapshotMaterializer, response: &MemoryReadResponse) -> bool {
+        let slot: u64 = this.cache_count;
+        this.cached_addresses[slot] = MemoryReadResponse::get_address(&response);
+        MemoryReadResponse::clone_from(&mut this.cached_responses[slot], response);
+        transition this.pending_was_cached_insert {
+            true -> store_module(this, slot)
+            false -> store_empty_module(this, slot)
         }
     }
-    state store_module(&mut self, slot: u64) -> bool
+    state store_module(this: &mut VirtualSnapshotMaterializer, slot: u64) -> bool
         requires slot < 16;
     {
-        _ = copy_slice(&self.pending_module_name, self.pending_module_name_len, &mut self.cached_module_names[slot], &mut self.cached_module_name_lens[slot]);
-        self.cache_count = ((self.cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        _ = copy_slice(&this.pending_module_name, this.pending_module_name_len, &mut this.cached_module_names[slot], &mut this.cached_module_name_lens[slot]);
+        this.cache_count = ((this.cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (true)
     }
-    state store_empty_module(&mut self, slot: u64) -> bool
+    state store_empty_module(this: &mut VirtualSnapshotMaterializer, slot: u64) -> bool
         requires slot < 16;
     {
-        self.cached_module_name_lens[slot] = 0;
-        self.cache_count = ((self.cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        this.cached_module_name_lens[slot] = 0;
+        this.cache_count = ((this.cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (true)
     }
 }
 
 // `pointer_size_definition` — resolves the pointer-width data type's
 // struct layout through the registry cache.
-machine VirtualSnapshotMaterializer::pointer_size_definition(&self, registry: &PrivilegedRegistryCache, out_definition: &mut SymbolicStructDefinition) -> bool {
-    let pointer_size: PointerScanPointerSize = self.pointer_size_value();
-    let data_type_ref: DataTypeRef = pointer_size.to_data_type_ref();
-    (registry.resolve_struct_layout_definition(data_type_ref.get_data_type_id(), out_definition))
+machine VirtualSnapshotMaterializer::pointer_size_definition(this: &VirtualSnapshotMaterializer, registry: &PrivilegedRegistryCache, out_definition: &mut SymbolicStructDefinition) -> bool {
+    let pointer_size: PointerScanPointerSize = VirtualSnapshotMaterializer::pointer_size_value(&this);
+    let data_type_ref: DataTypeRef = PointerScanPointerSize::to_data_type_ref(&pointer_size);
+    let hoist13: bool = PrivilegedRegistryCache::resolve_struct_layout_definition(&registry, DataTypeRef::get_data_type_id(&data_type_ref), &mut out_definition);
+    (hoist13)
 }
 
-machine VirtualSnapshotMaterializer::pointer_size_value(&self) -> PointerScanPointerSize {
-    transition self.pointer.get_pointer_size() == 4 {
+machine VirtualSnapshotMaterializer::pointer_size_value(this: &VirtualSnapshotMaterializer) -> PointerScanPointerSize {
+    let hoist11: u64 = StoredPointer::get_pointer_size(&this.pointer);
+    transition hoist11 == 4 {
         true -> (PointerScanPointerSize::Pointer32)
-        false -> check_three()
+        false -> check_three(this)
         _ -> (PointerScanPointerSize::Pointer64)
     }
-    state check_three(&self) -> PointerScanPointerSize {
-        transition self.pointer.get_pointer_size() == 3 {
+    state check_three(this: &VirtualSnapshotMaterializer) -> PointerScanPointerSize {
+        let hoist12: u64 = StoredPointer::get_pointer_size(&this.pointer);
+        transition hoist12 == 3 {
             true -> (PointerScanPointerSize::Pointer24)
             false -> (PointerScanPointerSize::Pointer64)
         }
@@ -788,268 +801,268 @@ machine VirtualSnapshotMaterializer::pointer_size_value(&self) -> PointerScanPoi
 }
 
 // Records the query's id alongside its result slot.
-machine VirtualSnapshotMaterializer::store_result_id(&mut self, position: u64) -> bool {
+machine VirtualSnapshotMaterializer::store_result_id(this: &mut VirtualSnapshotMaterializer, position: u64) -> bool {
     transition position < 16 {
-        true -> store_id(position)
+        true -> store_id(this, position)
         false -> (false)
         _ -> (false)
     }
-    state store_id(&mut self, position: u64) -> bool
+    state store_id(this: &mut VirtualSnapshotMaterializer, position: u64) -> bool
         requires position < 16;
     {
         let mut query_id: [u8; 128];
         let mut query_id_len: u64 = 0;
-        self.queries[position].copy_query_id_into(&mut query_id, &mut query_id_len);
-        self.result_ids[position] = query_id;
-        self.result_id_lens[position] = query_id_len;
-        transition self.result_count < 16 {
-            true -> bump(position)
+        VirtualSnapshotQuery::copy_query_id_into(&this.queries[position], &mut query_id, &mut query_id_len);
+        this.result_ids[position] = query_id;
+        this.result_id_lens[position] = query_id_len;
+        transition this.result_count < 16 {
+            true -> bump(this, position)
             false -> (true)
         }
     }
-    state bump(&mut self, position: u64) -> bool
+    state bump(this: &mut VirtualSnapshotMaterializer, position: u64) -> bool
         requires position < 16;
     {
-        transition position == self.result_count {
-            true -> bump_it()
+        transition position == this.result_count {
+            true -> bump_it(this)
             false -> (true)
         }
     }
-    state bump_it(&mut self) -> bool {
-        self.result_count = ((self.result_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    state bump_it(this: &mut VirtualSnapshotMaterializer) -> bool {
+        this.result_count = ((this.result_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (true)
     }
 }
 
 // Upstream `cached_pointer_query_evaluations.insert` — dedup by pointer.
-machine VirtualSnapshotMaterializer::store_eval_cache(&mut self, resolved_address: u64, has_address: bool) -> bool {
-    transition self.eval_cache_count < 16 {
-        true -> store_eval(resolved_address, has_address)
+machine VirtualSnapshotMaterializer::store_eval_cache(this: &mut VirtualSnapshotMaterializer, resolved_address: u64, has_address: bool) -> bool {
+    transition this.eval_cache_count < 16 {
+        true -> store_eval(this, resolved_address, has_address)
         false -> (false)
         _ -> (false)
     }
-    state store_eval(&mut self, resolved_address: u64, has_address: bool) -> bool {
-        let slot: u64 = self.eval_cache_count;
-        self.cached_eval_pointers[slot].clone_from(&self.pointer);
-        self.cached_eval_has_address[slot] = has_address;
-        self.cached_eval_addresses[slot] = resolved_address;
+    state store_eval(this: &mut VirtualSnapshotMaterializer, resolved_address: u64, has_address: bool) -> bool {
+        let slot: u64 = this.eval_cache_count;
+        StoredPointer::clone_from(&mut this.cached_eval_pointers[slot], &this.pointer);
+        this.cached_eval_has_address[slot] = has_address;
+        this.cached_eval_addresses[slot] = resolved_address;
         transition has_address {
-            true -> store_eval_module(slot)
-            false -> store_eval_path_only(slot)
+            true -> store_eval_module(this, slot)
+            false -> store_eval_path_only(this, slot)
         }
     }
-    state store_eval_module(&mut self, slot: u64) -> bool
+    state store_eval_module(this: &mut VirtualSnapshotMaterializer, slot: u64) -> bool
         requires slot < 16;
     {
-        _ = copy_slice(&self.resolved_module_name, self.resolved_module_name_len, &mut self.cached_eval_module_names[slot], &mut self.cached_eval_module_name_lens[slot]);
-        _ = copy_slice(&self.evaluated_path, self.evaluated_path_len, &mut self.cached_eval_paths[slot], &mut self.cached_eval_path_lens[slot]);
-        self.eval_cache_count = ((self.eval_cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        _ = copy_slice(&this.resolved_module_name, this.resolved_module_name_len, &mut this.cached_eval_module_names[slot], &mut this.cached_eval_module_name_lens[slot]);
+        _ = copy_slice(&this.evaluated_path, this.evaluated_path_len, &mut this.cached_eval_paths[slot], &mut this.cached_eval_path_lens[slot]);
+        this.eval_cache_count = ((this.eval_cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (true)
     }
-    state store_eval_path_only(&mut self, slot: u64) -> bool
+    state store_eval_path_only(this: &mut VirtualSnapshotMaterializer, slot: u64) -> bool
         requires slot < 16;
     {
-        self.cached_eval_module_name_lens[slot] = 0;
-        _ = copy_slice(&self.evaluated_path, self.evaluated_path_len, &mut self.cached_eval_paths[slot], &mut self.cached_eval_path_lens[slot]);
-        self.eval_cache_count = ((self.eval_cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        this.cached_eval_module_name_lens[slot] = 0;
+        _ = copy_slice(&this.evaluated_path, this.evaluated_path_len, &mut this.cached_eval_paths[slot], &mut this.cached_eval_path_lens[slot]);
+        this.eval_cache_count = ((this.eval_cache_count as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (true)
     }
 }
 
 // Appends " -> <text>" (or the leading segment) to evaluated_path —
 // upstream `evaluated_path_segments.join(" -> ")`.
-machine VirtualSnapshotMaterializer::append_path_segment(&mut self, text: &[u8]) -> bool {
-    transition self.evaluated_path_len == 0 {
-        true -> append_text(text)
-        false -> sep(text)
-        _ -> append_text(text)
+machine VirtualSnapshotMaterializer::append_path_segment(this: &mut VirtualSnapshotMaterializer, text: &[u8]) -> bool {
+    transition this.evaluated_path_len == 0 {
+        true -> append_text(this, text)
+        false -> sep(this, text)
+        _ -> append_text(this, text)
     }
-    state sep(&mut self, text: &[u8]) -> bool {
-        transition self.evaluated_path_len <= 508 {
-            true -> write_sep(text)
+    state sep(this: &mut VirtualSnapshotMaterializer, text: &[u8]) -> bool {
+        transition this.evaluated_path_len <= 508 {
+            true -> write_sep(this, text)
             false -> (false)
         }
     }
-    state write_sep(&mut self, text: &[u8]) -> bool
-        requires self.evaluated_path_len <= 508;
+    state write_sep(this: &mut VirtualSnapshotMaterializer, text: &[u8]) -> bool
+        requires this.evaluated_path_len <= 508;
     {
-        let index_one: u64 = self.evaluated_path_len + 1;
-        let index_two: u64 = self.evaluated_path_len + 2;
-        let index_three: u64 = self.evaluated_path_len + 3;
+        let index_one: u64 = this.evaluated_path_len + 1;
+        let index_two: u64 = this.evaluated_path_len + 2;
+        let index_three: u64 = this.evaluated_path_len + 3;
         transition index_one < 512 && index_two < 512 && index_three < 512 {
-            true -> write_sep_bounded(text, index_one, index_two, index_three)
+            true -> write_sep_bounded(this, text, index_one, index_two, index_three)
             _ -> (false)
         }
     }
-    state write_sep_bounded(&mut self, text: &[u8], index_one: u64, index_two: u64, index_three: u64) -> bool
-        requires self.evaluated_path_len <= 508 && index_one < 512 && index_two < 512 && index_three < 512;
+    state write_sep_bounded(this: &mut VirtualSnapshotMaterializer, text: &[u8], index_one: u64, index_two: u64, index_three: u64) -> bool
+        requires this.evaluated_path_len <= 508 && index_one < 512 && index_two < 512 && index_three < 512;
     {
-        self.evaluated_path[self.evaluated_path_len] = 32;
-        self.evaluated_path[index_one] = 45;
-        self.evaluated_path[index_two] = 62;
-        self.evaluated_path[index_three] = 32;
-        self.evaluated_path_len = self.evaluated_path_len + 4;
-        transition { _ -> append_text(text) }
+        this.evaluated_path[this.evaluated_path_len] = 32;
+        this.evaluated_path[index_one] = 45;
+        this.evaluated_path[index_two] = 62;
+        this.evaluated_path[index_three] = 32;
+        this.evaluated_path_len = this.evaluated_path_len + 4;
+        transition { _ -> append_text(this, text) }
     }
-    state append_text(&mut self, text: &[u8]) -> bool {
-        transition { _ -> loop_copy(text, 0) }
+    state append_text(this: &mut VirtualSnapshotMaterializer, text: &[u8]) -> bool {
+        transition { _ -> loop_copy(this, text, 0) }
     }
-    state loop_copy(&mut self, text: &[u8], index: u64) -> bool
+    state loop_copy(this: &mut VirtualSnapshotMaterializer, text: &[u8], index: u64) -> bool
 
     {
-        transition index < text.len && self.evaluated_path_len < 512 {
-            true -> copy_char(text, index)
+        transition index < text.len && this.evaluated_path_len < 512 {
+            true -> copy_char(this, text, index)
             false -> (true)
         }
     }
-    state copy_char(&mut self, text: &[u8], index: u64) -> bool
+    state copy_char(this: &mut VirtualSnapshotMaterializer, text: &[u8], index: u64) -> bool
         requires index < text.len;
     {
-        self.evaluated_path[self.evaluated_path_len] = text[index];
-        self.evaluated_path_len = ((self.evaluated_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
-        transition { _ -> loop_copy(text, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
+        this.evaluated_path[this.evaluated_path_len] = text[index];
+        this.evaluated_path_len = ((this.evaluated_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+        transition { _ -> loop_copy(this, text, ((index as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64) }
     }
 }
 
 // Appends the "0x" prefix onto the evaluated path.
-machine VirtualSnapshotMaterializer::append_hex_prefix(&mut self) -> bool {
-    transition self.evaluated_path_len <= 510 {
-        true -> write()
+machine VirtualSnapshotMaterializer::append_hex_prefix(this: &mut VirtualSnapshotMaterializer) -> bool {
+    transition this.evaluated_path_len <= 510 {
+        true -> write(this)
         false -> (false)
         _ -> (false)
     }
-    state write(&mut self) -> bool
-        requires self.evaluated_path_len <= 510;
+    state write(this: &mut VirtualSnapshotMaterializer) -> bool
+        requires this.evaluated_path_len <= 510;
     {
-        let index_one: u64 = self.evaluated_path_len + 1;
+        let index_one: u64 = this.evaluated_path_len + 1;
         transition index_one < 512 {
-            true -> write_bounded(index_one)
+            true -> write_bounded(this, index_one)
             _ -> (false)
         }
     }
-    state write_bounded(&mut self, index_one: u64) -> bool
-        requires self.evaluated_path_len <= 510 && index_one < 512;
+    state write_bounded(this: &mut VirtualSnapshotMaterializer, index_one: u64) -> bool
+        requires this.evaluated_path_len <= 510 && index_one < 512;
     {
-        self.evaluated_path[self.evaluated_path_len] = 48;
-        self.evaluated_path[index_one] = 120;
-        self.evaluated_path_len = self.evaluated_path_len + 2;
+        this.evaluated_path[this.evaluated_path_len] = 48;
+        this.evaluated_path[index_one] = 120;
+        this.evaluated_path_len = this.evaluated_path_len + 2;
         (true)
     }
 }
 
 // Appends an uppercase hex rendering — upstream `format!("{:X}", address)`.
 // Zero renders as a single '0'.
-machine VirtualSnapshotMaterializer::append_hex_u64(&mut self, value: u64) -> bool {
-    transition { _ -> walk(15, value) }
-    state walk(&mut self, nibble: u64, value: u64)
+machine VirtualSnapshotMaterializer::append_hex_u64(this: &mut VirtualSnapshotMaterializer, value: u64) -> bool {
+    transition { _ -> walk(this, 15, value) }
+    state walk(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
 
     {
         transition nibble > 0 {
-            true -> check_leading(nibble, value)
-            false -> last_digit(value)
+            true -> check_leading(this, nibble, value)
+            false -> last_digit(this, value)
         }
     }
-    state check_leading(&mut self, nibble: u64, value: u64)
+    state check_leading(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
         requires nibble > 0;
     {
         // The nibble cursor walks 15 down to 0 upstream — the `nibble * 4`
         // shift count needs the bound re-spelled so it reaches the multiply
         // and shift obligations inside the dominated state.
         transition nibble <= 15 {
-            true -> check_leading_bounded(nibble, value)
-            _ -> step_down(nibble, value)
+            true -> check_leading_bounded(this, nibble, value)
+            _ -> step_down(this, nibble, value)
         }
     }
-    state check_leading_bounded(&mut self, nibble: u64, value: u64)
+    state check_leading_bounded(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
         requires nibble <= 15 && nibble > 0;
     {
         transition (value >> (nibble * 4)) & 15 != 0 {
-            true -> write_nibble(nibble, value)
-            false -> step_down(nibble, value)
+            true -> write_nibble(this, nibble, value)
+            false -> step_down(this, nibble, value)
         }
     }
-    state step_down(&mut self, nibble: u64, value: u64)
+    state step_down(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
         requires nibble > 0;
     {
         let next_nibble: u64 = nibble - 1;
-        transition { _ -> walk_from(next_nibble, value) }
+        transition { _ -> walk_from(this, next_nibble, value) }
     }
-    state walk_from(&mut self, nibble: u64, value: u64)
+    state walk_from(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
 
     {
         transition nibble > 0 {
-            true -> check_leading(nibble, value)
-            false -> last_digit(value)
+            true -> check_leading(this, nibble, value)
+            false -> last_digit(this, value)
         }
     }
-    state write_nibble(&mut self, nibble: u64, value: u64) {
+    state write_nibble(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64) {
         transition nibble <= 15 {
-            true -> write_nibble_bounded(nibble, value)
+            true -> write_nibble_bounded(this, nibble, value)
             _ -> (true)
         }
     }
-    state write_nibble_bounded(&mut self, nibble: u64, value: u64)
+    state write_nibble_bounded(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
         requires nibble <= 15;
     {
-        _ = self.append_hex_digit(((value >> (nibble * 4)) & 15) as u8);
+        _ = VirtualSnapshotMaterializer::append_hex_digit(&mut this, ((value >> (nibble * 4)) & 15) as u8);
         transition nibble > 0 {
-            true -> write_step(nibble, value)
+            true -> write_step(this, nibble, value)
             false -> (true)
         }
     }
-    state write_step(&mut self, nibble: u64, value: u64)
+    state write_step(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
         requires nibble <= 15 && nibble > 0;
     {
         let next_nibble: u64 = nibble - 1;
-        transition { _ -> write_rest(next_nibble, value) }
+        transition { _ -> write_rest(this, next_nibble, value) }
     }
-    state write_rest(&mut self, nibble: u64, value: u64) {
+    state write_rest(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64) {
         transition nibble <= 15 {
-            true -> write_rest_bounded(nibble, value)
+            true -> write_rest_bounded(this, nibble, value)
             _ -> (true)
         }
     }
-    state write_rest_bounded(&mut self, nibble: u64, value: u64)
+    state write_rest_bounded(this: &mut VirtualSnapshotMaterializer, nibble: u64, value: u64)
         requires nibble <= 15;
     {
-        _ = self.append_hex_digit(((value >> (nibble * 4)) & 15) as u8);
+        _ = VirtualSnapshotMaterializer::append_hex_digit(&mut this, ((value >> (nibble * 4)) & 15) as u8);
         transition nibble > 0 {
-            true -> write_step(nibble, value)
+            true -> write_step(this, nibble, value)
             false -> (true)
         }
     }
-    state last_digit(&mut self, value: u64) -> bool {
-        _ = self.append_hex_digit((value & 15) as u8);
+    state last_digit(this: &mut VirtualSnapshotMaterializer, value: u64) -> bool {
+        _ = VirtualSnapshotMaterializer::append_hex_digit(&mut this, (value & 15) as u8);
         (true)
     }
 }
 
-machine VirtualSnapshotMaterializer::append_hex_digit(&mut self, digit: u8) -> bool {
+machine VirtualSnapshotMaterializer::append_hex_digit(this: &mut VirtualSnapshotMaterializer, digit: u8) -> bool {
     transition digit < 10 {
-        true -> numeric(digit)
-        false -> letter(digit)
-        _ -> letter(digit)
+        true -> numeric(this, digit)
+        false -> letter(this, digit)
+        _ -> letter(this, digit)
     }
-    state numeric(&mut self, digit: u8) -> bool {
-        transition self.evaluated_path_len < 512 {
-            true -> write_digit(digit + 48)
+    state numeric(this: &mut VirtualSnapshotMaterializer, digit: u8) -> bool {
+        transition this.evaluated_path_len < 512 {
+            true -> write_digit(this, digit + 48)
             false -> (false)
         }
     }
-    state letter(&mut self, digit: u8) -> bool {
-        transition digit >= 10 && digit < 16 && self.evaluated_path_len < 512 {
-            true -> write_letter(digit)
+    state letter(this: &mut VirtualSnapshotMaterializer, digit: u8) -> bool {
+        transition digit >= 10 && digit < 16 && this.evaluated_path_len < 512 {
+            true -> write_letter(this, digit)
             false -> (false)
         }
     }
-    state write_letter(&mut self, digit: u8) -> bool {
-        self.evaluated_path[self.evaluated_path_len] = digit + 55;
-        self.evaluated_path_len = ((self.evaluated_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    state write_letter(this: &mut VirtualSnapshotMaterializer, digit: u8) -> bool {
+        this.evaluated_path[this.evaluated_path_len] = digit + 55;
+        this.evaluated_path_len = ((this.evaluated_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (true)
     }
-    state write_digit(&mut self, byte: u8) -> bool {
-        self.evaluated_path[self.evaluated_path_len] = byte;
-        self.evaluated_path_len = ((self.evaluated_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
+    state write_digit(this: &mut VirtualSnapshotMaterializer, byte: u8) -> bool {
+        this.evaluated_path[this.evaluated_path_len] = byte;
+        this.evaluated_path_len = ((this.evaluated_path_len as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64;
         (true)
     }
 }
@@ -1057,15 +1070,18 @@ machine VirtualSnapshotMaterializer::append_hex_digit(&mut self, digit: u8) -> b
 // Indexed-element receivers do not parse under `_ =` — these helpers take
 // the element as an argument instead.
 machine result_set_evaluated_path(result: &mut VirtualSnapshotQueryResult, path: &[u8]) -> bool {
-    result.set_evaluated_pointer_path(path)
+    let hoist14: bool = set_evaluated_pointer_path(result, path);
+    (hoist14)
 }
 
 machine result_set_module_name(result: &mut VirtualSnapshotQueryResult, module_name: &[u8]) -> bool {
-    result.set_resolved_module_name(module_name)
+    let hoist15: bool = set_resolved_module_name(result, module_name);
+    (hoist15)
 }
 
 machine query_copy_pointer(query: &VirtualSnapshotQuery, pointer: &mut StoredPointer) -> bool {
-    query.copy_pointer(pointer)
+    let hoist16: bool = copy_pointer(query, pointer);
+    (hoist16)
 }
 
 // Record-machine counterpart of the hop-endian probe (internal states are
@@ -1073,6 +1089,6 @@ machine query_copy_pointer(query: &VirtualSnapshotQuery, pointer: &mut StoredPoi
 // process endianness — the materializer tracks it per walk today as the
 // pointer-size default; the real source lands with the executor leg's
 // OpenedProcess plumbing (documented approximation).
-machine VirtualSnapshotMaterializer::get_pointer_endian(&self) -> Endian {
+machine VirtualSnapshotMaterializer::get_pointer_endian(this: &VirtualSnapshotMaterializer) -> Endian {
     (Endian::Little)
 }

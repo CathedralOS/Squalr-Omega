@@ -85,26 +85,28 @@ pub machine TrackableTask::create(
         progress_queue_word: 0,
         substrate: substrate
     };
-    task.set_name(name);
-    task.set_task_identifier(task_identifier);
+    TrackableTask::set_name(&mut task, name);
+    TrackableTask::set_task_identifier(&mut task, task_identifier);
     task
 }
 
 // Upstream `get_task_handle`: an owned snapshot of name, progress and
 // identifier. The handle's fields borrow views of this task's buffers, so
 // the handle must not outlive the task.
-pub machine TrackableTask::get_task_handle<'a>(&self) -> trackable_task_handle::TrackableTaskHandle<'a> {
+pub machine TrackableTask::get_task_handle<'a>(this: &TrackableTask) -> trackable_task_handle::TrackableTaskHandle<'a> {
+    let hoist3: &'a [u8] = TrackableTask::get_task_identifier(&this);
+    let hoist2: &'a [u8] = TrackableTask::get_name(&this);
     trackable_task_handle::TrackableTaskHandle {
-        name: self.get_name(),
-        progress: self.progress,
-        task_identifier: self.get_task_identifier()
+        name: hoist2,
+        progress: this.progress,
+        task_identifier: hoist3
     }
 }
 
 // Upstream `get_progress`: the guarded read. A lock failure cannot occur
 // on an owned field, so the `0.0` error leg is absent by construction.
-pub machine TrackableTask::get_progress(&self) -> f32 {
-    self.progress
+pub machine TrackableTask::get_progress(this: &TrackableTask) -> f32 {
+    this.progress
 }
 
 // Upstream `set_progress`: store under the lock, then `send` on the
@@ -112,62 +114,62 @@ pub machine TrackableTask::get_progress(&self) -> f32 {
 // journal append that wakes a pending receiver (crossbeam's send also
 // releases one blocked `recv`). A full journal declines the send — the
 // `Err` leg upstream only logs.
-pub machine TrackableTask::set_progress(&mut self, progress: f32)
+pub machine TrackableTask::set_progress(this: &mut TrackableTask, progress: f32)
 reaches WaitWake
 invokes WaitWake;
 {
-    self.progress = progress;
-    transition self.progress_queue_len < 64 {
-        true -> enqueue(progress)
-        _ -> sent()
+    this.progress = progress;
+    transition this.progress_queue_len < 64 {
+        true -> enqueue(this, progress)
+        _ -> sent(this)
     }
 
-    state enqueue(&mut self, progress: f32) {
-        let tail: u64 = (((self.progress_queue_head as u64 in Saturating) + (self.progress_queue_len as u64 in Saturating)) as u64) % 64;
-        self.progress_queue[tail] = progress;
-        self.progress_queue_len = ((self.progress_queue_len as u64 in Saturating) + 1) as u64;
-        self.progress_queue_word.store(self.progress_queue_len, GlobalOrder);
-        _ = self.substrate.wake_one(&self.progress_queue_word);
+    state enqueue(this: &mut TrackableTask, progress: f32) {
+        let tail: u64 = (((this.progress_queue_head as u64 in Saturating) + (this.progress_queue_len as u64 in Saturating)) as u64) % 64;
+        this.progress_queue[tail] = progress;
+        this.progress_queue_len = ((this.progress_queue_len as u64 in Saturating) + 1) as u64;
+        this.progress_queue_word = this.progress_queue_len;
+        _ = WaitWake::wake_one(&this.progress_queue_word);
     }
 
-    state sent(&mut self) {
+    state sent(this: &mut TrackableTask) {
     }
 }
 
 // Upstream `subscribe_to_progress_updates`: clones the channel receiver.
-pub machine TrackableTask::subscribe_to_progress_updates(&self) -> ProgressReceiver {
+pub machine TrackableTask::subscribe_to_progress_updates(this: &TrackableTask) -> ProgressReceiver {
     ProgressReceiver {}
 }
 
 // Upstream `Receiver::try_recv`: a non-blocking pull on the shared queue —
 // `Optional::None` while empty, the oldest pending value otherwise.
 pub machine TrackableTask::next_progress_update(
-    &mut self,
+    this: &mut TrackableTask,
     receiver: &ProgressReceiver
 ) -> Optional<f32> {
-    transition self.progress_queue_len > 0 {
-        true -> head_in_bounds(receiver)
+    transition this.progress_queue_len > 0 {
+        true -> head_in_bounds(this, receiver)
         _ -> (Optional::None)
     }
 
-    state head_in_bounds(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
-        transition self.progress_queue_head < 64 {
-            true -> take(receiver, self.progress_queue_head)
+    state head_in_bounds(this: &mut TrackableTask, receiver: &ProgressReceiver) -> Optional<f32> {
+        transition this.progress_queue_head < 64 {
+            true -> take(this, receiver, this.progress_queue_head)
             _ -> (Optional::None)
         }
     }
 
     state take(
-        &mut self,
+        this: &mut TrackableTask,
         receiver: &ProgressReceiver,
         head: u64
     ) -> Optional<f32>
         requires 0 <= head && head < 64
     {
-        let value: f32 = self.progress_queue[head];
-        self.progress_queue_head = (((head as u64 in Saturating) + 1) as u64) % 64;
-        self.progress_queue_len = ((self.progress_queue_len as u64 in Saturating) - 1) as u64;
-        self.progress_queue_word.store(self.progress_queue_len, GlobalOrder);
+        let value: f32 = this.progress_queue[head];
+        this.progress_queue_head = (((head as u64 in Saturating) + 1) as u64) % 64;
+        this.progress_queue_len = ((this.progress_queue_len as u64 in Saturating) - 1) as u64;
+        this.progress_queue_word = this.progress_queue_len;
         Optional::Some { value: value }
     }
 }
@@ -177,51 +179,51 @@ pub machine TrackableTask::next_progress_update(
 // a losing competing receiver parked — upstream's own recv waits the same
 // way when another consumer claimed the message first.
 pub machine TrackableTask::wait_for_progress_update(
-    &mut self,
+    this: &mut TrackableTask,
     receiver: &ProgressReceiver
 ) -> Optional<f32>
 reaches WaitWake
 invokes WaitWake;
 blocks;
 {
-    transition self.progress_queue_len > 0 {
-        true -> head_in_bounds(receiver)
-        _ -> await_message(receiver)
+    transition this.progress_queue_len > 0 {
+        true -> head_in_bounds(this, receiver)
+        _ -> await_message(this, receiver)
     }
 
-    state await_message(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
+    state await_message(this: &mut TrackableTask, receiver: &ProgressReceiver) -> Optional<f32> {
         // Both wait outcomes take the same re-check edge; the outcome local
         // exists only to bind the blocking call's result.
         let outcome: WaitOutcome =
-            block self.substrate.wait(&self.progress_queue_word, 0);
-        transition { _ -> recheck(receiver) }
+            block WaitWake::wait(&this.progress_queue_word, 0);
+        transition { _ -> recheck(this, receiver) }
     }
 
-    state recheck(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
-        transition self.progress_queue_len > 0 {
-            true -> head_in_bounds(receiver)
-            _ -> await_message(receiver)
+    state recheck(this: &mut TrackableTask, receiver: &ProgressReceiver) -> Optional<f32> {
+        transition this.progress_queue_len > 0 {
+            true -> head_in_bounds(this, receiver)
+            _ -> await_message(this, receiver)
         }
     }
 
-    state head_in_bounds(&mut self, receiver: &ProgressReceiver) -> Optional<f32> {
-        transition self.progress_queue_head < 64 {
-            true -> take(receiver, self.progress_queue_head)
+    state head_in_bounds(this: &mut TrackableTask, receiver: &ProgressReceiver) -> Optional<f32> {
+        transition this.progress_queue_head < 64 {
+            true -> take(this, receiver, this.progress_queue_head)
             _ -> (Optional::None)
         }
     }
 
     state take(
-        &mut self,
+        this: &mut TrackableTask,
         receiver: &ProgressReceiver,
         head: u64
     ) -> Optional<f32>
         requires 0 <= head && head < 64
     {
-        let value: f32 = self.progress_queue[head];
-        self.progress_queue_head = (((head as u64 in Saturating) + 1) as u64) % 64;
-        self.progress_queue_len = ((self.progress_queue_len as u64 in Saturating) - 1) as u64;
-        self.progress_queue_word.store(self.progress_queue_len, GlobalOrder);
+        let value: f32 = this.progress_queue[head];
+        this.progress_queue_head = (((head as u64 in Saturating) + 1) as u64) % 64;
+        this.progress_queue_len = ((this.progress_queue_len as u64 in Saturating) - 1) as u64;
+        this.progress_queue_word = this.progress_queue_len;
         Optional::Some { value: value }
     }
 }
@@ -229,83 +231,83 @@ blocks;
 // Upstream `get_name` returns an owned `String` clone; the owned-copy
 // shape is the buffer copy `get_task_handle` performs, so the getter
 // exposes the live text as a borrowed slice.
-pub machine TrackableTask::get_name<'a>(&self) -> &'a [u8] {
+pub machine TrackableTask::get_name<'a>(this: &TrackableTask) -> &'a [u8] {
     // The copy bound keeps name_len <= 256; `% 257` is the ranged witness
     // the subslice's end bound needs (same modulo idiom as `tail`).
-    let end: u64 = self.name_len % 257;
-    self.name[0..end]
+    let end: u64 = this.name_len % 257;
+    this.name[0..end]
 }
 
-pub machine TrackableTask::set_name(&mut self, name: &[u8]) {
-    transition { _ -> copy(name, 0) }
-    state copy(&mut self, name: &[u8], position: u64) {
+pub machine TrackableTask::set_name(this: &mut TrackableTask, name: &[u8]) {
+    transition { _ -> copy(this, name, 0) }
+    state copy(this: &mut TrackableTask, name: &[u8], position: u64) {
         transition position < name.len && position < 256 {
-            true -> store(name, position)
-            false -> done(position)
+            true -> store(this, name, position)
+            false -> done(this, position)
         }
     }
-    state store(&mut self, name: &[u8], position: u64)
+    state store(this: &mut TrackableTask, name: &[u8], position: u64)
         requires 0 <= position && position < name.len && position < 256
     {
-        self.name[position] = name[position];
-        transition { _ -> copy(name, position + 1) }
+        this.name[position] = name[position];
+        transition { _ -> copy(this, name, position + 1) }
     }
-    state done(&mut self, position: u64) {
-        self.name_len = position;
+    state done(this: &mut TrackableTask, position: u64) {
+        this.name_len = position;
     }
 }
 
 // Identifier construction half of `create` (upstream has no setter).
-machine TrackableTask::set_task_identifier(&mut self, task_identifier: &[u8]) {
-    transition { _ -> copy(task_identifier, 0) }
-    state copy(&mut self, task_identifier: &[u8], position: u64) {
+machine TrackableTask::set_task_identifier(this: &mut TrackableTask, task_identifier: &[u8]) {
+    transition { _ -> copy(this, task_identifier, 0) }
+    state copy(this: &mut TrackableTask, task_identifier: &[u8], position: u64) {
         transition position < task_identifier.len && position < 256 {
-            true -> store(task_identifier, position)
-            false -> done(position)
+            true -> store(this, task_identifier, position)
+            false -> done(this, position)
         }
     }
-    state store(&mut self, task_identifier: &[u8], position: u64)
+    state store(this: &mut TrackableTask, task_identifier: &[u8], position: u64)
         requires 0 <= position && position < task_identifier.len && position < 256
     {
-        self.task_identifier[position] = task_identifier[position];
-        transition { _ -> copy(task_identifier, position + 1) }
+        this.task_identifier[position] = task_identifier[position];
+        transition { _ -> copy(this, task_identifier, position + 1) }
     }
-    state done(&mut self, position: u64) {
-        self.task_identifier_len = position;
+    state done(this: &mut TrackableTask, position: u64) {
+        this.task_identifier_len = position;
     }
 }
 
 // Upstream `get_task_identifier` returns an owned `String` clone; same
 // borrowed-view translation as `get_name`.
-pub machine TrackableTask::get_task_identifier<'a>(&self) -> &'a [u8] {
-    let end: u64 = self.task_identifier_len % 257;
-    self.task_identifier[0..end]
+pub machine TrackableTask::get_task_identifier<'a>(this: &TrackableTask) -> &'a [u8] {
+    let end: u64 = this.task_identifier_len % 257;
+    this.task_identifier[0..end]
 }
 
 // The `HashMap<String, _>` key lookup leg of the session's task manager:
 // identifier equality is live-length equality plus byte equality over the
 // live span — upstream's map `get`/`remove` on the `String` key.
 pub machine TrackableTask::matches_task_identifier(
-    &self,
+    this: &TrackableTask,
     needle: &[u8]
 ) -> bool {
-    transition needle.len == self.task_identifier_len {
-        true -> scan(needle, 0)
+    transition needle.len == this.task_identifier_len {
+        true -> scan(this, needle, 0)
         _ -> (false)
     }
 
-    state scan(&self, needle: &[u8], position: u64) -> bool {
+    state scan(this: &TrackableTask, needle: &[u8], position: u64) -> bool {
         transition position < needle.len && position < 256 {
-            true -> compare(needle, position)
+            true -> compare(this, needle, position)
             _ -> (true)
         }
     }
 
-    state compare(&self, needle: &[u8], position: u64) -> bool
+    state compare(this: &TrackableTask, needle: &[u8], position: u64) -> bool
         requires 0 <= position && position < needle.len && position < 256
     {
-        transition self.task_identifier[position] == needle[position] {
-            true -> scan(needle, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        transition this.task_identifier[position] == needle[position] {
+            true -> scan(this, needle, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
             _ -> (false)
         }
     }
@@ -314,26 +316,26 @@ pub machine TrackableTask::matches_task_identifier(
 // The same key match task-versus-task — upstream's `insert` re-key check
 // when a registered identifier is already tracked.
 pub machine TrackableTask::matches_task_identifier_of(
-    &self,
+    this: &TrackableTask,
     other: &TrackableTask
 ) -> bool {
-    transition other.task_identifier_len == self.task_identifier_len {
-        true -> scan(other, 0)
+    transition other.task_identifier_len == this.task_identifier_len {
+        true -> scan(this, other, 0)
         _ -> (false)
     }
 
-    state scan(&self, other: &TrackableTask, position: u64) -> bool {
+    state scan(this: &TrackableTask, other: &TrackableTask, position: u64) -> bool {
         transition position < other.task_identifier_len && position < 256 {
-            true -> compare(other, position)
+            true -> compare(this, other, position)
             _ -> (true)
         }
     }
 
-    state compare(&self, other: &TrackableTask, position: u64) -> bool
+    state compare(this: &TrackableTask, other: &TrackableTask, position: u64) -> bool
         requires 0 <= position && position < other.task_identifier_len && position < 256
     {
-        transition self.task_identifier[position] == other.task_identifier[position] {
-            true -> scan(other, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
+        transition this.task_identifier[position] == other.task_identifier[position] {
+            true -> scan(this, other, ((position as u64 in Wrapping) + (1 as u64 in Wrapping)) as u64)
             _ -> (false)
         }
     }
@@ -343,65 +345,65 @@ pub machine TrackableTask::matches_task_identifier_of(
 // for polling observation (`load(Acquire)`/`load(Relaxed)` at every
 // consumer site — never stored through). Without a cloneable shared cell
 // the token is the flag's current observation through a task borrow.
-pub machine TrackableTask::get_cancellation_token(&self) -> bool {
-    let observed: bool = self.is_canceled.load(Receive);
+pub machine TrackableTask::get_cancellation_token(this: &TrackableTask) -> bool {
+    let observed: bool = this.is_canceled as bool;
     observed
 }
 
-pub machine TrackableTask::is_completed(&self) -> bool {
-    let observed: bool = self.is_completed.load(GlobalOrder);
+pub machine TrackableTask::is_completed(this: &TrackableTask) -> bool {
+    let observed: bool = this.is_completed as bool;
     observed
 }
 
 // Upstream `cancel`: flag, then complete. The SeqCst store keeps its
 // GlobalOrder spelling.
-pub machine TrackableTask::cancel(&self)
+pub machine TrackableTask::cancel(this: &mut TrackableTask)
 reaches WaitWake
 invokes WaitWake;
 {
-    self.is_canceled.store(true, GlobalOrder);
-    self.complete()
+    this.is_canceled = true;
+    _ = TrackableTask::complete(this);
 }
 
 // Upstream `complete`: flag, then `completed_cv.notify_all()`. The word
 // flips before the wake edge so a released wait observes completion.
-pub machine TrackableTask::complete(&self)
+pub machine TrackableTask::complete(this: &mut TrackableTask)
 reaches WaitWake
 invokes WaitWake;
 {
-    self.is_completed.store(true, GlobalOrder);
-    self.completion_word.store(1, GlobalOrder);
+    this.is_completed = true;
+    this.completion_word = 1;
     let limit: u64 = 18446744073709551615;
-    _ = self.substrate.wake_many(&self.completion_word, limit);
+    _ = WaitWake::wake_many(&this.completion_word, limit);
 }
 
 // Upstream `wait_for_completion`: parks on the condvar until
 // `is_completed` reads true. The substrate wait releases only on a wake
 // edge or an already-differing word, and the re-check loop preserves
 // upstream's `while !is_completed` re-read after every wake.
-pub machine TrackableTask::wait_for_completion(&self)
+pub machine TrackableTask::wait_for_completion(this: &TrackableTask)
 reaches WaitWake
 invokes WaitWake;
 blocks;
 {
-    transition self.is_completed.load(GlobalOrder) {
-        true -> finished()
-        _ -> await_completion()
+    transition this.is_completed {
+        true -> finished(this)
+        _ -> await_completion(this)
     }
 
-    state await_completion(&self) {
+    state await_completion(this: &TrackableTask) {
         let outcome: WaitOutcome =
-            block self.substrate.wait(&self.completion_word, 0);
-        transition { _ -> recheck() }
+            block WaitWake::wait(&this.completion_word, 0);
+        transition { _ -> recheck(this) }
     }
 
-    state recheck(&self) {
-        transition self.is_completed.load(GlobalOrder) {
-            true -> finished()
-            _ -> await_completion()
+    state recheck(this: &TrackableTask) {
+        transition this.is_completed {
+            true -> finished(this)
+            _ -> await_completion(this)
         }
     }
 
-    state finished(&self) {
+    state finished(this: &TrackableTask) {
     }
 }

@@ -43,8 +43,8 @@ pub machine ContainerType::from_pointer_size(pointer_size: PointerScanPointerSiz
 }
 
 // Upstream `get_pointer_size` — Some only for the pointer cases.
-pub machine ContainerType::get_pointer_size(&self) -> Optional<PointerScanPointerSize> {
-    transition self {
+pub machine ContainerType::get_pointer_size(this: &ContainerType) -> Optional<PointerScanPointerSize> {
+    transition this {
         ContainerType::Pointer { pointer_size } -> (Optional::Some { value: pointer_size })
         ContainerType::PointerArray { pointer_size } -> (Optional::Some { value: pointer_size })
         ContainerType::PointerArrayFixed { pointer_size, length } ->
@@ -57,22 +57,22 @@ pub machine ContainerType::get_pointer_size(&self) -> Optional<PointerScanPointe
 
 // Kind accessors — a union-typed local bound from a call cannot serve as a
 // transition scrutinee, so callers hoist these predicates instead.
-pub machine ContainerType::is_array(&self) -> bool {
-    transition self {
+pub machine ContainerType::is_array(this: &ContainerType) -> bool {
+    transition this {
         ContainerType::Array -> (true)
         _ -> (false)
     }
 }
 
-pub machine ContainerType::is_array_fixed(&self) -> bool {
-    transition self {
+pub machine ContainerType::is_array_fixed(this: &ContainerType) -> bool {
+    transition this {
         ContainerType::ArrayFixed { length } -> (true)
         _ -> (false)
     }
 }
 
-pub machine ContainerType::array_fixed_length(&self) -> u64 {
-    transition self {
+pub machine ContainerType::array_fixed_length(this: &ContainerType) -> u64 {
+    transition this {
         ContainerType::ArrayFixed { length } -> (length)
         _ -> (0)
     }
@@ -80,15 +80,22 @@ pub machine ContainerType::array_fixed_length(&self) -> u64 {
 
 // Upstream `get_total_size_in_bytes` — arrays multiply their element size by
 // the fixed count, saturating like upstream's saturating_mul.
-pub machine ContainerType::get_total_size_in_bytes(&self, default_size: u64) -> u64 {
-    transition self {
+pub machine ContainerType::get_total_size_in_bytes(this: &ContainerType, default_size: u64) -> u64 {
+    transition this {
         ContainerType::None -> (default_size)
         ContainerType::Array -> (default_size)
-        ContainerType::ArrayFixed { length } -> (saturating_mul(default_size as u64 in Saturating, length as u64 in Saturating))
-        ContainerType::Pointer { pointer_size } -> (pointer_size.get_size_in_bytes())
-        ContainerType::PointerArray { pointer_size } -> (pointer_size.get_size_in_bytes())
+        ContainerType::ArrayFixed { length } ->
+            (saturating_mul(default_size as u64 in Saturating, length as u64 in Saturating))
+        ContainerType::Pointer { pointer_size } ->
+            (PointerScanPointerSize::get_size_in_bytes(&pointer_size))
+        ContainerType::PointerArray { pointer_size } ->
+            (PointerScanPointerSize::get_size_in_bytes(&pointer_size))
         ContainerType::PointerArrayFixed { pointer_size, length } ->
-            (saturating_mul(pointer_size.get_size_in_bytes() as u64 in Saturating, length as u64 in Saturating))
+            at_fixed(this, default_size, pointer_size, length)
+    }
+    state at_fixed(this: &ContainerType, default_size: u64, pointer_size: PointerScanPointerSize, length: u64) -> u64 {
+        let size: u64 = PointerScanPointerSize::get_size_in_bytes(&pointer_size);
+        (saturating_mul(size as u64 in Saturating, length as u64 in Saturating))
     }
 }
 
@@ -100,8 +107,8 @@ machine saturating_mul(left: u64 in Saturating, right: u64 in Saturating) -> u64
 
 // Upstream `with_fixed_element_count`: array cases keep their kind and gain
 // the count; `None` and a bare `Pointer` have no element sequence to size.
-pub machine ContainerType::with_fixed_element_count(&self, element_count: u64) -> Optional<ContainerType> {
-    transition self {
+pub machine ContainerType::with_fixed_element_count(this: &ContainerType, element_count: u64) -> Optional<ContainerType> {
+    transition this {
         ContainerType::Array ->
             (Optional::Some { value: ContainerType::ArrayFixed { length: element_count } })
         ContainerType::ArrayFixed { length } ->
@@ -133,7 +140,8 @@ machine trim_left(text: &[u8], cursor: u64, end: u64) -> u64 {
         }
     }
     state space(text: &[u8], cursor: u64, end: u64) -> u64 {
-        transition byte_is_space(text[cursor]) {
+        let hoist1: bool = byte_is_space(text[cursor]);
+        transition hoist1 {
             true -> probe(text, cursor + 1, end)
             false -> (cursor)
         }
@@ -158,7 +166,8 @@ machine trim_right(text: &[u8], start: u64, end: u64) -> u64 {
         }
     }
     state peek(text: &[u8], start: u64, end: u64, last: u64, byte: u8) -> u64 {
-        transition byte_is_space(byte) {
+        let hoist2: bool = byte_is_space(byte);
+        transition hoist2 {
             true -> edge(text, start, last)
             false -> (end)
         }
@@ -476,14 +485,15 @@ pub machine ContainerType::from_str_consistent() -> bool {
     // u64-digit paths share the same machines). Upstream accepts the full
     // grammar.
     let sized: ContainerTypeParse = ContainerType::from_str_window("*(u64)", 0, 6);
-    total(sized, 8)
+    let hoist9: bool = total(sized, 8);
+    (hoist9)
 }
 
 // The parsed container reports the upstream unit-element total
 // ('*(24be)[]' -> 3 bytes, '*(u32)[4]' -> 16, '' -> the unit).
 machine total(result: ContainerTypeParse, expected: u64) -> bool {
     transition result {
-        ContainerTypeParse::Parsed { value } -> (value.get_total_size_in_bytes(1) == expected)
+        ContainerTypeParse::Parsed { value } -> (ContainerType::get_total_size_in_bytes(&value, 1) == expected)
         ContainerTypeParse::Refused -> (false)
     }
 }
@@ -491,8 +501,8 @@ machine total(result: ContainerTypeParse, expected: u64) -> bool {
 // Upstream derived PartialEq — variant + payload equality. Enum cases carry
 // no `==`, so each arm re-matches `other` and compares payloads
 // (PointerScanPointerSize::equals for pointer sizes, scalar == for lengths).
-pub machine ContainerType::equals(&self, other: &ContainerType) -> bool {
-    transition self {
+pub machine ContainerType::equals(this: &ContainerType, other: &ContainerType) -> bool {
+    transition this {
         ContainerType::None -> none(other)
         ContainerType::Array -> array(other)
         ContainerType::ArrayFixed { length } -> array_fixed(other, length)
@@ -521,19 +531,19 @@ pub machine ContainerType::equals(&self, other: &ContainerType) -> bool {
     }
     state pointer(other: &ContainerType, self_size: PointerScanPointerSize) -> bool {
         transition other {
-            ContainerType::Pointer { pointer_size } -> (self_size.equals(&pointer_size))
+            ContainerType::Pointer { pointer_size } -> (PointerScanPointerSize::equals(&self_size, &pointer_size))
             _ -> (false)
         }
     }
     state pointer_array(other: &ContainerType, self_size: PointerScanPointerSize) -> bool {
         transition other {
-            ContainerType::PointerArray { pointer_size } -> (self_size.equals(&pointer_size))
+            ContainerType::PointerArray { pointer_size } -> (PointerScanPointerSize::equals(&self_size, &pointer_size))
             _ -> (false)
         }
     }
     state pointer_array_fixed(other: &ContainerType, self_size: PointerScanPointerSize, self_length: u64) -> bool {
         transition other {
-            ContainerType::PointerArrayFixed { pointer_size, length } -> (self_size.equals(&pointer_size) && self_length == length)
+            ContainerType::PointerArrayFixed { pointer_size, length } -> (PointerScanPointerSize::equals(&self_size, &pointer_size) && self_length == length)
             _ -> (false)
         }
     }
