@@ -78,3 +78,6 @@ Re-probed 2026-10-09 on omega @13f22140150 (tip incl. the bare
 catalog-signature wave): identical failure, 6/6. Diagnostic now reads
 "machine satisfaction target `I8::from_f32` does not resolve to an exact
 trait requirement or top-level `boundary requirement`". Wall stands.
+
+Re-probed post-rewrite on omega @1cc8bbb1c99 (tip incl. the
+joined_path member-path wave): identical failure, 6/6. Wall stands.
