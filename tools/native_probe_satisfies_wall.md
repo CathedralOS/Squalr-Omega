@@ -73,3 +73,8 @@ U{8,64}::from_f32` decls — all six fail identically. Unambiguous names
 compiler. The gap is checker-side: satisfies resolution needs
 context-aware matching (impl machine `in Trapping` → the `in Trapping`
 decl) or the decls need distinct names.
+
+Re-probed 2026-10-09 on omega @13f22140150 (tip incl. the bare
+catalog-signature wave): identical failure, 6/6. Diagnostic now reads
+"machine satisfaction target `I8::from_f32` does not resolve to an exact
+trait requirement or top-level `boundary requirement`". Wall stands.
