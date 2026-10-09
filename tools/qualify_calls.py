@@ -18,6 +18,9 @@ FILES = sorted(set(glob.glob('squalr-*/src/**/*.omg', recursive=True)))
 MACHINE_SIG = re.compile(
     r'(?:pub\s+)?machine\s+([A-Z][A-Za-z0-9_]*)\s*::\s*([A-Za-z0-9_]+)\s*'
     r'(?:<[A-Za-z0-9_,\s\']*>)?\s*\(')
+# free `machine name(` decls (no `Type::` prefix) — bare `name(...)` calls
+# resolve to these, so they must never be qualified to `T::name(...)`.
+FREE_MACHINE_SIG = re.compile(r'(?:pub\s+)?machine\s+([A-Za-z_]\w*)\s*\(')
 STATE_SIG = re.compile(r'\bstate\s+([A-Za-z0-9_]+)\s*\(')
 DATA_SIG = re.compile(r'(?:pub\s+)?data\s+([A-Z][A-Za-z0-9_]*)\s*\{')
 UNION_SIG = re.compile(r'(?:pub\s+)?union\s+([A-Z][A-Za-z0-9_]*)\s*\{')
@@ -88,6 +91,7 @@ variants = {}      # Union -> {Variant: payload Type}
 machine_ret = {}   # (Type, name) -> return type
 machine_this = {}  # (Type, name) -> this param mode: '&', '&mut', 'value', 'mut value'
 all_machines = {}  # name -> set of Types
+free_machines = set()  # names declared as free `machine name(`
 
 for f in FILES:
     src = open(f).read()
@@ -123,6 +127,8 @@ for f in FILES:
         machine_ret[(ty, name)] = rm.group(1).strip() if rm else '()'
         machine_this[(ty, name)] = this_mode
         all_machines.setdefault(name, set()).add(ty)
+    for m in FREE_MACHINE_SIG.finditer(src):
+        free_machines.add(m.group(1))
 
 def strip_ref(t):
     return t.lstrip('&').replace('mut ', '').strip()
@@ -244,7 +250,7 @@ def _qualify_span(body, ty, env):
     state_names = set(re.findall(r'\bstate\s+([A-Za-z0-9_]+)\s*\(', body))
     for m in re.finditer(r'(?<![:\w.])([a-z_]\w*)\s*\(', body):
         name = m.group(1)
-        if name not in all_machines:
+        if name not in all_machines or name in free_machines:
             continue
         # bare `-> name(...)` tail = state destination, not a value call
         pre = body[max(0, m.start() - 8):m.start()]
