@@ -84,3 +84,8 @@ joined_path member-path wave): identical failure, 6/6. Wall stands.
 
 Re-probed 2026-10-09 on omega @d1210bad989 (tip incl. the float
 saturation/proof wave): identical failure, 6/6. Wall stands.
+
+Re-probed 2026-10-09 on omega @10f99a21b06 (tip incl. the
+numeric-imports/guarded-trap wave; float_operations.omg changed but the
+3-way plain/Trapping/Saturating overload stands on every int family):
+identical failure, 6/6. Wall stands.
