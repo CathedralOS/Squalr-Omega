@@ -1,0 +1,251 @@
+module src::scanners::vector::scanner_vector_overlapping_bytewise_shared;
+
+use squalr_engine_api::src::structures::scanning::filters::snapshot_region_filter::SnapshotRegionFilter;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
+use src::scanners::structures::snapshot_region_filter_run_length_encoder::SnapshotRegionFilterRunLengthEncoder;
+
+// Shared machinery of the two bytewise-overlapping scanners: the periodic
+// and staggered arms restate the same lane-mark, group-encode and pump-exit
+// graphs over identical field sets — only their compare loops and their
+// cursor/extent field names differ, so those arrive as parameters here.
+// (The element-wise aligned scanner shares only the lane-write and step
+// helpers; its stride-based encode semantics stay in its own module.)
+
+// The encode pass's outcome: the region a lane or finalize emitted, plus
+// the caller-cursor advance it consumed. `Empty` means continue the pump.
+pub data VectorBytewiseEncodeOutcome {
+    emitted: EmittedRegion;
+    advance: u64;
+}
+
+// Saturating single-step for unbounded u64 counters (lane/pattern indexes):
+// the compare/encode loops only ever reach their caller-bounded lane count,
+// but the param types carry no proof — upstream's plain `+1` would trip the
+// exact-arithmetic overflow check.
+pub machine sat_inc(value: u64) -> u64 {
+    ((value as u64 in Saturating) + (1 as u64 in Saturating)) as u64
+}
+
+// The 256^i weights the pattern gather shifts operand bytes by — the
+// eight arms a u64 operand value can address.
+pub machine pow256(byte_index: u64) -> u64
+requires 0 <= byte_index && byte_index < 8;
+{
+    transition byte_index {
+        0 -> 1
+        1 -> 256
+        2 -> 65536
+        3 -> 16777216
+        4 -> 4294967296
+        5 -> 1099511627776
+        6 -> 281474976710656
+        7 -> 72057594037927936
+        _ -> 1
+    }
+}
+
+// One lane's result write: a hit marks 1 and counts, a miss marks 0.
+// Returns the hit-count delta; the caller advances the lane index.
+pub machine vector_bytewise_mark_lane(
+    lane_results: &mut [u8; 64],
+    lane_index: u64,
+    matched: bool
+) -> u64 {
+    transition matched && lane_index < 64 {
+        true -> write_hit(lane_results, lane_index)
+        false -> write_miss_gate(lane_results, lane_index)
+        _ -> write_miss_gate(lane_results, lane_index)
+    }
+    state write_hit(lane_results: &mut [u8; 64], lane_index: u64) -> u64
+    requires 0 <= lane_index && lane_index < 64;
+    {
+        lane_results[lane_index] = 1;
+        transition { _ -> (1) }
+    }
+    state write_miss_gate(lane_results: &mut [u8; 64], lane_index: u64) -> u64 {
+        transition lane_index < 64 {
+            true -> write_miss(lane_results, lane_index)
+            _ -> (0)
+        }
+    }
+    state write_miss(lane_results: &mut [u8; 64], lane_index: u64) -> u64
+    requires 0 <= lane_index && lane_index < 64;
+    {
+        lane_results[lane_index] = 0;
+        transition { _ -> (0) }
+    }
+}
+
+// The post-compare encode pass the twins restate: upstream's all-true /
+// all-false fast paths on a FULL group (`lane_count == group_extent`), the
+// per-lane encode walk, the mid-group emit, and the group advance. The
+// compare loop keeps its own states upstream — this owns everything after
+// `hit_count` is known. Empty + `advance` means continue the caller's pump.
+pub machine vector_bytewise_encode_group(
+    lane_results: &[u8; 64],
+    encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+    group_extent: u64,
+    data_type_size_bytes: u64,
+    lane_count: u64,
+    hit_count: u64
+) -> VectorBytewiseEncodeOutcome {
+    transition lane_count == group_extent && hit_count == lane_count {
+        true -> encode_all(encoder, group_extent, lane_count)
+        false -> decide_miss(lane_results, encoder, group_extent, data_type_size_bytes, lane_count, hit_count)
+        _ -> decide_miss(lane_results, encoder, group_extent, data_type_size_bytes, lane_count, hit_count)
+    }
+
+    state decide_miss(
+        lane_results: &[u8; 64],
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        group_extent: u64,
+        data_type_size_bytes: u64,
+        lane_count: u64,
+        hit_count: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        transition lane_count == group_extent && hit_count == 0 {
+            true -> encode_none(encoder, group_extent, data_type_size_bytes, lane_count)
+            false -> encode_lane(lane_results, encoder, data_type_size_bytes, lane_count, 0)
+            _ -> encode_lane(lane_results, encoder, data_type_size_bytes, lane_count, 0)
+        }
+    }
+
+    state encode_all(
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        group_extent: u64,
+        lane_count: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        encoder.encode_range(group_extent);
+        transition { _ -> (VectorBytewiseEncodeOutcome { emitted: EmittedRegion::Empty, advance: lane_count }) }
+    }
+
+    state encode_none(
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        group_extent: u64,
+        data_type_size_bytes: u64,
+        lane_count: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        let emitted: EmittedRegion = encoder
+            .finalize_current_encode_with_minimum_size_filtering(
+                group_extent, data_type_size_bytes);
+        transition { _ -> emit_or_pump(emitted, lane_count) }
+    }
+
+    state encode_lane(
+        lane_results: &[u8; 64],
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        data_type_size_bytes: u64,
+        lane_count: u64,
+        lane_index: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        transition lane_index < lane_count {
+            true -> encode_lane_read(lane_results, encoder, data_type_size_bytes, lane_count, lane_index)
+            false -> group_done(lane_count)
+        }
+    }
+
+    state encode_lane_read(
+        lane_results: &[u8; 64],
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        data_type_size_bytes: u64,
+        lane_count: u64,
+        lane_index: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        transition lane_index < 64 {
+            true -> encode_lane_take(lane_results, encoder, data_type_size_bytes, lane_count, lane_index)
+            _ -> encode_lane_miss(lane_results, encoder, data_type_size_bytes, lane_count, lane_index)
+        }
+    }
+
+    state encode_lane_take(
+        lane_results: &[u8; 64],
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        data_type_size_bytes: u64,
+        lane_count: u64,
+        lane_index: u64
+    ) -> VectorBytewiseEncodeOutcome
+    requires 0 <= lane_index && lane_index < 64;
+    {
+        let lane_result: u8 = lane_results[lane_index];
+        transition lane_result == 1 {
+            true -> encode_lane_hit(lane_results, encoder, data_type_size_bytes, lane_count, lane_index)
+            false -> encode_lane_miss(lane_results, encoder, data_type_size_bytes, lane_count, lane_index)
+            _ -> encode_lane_miss(lane_results, encoder, data_type_size_bytes, lane_count, lane_index)
+        }
+    }
+
+    state encode_lane_hit(
+        lane_results: &[u8; 64],
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        data_type_size_bytes: u64,
+        lane_count: u64,
+        lane_index: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        encoder.encode_range(1);
+        let next_lane: u64 = sat_inc(lane_index);
+        transition { _ -> encode_lane(lane_results, encoder, data_type_size_bytes, lane_count, next_lane) }
+    }
+
+    state encode_lane_miss(
+        lane_results: &[u8; 64],
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        data_type_size_bytes: u64,
+        lane_count: u64,
+        lane_index: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        let emitted: EmittedRegion = encoder
+            .finalize_current_encode_with_minimum_size_filtering(
+                1, data_type_size_bytes);
+        // Payload moves out of the union — the case split rides a
+        // param-position scrutinee in a hop state.
+        transition {
+            _ -> emitted_kind(
+                emitted, lane_results, encoder, data_type_size_bytes, lane_count, lane_index)
+        }
+    }
+
+    state emitted_kind(
+        emitted: EmittedRegion,
+        lane_results: &[u8; 64],
+        encoder: &mut SnapshotRegionFilterRunLengthEncoder,
+        data_type_size_bytes: u64,
+        lane_count: u64,
+        lane_index: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        transition emitted {
+            EmittedRegion::Region { region } -> emit_advance(
+                lane_index, region)
+            EmittedRegion::Empty -> encode_lane(
+                lane_results, encoder, data_type_size_bytes, lane_count, sat_inc(lane_index))
+            _ -> encode_lane(lane_results, encoder, data_type_size_bytes, lane_count, sat_inc(lane_index))
+        }
+    }
+
+    // An emitted region mid-group: the emitted lane was consumed, so the
+    // group cursor advances past it before the region leaves `next`.
+    state emit_advance(
+        lane_index: u64,
+        region: SnapshotRegionFilter
+    ) -> VectorBytewiseEncodeOutcome {
+        let advance: u64 = ((lane_index as u64 in Saturating)
+            + (1 as u64 in Saturating)) as u64;
+        transition {
+            _ -> (VectorBytewiseEncodeOutcome { emitted: EmittedRegion::Region { region: region }, advance: advance })
+        }
+    }
+
+    state group_done(lane_count: u64) -> VectorBytewiseEncodeOutcome {
+        transition { _ -> (VectorBytewiseEncodeOutcome { emitted: EmittedRegion::Empty, advance: lane_count }) }
+    }
+
+    state emit_or_pump(
+        emitted: EmittedRegion,
+        lane_count: u64
+    ) -> VectorBytewiseEncodeOutcome {
+        transition emitted {
+            EmittedRegion::Region { region } -> (VectorBytewiseEncodeOutcome { emitted: EmittedRegion::Region { region: region }, advance: lane_count })
+            EmittedRegion::Empty -> (VectorBytewiseEncodeOutcome { emitted: EmittedRegion::Empty, advance: lane_count })
+            _ -> (VectorBytewiseEncodeOutcome { emitted: EmittedRegion::Empty, advance: lane_count })
+        }
+    }
+}

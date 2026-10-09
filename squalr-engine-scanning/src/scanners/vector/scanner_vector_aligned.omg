@@ -11,6 +11,8 @@ use squalr_engine_api::src::structures::scanning::plans::plan_types::planned_sca
 use src::scanners::snapshot_scanner::Scanner;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::EmittedRegion;
 use src::scanners::structures::snapshot_region_filter_run_length_encoder::SnapshotRegionFilterRunLengthEncoder;
+use src::scanners::vector::scanner_vector_overlapping_bytewise_shared::sat_inc;
+use src::scanners::vector::scanner_vector_overlapping_bytewise_shared::vector_bytewise_mark_lane;
 
 // Port of ScannerVectorAligned over a typed u64 element window — and the
 // shared driver for the whole vector family. Upstream loads N-byte vectors
@@ -461,6 +463,8 @@ pub machine VectorElementScan::next(
         }
     }
 
+    // The lane write itself is shared with the bytewise-overlapping
+    // scanners — the mark machine returns the hit delta.
     state lane_hit_write(
         &mut self,
         current_values: &[u64],
@@ -468,12 +472,12 @@ pub machine VectorElementScan::next(
         lane_count: u64,
         lane_index: u64,
         hit_count: u64
-    ) -> EmittedRegion
-    requires 0 <= lane_index && lane_index < 64;
-    {
-        self.lane_results[lane_index] = 1;
+    ) -> EmittedRegion {
+        let hit_delta: u64 = vector_bytewise_mark_lane(
+            &mut self.lane_results, lane_index, true);
         let next_lane: u64 = sat_inc(lane_index);
-        let next_hits: u64 = sat_inc(hit_count);
+        let next_hits: u64 = ((hit_count as u64 in Saturating)
+            + (hit_delta as u64 in Saturating)) as u64;
         transition { _ -> compare_lane(current_values, previous_values, lane_count, next_lane, next_hits) }
     }
 
@@ -485,25 +489,12 @@ pub machine VectorElementScan::next(
         lane_index: u64,
         hit_count: u64
     ) -> EmittedRegion {
-        transition lane_index < 64 {
-            true -> lane_miss_write(current_values, previous_values, lane_count, lane_index, hit_count)
-            _ -> compare_lane(current_values, previous_values, lane_count, sat_inc(lane_index), hit_count)
-        }
-    }
-
-    state lane_miss_write(
-        &mut self,
-        current_values: &[u64],
-        previous_values: &[u64],
-        lane_count: u64,
-        lane_index: u64,
-        hit_count: u64
-    ) -> EmittedRegion
-    requires 0 <= lane_index && lane_index < 64;
-    {
-        self.lane_results[lane_index] = 0;
+        let hit_delta: u64 = vector_bytewise_mark_lane(
+            &mut self.lane_results, lane_index, false);
         let next_lane: u64 = sat_inc(lane_index);
-        transition { _ -> compare_lane(current_values, previous_values, lane_count, next_lane, hit_count) }
+        let next_hits: u64 = ((hit_count as u64 in Saturating)
+            + (hit_delta as u64 in Saturating)) as u64;
+        transition { _ -> compare_lane(current_values, previous_values, lane_count, next_lane, next_hits) }
     }
 
     // Upstream's all-true / all-false fast paths apply only to FULL vector
@@ -948,10 +939,3 @@ crashes Abort
     )
 }
 
-// Saturating single-step for unbounded u64 counters (lane/pattern indexes):
-// the compare/encode loops only ever reach their caller-bounded lane count,
-// but the param types carry no proof — upstream's plain `+1` would trip the
-// exact-arithmetic overflow check.
-machine sat_inc(value: u64) -> u64 {
-    ((value as u64 in Saturating) + (1 as u64 in Saturating)) as u64
-}
