@@ -81,3 +81,6 @@ trait requirement or top-level `boundary requirement`". Wall stands.
 
 Re-probed post-rewrite on omega @1cc8bbb1c99 (tip incl. the
 joined_path member-path wave): identical failure, 6/6. Wall stands.
+
+Re-probed 2026-10-09 on omega @d1210bad989 (tip incl. the float
+saturation/proof wave): identical failure, 6/6. Wall stands.
