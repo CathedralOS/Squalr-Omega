@@ -1,5 +1,7 @@
 module src::project::serialization::project_item_serialization;
 
+use omega::language::core::numeric_conversion;
+use omega::language::core::filesystem_authority;
 use squalr_engine_api::src::structures::projects::project_items::project_item::ProjectItem;
 use src::project::serialization::project_file_codec::ProjectFileReader;
 use src::project::serialization::project_file_codec::ProjectFileWriter;
@@ -8,6 +10,7 @@ use src::project::serialization::project_file_codec_item::encode_project_item;
 use src::project::serialization::serializable_project_file::ProjectFileSave;
 use src::project::serialization::serializable_project_file::SerializableProjectFile;
 use omega_language_std::filesystem_host;
+use omega_language_std::posix_filesystem_host;
 
 // Port of project_item_serialization.rs — `SerializableProjectFile for
 // ProjectItem`: the save arm creates the item's own directory when the
@@ -26,7 +29,7 @@ use omega_language_std::filesystem_host;
 // channel's own route) and `create_dir_name` (the plain-path create_dir
 // twin). `save_at`/`fill_and_decode`/`read_mode` are that seam; they
 // encode the identical upstream behavior against an open parent dirfd.
-pub data ProjectItemLoad {
+public data ProjectItemLoad {
     case Refused;
     case Loaded(project_item: ProjectItem);
 }
@@ -35,20 +38,20 @@ pub data ProjectItemLoad {
 // at byte 24; `S_IFMT == 61440` masks the kind, `S_IFREG == 32768`,
 // `S_IFDIR == 16384`. The buffer is the std Filesystem's 144-byte stat
 // carrier.
-pub data ProjectItemPathProbe {
+public data ProjectItemPathProbe {
     stat_buf: [u8; 144];
     stat_rc: i32;
     mode: u32;
 }
 
-pub linux_x86_64 machine ProjectItem::save_to_path(
+public linux_x86_64 machine ProjectItem::save_to_path(
     this: &mut ProjectItem,
     project_item_path: &[u8] in Path,
     save_even_if_unchanged: bool
 ) -> ProjectFileSave
 satisfies SerializableProjectFile<ProjectItem>::save_to_path
-reaches FilesystemHost
-invokes FilesystemHost;
+reaches PosixFilesystemHost + FilesystemContentRead + FilesystemContentWrite + FilesystemMetadataQuery + FilesystemMetadataMutation + DirectoryEnumeration + FilesystemNamespaceMutation
+invokes PosixFilesystemHost;
 {
     transition save_even_if_unchanged || this.has_unsaved_changes {
         true -> probe(this, project_item_path)
@@ -59,7 +62,7 @@ invokes FilesystemHost;
             stat_rc: -1,
             mode: 0,
         };
-        probe.stat_rc = FilesystemHost::read_metadata(project_item_path, &mut probe.stat_buf);
+        probe.stat_rc = PosixFilesystemHost::read_metadata(project_item_path, &mut probe.stat_buf);
         transition probe.stat_rc >= 0 {
             true -> kind(this, project_item_path, probe)
             _ -> make_dir(this, project_item_path)
@@ -69,7 +72,7 @@ invokes FilesystemHost;
         // Upstream `fs::create_dir(&project_item_path)?` — the item's own
         // path becomes a directory; the subsequent `is_file` reads false,
         // so a directory item completes with nothing serialized.
-        let created: i32 = FilesystemHost::create_dir(project_item_path, 493);
+        let created: i32 = PosixFilesystemHost::create_dir(project_item_path, 493);
         transition created >= 0 {
             true -> (ProjectFileSave::Stored)
             _ -> (ProjectFileSave::Refused)
@@ -96,7 +99,7 @@ invokes FilesystemHost;
         }
     }
     state open(this: &mut ProjectItem, project_item_path: &[u8] in Path, writer: ProjectFileWriter) -> ProjectFileSave {
-        let fd: i32 = FilesystemHost::create(project_item_path, 438);
+        let fd: i32 = PosixFilesystemHost::create(project_item_path, 438);
         transition fd >= 0 {
             true -> write(this, fd, writer)
             _ -> (ProjectFileSave::Refused)
@@ -105,8 +108,8 @@ invokes FilesystemHost;
     state write(this: &mut ProjectItem, fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
         let mut carried: ProjectFileWriter = writer;
         let put: i64 = ProjectFileWriter::flush_to_fd(&mut carried, fd);
-        let expected: i64 = ((carried.written as i64 in Wrapping) as i64);
-        let closed: i32 = FilesystemHost::close(fd);
+        let expected: i64 = narrow_u64_to_i64_wrapping(carried.written);
+        let closed: i32 = PosixFilesystemHost::close(fd);
         transition put == expected && put >= 0 {
             true -> clean(this)
             _ -> (ProjectFileSave::Refused)
@@ -127,22 +130,22 @@ invokes FilesystemHost;
 // `full_path` is the same path whole, for `create_dir_name` which runs
 // mkdir on the path itself relative to the caller's cwd like upstream's
 // own `fs::create_dir` call.
-pub linux_x86_64 machine ProjectItem::save_at(
+public linux_x86_64 machine ProjectItem::save_at(
     this: &mut ProjectItem,
     parent_fd: i32,
     item_path: &[u8],
     full_path: &[u8],
     save_even_if_unchanged: bool
 ) -> ProjectFileSave
-reaches FilesystemHost
-invokes FilesystemHost;
+reaches PosixFilesystemHost + FilesystemContentRead + FilesystemContentWrite + FilesystemMetadataQuery + FilesystemMetadataMutation + DirectoryEnumeration + FilesystemNamespaceMutation
+invokes PosixFilesystemHost;
 {
     transition save_even_if_unchanged || this.has_unsaved_changes {
         true -> probe(this, parent_fd, item_path, full_path)
         _ -> (ProjectFileSave::Stored)
     }
     state probe(this: &mut ProjectItem, parent_fd: i32, item_path: &[u8], full_path: &[u8]) -> ProjectFileSave {
-        let fd: i32 = FilesystemHost::open_at(parent_fd, item_path, 0);
+        let fd: i32 = PosixFilesystemHost::open_at(parent_fd, item_path, 0);
         transition fd >= 0 {
             true -> kind(this, parent_fd, fd, item_path, full_path)
             _ -> make_dir(this, full_path)
@@ -151,7 +154,7 @@ invokes FilesystemHost;
     state make_dir(this: &mut ProjectItem, full_path: &[u8]) -> ProjectFileSave {
         // Upstream `fs::create_dir(&project_item_path)?` — full-path
         // mkdir, the boundary's plain-bytes twin of `create_dir`.
-        let created: i32 = FilesystemHost::create_dir_name(full_path, 493);
+        let created: i32 = PosixFilesystemHost::create_dir_name(full_path, 493);
         transition created >= 0 {
             true -> (ProjectFileSave::Stored)
             _ -> (ProjectFileSave::Refused)
@@ -162,8 +165,8 @@ invokes FilesystemHost;
             stat_rc: -1,
             mode: 0,
         };
-        probe.stat_rc = FilesystemHost::read_file_metadata(fd, &mut probe.stat_buf);
-        let closed: i32 = FilesystemHost::close(fd);
+        probe.stat_rc = PosixFilesystemHost::read_file_metadata(fd, &mut probe.stat_buf);
+        let closed: i32 = PosixFilesystemHost::close(fd);
         transition probe.stat_rc >= 0 {
             true -> mode(this, parent_fd, item_path, probe)
             _ -> (ProjectFileSave::Refused)
@@ -191,7 +194,7 @@ invokes FilesystemHost;
     }
     state open(this: &mut ProjectItem, parent_fd: i32, item_path: &[u8], writer: ProjectFileWriter) -> ProjectFileSave {
         // O_WRONLY|O_CREAT|O_TRUNC (1|64|512) — upstream `File::create`.
-        let fd: i32 = FilesystemHost::open_at(parent_fd, item_path, 577);
+        let fd: i32 = PosixFilesystemHost::open_at(parent_fd, item_path, 577);
         transition fd >= 0 {
             true -> write(this, fd, writer)
             _ -> (ProjectFileSave::Refused)
@@ -200,8 +203,8 @@ invokes FilesystemHost;
     state write(this: &mut ProjectItem, fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
         let mut carried: ProjectFileWriter = writer;
         let put: i64 = ProjectFileWriter::flush_to_fd(&mut carried, fd);
-        let expected: i64 = ((carried.written as i64 in Wrapping) as i64);
-        let closed: i32 = FilesystemHost::close(fd);
+        let expected: i64 = narrow_u64_to_i64_wrapping(carried.written);
+        let closed: i32 = PosixFilesystemHost::close(fd);
         transition put == expected && put >= 0 {
             true -> clean(this)
             _ -> (ProjectFileSave::Refused)
@@ -213,13 +216,13 @@ invokes FilesystemHost;
     }
 }
 
-pub linux_x86_64 machine ProjectItem::load_from_path(
+public linux_x86_64 machine ProjectItem::load_from_path(
     project_item_path: &[u8] in Path
 ) -> ProjectItemLoad
-reaches FilesystemHost
-invokes FilesystemHost;
+reaches PosixFilesystemHost + FilesystemContentRead + FilesystemContentWrite + FilesystemMetadataQuery + FilesystemMetadataMutation + DirectoryEnumeration + FilesystemNamespaceMutation
+invokes PosixFilesystemHost;
 {
-    let fd: i32 = FilesystemHost::open(project_item_path, 0);
+    let fd: i32 = PosixFilesystemHost::open(project_item_path, 0);
     transition fd >= 0 {
         true -> fill(fd)
         _ -> (ProjectItemLoad::Refused)
@@ -227,7 +230,7 @@ invokes FilesystemHost;
     state fill(fd: i32) -> ProjectItemLoad {
         let mut project_item: ProjectItem = ProjectItem::default();
         let ok: bool = ProjectItem::fill_and_decode(&mut project_item, fd);
-        let closed: i32 = FilesystemHost::close(fd);
+        let closed: i32 = PosixFilesystemHost::close(fd);
         transition ok {
             true -> clean(project_item)
             _ -> (ProjectItemLoad::Refused)
@@ -243,9 +246,9 @@ invokes FilesystemHost;
 // The read half shared by `load_from_path` and the project walk: fill
 // the codec reader off an open fd, check the header, decode into self.
 // Returns false on any transport/format failure (upstream's `?` arms).
-pub linux_x86_64 machine ProjectItem::fill_and_decode(this: &mut ProjectItem, fd: i32) -> bool
-reaches FilesystemHost
-invokes FilesystemHost;
+public linux_x86_64 machine ProjectItem::fill_and_decode(this: &mut ProjectItem, fd: i32) -> bool
+reaches PosixFilesystemHost + FilesystemContentRead + FilesystemContentWrite + FilesystemMetadataQuery + FilesystemMetadataMutation + DirectoryEnumeration + FilesystemNamespaceMutation
+invokes PosixFilesystemHost;
 {
     let mut reader: ProjectFileReader = ProjectFileReader::default();
     let got: i64 = ProjectFileReader::fill_from_fd(&mut reader, fd);

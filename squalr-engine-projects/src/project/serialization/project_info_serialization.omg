@@ -1,5 +1,7 @@
 module src::project::serialization::project_info_serialization;
 
+use omega::language::core::numeric_conversion;
+use omega::language::core::filesystem_authority;
 use squalr_engine_api::src::plugins::plugin_configuration::PluginConfiguration;
 use squalr_engine_api::src::structures::processes::process_icon::ProcessIcon;
 use squalr_engine_api::src::structures::projects::project_info::ProjectInfo;
@@ -13,6 +15,7 @@ use src::project::serialization::project_serialization::resolve_project_info_fil
 use src::project::serialization::serializable_project_file::ProjectFileSave;
 use src::project::serialization::serializable_project_file::SerializableProjectFile;
 use omega_language_std::filesystem_host;
+use omega_language_std::posix_filesystem_host;
 
 // Port of project/serialization/project_info_serialization.rs —
 // `ProjectInfoStub`, the condensed record that excludes everything a
@@ -21,7 +24,7 @@ use omega_language_std::filesystem_host;
 // commands, hence the stub). The `SerializableProjectFile` impls land
 // below — the stub is the serde-staging record upstream builds in
 // `save_to_path` and rebuilds from in `load_from_path`.
-pub data ProjectInfoStub {
+public data ProjectInfoStub {
     has_project_icon_rgba: bool;
     project_icon_rgba: ProcessIcon;
     project_manifest: ProjectManifest;
@@ -35,7 +38,7 @@ pub data ProjectInfoStub {
 // Manifest/catalog/plugin move by value into the stub like upstream's
 // `.clone()`/`.cloned()` — callers deserializing build them fresh from
 // the decoded file; the save-side clone walks land with the codec leg.
-pub machine ProjectInfoStub::new(
+public machine ProjectInfoStub::new(
     has_project_icon_rgba: bool,
     project_icon_rgba: ProcessIcon,
     project_manifest: ProjectManifest,
@@ -56,7 +59,7 @@ pub machine ProjectInfoStub::new(
 // The deserializer's starting stub — the file's `has_` flags begin false,
 // the payload records are defaults; decode overwrites what the file
 // carries (upstream's `default` serde arms).
-pub machine ProjectInfoStub::default() -> ProjectInfoStub {
+public machine ProjectInfoStub::default() -> ProjectInfoStub {
     (ProjectInfoStub {
         has_project_icon_rgba: false,
         project_icon_rgba: ProcessIcon::default(),
@@ -70,7 +73,7 @@ pub machine ProjectInfoStub::default() -> ProjectInfoStub {
 // Upstream `anyhow::Result<ProjectInfo>` for the load half (the trait
 // keeps load per-type like upstream's `where Self: Sized`): `Loaded`
 // carries the rebuilt record, `Refused` covers open/parse failures.
-pub data ProjectInfoLoad {
+public data ProjectInfoLoad {
     case Refused;
     case Loaded(project_info: ProjectInfo);
 }
@@ -79,14 +82,14 @@ pub data ProjectInfoLoad {
 // honors the unchanged fast-path, then writes the stub through the
 // codec (upstream's `to_writer`; the byte format is the recorded
 // deviation) to `directory/project.json`, truncating any prior file.
-pub linux_x86_64 machine ProjectInfo::save_to_path(
+public linux_x86_64 machine ProjectInfo::save_to_path(
     this: &mut ProjectInfo,
     directory: &[u8] in Path,
     save_even_if_unchanged: bool
 ) -> ProjectFileSave
 satisfies SerializableProjectFile<ProjectInfo>::save_to_path
-reaches FilesystemHost
-invokes FilesystemHost;
+reaches PosixFilesystemHost + FilesystemContentRead + FilesystemContentWrite + FilesystemMetadataQuery + FilesystemMetadataMutation + DirectoryEnumeration + FilesystemNamespaceMutation
+invokes PosixFilesystemHost;
 {
     transition save_even_if_unchanged || this.has_unsaved_changes {
         true -> store(this, directory)
@@ -113,29 +116,29 @@ invokes FilesystemHost;
         // Upstream `File::create(directory.join(PROJECT_FILE))` spelled
         // through the dirfd seam: open the project directory, then
         // `open_at` the literal leaf name O_WRONLY|O_CREAT|O_TRUNC.
-        let dfd: i32 = FilesystemHost::open(directory, 0);
+        let dfd: i32 = PosixFilesystemHost::open(directory, 0);
         transition dfd >= 0 {
             true -> create(this, dfd, writer)
             _ -> (ProjectFileSave::Refused)
         }
     }
     state create(this: &mut ProjectInfo, dfd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
-        let fd: i32 = FilesystemHost::open_at(dfd, "project.json", 577);
+        let fd: i32 = PosixFilesystemHost::open_at(dfd, "project.json", 577);
         transition fd >= 0 {
             true -> write(this, dfd, fd, writer)
             _ -> close_dir(this, dfd)
         }
     }
     state close_dir(this: &mut ProjectInfo, dfd: i32) -> ProjectFileSave {
-        let closed: i32 = FilesystemHost::close(dfd);
+        let closed: i32 = PosixFilesystemHost::close(dfd);
         (ProjectFileSave::Refused)
     }
     state write(this: &mut ProjectInfo, dfd: i32, fd: i32, writer: ProjectFileWriter) -> ProjectFileSave {
         let mut carried: ProjectFileWriter = writer;
         let put: i64 = ProjectFileWriter::flush_to_fd(&mut carried, fd);
-        let expected: i64 = ((carried.written as i64 in Wrapping) as i64);
-        let closed: i32 = FilesystemHost::close(fd);
-        let closed_dir: i32 = FilesystemHost::close(dfd);
+        let expected: i64 = narrow_u64_to_i64_wrapping(carried.written);
+        let closed: i32 = PosixFilesystemHost::close(fd);
+        let closed_dir: i32 = PosixFilesystemHost::close(dfd);
         transition put == expected && put >= 0 {
             true -> clean(this)
             _ -> (ProjectFileSave::Refused)
@@ -156,33 +159,33 @@ invokes FilesystemHost;
 // re-prove `Path`, so callers pass the domained directory and the leaf
 // name stays a literal. The record still stores the identical joined
 // path bytes upstream's caller would have produced.
-pub linux_x86_64 machine ProjectInfo::load_from_path(
+public linux_x86_64 machine ProjectInfo::load_from_path(
     project_directory_path: &[u8] in Path
 ) -> ProjectInfoLoad
-reaches FilesystemHost
-invokes FilesystemHost;
+reaches PosixFilesystemHost + FilesystemContentRead + FilesystemContentWrite + FilesystemMetadataQuery + FilesystemMetadataMutation + DirectoryEnumeration + FilesystemNamespaceMutation
+invokes PosixFilesystemHost;
 {
-    let dfd: i32 = FilesystemHost::open(project_directory_path, 0);
+    let dfd: i32 = PosixFilesystemHost::open(project_directory_path, 0);
     transition dfd >= 0 {
         true -> open(dfd, project_directory_path)
         _ -> (ProjectInfoLoad::Refused)
     }
     state open(dfd: i32, project_directory_path: &[u8] in Path) -> ProjectInfoLoad {
-        let fd: i32 = FilesystemHost::open_at(dfd, "project.json", 0);
+        let fd: i32 = PosixFilesystemHost::open_at(dfd, "project.json", 0);
         transition fd >= 0 {
             true -> fill(dfd, fd, project_directory_path)
             _ -> close_dir(dfd)
         }
     }
     state close_dir(dfd: i32) -> ProjectInfoLoad {
-        let closed: i32 = FilesystemHost::close(dfd);
+        let closed: i32 = PosixFilesystemHost::close(dfd);
         (ProjectInfoLoad::Refused)
     }
     state fill(dfd: i32, fd: i32, project_directory_path: &[u8]) -> ProjectInfoLoad {
         let mut reader: ProjectFileReader = ProjectFileReader::default();
         let got: i64 = ProjectFileReader::fill_from_fd(&mut reader, fd);
-        let closed: i32 = FilesystemHost::close(fd);
-        let closed_dir: i32 = FilesystemHost::close(dfd);
+        let closed: i32 = PosixFilesystemHost::close(fd);
+        let closed_dir: i32 = PosixFilesystemHost::close(dfd);
         transition got > 0 {
             true -> decode(reader, project_directory_path)
             _ -> (ProjectInfoLoad::Refused)
