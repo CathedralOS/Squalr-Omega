@@ -17,6 +17,9 @@ use squalr_engine_api::src::structures::pointer_scans::pointer_scan_summary::Sto
 use squalr_engine_api::src::structures::pointer_scans::pointer_scan_target_descriptor::PointerScanTargetDescriptor;
 use squalr_engine_api::src::structures::snapshots::snapshot::Snapshot;
 use squalr_engine_scanning::src::pointer_scans::pointer_scan_validator::PointerScanValidator;
+use squalr_engine_api::src::structures::scanning::plans::pointer_scan::pointer_scan_parameters::PointerScanParameters;
+use squalr_engine_scanning::src::pointer_scans::pointer_scan_results_builder::PointerScanResultsBuilder;
+use squalr_engine_scanning::src::pointer_scans::pointer_scan_results_builder::PointerScanResultsBuild;
 use squalr_engine_scanning::src::pointer_scans::structures::pointer_scan_collected_level::PointerScanCollectedLevel;
 use squalr_engine_scanning::src::scanners::scan_control::ScanControl;
 use squalr_engine_api::src::structures::memory::memory_alignment::MemoryAlignment;
@@ -30,13 +33,15 @@ use src::command_executors::pointer_scan_target_resolution::PointerScanTargetRes
 use src::command_executors::pointer_scan_target_resolution::PointerScanTargetResolver;
 use src::command_executors::snapshot_region_builder::SnapshotRegionBuilder;
 use src::command_executors::snapshot_value_collector::SnapshotValueCollector;
+use squalr_engine_session::src::pointer_scan_results_store::PointerScanResultsStore;
 
 // Port of command_executors/pointer_scan/validate/pointer_scan_validate_request_executor.rs.
 // Upstream: gate open process → gate stored results → gate session-id
 // match → modules + regions by the STORED results' address space → build
 // + collect a fresh validation snapshot → resolve the target request →
-// `validate_scan` rebuilds levels against the fresh values → the guard is
-// overwritten with the validated results → summary + pruned count.
+// `collect_validated_levels` rebuilds levels against the fresh values into
+// the arenas, `seal_results` assembles them → the guard is overwritten with
+// the validated results → summary + pruned count.
 //
 // Deviations: the results store is one slot, so the pre-validation entry
 // is dropped on commit — upstream replaces `*guard` too (same slot
@@ -146,14 +151,13 @@ crashes Abort
         validation_snapshot: Snapshot
     ) -> PointerScanValidateResponse {
         let mut validation_arenas: PointerScanValidationArenas = PointerScanValidationArenas::empty();
-        let resolver: PointerScanTargetResolver = PointerScanTargetResolver {};
         let targets: &mut [u64] = PointerScanValidationArenas::borrow_target_addresses_mut(&mut validation_arenas);
         // Upstream: pointer_scan_results.get_pointer_size().
         let pointer_size: PointerScanPointerSize = engine_privileged_state.pointer_scan_results_store.pointer_size;
         let memory_alignment: MemoryAlignment = engine_privileged_state.scan_settings.memory_alignment;
         let is_single_threaded_scan: bool = engine_privileged_state.scan_settings.is_single_threaded_scan;
         let debug_perform_validation_scan: bool = engine_privileged_state.scan_settings.debug_perform_validation_scan;
-        let resolution: PointerScanTargetResolution = PointerScanTargetResolver::resolve_targets(resolver, &pointer_scan_validate_request.target,
+        let resolution: PointerScanTargetResolution = PointerScanTargetResolver::resolve_targets(&pointer_scan_validate_request.target,
             pointer_size,
             &validation_snapshot,
             memory_alignment,
@@ -208,9 +212,7 @@ crashes Abort
             NormalizedModule::new(&empty_module_name[0..0], 0, 0)
         ];
         let supplied_module_count: u64 = EnginePrivilegedState::copy_supplied_modules(&mut engine_privileged_state, &mut supplied_modules);
-        let mut source_results: PointerScanResults = engine_privileged_state
-            .pointer_scan_results_store
-            .assemble_results_view(&mut source_level_candidates);
+        let mut source_results: PointerScanResults = PointerScanResultsStore::assemble_results_view(&mut engine_privileged_state.pointer_scan_results_store, &mut source_level_candidates);
         let prior_total_node_count: u64 = PointerScanResults::get_total_node_count(&source_results);
         // `let mut` — the validate output needs `mut` fields of the local.
         let mut arenas: PointerScanValidationArenas = validation_arenas;
@@ -233,15 +235,12 @@ crashes Abort
         let validator: PointerScanValidator = PointerScanValidator {};
         let views: PointerScanValidationArenaViews = PointerScanValidationArenas::borrow_views_mut(&mut arenas);
         let validation_descriptor: PointerScanTargetDescriptor = PointerScanTargetDescriptor::clone(&target_descriptor);
-        let mut validated_results: PointerScanResults = PointerScanValidator::validate_scan(&validator, &source_results,
-            validation_descriptor,
-            views.target_addresses,
-            target_address_count,
+        let build: PointerScanResultsBuild = PointerScanValidator::collect_validated_levels(&validator, &source_results,
+            &views.target_addresses[..],
             &snapshots,
             &validation_snapshot,
             &supplied_modules[0..supplied_module_count],
             &scan_control,
-            true,
             &mut scratch.sorted_scratch,
             &mut scratch.target_ranges,
             &mut scratch.lower_bounds,
@@ -257,6 +256,19 @@ crashes Abort
             views.module_names,
             views.levels,
             &mut scratch.level_spans_out,
+            views.static_candidate_arena,
+            views.heap_candidate_arena);
+        let validation_parameters: PointerScanParameters = PointerScanValidator::validation_parameters(&source_results);
+        let mut validated_results: PointerScanResults = PointerScanResultsBuilder::seal_results(build,
+            PointerScanResults::get_session_id(&source_results),
+            &validation_parameters,
+            validation_descriptor,
+            views.target_addresses,
+            target_address_count,
+            PointerScanResults::get_address_space(&source_results),
+            views.module_names,
+            views.levels,
+            &scratch.level_spans_out,
             &mut validated_level_candidates,
             views.static_candidate_arena,
             views.heap_candidate_arena,
@@ -433,7 +445,7 @@ machine pointer_scan_stored_summary(
         level_summaries: [PointerScanLevelSummary; 8],
         level_index: u64
     ) -> StoredPointerScanSummary {
-        let hoist3: u64 = get_level_count(engine_privileged_state.pointer_scan_results_store);
+        let hoist3: u64 = PointerScanResultsStore::get_level_count(engine_privileged_state.pointer_scan_results_store);
         transition level_index < hoist3
             && level_index < 8 {
             true -> level(engine_privileged_state, level_summaries, level_index)
@@ -448,12 +460,12 @@ machine pointer_scan_stored_summary(
     ) -> StoredPointerScanSummary
     requires 0 <= level_index && level_index < 8;
     {
-        let level: PointerScanLevel = get_level(engine_privileged_state.pointer_scan_results_store, level_index);
+        let level: PointerScanLevel = PointerScanResultsStore::get_level(engine_privileged_state.pointer_scan_results_store, level_index);
         let mut next_summaries: [PointerScanLevelSummary; 8] = level_summaries;
-        let depth: u64 = get_depth(level);
-        let node_count: u64 = get_node_count(level);
-        let static_node_count: u64 = get_static_node_count(level);
-        let heap_node_count: u64 = get_heap_node_count(level);
+        let depth: u64 = PointerScanLevel::get_depth(level);
+        let node_count: u64 = PointerScanLevel::get_node_count(level);
+        let static_node_count: u64 = PointerScanLevel::get_static_node_count(level);
+        let heap_node_count: u64 = PointerScanLevel::get_heap_node_count(level);
         next_summaries[level_index] = PointerScanLevelSummary::new(
             depth,
             node_count,
@@ -465,10 +477,10 @@ machine pointer_scan_stored_summary(
         engine_privileged_state: &mut EnginePrivilegedState,
         level_summaries: [PointerScanLevelSummary; 8]
     ) -> StoredPointerScanSummary {
-        let level_count: u64 = get_level_count(engine_privileged_state.pointer_scan_results_store);
-        let cloned_descriptor: PointerScanTargetDescriptor = clone(engine_privileged_state.pointer_scan_results_store.target_descriptor);
+        let level_count: u64 = PointerScanResultsStore::get_level_count(engine_privileged_state.pointer_scan_results_store);
+        let cloned_descriptor: PointerScanTargetDescriptor = PointerScanTargetDescriptor::clone(engine_privileged_state.pointer_scan_results_store.target_descriptor);
         (StoredPointerScanSummary::of_scalars(
-            get_session_id(engine_privileged_state.pointer_scan_results_store),
+            PointerScanResultsStore::get_session_id(engine_privileged_state.pointer_scan_results_store),
             cloned_descriptor,
             engine_privileged_state.pointer_scan_results_store.address_space,
             engine_privileged_state.pointer_scan_results_store.pointer_size,
@@ -499,7 +511,7 @@ machine pointer_scan_validate_harvest<'ext, 'sh, 's, 'h>(
         level_summaries: &mut [PointerScanLevelSummary; 8],
         level_index: u64
     ) {
-        let hoist4: u64 = get_pointer_scan_level_count(pointer_scan_results);
+        let hoist4: u64 = PointerScanResults::get_pointer_scan_level_count(pointer_scan_results);
         transition level_index < hoist4
             && level_index < 8 {
             true -> harvest(pointer_scan_results, level_static_counts, level_heap_counts, level_summaries, level_index)
@@ -516,13 +528,13 @@ machine pointer_scan_validate_harvest<'ext, 'sh, 's, 'h>(
     )
     requires 0 <= level_index && level_index < 8;
     {
-        let level: PointerScanLevel = get_pointer_scan_level_copy(pointer_scan_results, level_index);
-        level_static_counts[level_index] = get_static_node_count(level);
-        level_heap_counts[level_index] = get_heap_node_count(level);
-        let depth: u64 = get_depth(level);
-        let node_count: u64 = get_node_count(level);
-        let static_node_count: u64 = get_static_node_count(level);
-        let heap_node_count: u64 = get_heap_node_count(level);
+        let level: PointerScanLevel = PointerScanResults::get_pointer_scan_level_copy(pointer_scan_results, level_index);
+        level_static_counts[level_index] = PointerScanLevel::get_static_node_count(level);
+        level_heap_counts[level_index] = PointerScanLevel::get_heap_node_count(level);
+        let depth: u64 = PointerScanLevel::get_depth(level);
+        let node_count: u64 = PointerScanLevel::get_node_count(level);
+        let static_node_count: u64 = PointerScanLevel::get_static_node_count(level);
+        let heap_node_count: u64 = PointerScanLevel::get_heap_node_count(level);
         level_summaries[level_index] = PointerScanLevelSummary::new(
             depth,
             node_count,
