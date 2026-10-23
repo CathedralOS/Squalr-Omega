@@ -299,7 +299,7 @@ crashes Abort
                 ScalarScanSelection::Some {
                     driver: ScalarRegionScan {
                         kind: ScalarRegionScanKind::Iterative,
-                        iterative_scan: SnapshotRegionFilter::new(&snapshot_region_filter,
+                        iterative_scan: ScalarIterativeScan::new(&snapshot_region_filter,
                             snapshot_filter_element_scan_plan
                         ),
                         byte_array_scan: hoist15,
@@ -609,30 +609,30 @@ crashes Abort
     // constraint order, so the ordinal is the plan index — the constraint
     // navigation upstream's flattened index answered is this same slot).
     let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
-    let plan_list: TypePlanList = get_plan_list_for(element_scan_plan, &data_type_ref);
-    let plan: SnapshotFilterElementScanPlan = get_plan(plan_list, constraint_index);
-    let compare_type: ScanCompareType = get_scan_compare_type(plan);
-    let operand_value: u64 = get_operand_value(plan);
-    let unit_size: u64 = get_unit_size_in_bytes(plan);
-    let periodicity: u64 = get_periodicity(plan);
-    let is_floating_point: bool = get_is_floating_point(plan);
-    let prefer_type_scanner: bool = get_prefer_type_scanner(plan);
-    let has_mask: bool = get_has_mask(plan);
+    let plan_list: TypePlanList = ElementScanPlan::get_plan_list_for(element_scan_plan, &data_type_ref);
+    let plan: SnapshotFilterElementScanPlan = TypePlanList::get_plan(plan_list, constraint_index);
+    let compare_type: ScanCompareType = SnapshotFilterElementScanPlan::get_scan_compare_type(plan);
+    let operand_value: u64 = SnapshotFilterElementScanPlan::get_operand_value(plan);
+    let unit_size: u64 = SnapshotFilterElementScanPlan::get_unit_size_in_bytes(plan);
+    let periodicity: u64 = SnapshotFilterElementScanPlan::get_periodicity(plan);
+    let is_floating_point: bool = SnapshotFilterElementScanPlan::get_is_floating_point(plan);
+    let prefer_type_scanner: bool = SnapshotFilterElementScanPlan::get_prefer_type_scanner(plan);
+    let has_mask: bool = SnapshotFilterElementScanPlan::get_has_mask(plan);
     let memory_alignment: MemoryAlignment =
-        get_memory_alignment(element_scan_plan);
+        ElementScanPlan::get_memory_alignment(element_scan_plan);
     // The rule pass mutates a scratch copy; the stored plan keeps its
     // planned scan type from build time.
     let mut scan_plan: SnapshotFilterElementScanPlan =
         SnapshotFilterElementScanPlan::clone(&plan);
     ElementScanRuleRegistry::apply_filter_rules(
         compare_type,
-        has_current_values(snapshot_region),
-        has_previous_values(snapshot_region),
-        get_region_size(snapshot_region_filter),
+        SnapshotRegion::has_current_values(snapshot_region),
+        SnapshotRegion::has_previous_values(snapshot_region),
+        SnapshotRegionFilter::get_region_size(snapshot_region_filter),
         result_value_size_in_bytes,
         is_floating_point,
         prefer_type_scanner,
-        get_size_in_bytes(memory_alignment),
+        MemoryAlignment::get_size_in_bytes(memory_alignment),
         periodicity,
         has_mask,
         &mut scan_plan
@@ -642,7 +642,7 @@ crashes Abort
     // same window is the decoded-byte view — unit 1, alignment 1. Byte-array
     // scans are current-values-only upstream, so the previous decode is
     // skipped entirely for that plan.
-    let hoist4: PlannedScanType = get_planned_scan_type(scan_plan);
+    let hoist4: PlannedScanType = SnapshotFilterElementScanPlan::get_planned_scan_type(scan_plan);
     transition hoist4 {
         PlannedScanType::ByteArray { scan_type } -> fill_bytes(
             snapshot_region,
@@ -655,7 +655,7 @@ crashes Abort
             dst,
             dst_len
         )
-        _ -> fill_elements(
+        _ -> gate_elements(
             snapshot_region,
             element_scan_plan,
             snapshot_region_filter,
@@ -670,7 +670,9 @@ crashes Abort
         )
     }
 
-    state fill_elements(
+    // A zero-width element reads nothing; the plan never mints one, and the
+    // element reads below require the width as a stated fact.
+    state gate_elements(
         snapshot_region: &SnapshotRegion,
         element_scan_plan: &ElementScanPlan,
         snapshot_region_filter: &SnapshotRegionFilter,
@@ -683,11 +685,32 @@ crashes Abort
         dst: &mut [SnapshotRegionFilter],
         dst_len: u64
     ) -> u64 {
-        let current_count: u64 = read_current_elements(snapshot_region, snapshot_region_filter,
+        transition unit_size > 0 {
+            true -> fill_elements(snapshot_region, element_scan_plan, snapshot_region_filter, scan_plan, unit_size, memory_alignment, current_elements, previous_elements, driver_cell, dst, dst_len)
+            _ -> (0)
+        }
+    }
+
+    state fill_elements(
+        snapshot_region: &SnapshotRegion,
+        element_scan_plan: &ElementScanPlan,
+        snapshot_region_filter: &SnapshotRegionFilter,
+        scan_plan: SnapshotFilterElementScanPlan,
+        unit_size: u64,
+        memory_alignment: MemoryAlignment,
+        current_elements: &mut [u64],
+        previous_elements: &mut [u64],
+        driver_cell: &mut [ScalarRegionScan],
+        dst: &mut [SnapshotRegionFilter],
+        dst_len: u64
+    ) -> u64
+        requires unit_size > 0;
+    {
+        let current_count: u64 = SnapshotRegion::read_current_elements(snapshot_region, snapshot_region_filter,
             unit_size,
             memory_alignment,
             current_elements);
-        let hoist5: bool = has_previous_values(snapshot_region);
+        let hoist5: bool = SnapshotRegion::has_previous_values(snapshot_region);
         transition hoist5 {
             true -> decode_previous(
                 snapshot_region,
@@ -747,7 +770,7 @@ crashes Abort
         dst: &mut [SnapshotRegionFilter],
         dst_len: u64
     ) -> u64 {
-        let current_count: u64 = read_current_elements(snapshot_region, snapshot_region_filter,
+        let current_count: u64 = SnapshotRegion::read_current_elements(snapshot_region, snapshot_region_filter,
             1,
             MemoryAlignment::Alignment1,
             current_elements);
@@ -779,8 +802,10 @@ crashes Abort
         driver_cell: &mut [ScalarRegionScan],
         dst: &mut [SnapshotRegionFilter],
         dst_len: u64
-    ) -> u64 {
-        let previous_count: u64 = read_previous_elements(snapshot_region, snapshot_region_filter,
+    ) -> u64
+        requires unit_size > 0;
+    {
+        let previous_count: u64 = SnapshotRegion::read_previous_elements(snapshot_region, snapshot_region_filter,
             unit_size,
             memory_alignment,
             previous_elements);
@@ -982,7 +1007,7 @@ crashes Abort
         single_current: u64,
         single_previous: u64
     ) -> u64 {
-        let hoist6: ScalarScanSelection = dispatch_scalar_selection(
+        let hoist6: ScalarScanSelection = ElementScanDispatcher::dispatch_scalar_selection(
             snapshot_region_filter,
             &scan_plan,
             single_current,
@@ -1096,7 +1121,7 @@ crashes Abort
         // has already established the scratch holds `count` elements, so a
         // caller undersizing the scratch aborts there rather than silently
         // truncating the element windows.
-        let emitted: EmittedRegion = next(driver_cell[0], current_elements,
+        let emitted: EmittedRegion = ScalarRegionScan::next(&mut driver_cell[0], current_elements,
             previous_elements);
         // Payload moves to a param-position scrutinee in a hop state.
         transition {
@@ -1910,12 +1935,12 @@ machine resolve_result_value_size<'d, 'c>(
         constraint_ordinal: u64
     ) -> u64 {
         let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
-        let plan_list: TypePlanList = get_plan_list_for(element_scan_plan, &data_type_ref);
-        let plan: SnapshotFilterElementScanPlan = get_plan(plan_list, constraint_ordinal);
+        let plan_list: TypePlanList = ElementScanPlan::get_plan_list_for(element_scan_plan, &data_type_ref);
+        let plan: SnapshotFilterElementScanPlan = TypePlanList::get_plan(plan_list, constraint_ordinal);
         // Upstream's operand width is the parsed data value's width; the
         // owned plan carries the operand at unit width, so the unit stands
         // in for it.
-        let operand_size: u64 = get_unit_size_in_bytes(plan);
+        let operand_size: u64 = SnapshotFilterElementScanPlan::get_unit_size_in_bytes(plan);
         transition operand_size > best {
             true -> walk(
                 element_scan_plan,
@@ -1975,13 +2000,13 @@ machine resolve_result_container_type<'d, 'c>(
         constraint_ordinal: u64
     ) -> ContainerType {
         let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
-        let plan_list: TypePlanList = get_plan_list_for(element_scan_plan, &data_type_ref);
-        let plan: SnapshotFilterElementScanPlan = get_plan(plan_list, constraint_ordinal);
-        let container_type: ContainerType = get_result_container_type(plan);
+        let plan_list: TypePlanList = ElementScanPlan::get_plan_list_for(element_scan_plan, &data_type_ref);
+        let plan: SnapshotFilterElementScanPlan = TypePlanList::get_plan(plan_list, constraint_ordinal);
+        let container_type: ContainerType = SnapshotFilterElementScanPlan::get_result_container_type(plan);
         // Union scrutinees are admitted on params, not locals — hoist the
         // kind bools; the union itself passes through in the keep arms.
         let container_keep: bool =
-            is_array(container_type) || is_array_fixed(container_type);
+            ContainerType::is_array(container_type) || ContainerType::is_array_fixed(container_type);
         transition container_keep {
             true -> (container_type)
             _ -> walk(
@@ -2038,8 +2063,8 @@ public machine ElementScanDispatcher::dispatch_scan<'a, 'p, 'r, 't, 'd, 'c, 'f>(
 crashes Abort
 {
     let data_type_ref: DataTypeRef = DataTypeRef::new(data_type_id);
-    let constraint_count: u64 =
-        ElementScanPlan::get_plan_list_for(&element_scan_plan, &data_type_ref).get_plan_count();
+    let plan_list: TypePlanList = ElementScanPlan::get_plan_list_for(&element_scan_plan, &data_type_ref);
+    let constraint_count: u64 = TypePlanList::get_plan_count(&plan_list);
     let memory_alignment: MemoryAlignment =
         SnapshotRegionFilterCollection::get_memory_alignment(&snapshot_region_filter_collection);
     let default_size: u64 =
