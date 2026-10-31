@@ -63,10 +63,11 @@ omega update --resume --project squalr-tests
 
 Inspect the first command's review and resolve its exact pending decisions before
 resuming. The initial update selects the target; resume retains the proposal's
-targets and does not accept a target override. The checked-in
-`squalr-tests/omega.lock` records a reviewed Linux x86_64 baseline. Local package
-identities include checkout paths, so another checkout needs ordinary
-update/review for its local owners. A lock records package admission; native
+targets and does not accept a target override. The historical
+`squalr-tests/omega.lock` is retained in Git history, not supplied as approval for
+the migrated sources. Local package identities include checkout paths, so each
+checkout needs ordinary update/review for its local owners. A lock records
+package admission; native
 acceptance still requires executing the application. A timeout is not a
 successful check.
 

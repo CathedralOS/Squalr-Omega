@@ -61,23 +61,18 @@ behavior changes and compare the internal package edges. Preserve attribution
 and the upstream license. Implementation mappings belong beside source or in
 the active task; do not copy an ever-growing historical ledger into this file.
 
-## Toolchain mechanics (measured, current pin)
+## Nested machines and compiler failures
 
-Porting hit these compiler rules repeatedly; author around them instead of
-re-diagnosing:
+Use nested `machine` declarations, not the retired `state` spelling. Nesting
+scopes helper names; it does not capture runtime locals or grant the enclosing
+machine's entry facts. Pass runtime data explicitly and state the helper's
+required contract. Ordinary calls return to their caller; terminal calls forward
+completion, with constant-stack cycles preserved by the compiler.
 
-- `&mut`-param to `&`-param machine calls need an explicit reborrow binding
-  (`let view: &T = fields;`); direct passing does not resolve.
-- `requires` conjuncts match literally by callee parameter name AND text —
-  caller locals must share the callee's parameter names and guards must state
-  the conjunct exactly (`slot < fields.field_name_count`, not an equal bound
-  local).
-- `requires` on a `&mut` state parameter cannot reference that record's
-  fields ("receives fields as both mutable and read-only") — hoist reads into
-  the caller's guard.
-- A `(fields)` terminal returning a `&mut` binding reports "expects T, got
-  named value" — return an owned record via `clone_of` into a fresh local.
-- `&mut`-typed arguments to state targets need explicit `&mut work` at call
-  sites.
-- State calls are banned in return position and as machine arguments —
-  let-bind or use as a transition target only.
+Keep the application's data flow and contracts when migrating declarations.
+Historical compiler failures around parameter substitution, mutable borrows and
+helper results are not language restrictions. Reproduce a current failure with
+the pinned compiler and fix its general compiler operation; do not rename locals,
+clone records, move obligations into caller guards, or reshape calls merely to
+satisfy an old checker limitation. Record exact current diagnostics with their
+producer revision rather than perpetuating workaround instructions.
