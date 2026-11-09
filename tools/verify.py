@@ -64,6 +64,17 @@ def check_layout(root, upstream=None):
     return len(packages), sum(len(package["dependencies"]) for package in packages)
 
 
+def host_target():
+    """Name the Omega target this Python host executes, or None if unknown."""
+    return {
+        ("Darwin", "arm64"): "macos_arm64",
+        ("Darwin", "x86_64"): "macos_x86_64",
+        ("Linux", "aarch64"): "linux_arm64",
+        ("Linux", "x86_64"): "linux_x86_64",
+        ("Windows", "amd64"): "windows_x86_64",
+    }.get((platform.system(), platform.machine().lower()))
+
+
 def compiler_command(mode, executable, application, target, report):
     if mode == "audit":
         command = [executable, "audit", "packages", "--project", str(application), "--details"]
@@ -74,13 +85,7 @@ def compiler_command(mode, executable, application, target, report):
         # Here --target asserts the execution host; it must not turn this native
         # acceptance gate into a compile-only invocation.
         if target:
-            host = {
-                ("Darwin", "arm64"): "macos_arm64",
-                ("Darwin", "x86_64"): "macos_x86_64",
-                ("Linux", "aarch64"): "linux_arm64",
-                ("Linux", "x86_64"): "linux_x86_64",
-                ("Windows", "amd64"): "windows_x86_64",
-            }.get((platform.system(), platform.machine().lower()))
+            host = host_target()
             if target != host:
                 raise ValueError(
                     f"native target {target} does not match host {host or platform.platform()}; "

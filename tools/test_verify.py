@@ -21,9 +21,16 @@ class HarnessTests(unittest.TestCase):
                 verify.check_layout(root)
 
     def test_native_uses_real_run_not_interpretation(self):
-        command = verify.compiler_command("native", "omega", Path("application"), "macos_arm64", Path("report"))
+        # Name the executing host so the same control runs on Windows, Linux and macOS.
+        command = verify.compiler_command("native", "omega", Path("application"), verify.host_target(), Path("report"))
         self.assertEqual(command[:3], ["omega", "run", "--keep"])
         self.assertNotIn("--accept-admissions", command)
+        self.assertNotIn("--target", command)
+
+    def test_native_rejects_another_host_target(self):
+        other = "linux_arm64" if verify.host_target() != "linux_arm64" else "macos_arm64"
+        with self.assertRaisesRegex(ValueError, "does not match host"):
+            verify.compiler_command("native", "omega", Path("application"), other, Path("report"))
 
     def execute(self, program, mode="check", timeout=5):
         with tempfile.TemporaryDirectory() as directory:
